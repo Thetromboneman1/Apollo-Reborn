@@ -15,7 +15,6 @@ concurrency:
 
 env:
   UPSTREAM_REPOSITORY: Apollo-Reborn/Apollo-Reborn
-  CUSTOM_BRANCH: boneman/pr-fixes-2026-08-09
 
 jobs:
   sync:
@@ -23,7 +22,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Check out fork main
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -48,22 +47,8 @@ jobs:
             echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Merge refreshed main into custom fixes
-        id: custom
-        if: steps.upstream.outputs.conflict == 'false'
-        run: |
-          git fetch origin "$CUSTOM_BRANCH"
-          git checkout -B "$CUSTOM_BRANCH" "origin/$CUSTOM_BRANCH"
-          if git merge --no-edit origin/main; then
-            git push origin "$CUSTOM_BRANCH"
-            echo "conflict=false" >> "$GITHUB_OUTPUT"
-          else
-            git merge --abort || true
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Report a merge conflict
-        if: steps.upstream.outputs.conflict == 'true' || steps.custom.outputs.conflict == 'true'
+        if: steps.upstream.outputs.conflict == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
