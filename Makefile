@@ -48,6 +48,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWhatsNew.xm \
     $(WHATS_NEW_GEN_M) \
     $(SRC_DIR)/Tweak.xm \
+    $(SRC_DIR)/ApolloRecommendedSettingsMigration.m \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
     $(SRC_DIR)/settings/ApolloSettingsTableViewController.m \
