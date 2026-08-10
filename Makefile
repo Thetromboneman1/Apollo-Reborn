@@ -48,6 +48,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWhatsNew.xm \
     $(WHATS_NEW_GEN_M) \
     $(SRC_DIR)/Tweak.xm \
+    $(SRC_DIR)/ApolloRecommendedSettingsMigration.m \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
     $(SRC_DIR)/settings/ApolloSettingsTableViewController.m \
@@ -141,6 +142,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloFlairColors.xm \
     $(SRC_DIR)/ApolloNativeActionMenus.xm \
     $(SRC_DIR)/ApolloContextMenuPreviewTheme.xm \
+    $(SRC_DIR)/ApolloActionMenu.xm \
     $(SRC_DIR)/ApolloHostedVideo.m \
     $(SRC_DIR)/ApolloSportsClipResolver.m \
     $(SRC_DIR)/ApolloSportsClips.xm \
