@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: boneman-apollo-upstream-sync
@@ -50,14 +49,14 @@ jobs:
       - name: Report a merge conflict
         if: steps.upstream.outputs.conflict == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          title="Apollo upstream sync conflict"
-          body="The bounded upstream sync stopped without pushing a conflicted merge. Review: $RUN_URL"
-          issue_number="$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
-          if [[ -n "$issue_number" ]]; then
-            gh issue comment "$issue_number" --body "$body"
-          else
-            gh issue create --title "$title" --body "$body"
-          fi
+          echo "::error title=Apollo upstream sync conflict::The bounded upstream sync stopped without pushing a conflicted merge. Review: $RUN_URL"
+          {
+            echo "## Apollo upstream sync conflict"
+            echo
+            echo "The bounded upstream sync stopped without pushing a conflicted merge."
+            echo
+            echo "Review: $RUN_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
