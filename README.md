@@ -374,3 +374,9 @@ Thank you to these wonderful people:
 </table>
 
 <!-- CONTRIBUTORS-LIST:END -->
+
+## Fork Maintenance
+
+This fork tracks `Apollo-Reborn/Apollo-Reborn`. Upstream changes must use a
+review branch because downstream builds and signing behavior need validation.
+See [repository maintenance](docs/repository-maintenance.md) before syncing.
