@@ -3421,8 +3421,11 @@ static BOOL ApolloDefaultsKeyChangesActiveAccount(NSString *key) {
                                     UDKeyShowRecentlyReadThumbnails: @YES,
                                     UDKeyFeedTextPostThumbnails: @YES,
                                     UDKeyFeedGalleryCarousel: @YES,
+                                    UDKeyFeedGalleryEdgeSwipeNav: @YES,
                                     UDKeySwipeUpForComments: @YES,
                                     UDKeySportsClipsInlineVideo: @YES,
+                                    UDKeyDevvitInteractivePosts: @NO,
+                                    UDKeyDevvitFeedWidgets: @YES,
                                     UDKeyPreferredGIFFallbackFormat: @1,
                                     UDKeyUnmuteCommentsVideos: @0,
                                     UDKeyVideoHoldSpeedEnabled: @YES,
@@ -3543,7 +3546,10 @@ static BOOL ApolloDefaultsKeyChangesActiveAccount(NSString *key) {
     sShowRecentlyReadThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRecentlyReadThumbnails];
     sFeedTextPostThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedTextPostThumbnails];
     sFeedGalleryCarousel = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedGalleryCarousel];
+    sFeedGalleryEdgeSwipeNav = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedGalleryEdgeSwipeNav];
     sSwipeUpForComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySwipeUpForComments];
+    sDevvitInteractivePosts = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts];
+    sDevvitFeedWidgets = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitFeedWidgets];
     sPreferredGIFFallbackFormat = ([[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;
     sReadPostMaxCount = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyReadPostMaxCount];
     sUnmuteCommentsVideos = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyUnmuteCommentsVideos];
