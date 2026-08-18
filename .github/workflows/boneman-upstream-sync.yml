@@ -53,6 +53,16 @@ jobs:
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      - name: Refresh generated documentation
+        if: steps.upstream.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/documentation_health.py --write
+          python3 scripts/documentation_health.py --check
+          if git status --porcelain | grep -q .; then
+            git add -A
+            git commit -m "docs: refresh generated repository state [skip ci]"
+          fi
       - name: Install build dependencies
         if: steps.upstream.outputs.changed == 'true'
         run: brew install ldid dpkg make
