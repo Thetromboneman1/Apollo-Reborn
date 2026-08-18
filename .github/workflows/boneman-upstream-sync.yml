@@ -61,7 +61,7 @@ jobs:
           python3 scripts/documentation_health.py --check
           if git status --porcelain | grep -q .; then
             git add -A
-            git commit -m "docs: refresh generated repository state [skip ci]"
+            git commit -m "docs: refresh generated repository state"
           fi
       - name: Install build dependencies
         if: steps.upstream.outputs.changed == 'true'
