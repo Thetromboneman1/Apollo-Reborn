@@ -16,6 +16,8 @@ Apollo
 !liquid-glass/icons/apollo/**
 .cache
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Liquid Glass
 liquid-glass/scripts/__pycache__/
