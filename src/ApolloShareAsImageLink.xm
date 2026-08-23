@@ -494,7 +494,8 @@ static BOOL ApolloShareLinkAlreadyHasLinkSource(NSArray *items) {
             NSMutableArray *items = [rewrittenActivityItems isKindOfClass:[NSArray class]]
                 ? [rewrittenActivityItems mutableCopy] : [NSMutableArray array];
             [items addObject:source];
-            ApolloLog(@"[ShareLink] appended link to share sheet: %@", source.url.absoluteString);
+            ApolloLog(@"[ShareLink] appended configured link to share sheet (host=%@)",
+                      source.url.host ?: @"(none)");
             return %orig(items, applicationActivities);
         }
         ApolloLog(@"[ShareLink] share active but no link resolved — leaving items unchanged");
@@ -549,7 +550,8 @@ static BOOL ApolloShareLinkAlreadyHasLinkSource(NSArray *items) {
     }
 
     pasteboard.URL = rewritten;
-    ApolloLog(@"[ShareLink] CopyURLActivity rewrote copied URL to %@", rewritten.absoluteString);
+    ApolloLog(@"[ShareLink] CopyURLActivity rewrote copied URL (host=%@)",
+              rewritten.host ?: @"(none)");
 }
 
 %end

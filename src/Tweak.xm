@@ -2253,13 +2253,13 @@ static NSURL *ApolloWriteTrendingPlist(NSDictionary *table) {
         if (![data writeToFile:path options:NSDataWritingAtomic error:NULL]) {
             [fileManager removeItemAtPath:path error:NULL];
             if (![data writeToFile:path options:NSDataWritingAtomic error:NULL]) {
-                ApolloLog(@"[RandomSources] Trending plist write failed at %@", path);
+                ApolloLog(@"[RandomSources] Trending plist write failed in candidate directory");
                 continue;
             }
         }
         if ([NSDictionary dictionaryWithContentsOfFile:path].count == 0) {
-            ApolloLog(@"[RandomSources] Trending plist at %@ did not read back as a "
-                      @"dictionary; discarding", path);
+            ApolloLog(@"[RandomSources] Trending plist did not read back as a dictionary; "
+                      @"discarding candidate");
             [fileManager removeItemAtPath:path error:NULL];
             continue;
         }

@@ -23,6 +23,8 @@ bash -n \
   "$ROOT/scripts/build_release_variants.sh" \
   "$ROOT/scripts/validate_release_variants.sh"
 
+bash "$ROOT/tests/boneman_upstream_repairs_source_test.sh"
+
 if [[ "$BUILD" == true ]]; then
   : "${THEOS:?THEOS must point to a Theos checkout for --build}"
   make -C "$ROOT" package FINALPACKAGE=1
