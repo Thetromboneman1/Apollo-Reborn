@@ -128,14 +128,6 @@ static BOOL ApolloPathIsLiveActivityRegistration(NSString *path) {
     return [path isEqualToString:@"/v1/live_activities"];
 }
 
-// Endpoints behind REGISTRATION_SECRET on the new backend.
-static BOOL ApolloPathRequiresRegistrationToken(NSString *path) {
-    return ApolloPathIsDeviceRegistration(path)
-        || ApolloPathIsAccountUpsertSingular(path)
-        || ApolloPathIsAccountUpsertBulk(path)
-        || ApolloPathIsLiveActivityRegistration(path);
-}
-
 // MARK: - JSON body augmentation
 
 // Inject the four per-account Reddit OAuth fields the forked backend's
@@ -286,15 +278,18 @@ NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) 
     NSMutableURLRequest *mutable = [request mutableCopy];
     mutable.URL = rewrittenURL;
 
+    // A configured backend token authenticates the rewritten backend request,
+    // not a small historical set of registration paths. Attach it before any
+    // method/path-specific compatibility work so DELETE, PATCH, GET, receipt,
+    // and diagnostic requests all keep working when the backend requires it.
+    // Requests that are not rewritten return above unchanged; an unset token
+    // intentionally adds no header.
+    if (sCachedRegistrationToken.length > 0) {
+        [mutable setValue:sCachedRegistrationToken forHTTPHeaderField:@"X-Registration-Token"];
+    }
+
     NSString *method = mutable.HTTPMethod.uppercaseString ?: @"GET";
     NSString *path = requestURL.path ?: @"";
-
-    // Header gate: only POSTs hit the gated handlers, but be defensive.
-    if ([method isEqualToString:@"POST"] && ApolloPathRequiresRegistrationToken(path)) {
-        if (sCachedRegistrationToken.length > 0) {
-            [mutable setValue:sCachedRegistrationToken forHTTPHeaderField:@"X-Registration-Token"];
-        }
-    }
 
     // Credential injection for the two account-upsert endpoints. The forked
     // backend's accountRegistrationRequest requires four Reddit OAuth fields
