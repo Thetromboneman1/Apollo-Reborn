@@ -122,12 +122,6 @@ static BOOL ApolloPathIsAccountUpsertBulk(NSString *path) {
         && [parts[4] isEqualToString:@"accounts"];
 }
 
-// Match `/v1/live_activities` (Live Activity registration — the backend polls
-// the thread and pushes ActivityKit updates).
-static BOOL ApolloPathIsLiveActivityRegistration(NSString *path) {
-    return [path isEqualToString:@"/v1/live_activities"];
-}
-
 // MARK: - JSON body augmentation
 
 // Inject the four per-account Reddit OAuth fields the forked backend's
