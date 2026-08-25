@@ -3734,6 +3734,8 @@ static BOOL ApolloDefaultsKeyChangesActiveAccount(NSString *key) {
                                     UDKeyTranslationProviderUserSelected: @NO,
                                     UDKeyLibreTranslateURL: @"https://libretranslate.com/translate",
                                     UDKeyLibreTranslateAPIKey: @"",
+                                    UDKeyMicrosoftTranslateAPIKey: @"",
+                                    UDKeyMicrosoftTranslateRegion: @"",
                                     UDKeyTranslationSkipLanguages: @[],
                                     UDKeyAppleTranslateSheet: @NO,
                                     UDKeyEnableAISummaries: @NO,
@@ -4037,6 +4039,8 @@ static BOOL ApolloDefaultsKeyChangesActiveAccount(NSString *key) {
         sTranslationProvider = @"libre";
     } else if ([provider isEqualToString:@"google"]) {
         sTranslationProvider = @"google";
+    } else if ([provider isEqualToString:@"microsoft"]) {
+        sTranslationProvider = @"microsoft";
     } else if ([provider isEqualToString:@"apple"] && IsAppleTranslationSupported()) {
         sTranslationProvider = @"apple";
     } else {
@@ -4057,6 +4061,11 @@ static BOOL ApolloDefaultsKeyChangesActiveAccount(NSString *key) {
 
     NSString *libreAPIKey = (NSString *)[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyLibreTranslateAPIKey];
     sLibreTranslateAPIKey = [libreAPIKey length] > 0 ? [libreAPIKey copy] : nil;
+
+    NSString *msKey = (NSString *)[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyMicrosoftTranslateAPIKey];
+    sMicrosoftTranslateAPIKey = [msKey length] > 0 ? [msKey copy] : nil;
+    NSString *msRegion = (NSString *)[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyMicrosoftTranslateRegion];
+    sMicrosoftTranslateRegion = [msRegion length] > 0 ? [msRegion copy] : nil;
 
     {
         id raw = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeyTranslationSkipLanguages];
