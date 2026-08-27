@@ -390,7 +390,7 @@ See [repository maintenance](docs/repository-maintenance.md) before syncing.
 
 ![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
 
-- **Default branch:** `repair/upstream-sync-cc878-20260827`
+- **Default branch:** `main`
 - **Implementation fingerprint:** `1f06ac7f7fff8e95`
 - **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
