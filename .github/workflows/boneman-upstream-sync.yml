@@ -104,6 +104,14 @@ jobs:
           git push --set-upstream origin "$BRANCH"
           existing=$(gh pr list --head "$BRANCH" --base "$DOWNSTREAM_BRANCH" --state open --json url --jq '.[0].url // empty')
           if [[ -z "$existing" ]]; then
+            existing=$(curl --fail --silent --show-error --get \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+              --data-urlencode "state=open" \
+              --data-urlencode "head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" \
+              --data-urlencode "base=${DOWNSTREAM_BRANCH}" \
+              | python3 -c 'import json, sys; rows = json.load(sys.stdin); print(rows[0]["html_url"] if rows else "")')
+          fi
+          if [[ -z "$existing" ]]; then
             gh pr create --head "$BRANCH" --base "$DOWNSTREAM_BRANCH" \
               --title "chore: sync Apollo-Reborn/Apollo-Reborn main" \
               --body "Merges \`${UPSTREAM_REPOSITORY}@${UPSTREAM_SHA}\` through the downstream package validation contract."
