@@ -1395,10 +1395,15 @@ typedef NS_ENUM(NSInteger, Tag) {
                                   onToggle:^(UISwitch *sender) { [weakSelf feedVideoScrubberSwitchToggled:sender]; }];
 
     ApolloSettingsRow *forwardSwipeForget =
-        [ApolloSettingsRow switchRowWithID:@"gen.forwardSwipeForget"
-                                     title:@"Forget Forward Swipe After Scrolling"
-                                      isOn:^BOOL { return sForwardSwipeForgetAfterScrolling; }
-                                  onToggle:^(UISwitch *sender) { [weakSelf forwardSwipeForgetSwitchToggled:sender]; }];
+        [ApolloSettingsRow customRowWithID:@"gen.forwardSwipeForget"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_Gen_ForwardSwipeForget"
+                                                label:@"Forget Forward Swipe After Scrolling"
+                                               detail:@"Prevents an accidental forward swipe from reopening a post after you scroll several rows away."
+                                                   on:sForwardSwipeForgetAfterScrolling
+                                               action:@selector(forwardSwipeForgetSwitchToggled:)];
+        }
+                                  onSelect:nil];
 
     ApolloSettingsRow *blockAnnouncements =
         [ApolloSettingsRow switchRowWithID:@"gen.blockAnnouncements"
@@ -1428,7 +1433,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     devvitFeedPosts.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Feed"
-                                            footer:@"Small tweaks for the post list. Feed Video Scrubber: drag the progress bar at the bottom of a video — in the feed or on the post itself — to scrub it without opening the video. Forget Forward Swipe After Scrolling: Apollo's swipe forward (from the right edge, or swiping past a gallery's last image) normally re-opens the post you last swiped back from no matter how long ago that was; with this on, that memory is dropped once you've scrolled a few posts away, so a stray swipe can't jump to a long-gone post. Live Interactive Posts shows Reddit's Developer Platform posts as their real live widget — match scores and threads, market tickers and trading dashboards, predictions, brackets, polls, and community games — instead of the placeholder text old Reddit gets. Always shown in comments; Show in Feed also puts it on large-mode feed cards, and keeps a pinned one (a subreddit's daily discussion thread, say) in the feed rather than folding it into Community Highlights, where a static card can't show live data."
+                                            footer:@"Feed Video Scrubber lets you drag a video's progress bar without opening it. Live Interactive Posts renders Reddit Developer Platform widgets in comments; Show in Feed also enables them on large feed cards."
                                               rows:@[ textPostThumbnails, infoRow, feedScrubber, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts ]];
 }
 
