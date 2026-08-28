@@ -1,14 +1,14 @@
 # Repository State
 
-Updated: 2026-08-27
+Updated: 2026-08-28
 
 This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
 - Repository: `Thetromboneman1/Apollo-Reborn`
-- Default branch: `main`
-- Implementation fingerprint: `e0006e02e0ee857a`
-- Maintained documents: 24
+- Default branch: `automation/upstream-sync-2760388b9432`
+- Implementation fingerprint: `8b490ab9256e5ed4`
+- Maintained documents: 25
 - Architecture assets: 2
 
 ## Detected architecture
