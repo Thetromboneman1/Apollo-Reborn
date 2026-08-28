@@ -18,7 +18,8 @@ BOOL sPassiveDeletedComments = NO;
 BOOL sShowRecentlyReadThumbnails = YES;
 BOOL sFeedTextPostThumbnails = YES;
 BOOL sFeedGalleryCarousel = YES;
-BOOL sFeedGalleryEdgeSwipeNav = YES;
+BOOL sFeedGalleryEdgeSwipeNav = NO;
+BOOL sForwardSwipeForgetAfterScrolling = NO; // scrolling the feed away expires the forward-swipe memory (opt-in)
 BOOL sSwipeUpForComments = YES;
 BOOL sDevvitInteractivePosts = NO;
 BOOL sDevvitFeedWidgets = YES;
@@ -27,6 +28,8 @@ NSInteger sPreferredGIFFallbackFormat = 1; // 0=GIF, 1=MP4
 NSInteger sReadPostMaxCount = 0;
 
 NSInteger sUnmuteCommentsVideos = 0; // 0=Default, 1=Remember from Full Screen, 2=Always
+NSInteger sUnmuteFeedVideos = 0;     // 0=Never, 1=Remember, 2=Always (UDKeyUnmuteFeedVideos)
+BOOL sFeedVideoScrubber = NO;        // hold a feed video's progress bar and slide to scrub
 
 BOOL sVideoHoldSpeedEnabled = YES;   // effective default ON via registerDefaults (UDKeyVideoHoldSpeedEnabled)
 float sVideoHoldSpeed = 2.0f;        // effective default 2.0× via registerDefaults (UDKeyVideoHoldSpeed)
@@ -100,6 +103,28 @@ NSString *sLinkPreviewCardColorHex = nil;
 uint32_t sLinkPreviewCardColorPacked = 0;
 NSInteger sImageUploadProvider = ImageUploadProviderImgur;
 NSInteger sCommentLinkHost = CommentLinkHostOff;
+BOOL sCommentLinkPreferNative = NO;
+NSInteger sShareLinkHost = ShareLinkHostDefault;
+
+NSString *ApolloShareLinkHostDomain(ShareLinkHost host) {
+    switch (host) {
+        case ShareLinkHostOldReddit: return @"old.reddit.com";
+        case ShareLinkHostVXReddit:  return @"vxreddit.com";
+        case ShareLinkHostFXReddit:  return @"fxddit.com";
+        case ShareLinkHostDefault:
+        default:                     return nil;
+    }
+}
+
+NSString *ApolloShareLinkHostDisplayName(ShareLinkHost host) {
+    switch (host) {
+        case ShareLinkHostOldReddit: return @"old.reddit";
+        case ShareLinkHostVXReddit:  return @"vxReddit";
+        case ShareLinkHostFXReddit:  return @"fxReddit (fxddit.com)";
+        case ShareLinkHostDefault:
+        default:                     return @"Reddit";
+    }
+}
 
 NSString *sLatestRedditBearerToken = nil;
 

@@ -10,6 +10,7 @@
 #import "InfoRowSettingsViewController.h"
 #import "ApolloWebSessionLoginViewController.h"
 #import "ApolloDirectChatWeb.h"
+#import "ApolloDevvitPosts.h"        // ApolloDevvitFeedOwnershipChangedNotification
 #import "settings/ApolloAISettingsViewController.h"
 #import "ApolloWebSessionStore.h"
 #import "ApolloAccountCredentials.h"
@@ -292,6 +293,71 @@ typedef NS_ENUM(NSInteger, Tag) {
     });
 }
 
+- (NSString *)shareLinkHostText {
+    return ApolloShareLinkHostDisplayName((ShareLinkHost)sShareLinkHost);
+}
+
+- (void)setShareLinkHost:(NSInteger)host {
+    sShareLinkHost = host;
+    [[NSUserDefaults standardUserDefaults] setInteger:sShareLinkHost
+                                                forKey:UDKeyShareLinkHost];
+    [self reloadRowWithID:@"media.shareLinkHost"];
+}
+
+- (void)presentShareLinkHostSheetFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(
+        self,
+        sourceView,
+        @"Share Link Host",
+        @[
+            ApolloShareLinkHostDisplayName(ShareLinkHostDefault),
+            ApolloShareLinkHostDisplayName(ShareLinkHostOldReddit),
+            ApolloShareLinkHostDisplayName(ShareLinkHostVXReddit),
+            ApolloShareLinkHostDisplayName(ShareLinkHostFXReddit)
+        ],
+        sShareLinkHost,
+        ^(NSInteger pickedIndex) {
+            [weakSelf setShareLinkHost:pickedIndex];
+        });
+}
+
+- (NSString *)unmuteFeedVideosModeText {
+    switch (sUnmuteFeedVideos) {
+        case 1:  return @"Remember";
+        case 2:  return @"Always";
+        default: return @"Never";
+    }
+}
+
+- (void)setUnmuteFeedVideosMode:(NSInteger)mode {
+    sUnmuteFeedVideos = mode;
+    [[NSUserDefaults standardUserDefaults] setInteger:sUnmuteFeedVideos forKey:UDKeyUnmuteFeedVideos];
+    [self reloadRowWithID:@"media.unmuteFeed"];
+}
+
+// Title + options + "(Current)" only — shared picker (option index == stored mode).
+- (void)presentUnmuteFeedVideosModeSheetFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Unmute Videos in Feed",
+                                @[@"Never", @"Remember", @"Always"],
+                                sUnmuteFeedVideos,
+                                ^(NSInteger pickedIndex) {
+        [weakSelf setUnmuteFeedVideosMode:pickedIndex];
+    });
+}
+
+- (void)feedVideoScrubberSwitchToggled:(UISwitch *)sender {
+    sFeedVideoScrubber = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedVideoScrubber forKey:UDKeyFeedVideoScrubber];
+}
+
+- (void)forwardSwipeForgetSwitchToggled:(UISwitch *)sender {
+    sForwardSwipeForgetAfterScrolling = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sForwardSwipeForgetAfterScrolling
+                                            forKey:UDKeyForwardSwipeForgetAfterScrolling];
+}
+
 - (NSString *)mediaUploadProviderText {
     switch (sImageUploadProvider) {
         case ImageUploadProviderReddit:   return @"Reddit";
@@ -359,11 +425,18 @@ typedef NS_ENUM(NSInteger, Tag) {
     // un-blocks while a link host is set) — let it re-apply immediately.
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloCommentLinkHostChangedNotification object:nil];
     [self reloadRowWithID:@"media.commentLinkHost"];
+    // The Prefer Native Images row is only shown while a link host is set.
+    [self visibilityDidChange];
+}
+
+- (void)commentLinkPreferNativeSwitchToggled:(UISwitch *)sender {
+    sCommentLinkPreferNative = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyCommentLinkPreferNative];
 }
 
 - (void)presentCommentLinkHostSheetFromSourceView:(UIView *)sourceView {
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Comment Link Host"
-                                                                   message:@"Images added to a comment or reply upload to this host and are inserted as a plain link instead of a native Reddit image — so they still work in subreddits that don't allow images or GIFs in comments. Apollo shows the linked image inline; other apps and the website show a tappable link. Posts keep using the Media Upload Host."
+                                                                   message:@"Images added to a comment or reply upload to this host and are inserted as a plain link instead of a native Reddit image — so they still work in subreddits that don't allow images or GIFs in comments. Apollo shows the linked image inline; other apps and the website show a tappable link. Posts keep using the Media Upload Host.\n\nTo use this host only where it's needed, turn on Prefer Native Images: comment images then upload to Reddit and display inline wherever the subreddit allows them."
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSString *offTitle = (sCommentLinkHost == CommentLinkHostOff) ? @"Off (Current)" : @"Off";
@@ -1315,15 +1388,32 @@ typedef NS_ENUM(NSInteger, Tag) {
             return [[InfoRowSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
 
+    ApolloSettingsRow *feedScrubber =
+        [ApolloSettingsRow switchRowWithID:@"media.feedScrubber"
+                                     title:@"Feed Video Scrubber"
+                                      isOn:^BOOL { return sFeedVideoScrubber; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf feedVideoScrubberSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *forwardSwipeForget =
+        [ApolloSettingsRow switchRowWithID:@"gen.forwardSwipeForget"
+                                     title:@"Forget Forward Swipe After Scrolling"
+                                      isOn:^BOOL { return sForwardSwipeForgetAfterScrolling; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf forwardSwipeForgetSwitchToggled:sender]; }];
+
     ApolloSettingsRow *blockAnnouncements =
         [ApolloSettingsRow switchRowWithID:@"gen.blockAnnouncements"
                                      title:@"Block Announcements"
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBlockAnnouncements]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf blockAnnouncementsSwitchToggled:sender]; }];
 
+    // Named for the whole class of Reddit Developer Platform posts, not the
+    // sports ones it was first built against: the same widget mechanism carries
+    // r/wallstreetbets' live market dashboard, brackets, polls and community
+    // games. Settings search indexes row TITLES only, so the footer below spells
+    // the range out for anyone who lands on this screen.
     ApolloSettingsRow *devvitPosts =
         [ApolloSettingsRow switchRowWithID:@"gen.devvitPosts"
-                                     title:@"Live Match Threads & Games"
+                                     title:@"Live Interactive Posts"
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf devvitPostsSwitchToggled:sender]; }];
 
@@ -1338,8 +1428,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     devvitFeedPosts.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Feed"
-                                            footer:@"Small tweaks for the post list. Live Match Threads & Games shows the real live widget for Reddit's interactive posts — match scores, predictions, brackets, and community games — instead of a placeholder. Always shown in comments; Show in Feed also puts it on large-mode feed cards."
-                                              rows:@[ textPostThumbnails, infoRow, blockAnnouncements, devvitPosts, devvitFeedPosts ]];
+                                            footer:@"Small tweaks for the post list.\n\nFeed Video Scrubber: drag the bar under a video to scrub it without opening it.\n\nForget Forward Swipe After Scrolling: Apollo's forward swipe re-opens the post you last swiped back from, however long ago that was. This forgets it once you've scrolled a few posts on, so a stray swipe can't jump to an old post.\n\nLive Interactive Posts: shows Reddit Developer Platform posts as their real widget — live scores, market tickers, predictions, brackets, polls, games — instead of placeholder text. Always on in comments; Show in Feed adds them to large feed cards and keeps a pinned one in the feed instead of Community Highlights."
+                                              rows:@[ textPostThumbnails, infoRow, feedScrubber, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts ]];
 }
 
 // Interface group screen (ApolloInterfaceSettingsViewController) — the
@@ -1666,7 +1756,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   onToggle:^(UISwitch *sender) { [weakSelf swipeUpCommentsSwitchToggled:sender]; }];
 
     return [ApolloSettingsSection sectionWithTitle:@"Browsing"
-                                            footer:@"Swipe through Reddit image galleries without leaving the feed. With Swipe Past Gallery to Navigate, continuing to swipe at a gallery's first or last image goes back or forward to the previous page instead of bouncing. In the fullscreen media viewer, swipe upward or tap the comments button to open comments over the media."
+                                            footer:@"Swipe Through Feed Galleries: page through a gallery post's images without leaving the feed.\n\nSwipe Past Gallery to Navigate: keep swiping at the first or last image to go back or forward a page instead of bouncing. Off by default.\n\nSwipe Up for Comments: in the fullscreen media viewer, swipe up or tap the comments button to open comments over the media."
                                               rows:@[ feedGalleries, edgeSwipeNav, swipeComments ]];
 }
 
@@ -1719,6 +1809,15 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         }];
     gifFallback.configure = disclosure;
 
+    ApolloSettingsRow *unmuteFeed =
+        [ApolloSettingsRow valueRowWithID:@"media.unmuteFeed"
+                                    title:@"Unmute Videos in Feed"
+                                   detail:^NSString * { return [weakSelf unmuteFeedVideosModeText]; }
+                                 onSelect:^{
+            [weakSelf presentUnmuteFeedVideosModeSheetFromSourceView:[weakSelf cellForRowID:@"media.unmuteFeed"]];
+        }];
+    unmuteFeed.configure = disclosure;
+
     ApolloSettingsRow *unmuteComments =
         [ApolloSettingsRow valueRowWithID:@"media.unmuteComments"
                                     title:@"Unmute Videos in Comments"
@@ -1749,14 +1848,37 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     holdSpeedValue.visible = ^BOOL { return sVideoHoldSpeedEnabled; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Playback"
-                                            footer:@"Hold for Video Speed: press and hold the right side of a fullscreen video to play it at the chosen speed."
-                                              rows:@[ gifFallback, unmuteComments, holdSpeed, holdSpeedValue ]];
+                                            footer:@"Unmute Videos in Feed: Never keeps feed videos silent, Always plays every one with sound, and Remember follows the last video you muted or unmuted yourself. Only one feed video plays sound at a time. Hold for Video Speed: press and hold the right side of a fullscreen video to play it at the chosen speed."
+                                              rows:@[ gifFallback, unmuteFeed, unmuteComments, holdSpeed, holdSpeedValue ]];
 }
 
 - (ApolloSettingsSection *)buildMediaInlineSection {
     return [ApolloSettingsSection sectionWithTitle:@"Inline Media"
                                             footer:@"Show images and play GIFs inline in the feed."
                                               rows:@[ [self buildInlineMediaRow] ]];
+}
+
+- (ApolloSettingsSection *)buildMediaSharingSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *shareLinkHost =
+        [ApolloSettingsRow valueRowWithID:@"media.shareLinkHost"
+                                    title:@"Share Link Host"
+                                   detail:^NSString * {
+            return [weakSelf shareLinkHostText];
+        }
+                                 onSelect:^{
+            [weakSelf presentShareLinkHostSheetFromSourceView:
+                [weakSelf cellForRowID:@"media.shareLinkHost"]];
+        }];
+
+    shareLinkHost.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Sharing"
+                                            footer:@"Choose which Reddit host Apollo uses for shared post and comment links, including Copy Link and links included with shared media. fxReddit uses fxddit.com."
+                                              rows:@[ shareLinkHost ]];
 }
 
 - (ApolloSettingsSection *)buildMediaUploadsSection {
@@ -1784,9 +1906,20 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         }];
     commentLinkHost.configure = disclosure;
 
+    ApolloSettingsRow *commentLinkAuto =
+        [ApolloSettingsRow switchRowWithID:@"media.commentLinkAuto"
+                                     title:@"Prefer Native Images"
+                                      isOn:^BOOL { return sCommentLinkPreferNative; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf commentLinkPreferNativeSwitchToggled:sender]; }];
+    // Auto mode only means something while a link host is set (see -setCommentLinkHost:).
+    commentLinkAuto.visible = ^BOOL { return sCommentLinkHost != CommentLinkHostOff; };
+
+    // NOTE: the rendered footer for this section is the attributed one in
+    // -footerAttributedTextForSection: (matched by the "Uploads" title) — keep
+    // the two in sync when editing either.
     return [ApolloSettingsSection sectionWithTitle:@"Uploads"
                                             footer:@"Media Upload Host sets where images attached to posts and comments are uploaded. Comment Link Host uploads images in comments to Imgur or Image Chest and inserts a plain link, so they work even where images aren't allowed."
-                                              rows:@[ uploadHost, commentLinkHost ]];
+                                              rows:@[ uploadHost, commentLinkHost, commentLinkAuto ]];
 }
 
 - (ApolloSettingsSection *)buildMediaNetworkSection {
@@ -2668,7 +2801,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             attributes:plainAttrs]];
     } else if ([sectionTitle isEqualToString:@"Uploads"]) {
         text = [[NSMutableAttributedString alloc]
-            initWithString:@"Media Upload Host selects where Apollo uploads media attached to posts and comments.\n\nComment Link Host uploads images added to a comment or reply to Imgur or Image Chest and inserts a plain link instead of a native Reddit image, so they work even in subreddits that don't allow images in comments. Apollo still shows the linked image inline.\n\nManage past uploads from Settings → General → Media → Manage Uploads."
+            initWithString:@"Media Upload Host selects where Apollo uploads media attached to posts and comments.\n\nComment Link Host uploads images added to a comment or reply to Imgur or Image Chest and inserts a plain link instead of a native Reddit image, so they work even in subreddits that don't allow images in comments. Apollo still shows the linked image inline.\n\nWith Prefer Native Images on, comment images upload to Reddit and display inline wherever the subreddit allows image comments — the link host is used only where it doesn't, or when Apollo doesn't know yet.\n\nManage past uploads from Settings → General → Media → Manage Uploads."
             attributes:plainAttrs];
     } else if ([sectionTitle isEqualToString:@"Network"]) {
         text = [[NSMutableAttributedString alloc]
@@ -3488,11 +3621,15 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     sDevvitInteractivePosts = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sDevvitInteractivePosts forKey:UDKeyDevvitInteractivePosts];
     [self visibilityDidChange];  // drives the "Interactive Posts in Feed" sub-row
+    // Community Highlights hands a PINNED interactive post back to the feed while
+    // its widget renders there, so both toggles change what belongs in a carousel.
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloDevvitFeedOwnershipChangedNotification object:nil];
 }
 
 - (void)devvitFeedPostsSwitchToggled:(UISwitch *)sender {
     sDevvitFeedWidgets = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sDevvitFeedWidgets forKey:UDKeyDevvitFeedWidgets];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloDevvitFeedOwnershipChangedNotification object:nil];
 }
 
 - (void)keepSearchBarInPlaceSwitchToggled:(UISwitch *)sender {
@@ -3769,6 +3906,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
               [self buildMediaNSFWSection],
               [self buildMediaPlaybackSection],
               [self buildMediaInlineSection],
+              [self buildMediaSharingSection],
               [self buildMediaUploadsSection],
               [self buildMediaNetworkSection] ];
 }
