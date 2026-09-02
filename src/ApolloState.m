@@ -23,6 +23,9 @@ BOOL sForwardSwipeForgetAfterScrolling = NO; // opt in before changing Apollo's 
 BOOL sSwipeUpForComments = YES;
 BOOL sDevvitInteractivePosts = NO;
 BOOL sDevvitFeedWidgets = YES;
+BOOL sFloatingPostTabs = NO;         // chat-heads-style floating post tabs (ApolloFloatingTabs.xm)
+BOOL sFloatingPostTabsMagnet = YES;  // effective default ON via registerDefaults; consulted only while master is on
+BOOL sFloatingPostTabsPreview = YES; // effective default ON via registerDefaults; hold-to-preview peek cards
 NSInteger sPreferredGIFFallbackFormat = 1; // 0=GIF, 1=MP4
 
 NSInteger sReadPostMaxCount = 0;
@@ -70,6 +73,8 @@ BOOL sInfoRowTapTranslation = YES; // effective default ON via registerDefaults 
 NSInteger sScrollEdgeEffectStyle = ApolloScrollEdgeEffectStyleAutomatic;
 BOOL sModernSubredditDividers = YES;
 BOOL sSubredditListEnhancements = YES;
+NSInteger sSubredditFeedIconStyle = ApolloSubredditFeedIconStyleClassic;
+NSInteger sSubredditFeedLayout = ApolloSubredditFeedLayoutRows;
 BOOL sHideSubredditListDescriptions = NO;
 BOOL sHideMultiredditDescriptions = NO;
 BOOL sEnableFlairColors = NO;

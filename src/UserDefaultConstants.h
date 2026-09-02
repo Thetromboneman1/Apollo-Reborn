@@ -37,9 +37,19 @@ static NSString *const UDKeyRandomSubredditsSource = @"RandomSubredditsSource";
 static NSString *const UDKeyRandNsfwSubredditsSource = @"RandNsfwSubredditsSource";
 static NSString *const UDKeyTrendingSubredditsSource = @"TrendingSubredditsSource";
 static NSString *const UDKeyTrendingSubredditsLimit = @"TrendingSubredditsLimit";
-// Master toggle (short-term fix) for all subreddit list polish/enhancements. Default
-// YES. Modern Subreddit Dividers depends on it — that row hides when this is off.
+// Master toggle for subreddit list polish/enhancements. Default YES. Feed
+// Shortcuts is independent; Modern Subreddit Dividers remains a sub-option.
 static NSString *const UDKeySubredditListEnhancements = @"SubredditListEnhancements";
+// Home / Popular / All / Moderator icon appearance and arrangement. Independent
+// of Subreddit List Enhancements. Defaults: Classic icons + Rows.
+static NSString *const UDKeySubredditFeedIconStyle = @"SubredditFeedIconStyle";
+static NSString *const UDKeySubredditFeedLayout = @"SubredditFeedLayout";
+// Apollo-native visibility preferences for the optional meta-feed rows. Reborn
+// mirrors these on Feed Shortcuts and deliberately keeps Home always visible.
+static NSString *const UDKeyHideRPopularRedditList = @"HideRPopularRedditList";
+static NSString *const UDKeyHideRAllRedditList = @"HideRAllRedditList";
+static NSString *const UDKeyHideModeratorRedditList = @"HideModeratorRedditList";
+static NSString *const ApolloFeedShortcutsChangedNotification = @"ApolloFeedShortcutsChangedNotification";
 // Subreddits the user moderates but chose to hide from the Subreddits list
 // (Reddit offers no way to leave or delete some dead subreddits). Array of
 // display names, compared case-insensitively.
@@ -57,6 +67,20 @@ static NSString *const ApolloHideSubredditListDescriptionsChangedNotification = 
 // contains). Default NO. See ApolloMultiredditEdit.xm.
 static NSString *const UDKeyHideMultiredditDescriptions = @"HideMultiredditDescriptions";
 static NSString *const ApolloHideMultiredditDescriptionsChangedNotification = @"ApolloHideMultiredditDescriptionsChangedNotification";
+// Pull followed users (the u_<name> profile "subreddits" Reddit mixes into
+// subscriptions) out of the A-Z sections into a dedicated FOLLOWING section in
+// the Subreddits list. Default NO. See ApolloFollowingSection.xm.
+static NSString *const UDKeySeparateFollowedUsers = @"SeparateFollowedUsers";
+// Display order of the Favorites/Multireddits/Moderator/Following sections in
+// the Subreddits list: an array of the tokens declared in
+// ApolloFollowingSection.h. Missing/unknown tokens fall back to the native
+// order (favorites, multireddits, moderator, following).
+static NSString *const UDKeySubredditSectionOrder = @"SubredditSectionOrder";
+// Custom display order of the FOLLOWING section's rows (array of u_<name>
+// subscription names, matched case-insensitively). Users not in the array
+// append in their natural alphabetical order.
+static NSString *const UDKeyFollowedUsersOrder = @"FollowedUsersOrder";
+static NSString *const ApolloSubredditSectionsChangedNotification = @"ApolloSubredditSectionsChangedNotification";
 // Color post (link) and user/author flairs with Reddit's assigned colors. Default NO.
 static NSString *const UDKeyEnableFlairColors = @"EnableFlairColors";
 static NSString *const ApolloFlairColorsChangedNotification = @"ApolloFlairColorsChangedNotification";
@@ -541,17 +565,20 @@ static NSString *const ApolloFeedGalleryCarouselChangedNotification = @"ApolloFe
 // When the feed gallery carousel sits on its first (or last) image, continuing
 // to swipe toward the edge hands the drag to Apollo's swipe-back (or
 // swipe-forward) page navigation instead of rubber-banding, but only when a
-// previous (or forward) page actually exists. Default YES. Read live at
-// gesture time, so no change notification is needed (same reasoning as
-// UDKeySwipeUpForComments below). See ApolloFeedGalleryCarousel.xm.
+// previous (or forward) page actually exists. Default NO: handing a gallery
+// swipe to page navigation surprises people who only meant to bounce, so it's
+// opt-in (#996 review). Read live at gesture time, so no change notification
+// is needed (same reasoning as UDKeySwipeUpForComments below). See
+// ApolloFeedGalleryCarousel.xm.
 static NSString *const UDKeyFeedGalleryEdgeSwipeNav = @"FeedGalleryEdgeSwipeNavigation";
 // Apollo's forward-swipe (right edge, plus the gallery edge-swipe hand-off)
 // re-opens the screen you last swiped back from, and that memory natively
 // survives unlimited feed scrolling. With this on, scrolling the feed a few
 // posts away from where you popped back drops the stale forward memory, so a
-// much-later accidental swipe doesn't teleport to an old post. Default YES.
-// Read live per scroll tick, so no change notification is needed. See
-// ApolloForwardSwipeExpiry.xm.
+// much-later accidental swipe doesn't teleport to an old post. Default NO:
+// forward-swipe is a common enough gesture that changing what it does is
+// opt-in (#996 review). Read live per scroll tick, so no change notification
+// is needed. See ApolloForwardSwipeExpiry.xm.
 static NSString *const UDKeyForwardSwipeForgetAfterScrolling = @"ForwardSwipeForgetAfterScrolling";
 // In the fullscreen viewer for post-backed images, galleries, GIFs, and video,
 // an upward vertical flick or comments-button tap opens a media-owned comments
@@ -575,6 +602,24 @@ static NSString *const UDKeyDevvitInteractivePosts = @"DevvitInteractivePosts";
 // surface — comments is one widget at a time by construction). Default ON;
 // only consulted while DevvitInteractivePosts is on.
 static NSString *const UDKeyDevvitFeedWidgets = @"DevvitFeedWidgets";
+
+// Floating Post Tabs: chat-heads-style bubbles (max 5) that keep posts open
+// for instant return, created from the comments "..." menu. Default OFF
+// (opt-in). See ApolloFloatingTabs.xm.
+static NSString *const UDKeyFloatingPostTabs = @"FloatingPostTabs";
+// Sub-toggle: bubbles released near each other magnetize into a draggable
+// pile (tap fans it apart). Default ON; only consulted while the master
+// toggle is on. Turning it off fans existing piles out.
+static NSString *const UDKeyFloatingPostTabsMagnet = @"FloatingPostTabsMagnet";
+// Sub-toggle: holding a bubble pops a snapshot preview card with
+// peek-and-pop semantics (release opens the post, slide away first to
+// cancel). Default ON; only consulted while the master toggle is on. Off =
+// long-press does nothing (bubbles only tap and drag).
+static NSString *const UDKeyFloatingPostTabsPreview = @"FloatingPostTabsPreview";
+// Persisted open tabs (array of dicts: linkKey/permalink/title/subreddit +
+// dock state), rewritten on every tab mutation so bubbles survive relaunch.
+// Deliberately NOT registered with a default — absent means "no tabs".
+static NSString *const UDKeyFloatingPostTabsSaved = @"FloatingPostTabsSaved";
 
 // Rich link preview cards: 0 = Off, 1 = Compact, 2 = Full.
 static NSString *const UDKeyLinkPreviewBodyMode = @"LinkPreviewBodyMode";
