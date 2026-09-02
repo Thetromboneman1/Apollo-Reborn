@@ -19,6 +19,7 @@
 #import <objc/message.h>
 
 #import "ApolloCommon.h"
+#import "ApolloSearchNativeBar.h"
 #import "ApolloState.h"
 #import "ApolloThemeRuntime.h"
 
@@ -338,6 +339,7 @@ static BOOL ApolloFeedSearchIsSurfaced(UIScrollView *sv) {
 // query, which are exactly when the carousel SHOULD be restored. Lets the Highlights re-attach skip its
 // scroll-to-top during active typing/scrolling so it can never yank the results.
 BOOL ApolloFeedSearchIsActiveQuery(UIScrollView *tv) {
+    if (ApolloNativeFeedSearchActiveQuery(tv)) return YES;
     return sFeedSearchActive && !sFeedSearchDismissing &&
            (UIScrollView *)tv == sFeedSearchTable &&
            ApolloFeedSearchQueryText().length > 0;
@@ -551,6 +553,11 @@ static void recenterCancelButton(void) {
         }
         return;
     }
+    // Native Liquid Glass feed search (ApolloSearchNativeBar.xm) owns the whole
+    // activation there — its bridge drives Apollo directly and this delegate
+    // should never even fire (the field's becomeFirstResponder is blocked), but
+    // never arm the legacy pins against it.
+    if (ApolloNativeFeedSearchEnabled()) return;
 
     // Offset stabilizer (runs regardless of Liquid Glass): arm the active flags and capture the feed
     // table + docked toolbar (the rest anchor) + field so the ASTableView inset/offset hooks engage.
@@ -681,6 +688,7 @@ static void recenterCancelButton(void) {
     // Apply to the complete subtree after Apollo has prepared the controller.
     ApolloApplyScrollEdgeEffectStyleToViewController((UIViewController *)self);
     if (!IsLiquidGlass() || MSHookIvar<BOOL>(self, "searchBarShouldStickToKeyboard")) return;
+    if (ApolloNativeFeedSearchEnabled()) return; // native bar owns glass feed search
     id field = ApolloObjectIvar(self, "searchTextField");
     NSString *txt = [field isKindOfClass:[UITextField class]] ? [(UITextField *)field text] : nil;
 
@@ -722,6 +730,7 @@ static void recenterCancelButton(void) {
         ApolloApplyScrollEdgeEffectStyleToViewController(weakController);
     });
     if (!IsLiquidGlass() || MSHookIvar<BOOL>(self, "searchBarShouldStickToKeyboard")) return;
+    if (ApolloNativeFeedSearchEnabled()) return; // native bar owns glass feed search
     UINavigationBar *nb = [(UIViewController *)self navigationController].navigationBar;
 
     // Issue 2 safety net: if the nav bar slipped into the hidden state before our block armed, restore
