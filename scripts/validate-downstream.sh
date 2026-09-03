@@ -20,8 +20,11 @@ python3 -m py_compile \
 bash -n \
   "$ROOT/build-ipa.sh" \
   "$ROOT/patch.sh" \
+  "$ROOT/scripts/publish-upstream-sync-review.sh" \
   "$ROOT/scripts/build_release_variants.sh" \
   "$ROOT/scripts/validate_release_variants.sh"
+
+bash "$ROOT/tests/upstream_sync_publish_test.sh"
 
 if [[ "$BUILD" == true ]]; then
   : "${THEOS:?THEOS must point to a Theos checkout for --build}"

@@ -15,6 +15,15 @@ this fork owns only reviewed downstream changes and local build validation.
 5. Keep credentials in GitHub Actions or the Boneman vault. Never add API keys,
    signing material, or decrypted application packages to Git.
 
+The scheduled sync requires a repository Actions secret named
+`BONEMAN_UPSTREAM_SYNC_TOKEN`. Use a dedicated fine-grained token with access
+only to `Thetromboneman1/Apollo-Reborn` and grant Contents, Pull requests, and
+Workflows write permissions. Workflows permission is required because a
+review branch can legitimately contain upstream changes under
+`.github/workflows/`; the built-in `GITHUB_TOKEN` cannot push those changes.
+Rotate the token through GitHub Actions or the Boneman vault, never a tracked
+file.
+
 If the histories conflict, stop the automated sync and resolve the review
 branch manually. Closing the pull request and deleting its branch safely
 abandons an update.
