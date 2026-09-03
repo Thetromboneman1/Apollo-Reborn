@@ -19,14 +19,20 @@ BOOL sShowRecentlyReadThumbnails = YES;
 BOOL sFeedTextPostThumbnails = YES;
 BOOL sFeedGalleryCarousel = YES;
 BOOL sFeedGalleryEdgeSwipeNav = YES;
+BOOL sForwardSwipeForgetAfterScrolling = NO; // opt in before changing Apollo's common forward gesture
 BOOL sSwipeUpForComments = YES;
 BOOL sDevvitInteractivePosts = NO;
 BOOL sDevvitFeedWidgets = YES;
+BOOL sFloatingPostTabs = NO;         // chat-heads-style floating post tabs (ApolloFloatingTabs.xm)
+BOOL sFloatingPostTabsMagnet = YES;  // effective default ON via registerDefaults; consulted only while master is on
+BOOL sFloatingPostTabsPreview = YES; // effective default ON via registerDefaults; hold-to-preview peek cards
 NSInteger sPreferredGIFFallbackFormat = 1; // 0=GIF, 1=MP4
 
 NSInteger sReadPostMaxCount = 0;
 
 NSInteger sUnmuteCommentsVideos = 0; // 0=Default, 1=Remember from Full Screen, 2=Always
+NSInteger sUnmuteFeedVideos = 0;     // 0=Never, 1=Remember, 2=Always (UDKeyUnmuteFeedVideos)
+BOOL sFeedVideoScrubber = NO;        // hold a feed video's progress bar and slide to scrub
 
 BOOL sVideoHoldSpeedEnabled = YES;   // effective default ON via registerDefaults (UDKeyVideoHoldSpeedEnabled)
 float sVideoHoldSpeed = 2.0f;        // effective default 2.0× via registerDefaults (UDKeyVideoHoldSpeed)
@@ -67,6 +73,8 @@ BOOL sInfoRowTapTranslation = YES; // effective default ON via registerDefaults 
 NSInteger sScrollEdgeEffectStyle = ApolloScrollEdgeEffectStyleAutomatic;
 BOOL sModernSubredditDividers = YES;
 BOOL sSubredditListEnhancements = YES;
+NSInteger sSubredditFeedIconStyle = ApolloSubredditFeedIconStyleClassic;
+NSInteger sSubredditFeedLayout = ApolloSubredditFeedLayoutRows;
 BOOL sHideSubredditListDescriptions = NO;
 BOOL sHideMultiredditDescriptions = NO;
 BOOL sEnableFlairColors = NO;
@@ -100,6 +108,28 @@ NSString *sLinkPreviewCardColorHex = nil;
 uint32_t sLinkPreviewCardColorPacked = 0;
 NSInteger sImageUploadProvider = ImageUploadProviderImgur;
 NSInteger sCommentLinkHost = CommentLinkHostOff;
+BOOL sCommentLinkPreferNative = NO;
+NSInteger sShareLinkHost = ShareLinkHostDefault;
+
+NSString *ApolloShareLinkHostDomain(ShareLinkHost host) {
+    switch (host) {
+        case ShareLinkHostOldReddit: return @"old.reddit.com";
+        case ShareLinkHostVXReddit:  return @"vxreddit.com";
+        case ShareLinkHostFXReddit:  return @"fxddit.com";
+        case ShareLinkHostDefault:
+        default:                     return nil;
+    }
+}
+
+NSString *ApolloShareLinkHostDisplayName(ShareLinkHost host) {
+    switch (host) {
+        case ShareLinkHostOldReddit: return @"old.reddit";
+        case ShareLinkHostVXReddit:  return @"vxReddit";
+        case ShareLinkHostFXReddit:  return @"fxReddit (fxddit.com)";
+        case ShareLinkHostDefault:
+        default:                     return @"Reddit";
+    }
+}
 
 NSString *sLatestRedditBearerToken = nil;
 
@@ -114,6 +144,8 @@ NSString *sTranslationTargetLanguage = nil;
 NSString *sTranslationProvider = nil;
 NSString *sLibreTranslateURL = nil;
 NSString *sLibreTranslateAPIKey = nil;
+NSString *sMicrosoftTranslateAPIKey = nil;
+NSString *sMicrosoftTranslateRegion = nil;
 NSArray<NSString *> *sTranslationSkipLanguages = nil;
 BOOL sAppleTranslateSheet = NO;
 

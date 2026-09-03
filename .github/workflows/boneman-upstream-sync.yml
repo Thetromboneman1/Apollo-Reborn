@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: boneman-apollo-upstream-sync
@@ -22,12 +21,22 @@ jobs:
     if: github.repository == 'Thetromboneman1/Apollo-Reborn'
     runs-on: macos-15
     steps:
+      - name: Require upstream sync credential
+        env:
+          GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error title=Missing upstream sync credential::Configure BONEMAN_UPSTREAM_SYNC_TOKEN with Contents, Pull requests, and Workflows write access. The built-in GITHUB_TOKEN cannot push reviewed upstream workflow changes."
+            exit 1
+          fi
+
       - name: Check out fork main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
           submodules: recursive
+          token: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
 
       - name: Merge upstream into review branch
         id: upstream
@@ -43,7 +52,7 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          branch="automation/upstream-sync-${upstream_sha:0:12}"
+          branch="Thetromboneman1/upstream-sync-${upstream_sha:0:12}"
           if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
             git fetch origin "$branch"
             git switch --force-create "$branch" FETCH_HEAD
@@ -96,23 +105,7 @@ jobs:
       - name: Push review branch and open pull request
         if: steps.upstream.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
           BRANCH: ${{ steps.upstream.outputs.branch }}
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
-        run: |
-          set -euo pipefail
-          git push --set-upstream origin "$BRANCH"
-          existing=$(gh pr list --head "$BRANCH" --base "$DOWNSTREAM_BRANCH" --state open --json url --jq '.[0].url // empty')
-          if [[ -z "$existing" ]]; then
-            existing=$(curl --fail --silent --show-error --get \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
-              --data-urlencode "state=open" \
-              --data-urlencode "head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" \
-              --data-urlencode "base=${DOWNSTREAM_BRANCH}" \
-              | python3 -c 'import json, sys; rows = json.load(sys.stdin); print(rows[0]["html_url"] if rows else "")')
-          fi
-          if [[ -z "$existing" ]]; then
-            gh pr create --head "$BRANCH" --base "$DOWNSTREAM_BRANCH" \
-              --title "chore: sync Apollo-Reborn/Apollo-Reborn main" \
-              --body "Merges \`${UPSTREAM_REPOSITORY}@${UPSTREAM_SHA}\` through the downstream package validation contract."
-          fi
+        run: scripts/publish-upstream-sync-review.sh

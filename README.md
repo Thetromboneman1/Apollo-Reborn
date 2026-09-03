@@ -93,7 +93,7 @@ Finally, **don't copy these examples verbatim**. If everyone adopts the same "sa
 
 - New Comments Highlightifier
 - Saved Categories
-- App Icons + Wallpapers (Community Icon Pack, SPCA Animals, Ultra Icons, "sekrit" app icons)
+- App Icons + Wallpapers (Community and Ultra packs, the SPCA icon, and "sekrit" app icons)
 - Pixel Pals (including hidden "Artificial Superintelligence")
 - Themes (including hidden "Chumbus" theme)
 
@@ -349,6 +349,9 @@ Thank you to these wonderful people:
     <tr>
       <td align="center" valign="top" width="14.29%"><a href="https://github.com/federgilad"><img src="https://avatars.githubusercontent.com/u/38831140?v=4&amp;s=100" width="100px;" height="100px;" style="object-fit: cover;" alt="federgilad"/></a><br /><sub><b>federgilad</b></sub><br /><a href="https://github.com/Apollo-Reborn/Apollo-Reborn/commits?author=federgilad" title="Code">Code</a></td>
       <td align="center" valign="top" width="14.29%"><a href="https://github.com/ostechgit"><img src="https://avatars.githubusercontent.com/u/50818622?v=4&amp;s=100" width="100px;" height="100px;" style="object-fit: cover;" alt="ostechgit"/></a><br /><sub><b>ostechgit</b></sub><br /><a href="https://github.com/Apollo-Reborn/Apollo-Reborn/commits?author=ostechgit" title="Code">Code</a></td>
+      <td align="center" valign="top" width="14.29%"><a href="https://github.com/JamesLautner"><img src="https://avatars.githubusercontent.com/u/198249797?v=4&amp;s=100" width="100px;" height="100px;" style="object-fit: cover;" alt="JamesLautner"/></a><br /><sub><b>JamesLautner</b></sub><br /><a href="https://github.com/Apollo-Reborn/Apollo-Reborn/commits?author=JamesLautner" title="Code">Code</a></td>
+      <td align="center" valign="top" width="14.29%"><a href="https://github.com/Thetromboneman1"><img src="https://avatars.githubusercontent.com/u/38571121?v=4&amp;s=100" width="100px;" height="100px;" style="object-fit: cover;" alt="Thetromboneman1"/></a><br /><sub><b>Thetromboneman1</b></sub><br /><a href="https://github.com/Apollo-Reborn/Apollo-Reborn/commits?author=Thetromboneman1" title="Code">Code</a></td>
+      <td align="center" valign="top" width="14.29%"><a href="https://github.com/jaredrossberg"><img src="https://avatars.githubusercontent.com/u/45674604?v=4&amp;s=100" width="100px;" height="100px;" style="object-fit: cover;" alt="jaredrossberg"/></a><br /><sub><b>jaredrossberg</b></sub><br /><a href="https://github.com/Apollo-Reborn/Apollo-Reborn/commits?author=jaredrossberg" title="Code">Code</a></td>
     </tr>
   </tbody>
 </table>
@@ -387,8 +390,8 @@ See [repository maintenance](docs/repository-maintenance.md) before syncing.
 
 ![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
 
-- **Default branch:** `main`
-- **Implementation fingerprint:** `e0006e02e0ee857a`
+- **Default branch:** `Thetromboneman1/apollo-main-latest-20260902`
+- **Implementation fingerprint:** `4547dd356e2a9f51`
 - **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.

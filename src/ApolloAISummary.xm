@@ -26,6 +26,7 @@
 #import "ApolloCommon.h"
 #import "ApolloAISummary.h"
 #import "ApolloAICloudBridge.h"
+#import "ApolloWebTextDecoding.h"
 #import "ApolloThemeRuntime.h"
 #import "ApolloState.h"
 #import "ApolloTextureDecls.h"
@@ -942,9 +943,14 @@ static NSString *ApolloAISummaryTextFromTruncatedJSON(NSString *text) {
         }];
     }
 
+    // Complete `"key": "value"` pairs — the cut landed after this field.
+    static NSString *const kSummaryKeys =
+        @"reddit_post_summary|post_summary|article_summary|link_summary|discussion_summary"
+        @"|summary|consensus|takeaway|conclusion|notable_disagreement|disagreement";
     NSError *regexError = nil;
     NSRegularExpression *scalarRegex = [NSRegularExpression
-        regularExpressionWithPattern:@"\\\"(?:reddit_post_summary|post_summary|article_summary|link_summary|discussion_summary|summary|consensus|takeaway|conclusion|notable_disagreement|disagreement)\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\""
+        regularExpressionWithPattern:[NSString stringWithFormat:
+            @"\\\"(?:%@)\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"", kSummaryKeys]
                              options:0
                                error:&regexError];
     if (!regexError) {
@@ -957,17 +963,77 @@ static NSString *ApolloAISummaryTextFromTruncatedJSON(NSString *text) {
             ApolloAIAppendGeneratedValue(decoded, parts, seen);
         }];
     }
+    if (parts.count > 0) return [parts componentsJoinedByString:@" "];
+
+    // Nothing complete. The likeliest reason is that the cut landed INSIDE the
+    // summary value itself: Apollo's maximumResponseTokens are tight (110 for a
+    // Balanced comment summary) and a JSON envelope spends a chunk of that
+    // budget on syntax before the prose even starts, so generation stops
+    // mid-sentence with no closing quote. Recover the unterminated tail — a
+    // summary cut mid-sentence is what a token-capped PLAIN response gives the
+    // user today, so it is the consistent outcome, and it beats the "The model
+    // returned an empty summary." error the whole response would otherwise
+    // become.
+    NSRegularExpression *tailRegex = [NSRegularExpression
+        regularExpressionWithPattern:[NSString stringWithFormat:
+            // The trailing \\? lets the cut land on a lone backslash — half an
+            // escape sequence — without failing the whole match.
+            @"\\\"(?:%@)\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\\?$", kSummaryKeys]
+                             options:0
+                               error:NULL];
+    NSTextCheckingResult *tail = [tailRegex firstMatchInString:text options:0
+                                                         range:NSMakeRange(0, text.length)];
+    if (tail && tail.numberOfRanges >= 2) {
+        NSString *fragment = [text substringWithRange:[tail rangeAtIndex:1]];
+        // A trailing lone backslash is half an escape sequence; JSON-decoding
+        // it fails, so drop it before decoding.
+        while ([fragment hasSuffix:@"\\"]) fragment = [fragment substringToIndex:fragment.length - 1];
+        NSString *decoded = ApolloAIDecodeJSONStringFragment(fragment);
+        ApolloAIAppendGeneratedValue(decoded, parts, seen);
+    }
     return parts.count > 0 ? [parts componentsJoinedByString:@" "] : nil;
 }
 
+// How much of a response the structure test below reads. An envelope announces
+// itself in its first field, and this runs on every streamed snapshot as well as
+// on the final text, so the scan is capped rather than growing with the response.
+static const NSUInteger kApolloAIStructureScanLimit = 512;
+
+// Does this response look like the model's structured/tool protocol rather than
+// a summary?
+//
+// A leading bracket is deliberately NOT sufficient. Reddit prose opens with one
+// constantly — "[Serious] the thread mostly argues…", "[OC] …" — and treating
+// that as protocol output is expensive to get wrong: the Swift side burns a
+// whole retry generation on it, then the normalizer below finds no known JSON
+// fields and returns nil, so a perfectly good summary reaches the user as "The
+// model returned an empty summary." A bracket therefore only counts when an
+// actual JSON key (`"name":`) sits beside it, which no summary sentence writes.
+//
+// Truncated envelopes still have to be caught here — a response cut off
+// mid-object never parses as JSON — which is why this is a shape test and not
+// simply NSJSONSerialization.
 static BOOL ApolloAIGeneratedResponseLooksStructured(NSString *summary) {
-    NSString *trimmed = [summary stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0) return NO;
-    NSString *lower = trimmed.lowercaseString;
-    return [trimmed hasPrefix:@"{"] || [trimmed hasPrefix:@"["] ||
-        [lower hasPrefix:@"```json"] || [lower hasPrefix:@"toolcall:"] ||
+    NSString *head = summary.length > kApolloAIStructureScanLimit
+        ? [summary substringToIndex:kApolloAIStructureScanLimit] : summary;
+    head = [head stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (head.length == 0) return NO;
+    NSString *lower = head.lowercaseString;
+    // Markers no natural-language summary produces.
+    if ([lower hasPrefix:@"```json"] || [lower hasPrefix:@"toolcall:"] ||
         [lower hasPrefix:@"tool.call:"] || [lower containsString:@"\"_tool_calls\""] ||
-        [lower containsString:@"\"response_format\""];
+        [lower containsString:@"\"response_format\""]) {
+        return YES;
+    }
+    if (![head hasPrefix:@"{"] && ![head hasPrefix:@"["]) return NO;
+
+    static NSRegularExpression *keyRegex;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keyRegex = [NSRegularExpression regularExpressionWithPattern:@"\"[A-Za-z_][A-Za-z0-9_ ]*\"\\s*:"
+                                                             options:0 error:NULL];
+    });
+    return [keyRegex firstMatchInString:head options:0 range:NSMakeRange(0, head.length)] != nil;
 }
 
 static NSString *ApolloAINormalizeGeneratedSummary(NSString *summary) {
@@ -1753,8 +1819,10 @@ static void ApolloAIFetchAndExtract(NSURL *url, NSString *userAgent, void (^done
             NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
             if (!error && http && http.statusCode >= 200 && http.statusCode < 300 &&
                 data.length > 0 && data.length <= kApolloAIArticleFetchMaxBytes) {
-                html = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                if (!html) html = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+                // Charset-aware: a Korean/Japanese/Chinese article read as
+                // Latin-1 handed the model a page of mojibake to summarise
+                // (issue #945).
+                html = ApolloWebTextFromData(data, response, NULL);
                 if (html) text = ApolloAIExtractArticleText(html);
             } else if (!error && http && (http.statusCode < 200 || http.statusCode >= 300)) {
                 outErr = [NSError errorWithDomain:@"ApolloAIArticle" code:http.statusCode userInfo:nil];

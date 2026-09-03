@@ -51,6 +51,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/Tweak.xm \
     $(SRC_DIR)/ApolloRecommendedSettingsMigration.m \
     $(SRC_DIR)/ApolloCommon.m \
+    $(SRC_DIR)/ApolloWebTextDecoding.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
     $(SRC_DIR)/settings/ApolloSettingsTableViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsForm.m \
@@ -58,11 +59,14 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloBackupRestore.m \
     $(SRC_DIR)/settings/ApolloThanksToViewController.m \
     $(SRC_DIR)/settings/ApolloBuyUsACoffeeViewController.m \
+    $(SRC_DIR)/settings/ApolloWallpaperViewerViewController.m \
+    $(SRC_DIR)/settings/ApolloWallpapersViewController.m \
     $(SRC_DIR)/settings/ApolloReportViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsRouter.m \
     $(SRC_DIR)/settings/ApolloSettingsSearch.m \
     $(SRC_DIR)/ApolloToast.m \
     $(SRC_DIR)/ApolloRedditMediaUpload.m \
+    $(SRC_DIR)/ApolloNotificationBackendPath.m \
     $(SRC_DIR)/ApolloNotificationBackend.m \
     $(SRC_DIR)/ApolloUsageHeartbeat.m \
     $(SRC_DIR)/ApolloPushNotifications.m \
@@ -93,10 +97,12 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloGalleryViewController.m \
     $(SRC_DIR)/ApolloGalleryVideoExport.xm \
     $(SRC_DIR)/ApolloGalleryMenu.xm \
+    $(SRC_DIR)/ApolloGalleryOrientation.xm \
     $(SRC_DIR)/ApolloBannedProfile.xm \
     $(SRC_DIR)/ApolloImageUploadHost.xm \
     $(SRC_DIR)/ApolloPhotoPostComposerScrollFix.xm \
     $(SRC_DIR)/ApolloMarkdownToolbarGif.xm \
+    $(SRC_DIR)/ApolloComposerToolbarTint.xm \
     $(SRC_DIR)/ApolloMarkdownBodyCleanup.xm \
     $(SRC_DIR)/ApolloGiphyClient.m \
     $(SRC_DIR)/GiphyPickerViewController.m \
@@ -114,6 +120,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMediaAutoplay.m \
     $(SRC_DIR)/ApolloCommentsCollapse.xm \
     $(SRC_DIR)/ApolloInboxCommentScroll.xm \
+    $(SRC_DIR)/ApolloFindInComments.xm \
     $(SRC_DIR)/ApolloStatsRowTouch.xm \
     $(SRC_DIR)/ApolloCommentVoteFlicker.xm \
     $(SRC_DIR)/ApolloLiveCommentsFollow.xm \
@@ -134,10 +141,12 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloProgressiveBlur.xm \
     $(SRC_DIR)/settings/ApolloSettings.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
+    $(SRC_DIR)/ApolloProfileMoreMenu.xm \
     $(SRC_DIR)/ApolloHiddenContentData.m \
     $(SRC_DIR)/ApolloHiddenContentViewController.m \
     $(SRC_DIR)/ApolloHiddenContentMenu.xm \
     $(SRC_DIR)/ApolloHideLinksBatchFix.xm \
+    $(SRC_DIR)/ApolloSavedItemsDeduplicator.m \
     $(SRC_DIR)/ApolloSavedCategories.xm \
     $(SRC_DIR)/ApolloSwiftIvarBridge.swift \
     $(SRC_DIR)/ApolloUserFlair.xm \
@@ -159,15 +168,21 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAppleTranslateSheet.swift \
     $(SRC_DIR)/ApolloAppleTranslateSheet.xm \
     $(SRC_DIR)/ApolloVideoUnmute.xm \
+    $(SRC_DIR)/ApolloFeedVideoScrubber.xm \
+    $(SRC_DIR)/ApolloForwardSwipeExpiry.xm \
     $(SRC_DIR)/ApolloVideoSwipeFix.xm \
     $(SRC_DIR)/ApolloVideoPlaybackSpeed.xm \
     $(SRC_DIR)/ApolloVideoHoldSpeed.xm \
     $(SRC_DIR)/ApolloPictureInPicture.xm \
+    $(SRC_DIR)/ApolloFloatingTabs.xm \
     $(SRC_DIR)/ApolloMediaPreviewErrorFix.xm \
+    $(SRC_DIR)/ApolloFeedShortcutsAppearance.m \
     $(SRC_DIR)/ApolloSubredditIndexPolish.xm \
+    $(SRC_DIR)/ApolloSubredditListLaunchSettle.xm \
     $(SRC_DIR)/ApolloQuickActions.xm \
     $(SRC_DIR)/ApolloHideModSubreddits.xm \
     $(SRC_DIR)/ApolloMultiredditEdit.xm \
+    $(SRC_DIR)/ApolloFollowingSection.xm \
     $(SRC_DIR)/ApolloSubredditSidebar.xm \
     $(SRC_DIR)/ApolloTagFilters.xm \
     $(SRC_DIR)/ApolloThemeTokens.m \
@@ -188,6 +203,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloThemeShareImage.m \
     $(SRC_DIR)/ApolloThemeQRScanViewController.m \
     $(SRC_DIR)/ApolloSearchInPlace.xm \
+    $(SRC_DIR)/ApolloSearchNativeBar.xm \
+    $(SRC_DIR)/ApolloJumpBarSuggestionTint.xm \
     $(SRC_DIR)/ApolloSearchHeaderOverlapFix.xm \
     $(SRC_DIR)/ApolloSearchTabFixes.xm \
     $(SRC_DIR)/ApolloImageChestResolver.m \
@@ -224,6 +241,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloHideSubscribePrompt.xm \
     $(SRC_DIR)/settings/CustomAPIViewController.m \
     $(SRC_DIR)/settings/ApolloSubredditLayoutViewController.m \
+    $(SRC_DIR)/settings/ApolloSubredditSectionsViewController.m \
     $(SRC_DIR)/settings/ApolloAISettingsViewController.m \
     $(SRC_DIR)/settings/ApolloDeletedCommentsSettingsViewController.m \
     $(SRC_DIR)/settings/ApolloProfileLayoutViewController.m \
