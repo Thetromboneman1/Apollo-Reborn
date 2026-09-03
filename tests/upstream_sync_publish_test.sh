@@ -44,7 +44,7 @@ run_publish() {
     FAKE_LOG="$FAKE_LOG" \
     FAKE_EXISTING="${FAKE_EXISTING:-}" \
     GH_TOKEN="test-token" \
-    BRANCH="automation/upstream-sync-0123456789ab" \
+    BRANCH="Thetromboneman1/upstream-sync-0123456789ab" \
     UPSTREAM_SHA="0123456789abcdef" \
     DOWNSTREAM_BRANCH="main" \
     GITHUB_REPOSITORY="Thetromboneman1/Apollo-Reborn" \
@@ -63,7 +63,7 @@ grep -F 'requires GH_TOKEN' "$missing_output" >/dev/null
 : > "$FAKE_LOG"
 FAKE_EXISTING="https://github.com/Thetromboneman1/Apollo-Reborn/pull/41" run_publish >"$TEST_ROOT/existing.out"
 grep -F 'Reusing upstream review pull request' "$TEST_ROOT/existing.out" >/dev/null
-grep -F 'git <push> <--set-upstream> <origin> <automation/upstream-sync-0123456789ab>' "$FAKE_LOG" >/dev/null
+grep -F 'git <push> <--set-upstream> <origin> <Thetromboneman1/upstream-sync-0123456789ab>' "$FAKE_LOG" >/dev/null
 grep -F 'gh <api> <--method> <GET>' "$FAKE_LOG" >/dev/null
 if grep -F '<POST>' "$FAKE_LOG" >/dev/null; then
   printf 'existing-PR case unexpectedly created a pull request\n' >&2
@@ -74,7 +74,7 @@ fi
 FAKE_EXISTING='' run_publish >"$TEST_ROOT/create.out"
 grep -F 'Created upstream review pull request' "$TEST_ROOT/create.out" >/dev/null
 grep -F 'gh <api> <--method> <POST>' "$FAKE_LOG" >/dev/null
-grep -F '<head=automation/upstream-sync-0123456789ab>' "$FAKE_LOG" >/dev/null
+grep -F '<head=Thetromboneman1/upstream-sync-0123456789ab>' "$FAKE_LOG" >/dev/null
 grep -F '<base=main>' "$FAKE_LOG" >/dev/null
 expected_body="<body=Merges \`Apollo-Reborn/Apollo-Reborn@0123456789abcdef\` through the downstream package validation contract.>"
 grep -F "$expected_body" "$FAKE_LOG" >/dev/null

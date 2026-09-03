@@ -8,7 +8,7 @@ the documentation record advances with implementation changes.
 - Repository: `Thetromboneman1/Apollo-Reborn`
 - Default branch: `Thetromboneman1/apollo-main-latest-20260902`
 - Implementation fingerprint: `19ecf1f1f3a1f00c`
-- Maintained documents: 29
+- Maintained documents: 25
 - Architecture assets: 2
 
 ## Detected architecture

@@ -24,6 +24,9 @@ review branch can legitimately contain upstream changes under
 Rotate the token through GitHub Actions or the Boneman vault, never a tracked
 file.
 
+Automated review branches use the
+`Thetromboneman1/upstream-sync-<upstream-sha>` naming convention.
+
 If the histories conflict, stop the automated sync and resolve the review
 branch manually. Closing the pull request and deleting its branch safely
 abandons an update.

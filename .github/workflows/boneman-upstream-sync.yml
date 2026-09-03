@@ -52,7 +52,7 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          branch="automation/upstream-sync-${upstream_sha:0:12}"
+          branch="Thetromboneman1/upstream-sync-${upstream_sha:0:12}"
           if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
             git fetch origin "$branch"
             git switch --force-create "$branch" FETCH_HEAD
