@@ -27,6 +27,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          submodules: recursive
 
       - name: Merge upstream into review branch
         id: upstream
@@ -43,6 +44,13 @@ jobs:
             exit 0
           fi
           branch="automation/upstream-sync-${upstream_sha:0:12}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch origin "$branch"
+            git switch --force-create "$branch" FETCH_HEAD
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git switch -c "$branch"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -95,6 +103,14 @@ jobs:
           set -euo pipefail
           git push --set-upstream origin "$BRANCH"
           existing=$(gh pr list --head "$BRANCH" --base "$DOWNSTREAM_BRANCH" --state open --json url --jq '.[0].url // empty')
+          if [[ -z "$existing" ]]; then
+            existing=$(curl --fail --silent --show-error --get \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+              --data-urlencode "state=open" \
+              --data-urlencode "head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" \
+              --data-urlencode "base=${DOWNSTREAM_BRANCH}" \
+              | python3 -c 'import json, sys; rows = json.load(sys.stdin); print(rows[0]["html_url"] if rows else "")')
+          fi
           if [[ -z "$existing" ]]; then
             gh pr create --head "$BRANCH" --base "$DOWNSTREAM_BRANCH" \
               --title "chore: sync Apollo-Reborn/Apollo-Reborn main" \
