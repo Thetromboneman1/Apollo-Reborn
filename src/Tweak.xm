@@ -24,6 +24,7 @@
 #import "ApolloTranslation.h"
 #import "Tweak.h"
 #import "settings/CustomAPIViewController.h"
+#import "settings/ApolloAutomaticBackup.h"
 #import "Version.h"
 #import "UserDefaultConstants.h"
 #import "ApolloPostFilterStore.h"
@@ -3705,6 +3706,9 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
 
     NSDictionary *defaultValues = @{UDKeyBlockAnnouncements: @YES,
                                     UDKeyEnableFLEX: @NO,
+                                    UDKeyAutomaticBackupsEnabled: @NO,
+                                    UDKeyAutomaticBackupIntervalDays: @3,
+                                    UDKeyAutomaticBackupDestination: @0,
                                     UDKeyCrashCaptureEnabled: @YES,
                                     UDKeyTrendingSubredditsLimit: @"5",
                                     UDKeyShowRandNsfw: @NO,
@@ -3728,7 +3732,7 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                     UDKeyFeedGalleryCarousel: @YES,
                                     UDKeyFeedGalleryEdgeSwipeNav: @YES,
                                     UDKeyForwardSwipeForgetAfterScrolling: @NO,
-                                    UDKeySwipeUpForComments: @YES,
+                                    UDKeySwipeUpForComments: @NO,
                                     UDKeySportsClipsInlineVideo: @YES,
                                     UDKeyDevvitInteractivePosts: @NO,
                                     UDKeyDevvitFeedWidgets: @YES,
@@ -3755,6 +3759,7 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                     UDKeyLinkPreviewBodyMode: @(ApolloLinkPreviewModeFull),
                                     UDKeyLinkPreviewCommentsMode: @(ApolloLinkPreviewModeFull),
                                     UDKeyLinkPreviewPreviewPinned: @YES,
+                                    UDKeyActionMenuPreviewPinned: @YES,
                                     UDKeyLinkPreviewCardColor: @(ApolloLinkPreviewCardColorNeutral),
                                     UDKeyImageUploadProvider: @(ImageUploadProviderImgur),
                                     UDKeyCommentLinkHost: @(CommentLinkHostOff),
@@ -3790,6 +3795,8 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                     UDKeyTabBarCollapseSide: @0,
                                     UDKeyKeepSearchBarInPlace: @NO,
                                     UDKeyIPadTabBarBottom: @NO,
+                                    UDKeyIPadPaneLayout: @NO,
+                                    UDKeyTabBarSwipeNavigation: @NO,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyInfoRowTapUpvote: @YES,
                                     UDKeyInfoRowTapComments: @YES,
@@ -3852,6 +3859,13 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
     NSUserDefaults *standardDefaults = [NSUserDefaults standardUserDefaults];
     [standardDefaults registerDefaults:defaultValues];
     ApolloApplyRecommendedSettingsMigration(standardDefaults);
+    sAutomaticBackupsEnabled = [standardDefaults boolForKey:UDKeyAutomaticBackupsEnabled];
+    sAutomaticBackupIntervalDays = [standardDefaults integerForKey:UDKeyAutomaticBackupIntervalDays];
+    if (![@[@1, @3, @7] containsObject:@(sAutomaticBackupIntervalDays)]) {
+        sAutomaticBackupIntervalDays = 3;
+        [standardDefaults setInteger:3 forKey:UDKeyAutomaticBackupIntervalDays];
+    }
+    sAutomaticBackupDestination = [standardDefaults integerForKey:UDKeyAutomaticBackupDestination] == 1 ? 1 : 0;
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     NSDictionary *persistentDomain = bundleID.length > 0 ? [standardDefaults persistentDomainForName:bundleID] : nil;
 
@@ -4067,6 +4081,10 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
     sTabBarHideStyle = (ApolloTabBarHideStyle)storedTabBarHideStyle;
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
     sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
+    // Read once here: ApolloPaneInstall.xm builds the split controllers during
+    // scene connect, which happens after %ctor and never again for the process.
+    sIPadPaneLayout = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout];
+    sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
     sIconRowMagnifier = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIconRowMagnifier];
     sInfoRowTapUpvote = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapUpvote];
     sInfoRowTapComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapComments];
@@ -4468,6 +4486,7 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
     // synthesis has finished, so the first projection sees the final persisted
     // account array. The feature is dormant when its opt-in flag is off.
     ApolloPerAccountFavoritesStart();
+    [[ApolloAutomaticBackup sharedManager] start];
 
     // Mirror the selected app icon for Bark notification icon passthrough.
     ApolloBarkCaptureInitialIconSelection();
@@ -4482,7 +4501,16 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
             UITabBarController *tabBarController = (UITabBarController *)mainWindow.rootViewController;
             // Navigate to Settings tab
             tabBarController.selectedViewController = [tabBarController.viewControllers lastObject];
-            UINavigationController *settingsNavController = (UINavigationController *) tabBarController.selectedViewController;
+            // The selected child is the navigation controller in the stock
+            // layout, but a UISplitViewController under the iPad pane layout —
+            // unwrap rather than casting, or this push hits the split
+            // controller and throws.
+            UINavigationController *settingsNavController =
+                ApolloNavigationControllerForTabChild(tabBarController.selectedViewController);
+            if (!settingsNavController) {
+                ApolloLog(@"[Tweak] no navigation controller for the settings tab; skipping Custom API redirect");
+                return;
+            }
 
             // Push Custom API directly
             CustomAPIViewController *vc = [[CustomAPIViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
