@@ -869,11 +869,24 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
     [self.refreshControl addTarget:self
                             action:@selector(_pullToRefreshTriggered)
                   forControlEvents:UIControlEventValueChanged];
-        self.textSizeDefaultsObserver =
+            self.textSizeDefaultsObserver =
         [[NSNotificationCenter defaultCenter] addObserverForName:NSUserDefaultsDidChangeNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification * _Nonnull __unused note) {
+        NSInteger textSizeIndex = RRTextSizeIndex(self);
+        //Debug alert
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:@"Recently Read"
+                                                message:[NSString stringWithFormat:@"Text size index: %ld", (long)textSizeIndex]
+                                        preferredStyle:UIAlertControllerStyleAlert];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                style:UIAlertActionStyleDefault
+                                                handler:nil]];
+
+        [self presentViewController:alert animated:YES completion:nil];
+        //End debug
         [self softRefreshPosts];
     }];
 }
