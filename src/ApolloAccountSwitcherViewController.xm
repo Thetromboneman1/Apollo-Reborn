@@ -213,6 +213,39 @@ static NSArray<ApolloSwitcherAccountRow *> *ApolloSwitcherLoadAccountRows(void) 
     self.tableView.estimatedRowHeight = 64;
 }
 
+// The editor shares the switcher's navigation sheet, so use the same live
+// Apollo palette rather than UIKit's unrelated grouped-table defaults.
+- (void)applyCredentialEditorTheme {
+    UIColor *page = ApolloThemePageBackgroundColor() ?: UIColor.systemGroupedBackgroundColor;
+    self.view.backgroundColor = page;
+    self.tableView.backgroundColor = page;
+    self.navigationController.view.backgroundColor = page;
+    self.tableView.separatorColor = ApolloThemeSeparatorColor() ?: UIColor.separatorColor;
+    self.view.tintColor = ApolloThemeAccentColor() ?: self.view.tintColor;
+    for (UITableViewCell *cell in self.tableView.visibleCells) {
+        cell.backgroundColor = ApolloThemeCardBackgroundColor() ?: UIColor.secondarySystemGroupedBackgroundColor;
+    }
+    UIColor *text = ApolloThemeRuntimeColor(ApolloThemeTokenLabel) ?: UIColor.labelColor;
+    _clientIdField.textColor = text;
+    _secretField.textColor = text;
+    _redirectField.textColor = text;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self applyCredentialEditorTheme];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    if (self.isViewLoaded) [self applyCredentialEditorTheme];
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell
+    forRowAtIndexPath:(NSIndexPath *)indexPath {
+    cell.backgroundColor = ApolloThemeCardBackgroundColor() ?: UIColor.secondarySystemGroupedBackgroundColor;
+}
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return self.onClear ? 2 : 1; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -227,6 +260,7 @@ static NSArray<ApolloSwitcherAccountRow *> *ApolloSwitcherLoadAccountRows(void) 
     UITextField *field = [[UITextField alloc] init];
     field.placeholder = placeholder;
     field.text = text;
+    field.textColor = ApolloThemeRuntimeColor(ApolloThemeTokenLabel) ?: UIColor.labelColor;
     field.secureTextEntry = secure;
     field.autocorrectionType = UITextAutocorrectionTypeNo;
     field.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -1667,9 +1701,14 @@ static void ApolloQuarantineAccountSwitcher(UIViewController *controller) {
     UIViewController *host = ((UIPresentationController *)self).presentedViewController;
     for (UIViewController *child in host.childViewControllers) {
         if (![child isKindOfClass:UINavigationController.class]) continue;
-        UIViewController *top = ((UINavigationController *)child).topViewController;
-        if (![top isKindOfClass:ApolloAccountSwitcherViewController.class]) continue;
-        CGFloat height = top.preferredContentSize.height;
+        UINavigationController *navigation = (UINavigationController *)child;
+        // Pushing the credential editor must not restore Apollo's centered
+        // card frame on the next scroll/keyboard/layout pass. The switcher
+        // owns this whole navigation stack, not only its visible root page.
+        UIViewController *root = navigation.viewControllers.firstObject;
+        if (![root isKindOfClass:ApolloAccountSwitcherViewController.class]) continue;
+        CGFloat height = MAX(root.preferredContentSize.height,
+                             navigation.topViewController.preferredContentSize.height);
         UIView *container = ((UIPresentationController *)self).containerView;
         if (container) {
             UIEdgeInsets safeInsets = container.safeAreaInsets;
@@ -1758,6 +1797,27 @@ static void ApolloQuarantineAccountSwitcher(UIViewController *controller) {
         NSValue *storedFrame = objc_getAssociatedObject(
             self, kApolloAccountSwitcherPanelRestingFrameKey);
         CGRect restingFrame = storedFrame ? storedFrame.CGRectValue : presentedView.frame;
+        // The shared navigation bar remains available on Accounts, Edit,
+        // and the pushed API editor. A deliberate downward pull or flick
+        // dismisses that entire presentation; cancelled/short drags rebound.
+        CGFloat distance = [pan translationInView:container].y;
+        CGFloat velocity = [pan velocityInView:container].y;
+        CGFloat dismissDistance = MIN(120.0, CGRectGetHeight(restingFrame) * 0.25);
+        BOOL shouldDismiss = pan.state == UIGestureRecognizerStateEnded &&
+            (distance >= dismissDistance || (distance > 20.0 && velocity > 700.0));
+        if (shouldDismiss) {
+            UIViewController *host = ((UIPresentationController *)self).presentedViewController;
+            [host.view endEditing:YES];
+            // Keep the dragging flag until dismissal completes so a layout
+            // pass cannot snap the panel back before its exit animation.
+            [host dismissViewControllerAnimated:YES completion:^{
+                objc_setAssociatedObject(self, kApolloAccountSwitcherPanelDraggingKey, nil,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kApolloAccountSwitcherPanelRestingFrameKey, nil,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }];
+            return;
+        }
         [UIView animateWithDuration:0.28
                               delay:0.0
              usingSpringWithDamping:0.86

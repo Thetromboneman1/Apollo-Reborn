@@ -290,8 +290,12 @@ fi
 
 if [[ "$RESIZABLE_APP" == 1 ]]; then
     python3 scripts/prepare-resizable-app.py "$APP_DIR"
-    codesign -f -s - "$APP_DIR" >/dev/null 2>&1
 fi
+
+# Refresh document registration even for a cached simulator shell, then sign
+# once after every cached-bundle mutation above has finished.
+python3 scripts/register-backup-document.py "$APP_DIR"
+codesign -f -s - "$APP_DIR" >/dev/null 2>&1
 
 # Stage the tweak's resource bundle inside the app so ApolloBundledResourcePath()
 # resolves (<App>.app/ApolloReborn.bundle/). Cheap; refresh every run.
