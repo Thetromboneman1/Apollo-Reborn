@@ -628,7 +628,6 @@ static void recenterCancelButton(void) {
         }
         return;
     }
-
     // Native Liquid Glass feed search (ApolloSearchNativeBar.xm) owns the whole
     // activation there — its bridge drives Apollo directly and this delegate
     // should never even fire (the field's becomeFirstResponder is blocked), but

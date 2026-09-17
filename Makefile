@@ -49,6 +49,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWhatsNew.xm \
     $(WHATS_NEW_GEN_M) \
     $(SRC_DIR)/Tweak.xm \
+    $(SRC_DIR)/ApolloRecommendedSettingsMigration.m \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloProfilePagination.xm \
     $(SRC_DIR)/ApolloWebTextDecoding.m \
@@ -71,6 +72,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSettingsSearch.m \
     $(SRC_DIR)/ApolloToast.m \
     $(SRC_DIR)/ApolloRedditMediaUpload.m \
+    $(SRC_DIR)/ApolloNotificationBackendPath.m \
     $(SRC_DIR)/ApolloNotificationBackend.m \
     $(SRC_DIR)/ApolloUsageHeartbeat.m \
     $(SRC_DIR)/ApolloPushNotifications.m \
@@ -101,7 +103,16 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloGalleryImageLoader.m \
     $(SRC_DIR)/ApolloGalleryImageViewer.m \
     $(SRC_DIR)/ApolloGalleryViewController.m \
+    $(SRC_DIR)/ApolloMediaSecurity.m \
     $(SRC_DIR)/ApolloGalleryVideoExport.xm \
+    $(SRC_DIR)/ApolloSaveAllMediaItems.m \
+    $(SRC_DIR)/ApolloSaveAllMedia.xm \
+    $(SRC_DIR)/ApolloSaveAllMediaBridge.swift \
+    $(SRC_DIR)/ApolloSaveAllMediaMenus.xm \
+    $(SRC_DIR)/ApolloGIFSaveActivity.xm \
+    $(SRC_DIR)/ApolloMediaDownloadActions.xm \
+    $(SRC_DIR)/ApolloLinkedAlbumPostControls.xm \
+    $(SRC_DIR)/ApolloFeedAlbumMenus.xm \
     $(SRC_DIR)/ApolloGalleryMenu.xm \
     $(SRC_DIR)/ApolloGalleryOrientation.xm \
     $(SRC_DIR)/ApolloBannedProfile.xm \
@@ -151,13 +162,32 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloListBottomInsetGuard.xm \
     $(SRC_DIR)/ApolloTabBarHideStyle.xm \
     $(SRC_DIR)/ApolloIPadTabBarBottom.xm \
+    $(SRC_DIR)/ipad/ApolloPaneLayout.m \
+    $(SRC_DIR)/ipad/ApolloPaneDiagnostics.m \
+    $(SRC_DIR)/ipad/ApolloPaneGeometry.m \
+    $(SRC_DIR)/ipad/ApolloPaneTransitionObserver.m \
+    $(SRC_DIR)/ipad/ApolloPaneChrome.m \
+    $(SRC_DIR)/ipad/ApolloPaneSidebar.m \
+    $(SRC_DIR)/ipad/ApolloPaneFocus.m \
+    $(SRC_DIR)/ipad/ApolloPaneContent.xm \
+    $(SRC_DIR)/ipad/ApolloPaneColumnHostViewController.m \
+    $(SRC_DIR)/ipad/ApolloPaneRouting.m \
+    $(SRC_DIR)/ipad/ApolloPaneForwardHistory.m \
+    $(SRC_DIR)/ipad/ApolloPaneSplitViewController.m \
+    $(SRC_DIR)/ipad/ApolloPaneInstall.xm \
+    $(SRC_DIR)/ipad/ApolloPaneEntryPoints.xm \
+    $(SRC_DIR)/ipad/ApolloPaneRouter.xm \
     $(SRC_DIR)/ApolloScrollEdgeEffect.xm \
     $(SRC_DIR)/ApolloProgressiveBlur.xm \
     $(SRC_DIR)/settings/ApolloSettings.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloProfileMoreMenu.xm \
+    $(SRC_DIR)/ApolloSaveAllMediaItems.m \
+    $(SRC_DIR)/ApolloSaveAllMedia.xm \
     $(SRC_DIR)/ApolloHiddenContentData.m \
     $(SRC_DIR)/ApolloHiddenContentViewController.m \
+    $(SRC_DIR)/ApolloHiddenContentMedia.m \
+    $(SRC_DIR)/ApolloHiddenContentMediaBridge.swift \
     $(SRC_DIR)/ApolloHiddenContentMenu.xm \
     $(SRC_DIR)/ApolloHideLinksBatchFix.xm \
     $(SRC_DIR)/ApolloSavedItemsDeduplicator.m \
@@ -170,6 +200,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloNativeActionMenus.xm \
     $(SRC_DIR)/ApolloContextMenuPreviewTheme.xm \
     $(SRC_DIR)/ApolloActionMenu.xm \
+    $(SRC_DIR)/ApolloActionMenuLayout.m \
     $(SRC_DIR)/ApolloHostedVideo.m \
     $(SRC_DIR)/ApolloSportsClipResolver.m \
     $(SRC_DIR)/ApolloSportsClips.xm \
@@ -264,9 +295,11 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSubredditLayoutPreview.m \
     $(SRC_DIR)/settings/ApolloSubredditLayoutViewController.m \
     $(SRC_DIR)/settings/ApolloSubredditSectionsViewController.m \
+    $(SRC_DIR)/settings/ApolloActionMenuSettingsViewController.m \
     $(SRC_DIR)/settings/ApolloAISettingsViewController.m \
     $(SRC_DIR)/settings/ApolloDeletedCommentsSettingsViewController.m \
     $(SRC_DIR)/settings/ApolloProfileLayoutViewController.m \
+    $(SRC_DIR)/settings/ApolloLayoutViewController.m \
     $(SRC_DIR)/settings/ApolloLayoutPreviewCard.m \
     $(SRC_DIR)/settings/ApolloLinkPreviewSettingsViewController.m \
     $(SRC_DIR)/settings/InlineMediaSettingsViewController.m \
@@ -295,7 +328,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/crash/ApolloCrashBugsnagNeutralize.xm \
     $(KSCRASH_FILES) \
     $(SSZIPARCHIVE_FILES)
-ApolloReborn_FRAMEWORKS = UIKit Security AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion
+ApolloReborn_FRAMEWORKS = UIKit Security LocalAuthentication AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion
 ApolloReborn_LIBRARIES = z iconv
 # FoundationModels (Apple on-device AI) only ships in the iOS 26+ SDK. Weak-link
 # it so the dylib still loads on older OSes (the Swift bridge guards every call
@@ -325,7 +358,10 @@ endif
 # ApolloAppleTranslation.swift) only exists on iOS 18.0+. Weak-link it so the tweak still
 # loads on older iOS, where the Apple provider is gated off at runtime.
 ApolloReborn_LDFLAGS += -weak_framework Translation
-ApolloReborn_CFLAGS = -fobjc-arc -Wno-error=unguarded-availability-new -Wno-error=deprecated-declarations -Wno-module-import-in-extern-c -I$(THEOS_PROJECT_DIR)/$(SRC_DIR) -I$(THEOS_PROJECT_DIR)/liquid-glass/generated -I$(THEOS_PROJECT_DIR)/$(THEME_GALLERY_DIR)/generated -I$(THEOS_PROJECT_DIR)/$(WHATS_NEW_DIR)/generated -I$(THEOS_PROJECT_DIR)/$(MODULES_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR)/minizip -DHAVE_ARC4RANDOM_BUF -DHAVE_ICONV -DHAVE_INTTYPES_H -DHAVE_PKCRYPT -DHAVE_STDINT_H -DHAVE_WZAES -DHAVE_ZLIB -DZLIB_COMPAT
+# Xcode 27 warns that its bundled libc++ no longer supports deployment below
+# iOS 15. Keep the established iOS 14 target buildable while treating every
+# other warning as an error; runtime availability guards remain authoritative.
+ApolloReborn_CFLAGS = -fobjc-arc -Wno-error=\#warnings -Wno-error=unguarded-availability-new -Wno-error=deprecated-declarations -Wno-module-import-in-extern-c -I$(THEOS_PROJECT_DIR)/$(SRC_DIR) -I$(THEOS_PROJECT_DIR)/liquid-glass/generated -I$(THEOS_PROJECT_DIR)/$(THEME_GALLERY_DIR)/generated -I$(THEOS_PROJECT_DIR)/$(WHATS_NEW_DIR)/generated -I$(THEOS_PROJECT_DIR)/$(MODULES_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR) -I$(THEOS_PROJECT_DIR)/$(SSZIPARCHIVE_DIR)/minizip -DHAVE_ARC4RANDOM_BUF -DHAVE_ICONV -DHAVE_INTTYPES_H -DHAVE_PKCRYPT -DHAVE_STDINT_H -DHAVE_WZAES -DHAVE_ZLIB -DZLIB_COMPAT
 
 # KSCrash include paths (public `include/` dirs plus module roots for private
 # headers and the Monitors subdir). KSCRASH_NAMESPACE suffixes every public

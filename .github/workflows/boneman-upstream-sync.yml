@@ -1,0 +1,176 @@
+name: Boneman Upstream Sync
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boneman-apollo-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: Apollo-Reborn/Apollo-Reborn
+  DOWNSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    if: github.repository == 'Thetromboneman1/Apollo-Reborn'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Require upstream sync credential
+        env:
+          GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error title=Missing upstream sync credential::Configure BONEMAN_UPSTREAM_SYNC_TOKEN with Contents, Pull requests, and Workflows write access. The built-in GITHUB_TOKEN cannot push reviewed upstream workflow changes."
+            exit 1
+          fi
+
+      - name: Check out fork main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+
+      - name: Merge upstream into review branch
+        id: upstream
+        env:
+          UPSTREAM_URL: https://github.com/${{ env.UPSTREAM_REPOSITORY }}.git
+        run: |
+          set -euo pipefail
+          retry() {
+            local attempt=1
+            local max_attempts=3
+            until "$@"; do
+              if (( attempt >= max_attempts )); then
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed; retrying: $*" >&2
+              sleep $((attempt * 2))
+              attempt=$((attempt + 1))
+            done
+          }
+          set_output() {
+            printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+          report_conflict() {
+            local conflict_files=$1
+            {
+              echo "### Upstream merge needs reviewed conflict resolution"
+              echo
+              echo "Conflicts: \`${conflict_files//,/\`, \`}\`"
+              echo
+              echo "The review branch was preserved and the pull request metadata will be refreshed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Upstream sync needs conflict resolution::${conflict_files}"
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_URL"
+          else
+            git remote add upstream "$UPSTREAM_URL"
+          fi
+          retry git fetch --prune upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          downstream_sha=$(git rev-parse HEAD)
+          set_output sha "$upstream_sha"
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            set_output changed false
+            exit 0
+          fi
+          branch="Thetromboneman1/upstream-sync-${upstream_sha:0:12}"
+          remote_branch=$(retry git ls-remote --heads origin "$branch")
+          if [[ -n "$remote_branch" ]]; then
+            retry git fetch origin "$branch"
+            branch_sha=$(git rev-parse FETCH_HEAD)
+            set_output changed true
+            set_output branch "$branch"
+            if ! git merge-base --is-ancestor "$upstream_sha" "$branch_sha"; then
+              echo "::error title=Invalid upstream review branch::${branch} no longer contains ${upstream_sha}. Refusing to overwrite it."
+              exit 1
+            fi
+            git switch --force-create "$branch" "$branch_sha"
+            if git merge-base --is-ancestor "$downstream_sha" HEAD; then
+              set_output conflicted false
+            elif git merge --no-edit "$downstream_sha"; then
+              set_output conflicted false
+            else
+              conflict_files=$(git diff --name-only --diff-filter=U | paste -sd ',' -)
+              report_conflict "$conflict_files"
+              git merge --abort
+              # Keep downstream-only validation/publication helpers available
+              # while preserving the existing review branch exactly.
+              git switch --detach "$downstream_sha"
+              set_output conflicted true
+              set_output conflict_files "$conflict_files"
+            fi
+            exit 0
+          fi
+          git switch -c "$branch"
+          if ! git merge --no-edit upstream/main; then
+            conflict_files=$(git diff --name-only --diff-filter=U | paste -sd ',' -)
+            report_conflict "$conflict_files"
+            git merge --abort
+            # The conflict-review branch must remain the exact upstream head,
+            # but upstream does not contain our publication helper. Keep the
+            # runner on the downstream commit and move only the branch ref.
+            git switch --detach "$downstream_sha"
+            git branch --force "$branch" "$upstream_sha"
+            set_output changed true
+            set_output branch "$branch"
+            set_output conflicted true
+            set_output conflict_files "$conflict_files"
+            exit 0
+          fi
+          set_output changed true
+          set_output branch "$branch"
+          set_output conflicted false
+      - name: Refresh generated documentation
+        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/documentation_health.py --write
+          python3 scripts/documentation_health.py --check
+          if git status --porcelain | grep -q .; then
+            git add -A
+            git commit -m "docs: refresh generated repository state"
+          fi
+      - name: Install build dependencies
+        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+        run: brew install ldid dpkg make
+      - name: Add GNU Make to PATH
+        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+      - name: Check out Theos
+        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: theos/theos
+          ref: 9bc73406cf80b711ef4d02c15ff1dedc4478a275 # master @ 2026-04-09
+          path: theos
+          submodules: recursive
+      - name: Select Xcode 26.0.1
+        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+        run: sudo xcode-select -s /Applications/Xcode_26.0.1.app
+      - name: Validate preserved downstream behavior
+        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: scripts/validate-downstream.sh --build
+      - name: Push review branch and open pull request
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+          BRANCH: ${{ steps.upstream.outputs.branch }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          CONFLICTED: ${{ steps.upstream.outputs.conflicted }}
+          CONFLICT_FILES: ${{ steps.upstream.outputs.conflict_files }}
+        run: scripts/publish-upstream-sync-review.sh
