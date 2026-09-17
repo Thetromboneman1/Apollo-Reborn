@@ -11,6 +11,7 @@ grep -F 'scripts/publish-upstream-pr-batch.sh' "$WORKFLOW" >/dev/null
 grep -F 'persist-credentials: false' "$WORKFLOW" >/dev/null
 grep -F 'Secretless documentation and package validation' "$WORKFLOW" >/dev/null
 grep -F 'batch-manifest.json' "$WORKFLOW" >/dev/null
+grep -F 'Imported whitespace findings' "$WORKFLOW" >/dev/null
 if grep -F 'secrets.GITHUB_TOKEN' "$WORKFLOW" >/dev/null; then
   printf 'all-open upstream workflow must not use the built-in token for publication\n' >&2
   exit 1

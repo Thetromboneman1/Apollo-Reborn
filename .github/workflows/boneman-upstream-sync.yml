@@ -137,7 +137,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           downstream=$(python3 -c 'import json; print(json.load(open("batch-manifest.json"))["downstream_sha"])')
-          git diff --check "$downstream..HEAD"
+          if ! git diff --check "$downstream..HEAD" > whitespace-check.txt; then
+            echo "::warning title=Imported whitespace findings::The exact upstream PR heads contain whitespace findings; preserving their commits and continuing to the semantic/build gates."
+            {
+              echo
+              echo "## Imported whitespace findings"
+              echo
+              echo '```text'
+              cat whitespace-check.txt
+              echo '```'
+            } >> batch-summary.md
+          fi
           if [[ "$changed" == true ]]; then
             git push --set-upstream origin "$branch"
           fi
@@ -152,6 +162,7 @@ jobs:
             snapshot-after.json
             batch-manifest.json
             batch-summary.md
+            whitespace-check.txt
           if-no-files-found: error
           retention-days: 30
 
