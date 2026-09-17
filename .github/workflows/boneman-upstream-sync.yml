@@ -283,11 +283,18 @@ jobs:
             fi
           done < <(git apply --numstat ../report/documentation.patch)
           if [[ -s ../report/documentation.patch ]]; then
-            git apply --index ../report/documentation.patch
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "docs: refresh generated repository state [skip ci]"
-            git push
+            if git apply --check ../report/documentation.patch; then
+              git apply --index ../report/documentation.patch
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git commit -m "docs: refresh generated repository state [skip ci]"
+              git push
+            elif git apply --reverse --check ../report/documentation.patch; then
+              echo "Generated documentation patch is already present on the candidate branch."
+            else
+              echo "::error title=Documentation branch race::Generated patch is neither applicable nor already present."
+              exit 1
+            fi
           fi
 
       - name: Publish complete PR-specific report and enforce the gate
