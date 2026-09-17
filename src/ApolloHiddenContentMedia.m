@@ -6,12 +6,14 @@
 extern void *ApolloHiddenMediaPrepareURL(const void *);
 extern void ApolloHiddenMediaFreeURL(void *);
 extern void ApolloHiddenMediaAssignURLs(void *, const void *);
+extern void ApolloHiddenMediaAssignThumbnail(void *, NSInteger, const void *);
 
 // Forward page transitions to Apollo before updating the archive count.
 @interface ApolloHiddenMediaPageDelegate : NSObject <UIPageViewControllerDelegate>
 @property (nonatomic, weak) id<UIPageViewControllerDelegate> nativeDelegate;
 @property (nonatomic, strong) UILabel *counter;
 @property (nonatomic) NSUInteger count;
+@property (nonatomic, copy) void (^selectionChanged)(NSUInteger);
 @end
 @implementation ApolloHiddenMediaPageDelegate
 - (BOOL)respondsToSelector:(SEL)selector {
@@ -28,19 +30,23 @@ extern void ApolloHiddenMediaAssignURLs(void *, const void *);
     NSInteger value = *(NSInteger *)((uint8_t *)(__bridge void *)child + ivar_getOffset(index));
     if (value < 0 || (NSUInteger)value >= self.count) return;
     self.counter.text = [NSString stringWithFormat:@"%ld / %lu", (long)value + 1, (unsigned long)self.count];
+    if (self.selectionChanged) self.selectionChanged((NSUInteger)value);
 }
 @end
 static char kApolloHiddenMediaDelegate;
 
-BOOL ApolloHiddenContentPresentMedia(NSArray<NSURL *> *urls, NSUInteger initialIndex, UIViewController *presenter) {
-    if (!urls.count || !presenter.viewIfLoaded.window || presenter.presentedViewController) return NO;
+BOOL ApolloHiddenContentPresentMedia(NSArray<NSURL *> *urls, NSUInteger initialIndex, UIImageView *sourceView, UIViewController *presenter, void (^selectionChanged)(NSUInteger)) {
+    if (!urls.count || !presenter.viewIfLoaded.window || presenter.presentedViewController || !sourceView.window || !sourceView.image) return NO;
     initialIndex = MIN(initialIndex, urls.count - 1);
     Class pageClass = NSClassFromString(@"_TtC6Apollo23MediaPageViewController");
     Method coder = class_getInstanceMethod(pageClass, @selector(initWithCoder:));
+    Ivar thumbnails = class_getInstanceVariable(pageClass, "thumbnails");
+    Ivar selectedIndex = class_getInstanceVariable(pageClass, "selectedThumbnailIndex");
     Ivar foundURLs = class_getInstanceVariable(pageClass, "foundURLs");
     Ivar afterURLs = class_getInstanceVariable(pageClass, "contentTypeHints");
     void *emptyDictionary = dlsym(RTLD_DEFAULT, "_swiftEmptyDictionarySingleton");
-    if (!coder || !foundURLs || !afterURLs || !emptyDictionary ||
+    if (!coder || !thumbnails || !selectedIndex || !foundURLs || !afterURLs || !emptyDictionary ||
+        ivar_getOffset(selectedIndex) - ivar_getOffset(thumbnails) != sizeof(void *) ||
         ivar_getOffset(afterURLs) - ivar_getOffset(foundURLs) != sizeof(void *)) return NO;
 
     // Apollo 1.15.11's Swift designated initializer immediately precedes the
@@ -63,10 +69,15 @@ BOOL ApolloHiddenContentPresentMedia(NSArray<NSURL *> *urls, NSUInteger initialI
         void *, unsigned char, unsigned char, void *, void * __attribute__((swift_context)));
     void *urlStorage = ApolloHiddenMediaPrepareURL((__bridge void *)urls[initialIndex]);
     void *allocated = (__bridge_retained void *)[pageClass alloc];
-    void *result = ((NativeInit)entry)(urlStorage, emptyDictionary, initialIndex, 1, NULL, 0, 1, NULL, 0, 0, NULL, allocated);
+    void *result = ((NativeInit)entry)(urlStorage, emptyDictionary, initialIndex, 1, NULL, 0, 1, (__bridge_retained void *)sourceView, 0, 0, NULL, allocated);
     ApolloHiddenMediaFreeURL(urlStorage);
     UIViewController *page = CFBridgingRelease(result);
     if (!page) return NO;
+    // Seed the selected thumbnail before Apollo builds its first child. The
+    // native animator uses the attached source view's rectangle, while the
+    // viewer can display these pixels immediately during the full-size fetch.
+    ApolloHiddenMediaAssignThumbnail((uint8_t *)(__bridge void *)page + ivar_getOffset(thumbnails),
+                                    (NSInteger)initialIndex, (__bridge const void *)sourceView.image);
     [page loadViewIfNeeded];
     ApolloHiddenMediaAssignURLs((uint8_t *)(__bridge void *)page + ivar_getOffset(foundURLs), (__bridge void *)urls);
     // Loading the first direct URL primes UIKit's neighbor cache as a
@@ -91,23 +102,24 @@ BOOL ApolloHiddenContentPresentMedia(NSArray<NSURL *> *urls, NSUInteger initialI
     pager.dataSource = nil;
     pager.dataSource = dataSource;
     if (initialPages.count) [pager setViewControllers:initialPages direction:UIPageViewControllerNavigationDirectionForward animated:NO completion:nil];
-    // This screen has no Texture source node for Apollo's zoom transition.
-    // Use UIKit presentation while retaining the native pager and gestures.
-    page.transitioningDelegate = nil;
-    page.modalPresentationStyle = UIModalPresentationFullScreen;
+    // Keep Apollo's initializer-installed transition delegate and custom
+    // presentation controller. Clearing them bypasses both the thumbnail zoom
+    // and the shared backdrop/cancelled-pan fixes from #1143.
+    page.modalPresentationStyle = UIModalPresentationCustom;
     if (urls.count > 1) {
         ApolloHiddenMediaPageDelegate *delegate = [ApolloHiddenMediaPageDelegate new];
         delegate.nativeDelegate = ((UIPageViewController *)page).delegate;
         delegate.count = urls.count;
+        delegate.selectionChanged = selectionChanged;
         delegate.counter = [UILabel new];
-        delegate.counter.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
-        delegate.counter.textColor = UIColor.whiteColor;
+        delegate.counter.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+        delegate.counter.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
         delegate.counter.text = [NSString stringWithFormat:@"%lu / %lu", (unsigned long)initialIndex + 1, (unsigned long)urls.count];
         delegate.counter.translatesAutoresizingMaskIntoConstraints = NO;
         [page.view addSubview:delegate.counter];
         [NSLayoutConstraint activateConstraints:@[
-            [delegate.counter.centerXAnchor constraintEqualToAnchor:page.view.centerXAnchor],
-            [delegate.counter.topAnchor constraintEqualToAnchor:page.view.safeAreaLayoutGuide.topAnchor constant:16],
+            [delegate.counter.trailingAnchor constraintEqualToAnchor:page.view.safeAreaLayoutGuide.trailingAnchor constant:-28],
+            [delegate.counter.topAnchor constraintEqualToAnchor:page.view.topAnchor constant:16],
         ]];
         objc_setAssociatedObject(page, &kApolloHiddenMediaDelegate, delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         ((UIPageViewController *)page).delegate = delegate;
