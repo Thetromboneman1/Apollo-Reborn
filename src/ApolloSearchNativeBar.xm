@@ -2132,26 +2132,21 @@ static void NSBRemoveCancelStandIn(UISearchBar *bar, const char *why) {
 // cancel button takes the field's material too, so a stand-in filled with that
 // pill colour hands over to UIKit's button without a visible change. Without
 // a pill (stock look) the nearest is a glass capsule.
-static UIColor *NSBSearchFieldFill(UISearchBar *bar) {
-    UIColor *fill = nil;
-    for (UIView *sub in bar.searchTextField.subviews) {
-        UIColor *color = sub.backgroundColor;
-        if ([sub isMemberOfClass:UIView.class] && color && CGColorGetAlpha(color.CGColor) > 0.5) fill = color;
-    }
-    return fill;
-}
-
 static UIButton *NSBMakeCancelStandIn(UIButton *original, UISearchBar *bar) {
-    // Same glyph as UIKit's button, label-coloured like it. Not UIKit's own
-    // material: its button carries the search field's dynamic background, and
-    // that material is exactly what the transition does not composite — a
-    // stand-in given the same material (via the private configuration call)
-    // vanished with it, while a plain view in the same place showed.
+    // Same glyph as UIKit's button, label-coloured like it, on the stock glass
+    // look. Not UIKit's own material: its button carries the search field's
+    // dynamic background, and that material is exactly what the transition
+    // does not composite — a stand-in given the same material (via the
+    // private configuration call) vanished with it, while a plain view in the
+    // same place showed. Not the theme's pill colour either: UIKit's button
+    // keeps the stock material whatever the theme paints on the field, so a
+    // stand-in sampled from the field matched the field and not the button,
+    // and the glass "bubble" only arrived with UIKit's button when the
+    // transition ended (icpryde, dark custom theme). The glass configuration
+    // measures within 0.1–0.4 luma of the settled button in dark and light
+    // custom themes and under Blur and Hard; prominent glass is far brighter.
     if (@available(iOS 26.0, *)) {
-        UIColor *fill = NSBSearchFieldFill(bar);
-        UIButtonConfiguration *configuration = fill ? [UIButtonConfiguration filledButtonConfiguration]
-                                                    : [UIButtonConfiguration glassButtonConfiguration];
-        if (fill) configuration.baseBackgroundColor = fill;
+        UIButtonConfiguration *configuration = [UIButtonConfiguration glassButtonConfiguration];
         configuration.image = original.configuration.image ?: [original imageForState:UIControlStateNormal];
         configuration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
         configuration.baseForegroundColor = UIColor.labelColor;
@@ -2199,7 +2194,20 @@ static UIButton *NSBMakeCancelStandIn(UIButton *original, UISearchBar *bar) {
     if (!standIn || !button.superview || !standIn.superview) return;
     // Called inside the transition's animation block, after the searching
     // layout has been applied: the button's model frame is its final slot.
-    standIn.frame = [button.superview convertRect:button.frame toView:standIn.superview];
+    // The glass background does not ride a frame animation — UIKit places it
+    // from the model frame — so animating the frame parked the bubble at the
+    // final slot while the glyph slid into it from the bottom right. Lay the
+    // stand-in out at its final frame without animation and slide it in with
+    // a transform instead, so bubble and glyph move as one piece.
+    CGRect finalFrame = [button.superview convertRect:button.frame toView:standIn.superview];
+    CGRect parked = standIn.frame;
+    [UIView performWithoutAnimation:^{
+        standIn.frame = finalFrame;
+        standIn.transform = CGAffineTransformMakeTranslation(CGRectGetMinX(parked) - CGRectGetMinX(finalFrame),
+                                                             CGRectGetMinY(parked) - CGRectGetMinY(finalFrame));
+        [standIn layoutIfNeeded];
+    }];
+    standIn.transform = CGAffineTransformIdentity;
     standIn.alpha = 1.0;
     if (NSBTraceEnabled()) {
         ApolloLog(@"[NSBTrace] cancel stand-in animating to %@ (in animation block: %d)",
