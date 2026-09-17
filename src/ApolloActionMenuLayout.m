@@ -151,7 +151,11 @@ static ApolloActionMenuItem *ApolloAMItemViewReplies(void) { return ApolloAMNati
 static ApolloActionMenuItem *ApolloAMItemParent(void)      { return ApolloAMNative(@"parent-comment", @"Parent Comment", @"option-view-parent", K(@45)); }
 static ApolloActionMenuItem *ApolloAMItemFind(void)        { return ApolloAMNative(@"find", @"Find in Comments", @"option-search", K(@57)); }
 static ApolloActionMenuItem *ApolloAMItemLive(void)        { return ApolloAMNative(@"live-activity", @"Live Activity", @"option-live-activity", K(@70, @71)); }
-static ApolloActionMenuItem *ApolloAMItemRemind(void)      { return ApolloAMNative(@"remind", @"Remind Me", @"option-remind-me-in", K(@2)); }
+// Kind 2 ("Remind Me", option-remind-me-in) is deliberately NOT an item: Apollo
+// keeps it in every post/comment sheet's buffer with an EMPTY title and the
+// glass renderer drops empty-titled rows, so it never appears in a menu —
+// listing it offered a row the user can't see. Uncatalogued, it passes through
+// untouched like any unknown kind.
 static ApolloActionMenuItem *ApolloAMItemCollapseKids(void){ return ApolloAMNative(@"collapse-children", @"Collapse Child Comments", @"option-collapse-child-comments", K(@120, @121)); }
 static ApolloActionMenuItem *ApolloAMItemSubmit(void)      { return ApolloAMNative(@"submit", @"Submit Post", @"option-submit", K(@51)); }
 static ApolloActionMenuItem *ApolloAMItemSubscribe(void)   { return ApolloAMNative(@"subscribe", @"Subscribe", @"option-subscribe", K(@38, @39)); }
@@ -211,7 +215,7 @@ static NSArray<ApolloActionMenuItem *> *ApolloActionMenuBuildCatalog(ApolloActio
             @[ ApolloAMItemModerator(), ApolloAMItemUpvote(), ApolloAMItemDownvote(), ApolloAMItemSave(),
                ApolloAMItemReply(), ApolloAMItemAuthor(), ApolloAMItemSubreddit(), ApolloAMItemHide(),
                ApolloAMItemHideAbove(), ApolloAMItemShare(), ApolloAMItemShareImage(), ApolloAMItemCrosspost(),
-               ApolloAMItemAward(), ApolloAMItemReport(), ApolloAMItemRemind(), ApolloAMItemFloatingTabs() ],
+               ApolloAMItemAward(), ApolloAMItemReport(), ApolloAMItemFloatingTabs() ],
             @[ ApolloAMItemTranslate(), ApolloAMItemFilterSub(), ApolloAMItemEdit(), ApolloAMItemDelete(),
                ApolloAMItemNSFW(), ApolloAMItemSpoiler(), ApolloAMItemPostFlair(), ApolloAMItemMuteNotifs() ]);
     }
@@ -222,7 +226,7 @@ static NSArray<ApolloActionMenuItem *> *ApolloActionMenuBuildCatalog(ApolloActio
             @[ ApolloAMItemUpvote(), ApolloAMItemDownvote(), ApolloAMItemSave(), ApolloAMItemReply(),
                ApolloAMItemAuthor(), ApolloAMItemSubreddit(), ApolloAMItemCollapseKids(), ApolloAMItemSelectText(),
                ApolloAMItemShare(), ApolloAMItemShareImage(), ApolloAMItemCrosspost(), ApolloAMItemFind(),
-               ApolloAMItemAward(), ApolloAMItemReport(), ApolloAMItemLive(), ApolloAMItemRemind(),
+               ApolloAMItemAward(), ApolloAMItemReport(), ApolloAMItemLive(),
                ApolloAMItemDeletedComments(), ApolloAMItemFloatingTabs() ],
             @[ ApolloAMItemTranslate(), ApolloAMItemEdit(), ApolloAMItemDelete(),
                ApolloAMItemNSFW(), ApolloAMItemSpoiler(), ApolloAMItemPostFlair(), ApolloAMItemMuteNotifs() ]);
@@ -232,8 +236,7 @@ static NSArray<ApolloActionMenuItem *> *ApolloActionMenuBuildCatalog(ApolloActio
         return ApolloAMCatalogWithUsual(
             @[ ApolloAMItemModerator(), ApolloAMItemUpvote(), ApolloAMItemDownvote(), ApolloAMItemSave(),
                ApolloAMItemReply(), ApolloAMItemAuthor(), ApolloAMItemSelectText(), ApolloAMItemShare(),
-               ApolloAMItemShareImage(), ApolloAMItemCollapseTop(), ApolloAMItemAward(), ApolloAMItemReport(),
-               ApolloAMItemRemind() ],
+               ApolloAMItemShareImage(), ApolloAMItemCollapseTop(), ApolloAMItemAward(), ApolloAMItemReport() ],
             @[ ApolloAMItemViewReplies(), ApolloAMItemParent(), ApolloAMItemTranslate(),
                ApolloAMItemEdit(), ApolloAMItemDelete(), ApolloAMItemMuteNotifs() ]);
     }
@@ -456,16 +459,23 @@ NSArray<NSString *> *ApolloActionMenuLastPresentedItemIDs(ApolloActionMenuContex
     return clean.count > 0 ? clean : nil;
 }
 
-NSArray<ApolloActionMenuItem *> *ApolloActionMenuPreviewItems(ApolloActionMenuContext context) {
+BOOL ApolloActionMenuItemWasOffered(ApolloActionMenuContext context, NSString *itemID) {
     NSArray<NSString *> *seen = ApolloActionMenuLastPresentedItemIDs(context);
+    if (seen) return [seen containsObject:itemID];
+    return ApolloActionMenuCatalogItem(context, itemID).usuallyShown;
+}
+
+// Every non-hidden item, in order. Rows the menu didn't offer last time are
+// kept (the preview fades them) rather than dropped: dropping them meant a
+// row dragged to the top of the list vanished from the mock — a feature row
+// like Keep in Floating Tab, say, when the last sheet happened not to carry it.
+NSArray<ApolloActionMenuItem *> *ApolloActionMenuPreviewItems(ApolloActionMenuContext context) {
     NSSet<NSString *> *hidden = ApolloActionMenuHiddenItemIDs(context);
     NSMutableArray<ApolloActionMenuItem *> *items = [NSMutableArray array];
     for (NSString *itemID in ApolloActionMenuResolvedOrder(context)) {
         if ([hidden containsObject:itemID]) continue;
         ApolloActionMenuItem *item = ApolloActionMenuCatalogItem(context, itemID);
-        if (!item) continue;
-        BOOL offered = seen ? [seen containsObject:itemID] : item.usuallyShown;
-        if (offered) [items addObject:item];
+        if (item) [items addObject:item];
     }
     return items;
 }
