@@ -219,21 +219,12 @@ jobs:
           python3 scripts/documentation_health.py --check
           cp "$RUNNER_TEMP/candidate-documentation-health.py" scripts/documentation_health.py
           git diff --check
-          git diff --binary -- README.md docs > ../documentation.patch
 
       - name: Validate merged code and build release package without secrets
         working-directory: candidate
         env:
           THEOS: ${{ github.workspace }}/theos
         run: scripts/validate-downstream.sh --build
-
-      - name: Upload generated documentation patch
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: upstream-pr-docs-${{ github.run_id }}
-          path: documentation.patch
-          if-no-files-found: error
-          retention-days: 7
 
   report:
     name: Publish detailed fork PR and merge complete snapshots
@@ -255,13 +246,6 @@ jobs:
           name: upstream-pr-batch-${{ github.run_id }}
           path: report
 
-      - name: Download generated documentation patch
-        if: needs.prepare.outputs.changed == 'true' && needs.validate.result == 'success'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: upstream-pr-docs-${{ github.run_id }}
-          path: report
-
       - name: Check out candidate branch for documentation-only commit
         if: needs.prepare.outputs.changed == 'true' && needs.validate.result == 'success'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -269,33 +253,46 @@ jobs:
           ref: ${{ needs.prepare.outputs.branch }}
           path: candidate
           fetch-depth: 0
-          token: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+          persist-credentials: false
 
-      - name: Apply allowlisted documentation patch
+      - name: Regenerate allowlisted documentation with trusted tooling
+        id: docs
         if: needs.prepare.outputs.changed == 'true' && needs.validate.result == 'success'
         working-directory: candidate
         run: |
           set -euo pipefail
-          while IFS=$'\t' read -r _added _deleted path; do
+          cp scripts/documentation_health.py "$RUNNER_TEMP/candidate-documentation-health.py"
+          cp ../trusted/scripts/documentation_health.py scripts/documentation_health.py
+          python3 scripts/documentation_health.py --write
+          python3 scripts/documentation_health.py --check
+          cp "$RUNNER_TEMP/candidate-documentation-health.py" scripts/documentation_health.py
+          while read -r status path; do
             if [[ "$path" != README.md && "$path" != docs/* ]]; then
-              echo "::error title=Unsafe generated patch::Unexpected path: $path"
+              echo "::error title=Unsafe generated documentation::Unexpected path: $path ($status)"
               exit 1
             fi
-          done < <(git apply --numstat ../report/documentation.patch)
-          if [[ -s ../report/documentation.patch ]]; then
-            if git apply --check ../report/documentation.patch; then
-              git apply --index ../report/documentation.patch
-              git config user.name "github-actions[bot]"
-              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git commit -m "docs: refresh generated repository state [skip ci]"
-              git push
-            elif git apply --reverse --check ../report/documentation.patch; then
-              echo "Generated documentation patch is already present on the candidate branch."
-            else
-              echo "::error title=Documentation branch race::Generated patch is neither applicable nor already present."
-              exit 1
-            fi
+          done < <(git status --porcelain | sed -E 's/^(.{2}) (.*)$/\1 \2/')
+          git add README.md docs
+          if ! git diff --cached --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "docs: refresh generated repository state [skip ci]"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Push documentation-only commit with short-lived credentials
+        if: steps.docs.outputs.changed == 'true'
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: |
+          set -euo pipefail
+          authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${authorization}" \
+            push origin "HEAD:refs/heads/${BRANCH}"
 
       - name: Publish complete PR-specific report and enforce the gate
         env:

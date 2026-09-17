@@ -12,7 +12,8 @@ grep -F 'persist-credentials: false' "$WORKFLOW" >/dev/null
 grep -F 'Secretless documentation and package validation' "$WORKFLOW" >/dev/null
 grep -F 'batch-manifest.json' "$WORKFLOW" >/dev/null
 grep -F 'Imported whitespace findings' "$WORKFLOW" >/dev/null
-grep -F 'git apply --reverse --check' "$WORKFLOW" >/dev/null
+grep -F 'Regenerate allowlisted documentation with trusted tooling' "$WORKFLOW" >/dev/null
+grep -F 'persist-credentials: false' "$WORKFLOW" >/dev/null
 if grep -F 'secrets.GITHUB_TOKEN' "$WORKFLOW" >/dev/null; then
   printf 'all-open upstream workflow must not use the built-in token for publication\n' >&2
   exit 1
