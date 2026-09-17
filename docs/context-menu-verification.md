@@ -57,8 +57,8 @@ UIKit icon renderer was stubbed for the host build.
   swaps in) is LOCKED (`ApolloActionMenuItem.locked`): never listed for
   editing, always first in a resolved or saved order, never in the hidden
   set. A stored layout that predates the lock is normalised on read
-  (`ApolloActionMenuLockedFirst`). The ••• preview shows the button row when
-  that is what the menu shows, and the footer says the row stays put.
+  (`ApolloActionMenuLockedFirst`). The settings preview draws the button row
+  when that is what the menu shows, and the footer says the row stays put.
 - In the settings screen, the drag completion and Reset apply the visibility
   diff (`visibilityDidChange`: the Reset row appearing or disappearing)
   BEFORE rebuilding the items section: `rebuildSectionContainingRowID:`
@@ -66,36 +66,11 @@ UIKit icon renderer was stubbed for the host build.
   other order tripped UITableView's batch-update assertion on an untouched
   menu's first drag (section 3 went 0 → 1 rows). Found in the glass sim on
   2026-09-14 (KSCrash report, `_Bug_Detected_In_Client_Of_UITableView_Invalid_
-  Number_Of_Rows_In_Section`) and fixed; the visibility-tap path was never
-  affected (`reloadRowWithID:` does not re-snapshot).
-- Rows are tap-to-check (checkmark in the accent, drag grip to its right,
-  both in one accessory view; the All overview drops the grip). A tap restyles
-  the tapped cell IN PLACE (`styleItemCell:forItem:hidden:`, checkmark fading
-  over 0.2 s) and never reloads the row: the earlier switch rows showed that a
-  reload swaps the cell out under the finger (device recording, 2026-09-14
-  23:07) and re-resolves the estimates of rows above the viewport.
-- The ••• button top-right IS the preview (there is no pinned card any
-  more — it took a third of the screen). Tapping it opens the menu being
-  edited as Apollo would open it right now, with the saved order and
-  visibility applied: on Liquid Glass a real UIMenu on the bar button
-  (`ApolloAMBuildGlassPreviewMenu`, rows styled by the renderer's own
-  `ApolloNativeActionMenuPreviewAction`, the feed's Submit Post as the
-  Photo/Link/Text/Poll row via `ApolloSubmitPostTypesMenu`, Gallery View in
-  its own inline section), built on every open through
-  `UIDeferredMenuElement`'s uncached provider; before glass a sheet drawn
-  after the classic ActionController (`ApolloAMPreviewSheetViewController`:
-  10pt insets, 58pt accent rows, chevron on Submit Post, Cancel card, tweak
-  rows appended below Apollo's as the legacy path does). Rows the menu
-  doesn't offer right now are dimmed, not dropped, so a moved row is always
-  where it was put; All has no preview (the button is disabled).
-- Item rows have EXACT heights (`itemRowHeightWithSubtitle:` — one template
-  cell per variant, cached per cell width and content size category). UIKit
-  self-sized the rows from a 52 pt estimate;
-  subtitled rows are taller, so any batch update re-resolved the estimates of
-  rows above the viewport and scrolled the list several rows on every
-  visibility change while scrolled down (sim recording, 2026-09-15 02:11).
-  After the change a tap deep in the list moves nothing but its row's
-  checkmark and dimming (frame-diff of the list region: ~3 vs 8–26 before).
+  Number_Of_Rows_In_Section`) and fixed; the visibility-tap path was never affected
+  (`reloadRowWithID:` does not re-snapshot).
+- Rows are tap-to-check: an accent checkmark and drag grip share the accessory
+  area, while All omits the grip. A tap restyles the existing cell in place and
+  fades only the checkmark, so the list and pinned preview never jump.
 - Glass specs with a custom `buildElement` (Gallery View's combined section,
   the profile Hidden & Deleted row, Sticky as Subreddit) place their own
   element. `ApolloActionMenuInjectMenuElements` now diffs the children before
@@ -107,8 +82,8 @@ UIKit icon renderer was stubbed for the host build.
   Gallery View above Unsubscribe (sim, 2026-09-14). Unranked builders keep
   their own placement.
 - The settings list includes only that builder's supported actions; conditional
-  entries say “Shown when available.” The ••• preview dims rows the menu didn't offer last time.
-- All's taps affect every supporting context; mixed visibility is labelled.
+  entries say “Shown when available.” The preview uses the last offered rows.
+- All taps affect every supporting context; mixed visibility is labelled.
   All has no reorder controls. Individual menus can override the choice.
 - Reset removes the saved order and hidden set. Unknown native kinds remain
   visible. If a layout would hide every native row, the sheet shows all native
