@@ -20,6 +20,7 @@ jobs:
   sync:
     if: github.repository == 'Thetromboneman1/Apollo-Reborn'
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - name: Require upstream sync credential
         env:
@@ -44,11 +45,40 @@ jobs:
           UPSTREAM_URL: https://github.com/${{ env.UPSTREAM_REPOSITORY }}.git
         run: |
           set -euo pipefail
+          retry() {
+            local attempt=1
+            local max_attempts=3
+            until "$@"; do
+              if (( attempt >= max_attempts )); then
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed; retrying: $*" >&2
+              sleep $((attempt * 2))
+              attempt=$((attempt + 1))
+            done
+          }
           set_output() {
             printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
           }
-          git remote add upstream "$UPSTREAM_URL"
-          git fetch --prune upstream main
+          report_conflict() {
+            local conflict_files=$1
+            {
+              echo "### Upstream merge needs reviewed conflict resolution"
+              echo
+              echo "Conflicts: \`${conflict_files//,/\`, \`}\`"
+              echo
+              echo "The review branch was preserved and the pull request metadata will be refreshed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Upstream sync needs conflict resolution::${conflict_files}"
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_URL"
+          else
+            git remote add upstream "$UPSTREAM_URL"
+          fi
+          retry git fetch --prune upstream main
           upstream_sha=$(git rev-parse upstream/main)
           downstream_sha=$(git rev-parse HEAD)
           set_output sha "$upstream_sha"
@@ -57,34 +87,37 @@ jobs:
             exit 0
           fi
           branch="Thetromboneman1/upstream-sync-${upstream_sha:0:12}"
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            git fetch origin "$branch"
+          remote_branch=$(retry git ls-remote --heads origin "$branch")
+          if [[ -n "$remote_branch" ]]; then
+            retry git fetch origin "$branch"
             branch_sha=$(git rev-parse FETCH_HEAD)
             set_output changed true
             set_output branch "$branch"
-            if git merge-base --is-ancestor "$downstream_sha" "$branch_sha"; then
-              git switch --force-create "$branch" "$branch_sha"
+            if ! git merge-base --is-ancestor "$upstream_sha" "$branch_sha"; then
+              echo "::error title=Invalid upstream review branch::${branch} no longer contains ${upstream_sha}. Refusing to overwrite it."
+              exit 1
+            fi
+            git switch --force-create "$branch" "$branch_sha"
+            if git merge-base --is-ancestor "$downstream_sha" HEAD; then
+              set_output conflicted false
+            elif git merge --no-edit "$downstream_sha"; then
               set_output conflicted false
             else
-              # Keep downstream-only validation/publication helpers in the
-              # worktree while preserving the existing review branch exactly.
-              git branch --force "$branch" "$branch_sha"
+              conflict_files=$(git diff --name-only --diff-filter=U | paste -sd ',' -)
+              report_conflict "$conflict_files"
+              git merge --abort
+              # Keep downstream-only validation/publication helpers available
+              # while preserving the existing review branch exactly.
+              git switch --detach "$downstream_sha"
               set_output conflicted true
+              set_output conflict_files "$conflict_files"
             fi
             exit 0
           fi
           git switch -c "$branch"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if ! git merge --no-edit upstream/main; then
             conflict_files=$(git diff --name-only --diff-filter=U | paste -sd ',' -)
-            {
-              echo "### Upstream merge needs reviewed conflict resolution"
-              echo
-              echo "Conflicts: \`${conflict_files//,/\`, \`}\`"
-              echo
-              echo "A draft PR will preserve the exact upstream head for manual resolution."
-            } >> "$GITHUB_STEP_SUMMARY"
+            report_conflict "$conflict_files"
             git merge --abort
             # The conflict-review branch must remain the exact upstream head,
             # but upstream does not contain our publication helper. Keep the

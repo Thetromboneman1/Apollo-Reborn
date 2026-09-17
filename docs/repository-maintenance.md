@@ -27,6 +27,9 @@ file.
 Automated review branches use the
 `Thetromboneman1/upstream-sync-<upstream-sha>` naming convention.
 
-If the histories conflict, stop the automated sync and resolve the review
-branch manually. Closing the pull request and deleting its branch safely
-abandons an update.
+If the histories conflict, the workflow preserves the review branch, refreshes
+the pull request with the current conflict list, and waits for reviewed manual
+resolution. On later runs it safely merges an advanced downstream `main` into
+that branch when possible, then repeats documentation and build validation.
+It never overwrites a review branch that no longer contains the upstream SHA.
+Closing the pull request and deleting its branch safely abandons an update.

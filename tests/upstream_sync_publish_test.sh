@@ -8,6 +8,10 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 WORKFLOW="$ROOT/.github/workflows/boneman-upstream-sync.yml"
 grep -F 'secrets.BONEMAN_UPSTREAM_SYNC_TOKEN' "$WORKFLOW" >/dev/null
 grep -F 'run: scripts/publish-upstream-sync-review.sh' "$WORKFLOW" >/dev/null
+# shellcheck disable=SC2016
+grep -F 'elif git merge --no-edit "$downstream_sha"' "$WORKFLOW" >/dev/null
+# shellcheck disable=SC2016
+grep -F 'set_output conflict_files "$conflict_files"' "$WORKFLOW" >/dev/null
 if grep -F 'secrets.GITHUB_TOKEN' "$WORKFLOW" >/dev/null; then
   printf 'upstream sync workflow must not fall back to GITHUB_TOKEN for publication\n' >&2
   exit 1
@@ -50,6 +54,7 @@ run_publish() {
     GITHUB_REPOSITORY="Thetromboneman1/Apollo-Reborn" \
     GITHUB_REPOSITORY_OWNER="Thetromboneman1" \
     UPSTREAM_REPOSITORY="Apollo-Reborn/Apollo-Reborn" \
+    RETRY_DELAY_SECONDS=0 \
     CONFLICTED="${CONFLICTED:-false}" \
     CONFLICT_FILES="${CONFLICT_FILES:-}" \
     "$ROOT/scripts/publish-upstream-sync-review.sh"
@@ -63,10 +68,11 @@ fi
 grep -F 'requires GH_TOKEN' "$missing_output" >/dev/null
 
 : > "$FAKE_LOG"
-FAKE_EXISTING="https://github.com/Thetromboneman1/Apollo-Reborn/pull/41" run_publish >"$TEST_ROOT/existing.out"
-grep -F 'Reusing upstream review pull request' "$TEST_ROOT/existing.out" >/dev/null
+FAKE_EXISTING=$'41\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/41' run_publish >"$TEST_ROOT/existing.out"
+grep -F 'Refreshed upstream review pull request' "$TEST_ROOT/existing.out" >/dev/null
 grep -F 'git <push> <--set-upstream> <origin> <Thetromboneman1/upstream-sync-0123456789ab>' "$FAKE_LOG" >/dev/null
 grep -F 'gh <api> <--method> <GET>' "$FAKE_LOG" >/dev/null
+grep -F 'gh <api> <--method> <PATCH> <repos/Thetromboneman1/Apollo-Reborn/pulls/41>' "$FAKE_LOG" >/dev/null
 if grep -F '<POST>' "$FAKE_LOG" >/dev/null; then
   printf 'existing-PR case unexpectedly created a pull request\n' >&2
   exit 1
@@ -89,6 +95,7 @@ run_publish >"$TEST_ROOT/conflict-create.out"
 grep -F 'Created upstream review pull request' "$TEST_ROOT/conflict-create.out" >/dev/null
 grep -F '<draft=true>' "$FAKE_LOG" >/dev/null
 grep -F '<title=chore: resolve Apollo-Reborn/Apollo-Reborn sync conflicts>' "$FAKE_LOG" >/dev/null
+# shellcheck disable=SC2016
 grep -F '<body=Reviews `Apollo-Reborn/Apollo-Reborn@0123456789abcdef` against downstream customizations. Automatic merge conflicts: `src/Tweak.xm,src/settings/CustomAPIViewController.m`. Resolve locally, preserve both contracts, and run the downstream validation before marking this ready.>' "$FAKE_LOG" >/dev/null
 
 printf 'upstream sync publication tests passed\n'
