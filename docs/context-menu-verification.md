@@ -66,14 +66,11 @@ UIKit icon renderer was stubbed for the host build.
   other order tripped UITableView's batch-update assertion on an untouched
   menu's first drag (section 3 went 0 → 1 rows). Found in the glass sim on
   2026-09-14 (KSCrash report, `_Bug_Detected_In_Client_Of_UITableView_Invalid_
-  Number_Of_Rows_In_Section`) and fixed; the switch path was never affected
+  Number_Of_Rows_In_Section`) and fixed; the visibility-tap path was never affected
   (`reloadRowWithID:` does not re-snapshot).
-- A switch flip restyles the tapped cell IN PLACE (`styleItemCell:forItem:
-  hidden:`) and never reloads the row: `reloadRowWithID:` replaced the cell
-  under the switch while its knob was mid-transition, which cut the iOS 26
-  morph short and briefly composited two switches (device recording,
-  2026-09-14 23:07). After the change the glass sim's recording shows the
-  full knob-to-track morph on both flips (60 fps frame crops).
+- Rows are tap-to-check: an accent checkmark and drag grip share the accessory
+  area, while All omits the grip. A tap restyles the existing cell in place and
+  fades only the checkmark, so the list and pinned preview never jump.
 - Glass specs with a custom `buildElement` (Gallery View's combined section,
   the profile Hidden & Deleted row, Sticky as Subreddit) place their own
   element. `ApolloActionMenuInjectMenuElements` now diffs the children before
@@ -86,7 +83,7 @@ UIKit icon renderer was stubbed for the host build.
   their own placement.
 - The settings list includes only that builder's supported actions; conditional
   entries say “Shown when available.” The preview uses the last offered rows.
-- All switches affect every supporting context; mixed visibility is labelled.
+- All taps affect every supporting context; mixed visibility is labelled.
   All has no reorder controls. Individual menus can override the choice.
 - Reset removes the saved order and hidden set. Unknown native kinds remain
   visible. If a layout would hide every native row, the sheet shows all native
@@ -206,7 +203,7 @@ Full branch reviewed against freshly fetched upstream main `4683371` (3.7.1).
   All→Author OFF logged only post/post-detail/comment writes; Post→Author ON
   produced “Shown in Some Menus” in All. All has no preview or drag grips.
   Final build: short back swipe (2,500→55,500 over 900ms) left settings open;
-  subsequent Upvote toggle updated preview. Reset This Menu logged removal of
+  subsequent Upvote tap updated preview. Reset This Menu logged removal of
   the Post customization. Pinned preview remained visible while scrolling.
 - Host model and Swift ownership harnesses passed (described above).
 

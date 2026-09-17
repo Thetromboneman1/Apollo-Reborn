@@ -59,6 +59,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSettingsPinnedPreview.m \
     $(SRC_DIR)/settings/ApolloContributors.m \
     $(SRC_DIR)/settings/ApolloBackupRestore.m \
+    $(SRC_DIR)/settings/ApolloBackupDocument.m \
     $(SRC_DIR)/settings/ApolloAutomaticBackup.m \
     $(SRC_DIR)/settings/ApolloAutomaticBackupViewController.m \
     $(SRC_DIR)/settings/ApolloLocalBackupsViewController.m \
@@ -180,6 +181,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloScrollEdgeEffect.xm \
     $(SRC_DIR)/ApolloProgressiveBlur.xm \
     $(SRC_DIR)/settings/ApolloSettings.xm \
+    $(SRC_DIR)/settings/ApolloSettingsTabMenu.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloProfileMoreMenu.xm \
     $(SRC_DIR)/ApolloSaveAllMediaItems.m \

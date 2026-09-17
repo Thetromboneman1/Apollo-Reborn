@@ -476,44 +476,67 @@ static BOOL ApolloAMItemDrawsAsPalette(ApolloActionMenuItem *item, BOOL glass) {
 
 #pragma mark - Item row cell
 
-// One catalogue item: its menu icon, its title, a drag grip and the
-// show/hide switch. The switch is the accessory (so it keeps its native
-// placement and theming); the grip sits inside the content area just left of
-// it. A hidden item dims its icon and title but stays in the list, so it can
-// be dragged and switched back on any time.
+// One catalogue item: its menu icon, title, accent checkmark and drag grip.
+// Tapping flips visibility; a hidden item stays available for re-enabling.
 @interface ApolloAMItemCell : UITableViewCell
 @property (nonatomic, copy) NSString *itemID;
-@property (nonatomic, strong, readonly) UISwitch *toggle;
+@property (nonatomic, strong, readonly) UIImageView *checkmark;
 @property (nonatomic, strong, readonly) UIImageView *grip;
+@property (nonatomic) BOOL showsGrip;
 @end
 
-@implementation ApolloAMItemCell
+static const CGFloat kApolloAMCheckmarkWidth = 22.0;
+static const CGFloat kApolloAMGripWidth = 24.0;
+static const CGFloat kApolloAMAccessoryGap = 14.0;
+static const CGFloat kApolloAMAccessoryHeight = 28.0;
+
+@implementation ApolloAMItemCell {
+    UIView *_accessory;
+}
 
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     self = [super initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseIdentifier];
     if (!self) return nil;
-    self.selectionStyle = UITableViewCellSelectionStyleNone;
     self.detailTextLabel.font = [UIFont systemFontOfSize:12.0];
-    _toggle = [[UISwitch alloc] init];
-    self.accessoryView = _toggle;
+    UIImageSymbolConfiguration *checkConfiguration =
+        [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightSemibold];
+    _checkmark = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"checkmark" withConfiguration:checkConfiguration]];
+    _checkmark.contentMode = UIViewContentModeCenter;
     UIImageSymbolConfiguration *gripConfiguration =
         [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
     _grip = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"line.horizontal.3" withConfiguration:gripConfiguration]];
     _grip.tintColor = UIColor.tertiaryLabelColor;
     _grip.contentMode = UIViewContentModeCenter;
-    [self.contentView addSubview:_grip];
+    _accessory = [[UIView alloc] initWithFrame:CGRectZero];
+    [_accessory addSubview:_checkmark];
+    [_accessory addSubview:_grip];
+    self.accessoryView = _accessory;
+    _showsGrip = YES;
+    [self layoutAccessory];
     self.imageView.contentMode = UIViewContentModeCenter;
     self.textLabel.numberOfLines = 1;
     self.textLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     return self;
 }
 
+- (void)setShowsGrip:(BOOL)showsGrip {
+    if (_showsGrip == showsGrip) return;
+    _showsGrip = showsGrip;
+    [self layoutAccessory];
+}
+
+- (void)layoutAccessory {
+    CGFloat width = kApolloAMCheckmarkWidth + (self.showsGrip ? kApolloAMAccessoryGap + kApolloAMGripWidth : 0.0);
+    _accessory.bounds = CGRectMake(0.0, 0.0, width, kApolloAMAccessoryHeight);
+    self.checkmark.frame = CGRectMake(0.0, 0.0, kApolloAMCheckmarkWidth, kApolloAMAccessoryHeight);
+    self.grip.frame = CGRectMake(width - kApolloAMGripWidth, 0.0, kApolloAMGripWidth, kApolloAMAccessoryHeight);
+    self.grip.hidden = !self.showsGrip;
+    [self setNeedsLayout];
+}
+
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGRect content = self.contentView.bounds;
-    CGFloat gripSide = 24.0;
-    self.grip.frame = CGRectMake(CGRectGetMaxX(content) - gripSide - 4.0,
-                                 round((CGRectGetHeight(content) - gripSide) / 2.0), gripSide, gripSide);
     // Apollo's option-* art is a mixed bag of shapes; a fixed 28pt box keeps
     // every title on the same column.
     CGRect imageFrame = self.imageView.frame;
@@ -522,14 +545,14 @@ static BOOL ApolloAMItemDrawsAsPalette(ApolloActionMenuItem *item, BOOL glass) {
     self.imageView.frame = imageFrame;
     CGRect textFrame = self.textLabel.frame;
     textFrame.origin.x = CGRectGetMaxX(imageFrame) + 12.0;
-    textFrame.size.width = MAX(0.0, CGRectGetMinX(self.grip.frame) - 8.0 - CGRectGetMinX(textFrame));
+    textFrame.size.width = MAX(0.0, CGRectGetMaxX(content) - 8.0 - CGRectGetMinX(textFrame));
     self.textLabel.frame = textFrame;
     CGRect detailFrame = self.detailTextLabel.frame;
     detailFrame.origin.x = textFrame.origin.x;
     detailFrame.size.width = textFrame.size.width;
     self.detailTextLabel.frame = detailFrame;
     // The theme pass tints every image view in the cell with the accent; the
-    // grip is chrome, not content.
+    // grip is chrome, not content; the checkmark is accent-coloured.
     self.grip.tintColor = UIColor.tertiaryLabelColor;
 }
 
@@ -540,6 +563,8 @@ static BOOL ApolloAMItemDrawsAsPalette(ApolloActionMenuItem *item, BOOL glass) {
 @interface ApolloActionMenuSettingsViewController () <UITableViewDragDelegate, UITableViewDropDelegate>
 @property (nonatomic, copy) ApolloActionMenuContext context;
 @property (nonatomic, strong) ApolloPinnedPreviewHost *previewHost;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *itemRowHeights;
+@property (nonatomic, strong) ApolloAMItemCell *measuringItemCell;
 // Card width the spacer row was last measured for (0 = only the table's own
 // section inset was available). Updated from the real cell frame by the pinned
 // layout pass, which then asks for a one-row re-measure.
@@ -627,7 +652,7 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
     return first ? [self itemRowIDForItemID:first] : nil;
 }
 
-// All is a settings overview, never a runtime menu context. Each switch
+// All is a settings overview, never a runtime menu context. Each tap
 // updates only the contexts whose catalogue contains the item. A mixed state
 // remains visible in the subtitle; selecting a menu exposes its own override.
 - (BOOL)editingAllMenus {
@@ -721,13 +746,12 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     };
 
-    // ---- Items (drag to reorder, switch to show/hide) ----
+    // ---- Items (drag to reorder, tap to show/hide) ----
 
     NSMutableArray<ApolloSettingsRow *> *itemRows = [NSMutableArray array];
     for (ApolloActionMenuItem *item in [self editableItems]) {
         NSString *itemID = item.itemID;
-        // Hidden state is read live on every configure (a switch flip reloads
-        // just this row by identity), never captured at build time.
+        // Hidden state is read live on every configure and restyled in place.
         ApolloSettingsRow *row =
             [ApolloSettingsRow customRowWithID:[self itemRowIDForItemID:itemID]
                                           cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *r) {
@@ -735,7 +759,13 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
                                       hidden:[weakSelf itemIsHidden:item.itemID]
                                      inTable:tableView];
         }
-                                      onSelect:nil];
+                                      onSelect:^{ [weakSelf toggleItemWithID:itemID]; }];
+        row.height = ^CGFloat {
+            __strong __typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return UITableViewAutomaticDimension;
+            BOOL subtitle = strongSelf.editingAllMenus || !ApolloActionMenuItemWasOffered(strongSelf.context, itemID);
+            return [strongSelf itemRowHeightWithSubtitle:subtitle];
+        };
         [itemRows addObject:row];
     }
 
@@ -749,9 +779,9 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
 
     NSString *itemsFooter;
     if (self.editingAllMenus) {
-        itemsFooter = @"Switch an action on or off across the menus that support it. Shown in Some Menus means your per-menu choices differ. Select a menu to adjust its choices and order.";
+        itemsFooter = @"Tap an action to show or hide it across the menus that support it. Shown in Some Menus means your per-menu choices differ. Select a menu to adjust its choices and order.";
     } else {
-        itemsFooter = @"Only actions supported by this menu are listed. Some appear only for your own content or when a feature is enabled. Touch and hold to reorder. Switching visibility preserves Apollo’s order. The preview reflects the last time you opened this menu.";
+        itemsFooter = @"Only actions supported by this menu are listed. Some appear only for your own content or when a feature is enabled. Tap an action to show or hide it; touch and hold to reorder. Hiding preserves Apollo’s order. The pinned preview reflects the last time you opened this menu.";
         NSString *lockedNote = [self lockedItemsNote];
         if (lockedNote) itemsFooter = [itemsFooter stringByAppendingFormat:@" %@", lockedNote];
     }
@@ -774,31 +804,52 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
 - (UITableViewCell *)itemCellForItem:(ApolloActionMenuItem *)item hidden:(BOOL)hidden inTable:(UITableView *)tableView {
     static NSString *const reuseID = @"Cell_ActionMenuItem";
     ApolloAMItemCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
-    if (!cell) {
-        cell = [[ApolloAMItemCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
-        [cell.toggle addTarget:self action:@selector(itemSwitchToggled:) forControlEvents:UIControlEventValueChanged];
-    }
+    if (!cell) cell = [[ApolloAMItemCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
     cell.itemID = item.itemID;
     cell.textLabel.text = item.title;
     cell.imageView.image = [item icon];
-    cell.grip.hidden = self.editingAllMenus;
-    cell.toggle.on = !hidden;
+    cell.showsGrip = !self.editingAllMenus;
     [self styleItemCell:cell forItem:item hidden:hidden];
     return cell;
 }
 
-// The look that follows the hidden state: dimmed icon and title, the All
-// overview's per-menu subtitle, accessibility. Kept apart from the cell's
-// creation so a switch flip can restyle the cell IN PLACE — reloading the row
-// there swapped the cell out under the switch mid-animation, cutting the
-// knob's own transition short and briefly drawing two switches (the "odd
-// toggle" in the 2026-09-14 device recording). Never sets the switch: it is
-// either freshly configured by the caller or animating under the user's thumb.
+- (CGFloat)itemRowHeightWithSubtitle:(BOOL)subtitle {
+    UITableView *table = self.tableView;
+    CGFloat width = CGRectGetWidth(table.bounds) - table.layoutMargins.left - table.layoutMargins.right;
+    UITableViewCell *sample = table.visibleCells.firstObject;
+    if (sample && sample.superview) width = CGRectGetWidth([sample.superview convertRect:sample.frame toView:table]);
+    if (width <= 0.0) return UITableViewAutomaticDimension;
+    NSString *key = [NSString stringWithFormat:@"%d|%.0f|%@", subtitle, width,
+                     table.traitCollection.preferredContentSizeCategory ?: @""];
+    NSNumber *cached = self.itemRowHeights[key];
+    if (cached) return cached.doubleValue;
+    if (!self.measuringItemCell) {
+        self.measuringItemCell = [[ApolloAMItemCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    }
+    ApolloAMItemCell *cell = self.measuringItemCell;
+    cell.textLabel.text = @"Measure";
+    cell.detailTextLabel.text = subtitle ? @"Shown when available" : nil;
+    cell.imageView.image = [UIImage systemImageNamed:@"square"
+                                   withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:19.0
+                                                                                                   weight:UIImageSymbolWeightRegular]];
+    cell.bounds = CGRectMake(0.0, 0.0, width, 100.0);
+    [cell setNeedsLayout];
+    [cell layoutIfNeeded];
+    CGFloat height = ceil([cell systemLayoutSizeFittingSize:CGSizeMake(width, UILayoutFittingCompressedSize.height)
+                                  withHorizontalFittingPriority:UILayoutPriorityRequired
+                                        verticalFittingPriority:UILayoutPriorityFittingSizeLevel].height);
+    if (height <= 0.0) return UITableViewAutomaticDimension;
+    if (!self.itemRowHeights) self.itemRowHeights = [NSMutableDictionary dictionary];
+    self.itemRowHeights[key] = @(height);
+    return height;
+}
+
+// Restyle the checkmark, content and accessibility in place so a tap never
+// replaces the row or shifts the pinned preview/list under the user's finger.
 - (void)styleItemCell:(ApolloAMItemCell *)cell forItem:(ApolloActionMenuItem *)item hidden:(BOOL)hidden {
     // A row Apollo only offers sometimes says so — unless this user's menu
     // offered it last time (a moderator's Moderator row, say).
-    NSArray<NSString *> *seen = ApolloActionMenuLastPresentedItemIDs(self.context);
-    BOOL offered = seen ? [seen containsObject:item.itemID] : item.usuallyShown;
+    BOOL offered = self.editingAllMenus || ApolloActionMenuItemWasOffered(self.context, item.itemID);
     cell.detailTextLabel.text = offered ? nil : @"Shown when available";
     if (self.editingAllMenus) {
         NSArray *contexts = [self contextsForItem:item.itemID];
@@ -810,18 +861,24 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
             (hiddenCount == contexts.count ? @"Hidden in All Supported Menus" : @"Shown in Some Menus");
     }
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-    cell.toggle.accessibilityLabel = [NSString stringWithFormat:@"Show %@", item.title];
     // Reuse pool: set BOTH states explicitly. A hidden row's label is disabled
     // (the theme pass leaves disabled labels alone, so the dim survives it);
     // a shown row is re-enabled, reset to the plain label colour and marked
     // for the theme's primary text like every other settings row.
     UIColor *accent = [self apollo_themeAccentColor] ?: ApolloThemeAccentColor() ?: self.view.tintColor;
+    cell.checkmark.tintColor = accent;
+    cell.checkmark.alpha = hidden ? 0.0 : 1.0;
     cell.imageView.tintColor = hidden ? UIColor.tertiaryLabelColor : accent;
     cell.textLabel.enabled = !hidden;
     cell.textLabel.textColor = hidden ? UIColor.secondaryLabelColor : UIColor.labelColor;
     if (!hidden) [self apollo_applyPrimaryTextColorToCell:cell];
     cell.textLabel.alpha = 1.0;
-    cell.accessibilityLabel = hidden ? [NSString stringWithFormat:@"%@, hidden", item.title] : item.title;
+    cell.accessibilityTraits = UIAccessibilityTraitButton;
+    cell.accessibilityLabel = offered ? item.title : [NSString stringWithFormat:@"%@, shown when available", item.title];
+    cell.accessibilityValue = hidden ? @"Hidden" : @"Shown";
+    cell.accessibilityHint = self.editingAllMenus
+        ? (hidden ? @"Double tap to show it in the menus that support it." : @"Double tap to hide it from the menus that support it.")
+        : (hidden ? @"Double tap to show it in this menu." : @"Double tap to hide it from this menu.");
 }
 
 #pragma mark - Actions
@@ -861,30 +918,23 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
     [self animatePreviewStateChange];
 }
 
-- (void)itemSwitchToggled:(UISwitch *)sender {
-    ApolloAMItemCell *cell = nil;
-    for (UIView *view = sender.superview; view; view = view.superview) {
-        if ([view isKindOfClass:[ApolloAMItemCell class]]) { cell = (ApolloAMItemCell *)view; break; }
-    }
-    NSString *itemID = cell.itemID;
+- (void)toggleItemWithID:(NSString *)itemID {
     if (itemID.length == 0) return;
-    BOOL hide = !sender.isOn;
-
+    BOOL hide = ![self itemIsHidden:itemID];
     for (NSString *context in [self contextsForItem:itemID]) {
         ApolloActionMenuSetItemHidden(context, itemID, hide);
     }
-    // Restyle the tapped cell in place (see styleItemCell:). No row reload
-    // here: the switch is still animating under the user's thumb, and a
-    // reload replaces the cell — and the switch — beneath it.
     ApolloActionMenuItem *item = nil;
     for (ApolloActionMenuItem *candidate in [self editableItems]) {
         if ([candidate.itemID isEqualToString:itemID]) { item = candidate; break; }
     }
-    BOOL nowHidden = [self itemIsHidden:itemID];
-    if (item) [self styleItemCell:cell forItem:item hidden:nowHidden];
-    // Only if the model refused the change (it never does for a listed item)
-    // does the switch need putting back; otherwise it keeps its own motion.
-    if (cell.toggle.on == nowHidden) [cell.toggle setOn:!nowHidden animated:YES];
+    UITableViewCell *cell = [self cellForRowID:[self itemRowIDForItemID:itemID]];
+    if (item && [cell isKindOfClass:[ApolloAMItemCell class]]) {
+        BOOL nowHidden = [self itemIsHidden:itemID];
+        [UIView animateWithDuration:0.2 animations:^{
+            [self styleItemCell:(ApolloAMItemCell *)cell forItem:item hidden:nowHidden];
+        }];
+    }
     [self visibilityDidChange]; // the reset row
     [self animatePreviewStateChange];
 }

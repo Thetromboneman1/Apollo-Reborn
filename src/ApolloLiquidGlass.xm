@@ -9,6 +9,7 @@
 #import "ApolloNavigationTitleGeometry.h"
 #import "ApolloNavigationActions.h"
 #import "ApolloNavigationTitlePresentation.h"
+#import "ApolloFindInCommentsGlass.h"
 
 /// Helpers for restoring long-press to activate account switcher w/ Liquid Glass
 static char kApolloTabButtonSetupKey;
@@ -444,6 +445,16 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
 %end
 
 %hook UITabBar
+
+- (void)tintColorDidChange {
+    %orig;
+    // A popup dims inherited tint independently of the press highlight. Keep
+    // the selected tab's accent when the Glass lens returns to it; the popup
+    // backdrop still dims the screen and normal pressed feedback is untouched.
+    if (IsLiquidGlass() && self.tintAdjustmentMode == UIViewTintAdjustmentModeDimmed) {
+        self.tintAdjustmentMode = UIViewTintAdjustmentModeNormal;
+    }
+}
 
 - (void)didMoveToWindow {
     %orig;
@@ -931,6 +942,12 @@ static void ApolloCollectNavigationTitleContent(UIView *root,
         if (subview == excluded || subview.hidden ||
             (!childIncludesTransparent && subview.alpha < 0.01)) continue;
 
+        // A segmented title is one content surface. Measuring its transient
+        // selection images/labels makes the capsule jump while it animates.
+        if ([subview isKindOfClass:UISegmentedControl.class]) {
+            [content addObject:subview];
+            continue;
+        }
         if ([subview isKindOfClass:UILabel.class] ||
             [subview isKindOfClass:UIImageView.class] ||
             [subview isKindOfClass:UITextField.class]) {
@@ -1176,6 +1193,12 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
 }
 
 - (CGRect)glassFrameForHostView:(UIView *)hostView candidateViews:(NSArray<UIView *> *)candidateViews {
+    // Segmented titles already include their own padding. Use their stable
+    // bounds while sharing every title-glass visibility and lifecycle rule.
+    if (candidateViews.count == 1 && [candidateViews.firstObject isKindOfClass:UISegmentedControl.class]) {
+        UIView *control = candidateViews.firstObject;
+        return [control convertRect:control.bounds toView:hostView];
+    }
     const CGFloat kVerticalPadding = 8.0;
     CGRect frame;
 
@@ -1809,6 +1832,17 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     // edges are not the editor's available width; reserve the final items once.
     if (searchActions) {
         rightLimit -= MAX(16.0, bar.layoutMargins.right) + searchActionsWidth;
+    }
+    // The Find in Comments navigator (ApolloFindInCommentsGlass.xm) holds the trailing
+    // group for the length of a glass search. Its swap keeps the outgoing action pill's
+    // platter on screen for a beat, and a recenter pass landing in that beat fitted the
+    // title to that outgoing edge — "264 Comments" squeezed to a 128pt "264 Com…" until
+    // the next pass refit it to the navigator's. The navigator's own platter is the edge,
+    // laid out or not; the outgoing one is skipped like Apollo's search actions above.
+    CGRect navigatorEdge = ApolloFindInCommentsGlassTrailingFrame(bar.topItem, bar);
+    if (!searchActions && !CGRectIsNull(navigatorEdge)) {
+        searchActions = YES;
+        rightLimit = MIN(rightLimit, CGRectGetMinX(navigatorEdge));
     }
     CGRect collapsedActions = ApolloNavigationActionsCollapsedFrame(bar);
     if (!searchActions && !CGRectIsNull(collapsedActions)) {
