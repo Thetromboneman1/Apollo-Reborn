@@ -1,4 +1,5 @@
 #import "ApolloCommon.h"
+#import "settings/ApolloBackupDocument.h"
 #import "ApolloDirectChatWeb.h"
 #import "settings/ApolloSettingsRouter.h"
 #import <UserNotifications/UserNotifications.h>
@@ -247,6 +248,7 @@ static void ApolloQuickActionsOpenModernMailboxWithRetry(NSDictionary<NSString *
 }
 
 static BOOL ApolloQuickActionsHandleURL(NSURL *url, UIWindowScene *originatingScene) {
+    if (ApolloBackupDocumentHandleURL(url)) return YES;
     NSDictionary<NSString *, NSString *> *mailboxRoute = ApolloModernMailboxRouteFromURL(url);
     if (mailboxRoute) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -265,6 +267,12 @@ static BOOL ApolloQuickActionsHandleURL(NSURL *url, UIWindowScene *originatingSc
 }
 
 %hook _TtC6Apollo11AppDelegate
+
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    BOOL result = %orig(application, launchOptions);
+    ApolloBackupDocumentHandleURL(launchOptions[UIApplicationLaunchOptionsURLKey]);
+    return result;
+}
 
 - (BOOL)application:(UIApplication *)application openURL:(NSURL *)url options:(NSDictionary *)options {
     if (ApolloQuickActionsHandleURL(url, nil)) {
