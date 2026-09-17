@@ -6,27 +6,19 @@ TEST_ROOT=$(mktemp -d)
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 WORKFLOW="$ROOT/.github/workflows/boneman-upstream-sync.yml"
-grep -F 'secrets.BONEMAN_UPSTREAM_SYNC_TOKEN' "$WORKFLOW" >/dev/null
-grep -F 'run: scripts/publish-upstream-sync-review.sh' "$WORKFLOW" >/dev/null
-# shellcheck disable=SC2016
-grep -F 'elif git merge --no-edit "$downstream_sha"' "$WORKFLOW" >/dev/null
-# shellcheck disable=SC2016
-grep -F 'set_output conflict_files "$conflict_files"' "$WORKFLOW" >/dev/null
+grep -F 'scripts/upstream_pr_batch.py' "$WORKFLOW" >/dev/null
+grep -F 'scripts/publish-upstream-pr-batch.sh' "$WORKFLOW" >/dev/null
+grep -F 'persist-credentials: false' "$WORKFLOW" >/dev/null
+grep -F 'Secretless documentation and package validation' "$WORKFLOW" >/dev/null
+grep -F 'batch-manifest.json' "$WORKFLOW" >/dev/null
 if grep -F 'secrets.GITHUB_TOKEN' "$WORKFLOW" >/dev/null; then
-  printf 'upstream sync workflow must not fall back to GITHUB_TOKEN for publication\n' >&2
+  printf 'all-open upstream workflow must not use the built-in token for publication\n' >&2
   exit 1
 fi
 
 FAKE_BIN="$TEST_ROOT/bin"
 FAKE_LOG="$TEST_ROOT/calls.log"
 mkdir -p "$FAKE_BIN"
-
-cat > "$FAKE_BIN/git" <<'SH'
-#!/usr/bin/env bash
-printf 'git' >> "$FAKE_LOG"
-printf ' <%s>' "$@" >> "$FAKE_LOG"
-printf '\n' >> "$FAKE_LOG"
-SH
 
 cat > "$FAKE_BIN/gh" <<'SH'
 #!/usr/bin/env bash
@@ -36,66 +28,84 @@ printf '\n' >> "$FAKE_LOG"
 if [[ "$*" == *"--method GET"* ]]; then
   printf '%s\n' "${FAKE_EXISTING:-}"
 elif [[ "$*" == *"--method POST"* ]]; then
-  printf 'https://github.com/Thetromboneman1/Apollo-Reborn/pull/42\n'
+  printf '%s\n' $'42\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/42\t'"${FAKE_CREATED_DRAFT:-false}"
 fi
 SH
+chmod +x "$FAKE_BIN/gh"
 
-chmod +x "$FAKE_BIN/git" "$FAKE_BIN/gh"
+SUMMARY="$TEST_ROOT/summary.md"
+printf '# Complete batch report\n' > "$SUMMARY"
+
+write_manifest() {
+  python3 - "$TEST_ROOT/manifest.json" "$1" "$2" <<'PY'
+import json
+import sys
+
+json.dump({
+    "complete": sys.argv[2] == "true",
+    "changed": sys.argv[3] == "true",
+    "fingerprint": "0123456789abcdef",
+    "total": 18,
+    "included_count": 18 if sys.argv[2] == "true" else 13,
+}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+}
 
 run_publish() {
   env \
     PATH="$FAKE_BIN:$PATH" \
     FAKE_LOG="$FAKE_LOG" \
     FAKE_EXISTING="${FAKE_EXISTING:-}" \
-    GH_TOKEN="test-token" \
-    BRANCH="Thetromboneman1/upstream-sync-0123456789ab" \
-    UPSTREAM_SHA="0123456789abcdef" \
-    DOWNSTREAM_BRANCH="main" \
-    GITHUB_REPOSITORY="Thetromboneman1/Apollo-Reborn" \
-    GITHUB_REPOSITORY_OWNER="Thetromboneman1" \
-    UPSTREAM_REPOSITORY="Apollo-Reborn/Apollo-Reborn" \
+    FAKE_CREATED_DRAFT="${FAKE_CREATED_DRAFT:-false}" \
+    GH_TOKEN=test-token \
+    BRANCH=Thetromboneman1/all-open-upstream-prs-0123456789ab \
+    DOWNSTREAM_BRANCH=main \
+    GITHUB_REPOSITORY=Thetromboneman1/Apollo-Reborn \
+    MANIFEST_PATH="$TEST_ROOT/manifest.json" \
+    SUMMARY_PATH="$SUMMARY" \
+    VALIDATION_RESULT="${VALIDATION_RESULT:-success}" \
+    RUN_URL=https://github.com/example/actions/runs/1 \
+    AUTO_MERGE="${AUTO_MERGE:-false}" \
     RETRY_DELAY_SECONDS=0 \
-    CONFLICTED="${CONFLICTED:-false}" \
-    CONFLICT_FILES="${CONFLICT_FILES:-}" \
-    "$ROOT/scripts/publish-upstream-sync-review.sh"
+    "$ROOT/scripts/publish-upstream-pr-batch.sh"
 }
 
-missing_output="$TEST_ROOT/missing.out"
-if env -u GH_TOKEN "$ROOT/scripts/publish-upstream-sync-review.sh" >"$missing_output" 2>&1; then
-  printf 'missing-token case unexpectedly succeeded\n' >&2
-  exit 1
-fi
-grep -F 'requires GH_TOKEN' "$missing_output" >/dev/null
-
 : > "$FAKE_LOG"
-FAKE_EXISTING=$'41\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/41' run_publish >"$TEST_ROOT/existing.out"
-grep -F 'Refreshed upstream review pull request' "$TEST_ROOT/existing.out" >/dev/null
-grep -F 'git <push> <--set-upstream> <origin> <Thetromboneman1/upstream-sync-0123456789ab>' "$FAKE_LOG" >/dev/null
-grep -F 'gh <api> <--method> <GET>' "$FAKE_LOG" >/dev/null
-grep -F 'gh <api> <--method> <PATCH> <repos/Thetromboneman1/Apollo-Reborn/pulls/41>' "$FAKE_LOG" >/dev/null
-if grep -F '<POST>' "$FAKE_LOG" >/dev/null; then
-  printf 'existing-PR case unexpectedly created a pull request\n' >&2
+write_manifest true false
+run_publish > "$TEST_ROOT/no-change.out"
+grep -F 'already present on main' "$TEST_ROOT/no-change.out" >/dev/null
+if [[ -s "$FAKE_LOG" ]]; then
+  printf 'no-change publication unexpectedly called GitHub\n' >&2
   exit 1
 fi
 
 : > "$FAKE_LOG"
-FAKE_EXISTING='' run_publish >"$TEST_ROOT/create.out"
-grep -F 'Created upstream review pull request' "$TEST_ROOT/create.out" >/dev/null
-grep -F 'gh <api> <--method> <POST>' "$FAKE_LOG" >/dev/null
-grep -F '<head=Thetromboneman1/upstream-sync-0123456789ab>' "$FAKE_LOG" >/dev/null
-grep -F '<base=main>' "$FAKE_LOG" >/dev/null
-expected_body="<body=Merges \`Apollo-Reborn/Apollo-Reborn@0123456789abcdef\` through the downstream package validation contract.>"
-grep -F "$expected_body" "$FAKE_LOG" >/dev/null
-
-: > "$FAKE_LOG"
-CONFLICTED=true \
-CONFLICT_FILES='src/Tweak.xm,src/settings/CustomAPIViewController.m' \
-FAKE_EXISTING='' \
-run_publish >"$TEST_ROOT/conflict-create.out"
-grep -F 'Created upstream review pull request' "$TEST_ROOT/conflict-create.out" >/dev/null
+write_manifest false true
+FAKE_CREATED_DRAFT=true
+export FAKE_CREATED_DRAFT
+if run_publish > "$TEST_ROOT/incomplete.out" 2>&1; then
+  printf 'incomplete batch unexpectedly passed the completeness gate\n' >&2
+  exit 1
+fi
 grep -F '<draft=true>' "$FAKE_LOG" >/dev/null
-grep -F '<title=chore: resolve Apollo-Reborn/Apollo-Reborn sync conflicts>' "$FAKE_LOG" >/dev/null
-# shellcheck disable=SC2016
-grep -F '<body=Reviews `Apollo-Reborn/Apollo-Reborn@0123456789abcdef` against downstream customizations. Automatic merge conflicts: `src/Tweak.xm,src/settings/CustomAPIViewController.m`. Resolve locally, preserve both contracts, and run the downstream validation before marking this ready.>' "$FAKE_LOG" >/dev/null
+grep -F 'batch remains review-required' "$TEST_ROOT/incomplete.out" >/dev/null
+
+: > "$FAKE_LOG"
+write_manifest true true
+unset FAKE_CREATED_DRAFT
+AUTO_MERGE=false run_publish > "$TEST_ROOT/ready.out"
+grep -F '<draft=false>' "$FAKE_LOG" >/dev/null
+if grep -F ' <pr> <merge>' "$FAKE_LOG" >/dev/null; then
+  printf 'auto-merge=false unexpectedly merged the PR\n' >&2
+  exit 1
+fi
+
+: > "$FAKE_LOG"
+FAKE_EXISTING=$'41\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/41\ttrue' \
+AUTO_MERGE=true \
+run_publish > "$TEST_ROOT/existing.out"
+grep -F ' <pr> <ready> <41>' "$FAKE_LOG" >/dev/null
+grep -F ' <pr> <merge> <41>' "$FAKE_LOG" >/dev/null
+grep -F 'Merged complete validated all-open PR snapshot' "$TEST_ROOT/existing.out" >/dev/null
 
 printf 'upstream sync publication tests passed\n'

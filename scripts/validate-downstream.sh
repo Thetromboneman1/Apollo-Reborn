@@ -14,17 +14,20 @@ fi
 python3 "$ROOT/scripts/documentation_health.py" --check
 python3 -m py_compile \
   "$ROOT/scripts/generate_release_notes.py" \
+  "$ROOT/scripts/upstream_pr_batch.py" \
   "$ROOT/scripts/update_source_json.py" \
   "$ROOT/scripts/validate_release_inputs.py"
 
 bash -n \
   "$ROOT/build-ipa.sh" \
   "$ROOT/patch.sh" \
+  "$ROOT/scripts/publish-upstream-pr-batch.sh" \
   "$ROOT/scripts/publish-upstream-sync-review.sh" \
   "$ROOT/scripts/build_release_variants.sh" \
   "$ROOT/scripts/validate_release_variants.sh"
 
 bash "$ROOT/tests/upstream_sync_publish_test.sh"
+python3 "$ROOT/tests/upstream_pr_batch_test.py"
 
 if [[ "$BUILD" == true ]]; then
   : "${THEOS:?THEOS must point to a Theos checkout for --build}"

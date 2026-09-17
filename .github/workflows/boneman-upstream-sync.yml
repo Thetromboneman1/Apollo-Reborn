@@ -4,12 +4,18 @@ on:
   schedule:
     - cron: "23 9 * * *"
   workflow_dispatch:
+    inputs:
+      auto_merge:
+        description: Merge the complete validated fork integration PR into main
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: boneman-apollo-upstream-sync
+  group: boneman-apollo-all-open-upstream-prs
   cancel-in-progress: false
 
 env:
@@ -17,160 +23,275 @@ env:
   DOWNSTREAM_BRANCH: main
 
 jobs:
-  sync:
+  prepare:
+    name: Inventory and assemble every open upstream PR
     if: github.repository == 'Thetromboneman1/Apollo-Reborn'
-    runs-on: macos-15
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      branch: ${{ steps.result.outputs.branch }}
+      changed: ${{ steps.result.outputs.changed }}
+      complete: ${{ steps.result.outputs.complete }}
+      fingerprint: ${{ steps.result.outputs.fingerprint }}
+      included_count: ${{ steps.result.outputs.included_count }}
+      total: ${{ steps.result.outputs.total }}
     steps:
-      - name: Require upstream sync credential
+      - name: Require fork sync credential
         env:
           GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
         run: |
           if [[ -z "$GH_TOKEN" ]]; then
-            echo "::error title=Missing upstream sync credential::Configure BONEMAN_UPSTREAM_SYNC_TOKEN with Contents, Pull requests, and Workflows write access. The built-in GITHUB_TOKEN cannot push reviewed upstream workflow changes."
+            echo "::error title=Missing upstream sync credential::Configure BONEMAN_UPSTREAM_SYNC_TOKEN with Contents, Pull requests, and Workflows write access on Thetromboneman1/Apollo-Reborn."
             exit 1
           fi
 
-      - name: Check out fork main
+      - name: Check out trusted fork main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
-          submodules: recursive
+          submodules: false
           token: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
 
-      - name: Merge upstream into review branch
-        id: upstream
-        env:
-          UPSTREAM_URL: https://github.com/${{ env.UPSTREAM_REPOSITORY }}.git
+      - name: Freeze trusted batch tooling
+        run: cp scripts/upstream_pr_batch.py "$RUNNER_TEMP/upstream_pr_batch.py"
+
+      - name: Configure upstream and fetch main
         run: |
           set -euo pipefail
-          retry() {
-            local attempt=1
-            local max_attempts=3
-            until "$@"; do
-              if (( attempt >= max_attempts )); then
-                return 1
-              fi
-              echo "Attempt ${attempt}/${max_attempts} failed; retrying: $*" >&2
-              sleep $((attempt * 2))
-              attempt=$((attempt + 1))
-            done
-          }
-          set_output() {
-            printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
-          }
-          report_conflict() {
-            local conflict_files=$1
-            {
-              echo "### Upstream merge needs reviewed conflict resolution"
-              echo
-              echo "Conflicts: \`${conflict_files//,/\`, \`}\`"
-              echo
-              echo "The review branch was preserved and the pull request metadata will be refreshed."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning title=Upstream sync needs conflict resolution::${conflict_files}"
-          }
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git remote get-url upstream >/dev/null 2>&1; then
-            git remote set-url upstream "$UPSTREAM_URL"
-          else
-            git remote add upstream "$UPSTREAM_URL"
-          fi
-          retry git fetch --prune upstream main
-          upstream_sha=$(git rev-parse upstream/main)
-          downstream_sha=$(git rev-parse HEAD)
-          set_output sha "$upstream_sha"
-          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
-            set_output changed false
-            exit 0
-          fi
-          branch="Thetromboneman1/upstream-sync-${upstream_sha:0:12}"
-          remote_branch=$(retry git ls-remote --heads origin "$branch")
-          if [[ -n "$remote_branch" ]]; then
-            retry git fetch origin "$branch"
-            branch_sha=$(git rev-parse FETCH_HEAD)
-            set_output changed true
-            set_output branch "$branch"
-            if ! git merge-base --is-ancestor "$upstream_sha" "$branch_sha"; then
-              echo "::error title=Invalid upstream review branch::${branch} no longer contains ${upstream_sha}. Refusing to overwrite it."
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          for attempt in 1 2 3; do
+            if git fetch --prune upstream main; then
+              exit 0
+            fi
+            if [[ "$attempt" == 3 ]]; then
               exit 1
             fi
-            git switch --force-create "$branch" "$branch_sha"
-            if git merge-base --is-ancestor "$downstream_sha" HEAD; then
-              set_output conflicted false
-            elif git merge --no-edit "$downstream_sha"; then
-              set_output conflicted false
-            else
-              conflict_files=$(git diff --name-only --diff-filter=U | paste -sd ',' -)
-              report_conflict "$conflict_files"
-              git merge --abort
-              # Keep downstream-only validation/publication helpers available
-              # while preserving the existing review branch exactly.
-              git switch --detach "$downstream_sha"
-              set_output conflicted true
-              set_output conflict_files "$conflict_files"
-            fi
-            exit 0
-          fi
-          git switch -c "$branch"
-          if ! git merge --no-edit upstream/main; then
-            conflict_files=$(git diff --name-only --diff-filter=U | paste -sd ',' -)
-            report_conflict "$conflict_files"
-            git merge --abort
-            # The conflict-review branch must remain the exact upstream head,
-            # but upstream does not contain our publication helper. Keep the
-            # runner on the downstream commit and move only the branch ref.
-            git switch --detach "$downstream_sha"
-            git branch --force "$branch" "$upstream_sha"
-            set_output changed true
-            set_output branch "$branch"
-            set_output conflicted true
-            set_output conflict_files "$conflict_files"
-            exit 0
-          fi
-          set_output changed true
-          set_output branch "$branch"
-          set_output conflicted false
-      - name: Refresh generated documentation
-        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+            echo "::warning::upstream main fetch attempt ${attempt}/3 failed"
+            sleep $((attempt * 2))
+          done
+
+      - name: Snapshot, order, and merge every exact PR head
+        id: assemble
+        env:
+          GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
         run: |
           set -euo pipefail
-          python3 scripts/documentation_health.py --write
-          python3 scripts/documentation_health.py --check
-          if git status --porcelain | grep -q .; then
-            git add -A
-            git commit -m "docs: refresh generated repository state"
+          downstream_sha=$(git rev-parse origin/main)
+          upstream_main_sha=$(git rev-parse upstream/main)
+          stable=false
+
+          for pass in 1 2 3; do
+            echo "::group::Snapshot pass ${pass}/3"
+            python3 "$RUNNER_TEMP/upstream_pr_batch.py" snapshot \
+              --upstream-repository "$UPSTREAM_REPOSITORY" \
+              --downstream-sha "$downstream_sha" \
+              --upstream-main-sha "$upstream_main_sha" \
+              --output snapshot.json
+            python3 "$RUNNER_TEMP/upstream_pr_batch.py" assemble \
+              --repository . \
+              --snapshot snapshot.json \
+              --manifest batch-manifest.json \
+              --summary batch-summary.md
+            python3 "$RUNNER_TEMP/upstream_pr_batch.py" snapshot \
+              --upstream-repository "$UPSTREAM_REPOSITORY" \
+              --downstream-sha "$downstream_sha" \
+              --upstream-main-sha "$upstream_main_sha" \
+              --output snapshot-after.json
+            if python3 "$RUNNER_TEMP/upstream_pr_batch.py" compare \
+              --before snapshot.json \
+              --after snapshot-after.json; then
+              stable=true
+              echo "::endgroup::"
+              break
+            fi
+            echo "::warning title=Upstream PR heads moved::Restarting the frozen inventory and merge plan."
+            echo "::endgroup::"
+          done
+
+          if [[ "$stable" != true ]]; then
+            echo "::error title=Repeated upstream drift::The open PR snapshot moved during all three bounded passes."
+            exit 1
           fi
+
+      - name: Verify exact-head completeness and publish integration branch
+        id: result
+        env:
+          GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch=$(python3 -c 'import json; print(json.load(open("batch-manifest.json"))["branch"])')
+          changed=$(python3 -c 'import json; print(str(json.load(open("batch-manifest.json"))["changed"]).lower())')
+          complete=$(python3 -c 'import json; print(str(json.load(open("batch-manifest.json"))["complete"]).lower())')
+          fingerprint=$(python3 -c 'import json; print(json.load(open("batch-manifest.json"))["fingerprint"])')
+          included=$(python3 -c 'import json; print(json.load(open("batch-manifest.json"))["included_count"])')
+          total=$(python3 -c 'import json; print(json.load(open("batch-manifest.json"))["total"])')
+
+          {
+            echo "branch=$branch"
+            echo "changed=$changed"
+            echo "complete=$complete"
+            echo "fingerprint=$fingerprint"
+            echo "included_count=$included"
+            echo "total=$total"
+          } >> "$GITHUB_OUTPUT"
+
+          downstream=$(python3 -c 'import json; print(json.load(open("batch-manifest.json"))["downstream_sha"])')
+          git diff --check "$downstream..HEAD"
+          if [[ "$changed" == true ]]; then
+            git push --set-upstream origin "$branch"
+          fi
+          cat batch-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable inventory and merge report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: upstream-pr-batch-${{ github.run_id }}
+          path: |
+            snapshot.json
+            snapshot-after.json
+            batch-manifest.json
+            batch-summary.md
+          if-no-files-found: error
+          retention-days: 30
+
+  validate:
+    name: Secretless documentation and package validation
+    needs: prepare
+    if: needs.prepare.result == 'success' && needs.prepare.outputs.changed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted validation tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out candidate integration branch without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.branch }}
+          path: candidate
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
       - name: Install build dependencies
-        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
         run: brew install ldid dpkg make
+
       - name: Add GNU Make to PATH
-        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
         run: echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
       - name: Check out Theos
-        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: theos/theos
           ref: 9bc73406cf80b711ef4d02c15ff1dedc4478a275 # master @ 2026-04-09
           path: theos
           submodules: recursive
+          persist-credentials: false
+
       - name: Select Xcode 26.0.1
-        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
         run: sudo xcode-select -s /Applications/Xcode_26.0.1.app
-      - name: Validate preserved downstream behavior
-        if: steps.upstream.outputs.changed == 'true' && steps.upstream.outputs.conflicted != 'true'
+
+      - name: Refresh documentation with trusted main-branch generator
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          cp scripts/documentation_health.py "$RUNNER_TEMP/candidate-documentation-health.py"
+          cp ../trusted/scripts/documentation_health.py scripts/documentation_health.py
+          python3 scripts/documentation_health.py --write
+          python3 scripts/documentation_health.py --check
+          cp "$RUNNER_TEMP/candidate-documentation-health.py" scripts/documentation_health.py
+          git diff --check
+          git diff --binary -- README.md docs > ../documentation.patch
+
+      - name: Validate merged code and build release package without secrets
+        working-directory: candidate
         env:
           THEOS: ${{ github.workspace }}/theos
         run: scripts/validate-downstream.sh --build
-      - name: Push review branch and open pull request
-        if: steps.upstream.outputs.changed == 'true'
+
+      - name: Upload generated documentation patch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: upstream-pr-docs-${{ github.run_id }}
+          path: documentation.patch
+          if-no-files-found: error
+          retention-days: 7
+
+  report:
+    name: Publish detailed fork PR and merge complete snapshots
+    needs: [prepare, validate]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out trusted publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
+
+      - name: Download immutable inventory and merge report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: upstream-pr-batch-${{ github.run_id }}
+          path: report
+
+      - name: Download generated documentation patch
+        if: needs.prepare.outputs.changed == 'true' && needs.validate.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: upstream-pr-docs-${{ github.run_id }}
+          path: report
+
+      - name: Check out candidate branch for documentation-only commit
+        if: needs.prepare.outputs.changed == 'true' && needs.validate.result == 'success'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.branch }}
+          path: candidate
+          fetch-depth: 0
+          token: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+
+      - name: Apply allowlisted documentation patch
+        if: needs.prepare.outputs.changed == 'true' && needs.validate.result == 'success'
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r _added _deleted path; do
+            if [[ "$path" != README.md && "$path" != docs/* ]]; then
+              echo "::error title=Unsafe generated patch::Unexpected path: $path"
+              exit 1
+            fi
+          done < <(git apply --numstat ../report/documentation.patch)
+          if [[ -s ../report/documentation.patch ]]; then
+            git apply --index ../report/documentation.patch
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "docs: refresh generated repository state [skip ci]"
+            git push
+          fi
+
+      - name: Publish complete PR-specific report and enforce the gate
         env:
           GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
-          BRANCH: ${{ steps.upstream.outputs.branch }}
-          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
-          CONFLICTED: ${{ steps.upstream.outputs.conflicted }}
-          CONFLICT_FILES: ${{ steps.upstream.outputs.conflict_files }}
-        run: scripts/publish-upstream-sync-review.sh
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+          DOWNSTREAM_BRANCH: ${{ env.DOWNSTREAM_BRANCH }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          MANIFEST_PATH: ${{ github.workspace }}/report/batch-manifest.json
+          SUMMARY_PATH: ${{ github.workspace }}/report/batch-summary.md
+          VALIDATION_RESULT: ${{ needs.prepare.outputs.changed == 'true' && needs.validate.result || 'success' }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AUTO_MERGE: ${{ github.event_name == 'schedule' || inputs.auto_merge }}
+        run: trusted/scripts/publish-upstream-pr-batch.sh
+
+      - name: Preserve the full report in the job summary
+        if: always()
+        run: cat report/batch-summary.md >> "$GITHUB_STEP_SUMMARY"

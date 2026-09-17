@@ -8,12 +8,20 @@ this fork owns only reviewed downstream changes and local build validation.
 
 ## Safe Synchronization
 
-1. Fetch upstream `main` and create a dedicated review branch.
-2. Merge without force-pushing or rewriting either history.
-3. Inspect changes to build, signing, packaging, and release workflows.
-4. Run the repository's tests and a bounded build before merging.
-5. Keep credentials in GitHub Actions or the Boneman vault. Never add API keys,
-   signing material, or decrypted application packages to Git.
+1. Snapshot upstream `main` and every open upstream pull request, including
+   drafts, review-blocked work, and stacked branches.
+2. Fetch each PR through its immutable `refs/pull/<number>/head` ref and verify
+   that it still matches the advertised SHA.
+3. Order stacked heads by commit ancestry, then merge every exact head into a
+   fork-owned snapshot branch with one detailed merge commit per PR.
+4. Preserve unknown semantic conflicts for reviewed resolution. Never use a
+   repository-wide `ours` or `theirs` strategy.
+5. Run documentation checks and a full release-package build in a secretless
+   job. Candidate code never runs with the write-capable sync token.
+6. Publish the complete inventory, per-PR state, conflicts, and validation
+   result in the fork PR, job summary, and machine-readable run artifact.
+7. Merge into fork `main` only when every frozen exact head is present and the
+   full validation job passes.
 
 The scheduled sync requires a repository Actions secret named
 `BONEMAN_UPSTREAM_SYNC_TOKEN`. Use a dedicated fine-grained token with access
@@ -25,11 +33,12 @@ Rotate the token through GitHub Actions or the Boneman vault, never a tracked
 file.
 
 Automated review branches use the
-`Thetromboneman1/upstream-sync-<upstream-sha>` naming convention.
+`Thetromboneman1/all-open-upstream-prs-<snapshot>` naming convention. The
+snapshot includes fork `main`, upstream `main`, and every open PR head SHA.
 
-If the histories conflict, the workflow preserves the review branch, refreshes
-the pull request with the current conflict list, and waits for reviewed manual
-resolution. On later runs it safely merges an advanced downstream `main` into
-that branch when possible, then repeats documentation and build validation.
-It never overwrites a review branch that no longer contains the upstream SHA.
-Closing the pull request and deleting its branch safely abandons an update.
+If a PR conflicts, the workflow records its unmerged files and stage blob IDs,
+aborts only that merge, and continues inventorying the remaining independent
+PRs. The fork PR remains draft and the workflow fails its completeness gate
+instead of reporting a false green. A reviewed resolution pushed to the exact
+snapshot branch is retained on the next run. Repeated head drift is retried at
+most three times, and network operations use bounded backoff.
