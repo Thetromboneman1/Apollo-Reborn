@@ -1300,8 +1300,8 @@ static void NSBEnsureBarRevealedAtTop(UIViewController *vc, UIScrollView *table)
     if (ApolloPaneUsesUnifiedChrome(vc.viewIfLoaded)) return;
     if (!NSBHasSettledFeedGeometry(vc, table)) return;
     ApolloNativeSearchRestingState *state = NSBRestingStateForVC(vc);
-    if (state.revealInFlight || state.revealAttemptedAtTop || session.dismissWindow) return;
-    if (table.isDragging || table.isDecelerating || table.isTracking) return;
+    if (state.revealInFlight || session.dismissWindow) return;
+    if (NSBUserIsScrolling(table)) return;
     UINavigationItem *navItem = vc.navigationItem;
     UISearchController *sc = navItem.searchController;
     if (!sc || sc.active || !navItem.hidesSearchBarWhenScrolling) return;
