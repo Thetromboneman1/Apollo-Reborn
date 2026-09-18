@@ -27,7 +27,7 @@
 
 #pragma mark - Preview model
 
-static NSString *const kApolloAMAllMenus = @"all";
+NSString *const ApolloActionMenuEditorAllMenus = @"all";
 
 static NSString *const kApolloAMPreviewKeyCaption = @"caption";
 static NSString *const kApolloAMPreviewKeyPanel = @"panel";
@@ -50,6 +50,95 @@ static const NSUInteger kApolloAMPreviewMaxRows = 8;
 @property (nonatomic, copy) NSArray<ApolloActionMenuItem *> *visibleItems;   // saved order, hidden removed
 @property (nonatomic) BOOL glass;
 @property (nonatomic) CGFloat previewHeight;
+@end
+
+#pragma mark - Action Menu hub
+
+static UIImage *ApolloAMHubGlyph(NSString *context) {
+    if ([context isEqualToString:ApolloActionMenuEditorAllMenus]) {
+        return [UIImage systemImageNamed:@"list.bullet"];
+    }
+    if (ApolloActionMenuContextIsModerator(context)) {
+        UIImage *shield = [ApolloActionMenuCatalogItem(ApolloActionMenuContextPost, @"moderator") icon];
+        if (shield) return [shield imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+    return [UIImage systemImageNamed:@"ellipsis"];
+}
+
+static NSString *ApolloAMMenuSummary(NSString *context) {
+    if ([context isEqualToString:ApolloActionMenuEditorAllMenus]) {
+        NSUInteger customized = ApolloActionMenuCustomizedContextCount();
+        return customized == 0 ? @"Default" : [NSString stringWithFormat:@"%lu customized", (unsigned long)customized];
+    }
+    BOOL order = ApolloActionMenuHasCustomOrder(context);
+    NSUInteger hidden = ApolloActionMenuHiddenItemIDs(context).count;
+    if (!order && hidden == 0) return @"Default";
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (order) [parts addObject:@"Custom order"];
+    if (hidden > 0) [parts addObject:[NSString stringWithFormat:@"%lu hidden", (unsigned long)hidden]];
+    return [parts componentsJoinedByString:@" · "];
+}
+
+static NSString *ApolloAMModeratorShortTitle(ApolloActionMenuContext context) {
+    NSString *title = ApolloActionMenuContextTitle(context);
+    NSRange open = [title rangeOfString:@"("];
+    NSRange close = [title rangeOfString:@")" options:NSBackwardsSearch];
+    if (open.location == NSNotFound || close.location == NSNotFound || close.location <= open.location) return title;
+    return [title substringWithRange:NSMakeRange(open.location + 1, close.location - open.location - 1)];
+}
+
+@implementation ApolloActionMenuSettingsViewController {
+    BOOL _appeared;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Action Menus";
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    if (_appeared) [self rebuildForm];
+    _appeared = YES;
+}
+
+- (ApolloSettingsRow *)menuRowForContext:(NSString *)context title:(NSString *)title {
+    UIImage *glyph = ApolloAMHubGlyph(context);
+    ApolloSettingsRow *row =
+        [ApolloSettingsRow disclosureRowWithID:[@"menu." stringByAppendingString:context]
+                                         title:title
+                                        detail:^NSString * { return ApolloAMMenuSummary(context); }
+                                          push:^UIViewController * {
+            return [[ApolloActionMenuEditorViewController alloc] initWithContext:context];
+        }];
+    row.detailAsSubtitle = YES;
+    row.configure = ^(UITableViewCell *cell) { cell.imageView.image = glyph; };
+    return row;
+}
+
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    NSMutableArray<ApolloSettingsRow *> *regular = [NSMutableArray array];
+    NSMutableArray<ApolloSettingsRow *> *moderator = [NSMutableArray array];
+    for (ApolloActionMenuContext context in ApolloActionMenuAllContexts()) {
+        BOOL mod = ApolloActionMenuContextIsModerator(context);
+        [(mod ? moderator : regular) addObject:[self menuRowForContext:context
+                                                                 title:mod ? ApolloAMModeratorShortTitle(context)
+                                                                           : ApolloActionMenuContextTitle(context)]];
+    }
+    ApolloSettingsRow *all = [self menuRowForContext:ApolloActionMenuEditorAllMenus title:@"All Menus"];
+    return @[
+        [ApolloSettingsSection sectionWithTitle:nil
+                                         footer:@"Show or hide actions across every menu at once."
+                                           rows:@[ all ]],
+        [ApolloSettingsSection sectionWithTitle:@"••• Menus"
+                                         footer:@"Open a menu to reorder or hide actions while keeping its live preview pinned above the list."
+                                           rows:regular],
+        [ApolloSettingsSection sectionWithTitle:@"Moderator Menus"
+                                         footer:@"The moderator shield’s menus. They only appear in subreddits you moderate."
+                                           rows:moderator],
+    ];
+}
+
 @end
 
 @implementation ApolloAMPreviewState
@@ -129,19 +218,24 @@ static BOOL ApolloAMItemDrawsAsPalette(ApolloActionMenuItem *item, BOOL glass) {
 - (UIView *)apollo_rowViewForItem:(ApolloActionMenuItem *)item last:(BOOL)last {
     BOOL glass = self.previewState.glass;
     if (ApolloAMItemDrawsAsPalette(item, glass)) return [self apollo_paletteRowViewLast:last];
+    BOOL moderator = ApolloActionMenuContextIsModerator(self.previewState.context) ||
+        [item.itemID isEqualToString:@"moderator"];
+    BOOL destructive = [item.title hasPrefix:@"Delete"] || [item.title hasPrefix:@"Remove"];
+    UIColor *rowColor = destructive ? UIColor.systemRedColor
+        : (moderator ? ApolloModeratorColor() : (glass ? UIColor.labelColor : [self apollo_accent]));
     UIView *row = [UIView new];
     row.backgroundColor = UIColor.clearColor;
 
     UIImageView *icon = [[UIImageView alloc] initWithImage:[item icon]];
     icon.contentMode = UIViewContentModeScaleAspectFit;
-    icon.tintColor = glass ? UIColor.labelColor : [self apollo_accent];
+    icon.tintColor = rowColor;
     icon.tag = 1;
     [row addSubview:icon];
 
     UILabel *title = [UILabel new];
     title.text = item.title;
     title.font = [UIFont systemFontOfSize:13.0];
-    title.textColor = glass ? UIColor.labelColor : [self apollo_accent];
+    title.textColor = rowColor;
     title.lineBreakMode = NSLineBreakByTruncatingTail;
     title.tag = 2;
     [row addSubview:title];
@@ -230,9 +324,11 @@ static BOOL ApolloAMItemDrawsAsPalette(ApolloActionMenuItem *item, BOOL glass) {
         [rows addObject:row];
         NSString *key = [kApolloAMPreviewRowKeyPrefix stringByAppendingString:item.itemID];
         viewsByKey[key] = row;
-        signaturesByKey[key] = [NSString stringWithFormat:@"%@|%@|%d|%d|%@",
+        BOOL moderator = ApolloActionMenuContextIsModerator(state.context) || [item.itemID isEqualToString:@"moderator"];
+        BOOL destructive = [item.title hasPrefix:@"Delete"] || [item.title hasPrefix:@"Remove"];
+        signaturesByKey[key] = [NSString stringWithFormat:@"%@|%@|%d|%d|%@|%d|%d",
                                 ApolloAMItemDrawsAsPalette(item, state.glass) ? @"palette" : @"row",
-                                item.title, state.glass, last, accentKey];
+                                item.title, state.glass, last, accentKey, moderator, destructive];
     }
     _rowViews = rows;
 
@@ -560,7 +656,7 @@ static const CGFloat kApolloAMAccessoryHeight = 28.0;
 
 #pragma mark - The screen
 
-@interface ApolloActionMenuSettingsViewController () <UITableViewDragDelegate, UITableViewDropDelegate>
+@interface ApolloActionMenuEditorViewController () <UITableViewDragDelegate, UITableViewDropDelegate>
 @property (nonatomic, copy) ApolloActionMenuContext context;
 @property (nonatomic, strong) ApolloPinnedPreviewHost *previewHost;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *itemRowHeights;
@@ -572,17 +668,23 @@ static const CGFloat kApolloAMAccessoryHeight = 28.0;
 @property (nonatomic, strong) UISelectionFeedbackGenerator *selectionFeedback;
 @end
 
-static NSString *const kApolloAMRowMenu = @"menu";
 static NSString *const kApolloAMRowReset = @"reset";
 static NSString *const kApolloAMRowPreview = @"preview";
 static NSString *const kApolloAMItemRowPrefix = @"item.";
 
-@implementation ApolloActionMenuSettingsViewController
+@implementation ApolloActionMenuEditorViewController
+
+- (instancetype)initWithContext:(NSString *)context {
+    if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
+        _context = [context copy];
+    }
+    return self;
+}
 
 - (void)viewDidLoad {
-    self.context = ApolloActionMenuContextPost;
+    if (!self.context) self.context = ApolloActionMenuContextPost;
     [super viewDidLoad];
-    self.title = @"Action Menus";
+    self.title = self.editingAllMenus ? @"All Menus" : ApolloActionMenuContextTitle(self.context);
     self.selectionFeedback = [[UISelectionFeedbackGenerator alloc] init];
 
     // Drag & drop powers the item rows' reordering (touch and hold a row, then
@@ -592,6 +694,10 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
     self.tableView.dragInteractionEnabled = YES;
     self.tableView.dragDelegate = self;
     self.tableView.dropDelegate = self;
+
+    // All Menus is only a visibility overview; it has no runtime menu to
+    // preview and no reorder controls.
+    if (self.editingAllMenus) return;
 
     // The pinned preview: shared layout pass on the table (the subclass adds no
     // ivars, so isa-swizzling the existing table view is safe) + the host as a
@@ -656,7 +762,7 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
 // updates only the contexts whose catalogue contains the item. A mixed state
 // remains visible in the subtitle; selecting a menu exposes its own override.
 - (BOOL)editingAllMenus {
-    return [self.context isEqualToString:kApolloAMAllMenus];
+    return [self.context isEqualToString:ApolloActionMenuEditorAllMenus];
 }
 
 - (NSArray<ApolloActionMenuItem *> *)editableItems {
@@ -712,7 +818,6 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
 
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     __weak __typeof(self) weakSelf = self;
-    ApolloActionMenuContext context = self.context;
 
     // ---- Preview (the spacer row the pinned card sits on) ----
 
@@ -733,17 +838,6 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
         __strong __typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return 0.0;
         return [ApolloAMPreviewContentView heightForState:ApolloAMCurrentPreviewState(strongSelf.context)];
-    };
-
-    // ---- Menu picker ----
-
-    ApolloSettingsRow *menu =
-        [ApolloSettingsRow valueRowWithID:kApolloAMRowMenu
-                                    title:@"Menu"
-                                   detail:^NSString * { return weakSelf.editingAllMenus ? @"All" : ApolloActionMenuContextTitle(weakSelf.context); }
-                                 onSelect:^{ [weakSelf presentMenuPicker]; }];
-    menu.configure = ^(UITableViewCell *cell) {
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     };
 
     // ---- Items (drag to reorder, tap to show/hide) ----
@@ -792,9 +886,6 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
     NSMutableArray *sections = [NSMutableArray array];
     if (!self.editingAllMenus) [sections addObject:[ApolloSettingsSection sectionWithTitle:@"Preview" footer:nil rows:@[ preview ]]];
     [sections addObjectsFromArray:@[
-        [ApolloSettingsSection sectionWithTitle:nil
-                                         footer:self.editingAllMenus ? @"Visibility across all context menus. Choose a specific menu to reorder its available actions." : ApolloActionMenuContextDescription(context)
-                                           rows:@[ menu ]],
         [ApolloSettingsSection sectionWithTitle:@"Items" footer:itemsFooter rows:itemRows],
         [ApolloSettingsSection sectionWithTitle:nil footer:nil rows:@[ reset ]],
     ]];
@@ -882,41 +973,6 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
 }
 
 #pragma mark - Actions
-
-- (void)presentMenuPicker {
-    NSArray<ApolloActionMenuContext> *contexts = [@[ kApolloAMAllMenus ] arrayByAddingObjectsFromArray:ApolloActionMenuAllContexts()];
-    NSMutableArray<NSString *> *titles = [NSMutableArray array];
-    for (ApolloActionMenuContext context in contexts) [titles addObject:[context isEqualToString:kApolloAMAllMenus] ? @"All" : ApolloActionMenuContextTitle(context)];
-    NSInteger current = (NSInteger)[contexts indexOfObject:self.context];
-    __weak __typeof(self) weakSelf = self;
-    ApolloSettingsPresentPicker(self, [self cellForRowID:kApolloAMRowMenu], @"Menu", titles, current,
-                                ^(NSInteger pickedIndex) {
-        if (pickedIndex < 0 || pickedIndex >= (NSInteger)contexts.count) return;
-        [weakSelf switchToContext:contexts[(NSUInteger)pickedIndex]];
-    });
-}
-
-// Swap the whole lower half of the screen to another menu: the picker row's
-// footer, the item list and the reset row all follow, and the preview
-// re-renders for that menu's layout (its rows cross over by key, so shared
-// items like Share glide between the two renderings).
-- (void)switchToContext:(ApolloActionMenuContext)context {
-    if (!context || [context isEqualToString:self.context]) return;
-    self.previewContentView.previewRefreshPending = NO;
-    self.previewContentView.pendingContext = nil;
-    [self.previewContentView apollo_finishPreviewTransition];
-    ++self.previewContentView.previewTransitionGeneration;
-    self.context = context;
-    self.previewHost.hidden = self.editingAllMenus;
-    ApolloLog(@"[ActionMenuSettings] editing %@", context);
-    // The item list changes length between menus, so this must be a whole
-    // reload (rebuildForm → reloadData): reloading one section against a
-    // model whose OTHER sections have already changed trips UITableView's
-    // batch-update consistency check. The pinned card survives reloadData
-    // (it is a table subview, never a cell); only the preview animates.
-    [self rebuildForm];
-    [self animatePreviewStateChange];
-}
 
 - (void)toggleItemWithID:(NSString *)itemID {
     if (itemID.length == 0) return;
@@ -1050,7 +1106,8 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
         tableBackground = [UIColor systemGroupedBackgroundColor];
     }
     host.backdropColor = tableBackground;
-    UIColor *accent = [self apollo_themeAccentColor];
+    UIColor *accent = ApolloActionMenuContextIsModerator(self.context)
+        ? ApolloModeratorColor() : [self apollo_themeAccentColor];
     host.accentColor = accent;
     self.previewContentView.accentColor = accent;
     [self.previewContentView apollo_refreshForContext:self.context

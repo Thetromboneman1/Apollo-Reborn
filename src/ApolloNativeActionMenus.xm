@@ -843,6 +843,8 @@ static UIAction *ApolloNativeActionMenuAction(NSString *title, NSString *subtitl
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
             });
+            // The moderator sheet this row opens gets its own saved layout.
+            ApolloActionMenuArmModeratorFollowUp(actionController);
         }
         ApolloNativeActionMenuSelectRow(actionController, row);
     }];
@@ -1675,14 +1677,24 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 
 - (void)moderatorOptionsButtonTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 
 - (void)moderatorBannerNodeTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 %end
 
@@ -1700,14 +1712,24 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 
 - (void)moderatorOptionsButtonTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 
 - (void)moderatorBannerNodeTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 %end
 
@@ -1725,8 +1747,25 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 
 - (void)moderatorBannerNodeTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorComment);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+// The comment cell's own shield (Hopper: -[CommentCellNode modButtonTappedWithSender:]).
+- (void)modButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorComment);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 %end
 
@@ -1754,16 +1793,26 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 
 - (void)moderatorBannerNodeTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 %end
 
 %hook _TtC6Apollo22CommentsHeaderCellNode
 - (void)moderatorBannerNodeTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 %end
 
@@ -1803,8 +1852,13 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 
 - (void)moderatorBarButtonItemTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorSubreddit);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 %end
 
@@ -1828,8 +1882,13 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 
 - (void)moderatorBarButtonItemTappedWithSender:(id)sender {
     ApolloNativeActionMenuBeginModeratorCapture(sender, self);
-    %orig;
-    ApolloNativeActionMenuEndCapture();
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
 }
 %end
 
