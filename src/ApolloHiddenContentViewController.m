@@ -174,6 +174,7 @@ static UIColor *ApolloHiddenOverviewMetadataColor(void) {
 @property (nonatomic) CGFloat mediaAspectRatio;
 @property (nonatomic) BOOL compactMedia;
 @property (nonatomic) NSUInteger mediaGeneration;
+@property (nonatomic) BOOL configuringContent;
 
 @property (nonatomic, strong) UIStackView *headerStack;
 @property (nonatomic, strong) UIView *headerMiddleSpacer;
@@ -311,7 +312,13 @@ static char kApolloHiddenRememberedMediaIndex;
         self.previewHeight.active = YES;
         self.contentStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.headerStack, self.bodyLabel, self.mediaContainerView, self.contextLabel]];
         self.contentStack.axis = UILayoutConstraintAxisVertical;
+        self.contentStack.alignment = UIStackViewAlignmentCenter;
         self.contentStack.spacing = 8;
+        // Media may reach the feed edges; text keeps Overview's normal inset.
+        for (UIView *textRow in @[self.headerStack, self.bodyLabel, self.contextLabel]) {
+            [textRow.widthAnchor constraintEqualToAnchor:self.contentStack.widthAnchor constant:-30].active = YES;
+        }
+        [self.mediaContainerView.widthAnchor constraintEqualToAnchor:self.contentStack.widthAnchor].active = YES;
         self.contentStack.translatesAutoresizingMaskIntoConstraints = NO;
         // Apollo's profile Overview separates entries with a short section
         // gutter rather than UITableView's one-pixel rule.
@@ -320,8 +327,8 @@ static char kApolloHiddenRememberedMediaIndex;
         [self.contentView addSubview:self.contentStack];
         [self.contentView addSubview:self.overviewSeparatorView];
         [NSLayoutConstraint activateConstraints:@[
-            [self.contentStack.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:15],
-            [self.contentStack.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-15],
+            [self.contentStack.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor],
+            [self.contentStack.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor],
             [self.contentStack.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:10],
             [self.contentStack.bottomAnchor constraintEqualToAnchor:self.overviewSeparatorView.topAnchor constant:-10],
             [self.overviewSeparatorView.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor],
@@ -416,7 +423,12 @@ static char kApolloHiddenRememberedMediaIndex;
     // Recalculate the self-sizing row when an asynchronous image resolves.
     UIView *parent = self.superview;
     while (parent && ![parent isKindOfClass:UITableView.class]) parent = parent.superview;
-    if (parent) [(UITableView *)parent performBatchUpdates:nil completion:nil];
+    if (parent && !self.configuringContent) {
+        [UIView performWithoutAnimation:^{
+            [(UITableView *)parent performBatchUpdates:nil completion:nil];
+            [parent layoutIfNeeded];
+        }];
+    }
 }
 - (void)apollo_showUnavailableAtIndex:(NSUInteger)index {
     [self.unavailableMediaIndexes addIndex:index];
@@ -493,7 +505,8 @@ static char kApolloHiddenRememberedMediaIndex;
         [self.loadedMediaIndexes addIndex:index];
         NSURL *url = self.mediaURLs[index];
         __weak typeof(self) weakSelf = self;
-        [ApolloUserProfileCache.sharedCache requestImageForURL:url completion:^(UIImage *image) {
+        UIImage *cachedImage = [ApolloUserProfileCache.sharedCache cachedImageForURL:url];
+        void (^applyImage)(UIImage *) = ^(UIImage *image) {
             typeof(self) owner = weakSelf;
             if (!owner || owner.mediaGeneration != generation || ![owner.representedName isEqualToString:representedName] || index >= owner.mediaURLs.count || ![owner.mediaURLs[index] isEqual:url]) return;
             ApolloHiddenImageIsTombstone(image, ^(BOOL unavailable) {
@@ -502,16 +515,17 @@ static char kApolloHiddenRememberedMediaIndex;
                 if (unavailable) {
                     [cell apollo_showUnavailableAtIndex:index];
                 } else {
-                    [UIView transitionWithView:cell.mediaImageViews[index] duration:0.18
-                        options:UIViewAnimationOptionTransitionCrossDissolve | UIViewAnimationOptionAllowAnimatedContent
-                        animations:^{ cell.mediaImageViews[index].image = image; } completion:nil];
+                    // Cached media is already loaded content, not a new reveal.
+                    cell.mediaImageViews[index].image = image;
                     // A distant page can finish loading after the selection
                     // callback. Keep the same dismissal source current then too.
                     if (cell.currentMediaIndex == index) [cell apollo_transitionSourceForIndex:index];
                 }
                 if (cell.mediaURLs.count == 1) cell.mediaLabel.hidden = YES;
             });
-        }];
+        };
+        if (cachedImage) applyImage(cachedImage);
+        else [ApolloUserProfileCache.sharedCache requestImageForURL:url completion:applyImage];
     }
 }
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
@@ -541,6 +555,7 @@ static char kApolloHiddenRememberedMediaIndex;
     }];
 }
 - (void)configureWithItem:(ApolloHiddenContentItem *)item username:(NSString *)username {
+    self.configuringContent = YES;
     self.pendingMediaSelectionRestore = YES;
     self.mediaSelectionItem = nil;
     self.transitionSourceView.image = nil;
@@ -579,21 +594,13 @@ static char kApolloHiddenRememberedMediaIndex;
     else if (age >= 3600) { amount = (NSInteger)(age / 3600); unit = @"h"; }
     else if (age >= 60) { amount = (NSInteger)(age / 60); unit = @"m"; }
     self.dateLabel.text = item.createdDate ? [NSString stringWithFormat:@"%ld%@", (long)amount, unit] : @"";
-    BOOL isImagePost = item.kind == ApolloHiddenContentKindPost && (item.mediaURLs.count > 0 || item.previewURL != nil);
-    if (isImagePost) {
-        // Apollo presents an image post as media plus its post-preview card;
-        // don't make the post title look like a comment body above the image.
-        self.bodyLabel.text = item.body;
-        self.bodyLabel.hidden = item.body.length == 0;
-    } else {
-        self.bodyLabel.text = item.kind == ApolloHiddenContentKindPost && item.title.length
-            ? [NSString stringWithFormat:@"%@%@", item.title, item.body.length ? [@"\n\n" stringByAppendingString:item.body] : @""]
-            : (item.body.length ? item.body : @"No text in the archive");
-        self.bodyLabel.hidden = NO;
-    }
-    NSString *contextTitle = item.kind == ApolloHiddenContentKindComment
-        ? item.parentPostTitle
-        : (isImagePost ? item.title : nil);
+    // All posts use the same overview preview as comments: the title belongs
+    // with the subreddit, while only archived body text appears above it.
+    // Hide an empty post body rather than repeating its title outside the card.
+    BOOL isPost = item.kind == ApolloHiddenContentKindPost;
+    self.bodyLabel.text = item.body.length ? item.body : (isPost ? nil : @"No text in the archive");
+    self.bodyLabel.hidden = isPost && item.body.length == 0;
+    NSString *contextTitle = isPost ? item.title : item.parentPostTitle;
     // Keep the parent title and subreddit as separate paragraphs, like the
     // native overview preview, with a small gap and quieter subreddit text.
     NSString *subreddit = item.subreddit ?: @"";
@@ -622,7 +629,9 @@ static char kApolloHiddenRememberedMediaIndex;
     NSInteger avatarStyle = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyProfileAvatarStyle];
     self.avatarView.layer.cornerRadius = avatarStyle == 2 ? ApolloHiddenOverviewAvatarSize() * 0.24 : ApolloHiddenOverviewAvatarSize() / 2;
     self.avatarView.hidden = ![[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
-    self.avatarView.image = [UIImage systemImageNamed:@"person.crop.circle.fill"];
+    ApolloUserProfileCache *avatarCache = ApolloUserProfileCache.sharedCache;
+    NSURL *cachedAvatarURL = [avatarCache cachedInfoForUsername:author].iconURL;
+    self.avatarView.image = [avatarCache cachedImageForURL:cachedAvatarURL] ?: [UIImage systemImageNamed:@"person.crop.circle.fill"];
     self.avatarView.tintColor = ApolloThemeAccentColor() ?: self.tintColor;
     for (UIView *page in self.mediaPagesStack.arrangedSubviews) {
         [self.mediaPagesStack removeArrangedSubview:page];
@@ -680,6 +689,7 @@ static char kApolloHiddenRememberedMediaIndex;
         }];
     }];
     [self apollo_loadMediaAroundIndex:0];
+    self.configuringContent = NO;
 }
 - (void)prepareForReuse {
     [super prepareForReuse];
@@ -841,14 +851,29 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
     [presenter presentViewController:alert animated:YES completion:nil];
 }
 
-@interface ApolloHiddenContentViewController ()
+// Publish the same geometry to UIKit's initial title fitting and the shared
+// glass owner, rather than a frame that disagrees with intrinsic size.
+@interface ApolloHiddenContentTabs : UISegmentedControl
+@end
+@implementation ApolloHiddenContentTabs
+- (CGSize)intrinsicContentSize { return CGSizeMake(220, 44); }
+- (CGSize)sizeThatFits:(CGSize)size { return self.intrinsicContentSize; }
+@end
+
+@interface ApolloHiddenContentViewController () <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, copy) NSString *username;
 @property (nonatomic) BOOL loading;
 @property (nonatomic, copy) NSArray<ApolloHiddenContentItem *> *items;
 @property (nonatomic, copy) NSArray<ApolloHiddenContentItem *> *allItems;
 @property (nonatomic, strong) UISegmentedControl *contentTabs;
 @property (nonatomic) NSInteger selectedTab;
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *tabOffsets;
+@property (nonatomic, strong) NSArray<UITableViewController *> *tabControllers;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *rowHeights;
+@property (nonatomic, strong) NSArray<NSArray<ApolloHiddenContentItem *> *> *tabItems;
+@property (nonatomic, strong) NSTimer *progressTimer;
+@property (nonatomic) double progressTarget;
+@property (nonatomic) double progressStart;
+@property (nonatomic) CFTimeInterval progressStartedAt;
 
 @property (nonatomic, strong) UIView *statusContainerView;
 @property (nonatomic, strong) DACircularProgressView *progressRing;
@@ -860,7 +885,7 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
 
 + (void)presentForUsername:(NSString *)username fromViewController:(UIViewController *)presenter {
     if (username.length == 0 || !presenter) return;
-    ApolloHiddenContentViewController *list = [[ApolloHiddenContentViewController alloc] initWithStyle:UITableViewStylePlain];
+    ApolloHiddenContentViewController *list = [ApolloHiddenContentViewController new];
     list.username = username;
     if (presenter.navigationController) {
         [presenter.navigationController pushViewController:list animated:YES];
@@ -870,30 +895,52 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = nil;
-    self.tabOffsets = [NSMutableDictionary dictionary];
-    self.contentTabs = [[UISegmentedControl alloc] initWithItems:@[@"Posts", @"Comments"]];
+    self.tabItems = @[@[], @[]];
+    self.rowHeights = [NSMutableDictionary dictionary];
+    NSMutableArray *controllers = [NSMutableArray array];
+    for (NSInteger tab = 0; tab < 2; tab++) {
+        UITableViewController *controller = [[UITableViewController alloc] initWithStyle:UITableViewStylePlain];
+        [self addChildViewController:controller];
+        controller.view.frame = self.view.bounds;
+        controller.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self.view addSubview:controller.view];
+        [controller didMoveToParentViewController:self];
+        controller.tableView.dataSource = self;
+        controller.tableView.delegate = self;
+        controller.view.hidden = tab != 0;
+        controller.tableView.scrollsToTop = tab == 0;
+        [controllers addObject:controller];
+    }
+    self.tabControllers = controllers;
+    self.contentTabs = [[ApolloHiddenContentTabs alloc] initWithItems:@[@"Posts", @"Comments"]];
     self.contentTabs.selectedSegmentIndex = 0;
     // UIKit owns the complete interactive-glass animation timeline.
     self.contentTabs.accessibilityLabel = @"Hidden and deleted content";
-    [self.contentTabs setWidth:100 forSegmentAtIndex:0];
-    [self.contentTabs setWidth:100 forSegmentAtIndex:1];
-    [self.contentTabs.widthAnchor constraintEqualToConstant:200].active = YES;
+    [self.contentTabs setWidth:110 forSegmentAtIndex:0];
+    [self.contentTabs setWidth:110 forSegmentAtIndex:1];
+    [self.contentTabs.widthAnchor constraintEqualToConstant:220].active = YES;
     [self.contentTabs addTarget:self action:@selector(apollo_contentTabChanged) forControlEvents:UIControlEventValueChanged];
     // Use Apollo's shared navigation-title presentation and glass lifecycle.
     // The shared owner handles Hard/Soft/Blur/Automatic, scrolling and pushes.
-    self.navigationItem.titleView = self.contentTabs;
     [self apollo_applyTabTheme];
-    [self.tableView registerClass:[ApolloHiddenContentCell class] forCellReuseIdentifier:@"Cell"];
-    self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 64.0;
-    self.tableView.alwaysBounceVertical = YES;
-    self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
-    self.tableView.backgroundColor = ApolloThemePageBackgroundColor() ?: UIColor.systemBackgroundColor;
-    self.tableView.separatorColor = ApolloThemeSeparatorColor() ?: UIColor.separatorColor;
+    [self.contentTabs sizeToFit];
+    [self.contentTabs layoutIfNeeded];
+    self.navigationItem.titleView = self.contentTabs;
+    for (UITableViewController *controller in self.tabControllers) {
+        UITableView *table = controller.tableView;
+        [table registerClass:[ApolloHiddenContentCell class] forCellReuseIdentifier:@"Cell"];
+        table.rowHeight = UITableViewAutomaticDimension;
+        table.estimatedRowHeight = 64.0;
+        table.alwaysBounceVertical = YES;
+        table.separatorStyle = UITableViewCellSeparatorStyleNone;
+        table.backgroundColor = ApolloThemePageBackgroundColor() ?: UIColor.systemBackgroundColor;
+        table.separatorColor = ApolloThemeSeparatorColor() ?: UIColor.separatorColor;
 
-    UIRefreshControl *refreshControl = [UIRefreshControl new];
-    [refreshControl addTarget:self action:@selector(apollo_refreshTriggered) forControlEvents:UIControlEventValueChanged];
-    self.tableView.refreshControl = refreshControl;
+        UIRefreshControl *refreshControl = [UIRefreshControl new];
+        [refreshControl addTarget:self action:@selector(apollo_refreshTriggered) forControlEvents:UIControlEventValueChanged];
+        table.refreshControl = refreshControl;
+
+    }
 
     // tableView.backgroundView rather than a plain subview of self.view: it's a
     // fixed, non-scrolling layer UIKit keeps sized to the table view's bounds.
@@ -943,35 +990,48 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
     }];
     // Let UIKit own label contrast during the glass selector's transition.
     // Forcing foreground colors fights its temporary vibrancy/legibility state.
-    NSDictionary *attributes = @{NSFontAttributeName:[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]};
+    NSDictionary *attributes = @{NSFontAttributeName:[UIFont systemFontOfSize:16 weight:UIFontWeightSemibold]};
     for (NSNumber *state in @[@(UIControlStateNormal), @(UIControlStateSelected),
                              @(UIControlStateHighlighted), @(UIControlStateSelected | UIControlStateHighlighted)]) {
         [self.contentTabs setTitleTextAttributes:attributes forState:state.unsignedIntegerValue];
     }
 }
 
+- (UITableView *)tableView {
+    return self.tabControllers[self.selectedTab].tableView;
+}
+
+- (NSArray<ApolloHiddenContentItem *> *)apollo_itemsForTable:(UITableView *)table {
+    return self.tabItems[table == self.tabControllers[0].tableView ? 0 : 1];
+}
+
 - (void)apollo_applyContentFilter {
-    ApolloHiddenContentKind kind = self.selectedTab == 0 ? ApolloHiddenContentKindPost : ApolloHiddenContentKindComment;
-    NSMutableArray *visible = [NSMutableArray array];
+    NSMutableArray *posts = [NSMutableArray array];
+    NSMutableArray *comments = [NSMutableArray array];
     for (ApolloHiddenContentItem *item in self.allItems) {
-        if (item.kind == kind) [visible addObject:item];
+        [(item.kind == ApolloHiddenContentKindPost ? posts : comments) addObject:item];
     }
-    self.items = visible;
+    self.tabItems = @[posts, comments];
+    self.items = self.tabItems[self.selectedTab];
     [self.emptyStateLabel removeFromSuperview];
-    [self.tableView reloadData];
+    for (UITableViewController *controller in self.tabControllers) [controller.tableView reloadData];
     if (!self.loading && self.items.count == 0) [self apollo_showEmptyState];
 }
 
 - (void)apollo_contentTabChanged {
-    self.tabOffsets[@(self.selectedTab)] = @(self.tableView.contentOffset.y);
+    // Each table owns its offset, measured heights, cells and album state.
+    // Never reload a table merely because its tab becomes visible.
+    [self.tableView setContentOffset:self.tableView.contentOffset animated:NO];
+    self.tableView.scrollsToTop = NO;
+    self.tableView.backgroundView = nil;
+    self.tabControllers[self.selectedTab].view.hidden = YES;
     self.selectedTab = self.contentTabs.selectedSegmentIndex;
-    [self apollo_applyContentFilter];
-    [self.tableView layoutIfNeeded];
-    CGFloat top = -self.tableView.adjustedContentInset.top;
-    CGFloat bottom = MAX(top, self.tableView.contentSize.height - self.tableView.bounds.size.height + self.tableView.adjustedContentInset.bottom);
-    NSNumber *saved = self.tabOffsets[@(self.selectedTab)];
-    CGFloat offset = saved ? saved.doubleValue : top;
-    [self.tableView setContentOffset:CGPointMake(0, MIN(bottom, MAX(top, offset))) animated:NO];
+    self.items = self.tabItems[self.selectedTab];
+    self.tableView.scrollsToTop = YES;
+    self.tabControllers[self.selectedTab].view.hidden = NO;
+    self.tableView.backgroundView = self.statusContainerView;
+    [self.emptyStateLabel removeFromSuperview];
+    if (!self.loading && self.items.count == 0) [self apollo_showEmptyState];
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
@@ -986,13 +1046,24 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self apollo_applyTabTheme];
-    // Reconfigure cached rows when returning after changing avatar preferences.
-    [self.tableView reloadData];
+    // A cancelled interactive pop also re-enters here. Keep the existing
+    // cells/images and offsets; appearance updates do not require a reload.
+    for (UITableViewController *controller in self.tabControllers) {
+        for (ApolloHiddenContentCell *cell in controller.tableView.visibleCells) {
+            [cell apollo_applyOverviewTheme];
+            NSInteger style = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyProfileAvatarStyle];
+            cell.avatarView.layer.cornerRadius = style == 2 ? ApolloHiddenOverviewAvatarSize() * 0.24 : ApolloHiddenOverviewAvatarSize() / 2;
+            cell.avatarView.hidden = ![[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
+        }
+    }
 }
 
 - (void)apollo_fetchForceRefresh:(BOOL)forceRefresh {
     if (self.loading) return;
     self.loading = YES;
+    [self.progressTimer invalidate];
+    self.progressTimer = nil;
+    self.progressTarget = 0;
     self.progressRing.progress = 0;
     self.progressRing.hidden = self.items.count > 0;
     self.progressLabel.hidden = self.items.count > 0;
@@ -1027,22 +1098,49 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
 - (void)apollo_updateProgress:(double)fraction stage:(NSString *)stage {
     // Updates arrive only when network work completes; never advance a timer
     // toward an invented completion percentage while a request is stalled.
-    double progress = MAX(self.progressRing.progress, MIN(1, fraction));
-    [self.progressRing setProgress:progress animated:YES];
+    double progress = MAX(self.progressTarget, MIN(1, fraction));
+    self.progressStart = self.progressRing.progress;
+    self.progressTarget = progress;
+    self.progressStartedAt = CACurrentMediaTime();
+    if (!self.progressTimer) {
+        __weak typeof(self) weakSelf = self;
+        self.progressTimer = [NSTimer timerWithTimeInterval:1.0 / 60.0 repeats:YES block:^(NSTimer *timer) {
+            typeof(self) owner = weakSelf;
+            if (!owner) { [timer invalidate]; return; }
+            double t = MIN(1, (CACurrentMediaTime() - owner.progressStartedAt) / 0.25);
+            double eased = t * t * (3 - 2 * t);
+            [owner.progressRing setProgress:owner.progressStart + (owner.progressTarget - owner.progressStart) * eased animated:NO];
+            if (t >= 1) { [timer invalidate]; owner.progressTimer = nil; }
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:self.progressTimer forMode:NSRunLoopCommonModes];
+    }
     self.progressRing.accessibilityValue = [NSString stringWithFormat:@"%.0f%%", progress * 100];
     self.progressLabel.text = stage;
 }
 
 - (void)apollo_finishWithItems:(NSArray *)items error:(NSString *)error {
     self.loading = NO;
-    [self.progressRing setProgress:error ? self.progressRing.progress : 1 animated:NO];
-    self.progressRing.hidden = YES;
-    self.progressLabel.hidden = YES;
-    [self.tableView.refreshControl endRefreshing];
+    if (error) {
+        [self.progressTimer invalidate];
+        self.progressTimer = nil;
+        self.progressRing.hidden = YES;
+        self.progressLabel.hidden = YES;
+    } else {
+        [self apollo_updateProgress:1 stage:@"Loaded"];
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!weakSelf.loading) {
+                weakSelf.progressRing.hidden = YES;
+                weakSelf.progressLabel.hidden = YES;
+            }
+        });
+    }
+    for (UITableViewController *controller in self.tabControllers) [controller.tableView.refreshControl endRefreshing];
     if (error) {
         [self apollo_showError:error];
         return;
     }
+    [self.rowHeights removeAllObjects];
     self.allItems = items ?: @[];
     [self apollo_applyContentFilter];
 }
@@ -1084,12 +1182,12 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
 #pragma mark - UITableViewDataSource
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.items.count;
+    return [self apollo_itemsForTable:tableView].count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloHiddenContentCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell" forIndexPath:indexPath];
-    ApolloHiddenContentItem *item = self.items[indexPath.row];
+    ApolloHiddenContentItem *item = [self apollo_itemsForTable:tableView][indexPath.row];
     [cell configureWithItem:item username:self.username];
     __weak typeof(self) weakSelf = self;
     __weak ApolloHiddenContentCell *weakCell = cell;
@@ -1119,7 +1217,24 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
     return cell;
 }
 
+// Key measurements by item, width and text size so rotation/Dynamic Type
+// cannot reuse a height measured under a different layout.
+- (NSString *)apollo_heightKeyForTable:(UITableView *)table indexPath:(NSIndexPath *)indexPath {
+    ApolloHiddenContentItem *item = [self apollo_itemsForTable:table][indexPath.row];
+    return [NSString stringWithFormat:@"%@|%.2f|%@", item.fullName, table.bounds.size.width, self.traitCollection.preferredContentSizeCategory];
+}
+
+- (CGFloat)tableView:(UITableView *)tableView estimatedHeightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSNumber *height = self.rowHeights[[self apollo_heightKeyForTable:tableView indexPath:indexPath]];
+    if (height) return height.doubleValue;
+    ApolloHiddenContentItem *item = [self apollo_itemsForTable:tableView][indexPath.row];
+    CGFloat ratio = item.previewAspectRatio;
+    CGFloat mediaHeight = (item.mediaURLs.count || item.previewURL) ? tableView.bounds.size.width / (isfinite(ratio) && ratio >= 0.1 && ratio <= 10 ? ratio : 1) : 0;
+    return 160 + mediaHeight;
+}
+
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    self.rowHeights[[self apollo_heightKeyForTable:tableView indexPath:indexPath]] = @(cell.bounds.size.height);
     ApolloHiddenContentCell *mediaCell = (ApolloHiddenContentCell *)cell;
     NSNumber *remembered = objc_getAssociatedObject(mediaCell.mediaSelectionItem, &kApolloHiddenRememberedMediaIndex);
     [mediaCell apollo_restoreMediaIndex:remembered.unsignedIntegerValue];
@@ -1127,7 +1242,7 @@ static void ApolloHiddenContentSaveMedia(NSArray<NSURL *> *urls, UIViewControlle
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    ApolloHiddenContentItem *item = self.items[indexPath.row];
+    ApolloHiddenContentItem *item = [self apollo_itemsForTable:tableView][indexPath.row];
 
     // Deleted and Removed items have no useful live reddit.com page (it's just
     // Reddit's own tombstone) -- show the archived copy instead. Only a
