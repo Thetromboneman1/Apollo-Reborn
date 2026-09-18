@@ -58,6 +58,25 @@ changed=$(read_manifest changed)
 fingerprint=$(read_manifest fingerprint)
 total=$(read_manifest total)
 included=$(read_manifest included_count)
+owner=${GITHUB_REPOSITORY%%/*}
+
+close_superseded_batches() {
+  local current_number=${1:-}
+  local records
+  records=$(retry gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+    -f state=open \
+    -f "base=${DOWNSTREAM_BRANCH}" \
+    -f per_page=100 \
+    --jq '.[] | select(.head.repo.owner.login == "'"$owner"'" and (.head.ref | startswith("Thetromboneman1/all-open-upstream-prs-"))) | [.number, .html_url] | @tsv')
+  while IFS=$'\t' read -r old_number old_url; do
+    [[ -n "$old_number" ]] || continue
+    [[ -n "$current_number" && "$old_number" == "$current_number" ]] && continue
+    retry gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${old_number}" \
+      -f state=closed \
+      --silent
+    printf 'Closed superseded fork integration PR: %s\n' "$old_url"
+  done <<< "$records"
+}
 
 {
   # shellcheck disable=SC2016
@@ -90,6 +109,7 @@ if [[ "$changed" != true ]]; then
     printf 'manifest is incomplete despite no repository change\n' >&2
     exit 1
   fi
+  close_superseded_batches
   exit 0
 fi
 
@@ -101,7 +121,6 @@ else
   ready=false
 fi
 
-owner=${GITHUB_REPOSITORY%%/*}
 existing=$(retry gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
   -f state=open \
   -f "head=${owner}:${BRANCH}" \
@@ -132,6 +151,8 @@ else
   IFS=$'\t' read -r number url is_draft <<< "$created"
   printf 'Created fork integration PR: %s\n' "$url"
 fi
+
+close_superseded_batches "$number"
 
 if [[ "$ready" == true && "$is_draft" == true ]]; then
   retry gh pr ready "$number" --repo "$GITHUB_REPOSITORY"

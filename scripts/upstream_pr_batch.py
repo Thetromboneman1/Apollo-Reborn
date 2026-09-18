@@ -268,6 +268,22 @@ def conflict_details(root: Path) -> tuple[list[str], list[dict[str, Any]]]:
     return files, stages
 
 
+def patch_equivalent_upstream_commits(root: Path, upstream_sha: str) -> list[str] | None:
+    """Return patch-equivalent upstream commits when a topology-only merge is safe."""
+    merge_commits = [
+        line for line in git(root, "rev-list", "--merges", f"HEAD..{upstream_sha}").splitlines() if line
+    ]
+    if merge_commits:
+        return None
+    cherry = run(["git", "cherry", "HEAD", upstream_sha], cwd=root, check=False)
+    if cherry.returncode != 0:
+        return None
+    lines = [line.strip() for line in cherry.stdout.splitlines() if line.strip()]
+    if not lines or any(not line.startswith("- ") for line in lines):
+        return None
+    return [line[2:] for line in lines]
+
+
 def markdown_escape(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
@@ -370,13 +386,40 @@ def command_assemble(args: argparse.Namespace) -> int:
             upstream_main_result = {"status": "merged", "merge_commit": git(root, "rev-parse", "HEAD")}
         else:
             files, stages = conflict_details(root)
-            upstream_main_result = {
-                "status": "conflict",
-                "conflict_files": files,
-                "conflict_stages": stages,
-                "error": ((merged_main.stdout or "") + (merged_main.stderr or ""))[-2000:].strip(),
-            }
             git(root, "merge", "--abort")
+            equivalent = patch_equivalent_upstream_commits(root, upstream_main_sha)
+            if equivalent:
+                topology_merge = run(
+                    [
+                        "git",
+                        "merge",
+                        "--strategy=ours",
+                        "--no-ff",
+                        "-m",
+                        f"Bridge patch-equivalent {snapshot['upstream_repository']} main ancestry",
+                        "-m",
+                        "Every upstream-only patch is already patch-equivalent in the fork; "
+                        "preserve the validated fork tree while recording exact upstream ancestry.",
+                        upstream_main_sha,
+                    ],
+                    cwd=root,
+                    check=False,
+                )
+                if topology_merge.returncode != 0 or not is_ancestor(root, upstream_main_sha, "HEAD"):
+                    raise RuntimeError("patch-equivalent upstream topology merge failed")
+                upstream_main_result = {
+                    "status": "patch-equivalent-topology-merge",
+                    "merge_commit": git(root, "rev-parse", "HEAD"),
+                    "patch_equivalent_commits": equivalent,
+                    "original_conflict_files": files,
+                }
+            else:
+                upstream_main_result = {
+                    "status": "conflict",
+                    "conflict_files": files,
+                    "conflict_stages": stages,
+                    "error": ((merged_main.stdout or "") + (merged_main.stderr or ""))[-2000:].strip(),
+                }
 
     fetch_errors: dict[int, str] = {}
     for pr in sorted(prs, key=lambda item: item.number):

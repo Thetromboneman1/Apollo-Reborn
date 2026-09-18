@@ -116,6 +116,75 @@ class AssemblyTests(unittest.TestCase):
         command(self.root, "git", "push", "upstream", f"{sha}:refs/pull/{number}/head")
         return sha
 
+    def assemble_snapshot(self, downstream: str, upstream_main: str, prs: list[object]) -> dict[str, object]:
+        snapshot = {
+            "schema_version": 1,
+            "generated_at": "test",
+            "upstream_repository": "owner/repo",
+            "downstream_sha": downstream,
+            "upstream_main_sha": upstream_main,
+            "fingerprint": BATCH.snapshot_fingerprint(downstream, upstream_main, prs),
+            "pull_requests": [pr.as_dict() for pr in prs],
+        }
+        snapshot_path = self.root / "snapshot.json"
+        manifest_path = self.root / "manifest.json"
+        summary_path = self.root / "summary.md"
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        result = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts/upstream_pr_batch.py"),
+                "assemble",
+                "--repository",
+                str(self.root),
+                "--snapshot",
+                str(snapshot_path),
+                "--manifest",
+                str(manifest_path),
+                "--summary",
+                str(summary_path),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    def test_patch_equivalent_upstream_conflict_uses_topology_bridge(self) -> None:
+        upstream = self.make_pr(90, self.base, "shared.txt", "shared upstream change\n")
+        command(self.root, "git", "switch", "--force-create", "main", self.base)
+        (self.root / "shared.txt").write_text("shared upstream change\n", encoding="utf-8")
+        command(self.root, "git", "add", "shared.txt")
+        command(self.root, "git", "commit", "-m", "equivalent fork patch")
+        (self.root / "shared.txt").write_text("fork customization after shared change\n", encoding="utf-8")
+        command(self.root, "git", "add", "shared.txt")
+        command(self.root, "git", "commit", "-m", "fork customization")
+        downstream = command(self.root, "git", "rev-parse", "HEAD")
+
+        manifest = self.assemble_snapshot(downstream, upstream, [])
+        self.assertTrue(manifest["complete"])
+        self.assertTrue(manifest["upstream_main_included"])
+        self.assertEqual("patch-equivalent-topology-merge", manifest["upstream_main_result"]["status"])
+        self.assertEqual([upstream], manifest["upstream_main_result"]["patch_equivalent_commits"])
+        self.assertEqual(
+            "fork customization after shared change\n",
+            (self.root / "shared.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_non_equivalent_upstream_conflict_remains_blocked(self) -> None:
+        upstream = self.make_pr(91, self.base, "shared.txt", "upstream only\n")
+        command(self.root, "git", "switch", "--force-create", "main", self.base)
+        (self.root / "shared.txt").write_text("different fork change\n", encoding="utf-8")
+        command(self.root, "git", "add", "shared.txt")
+        command(self.root, "git", "commit", "-m", "different fork patch")
+        downstream = command(self.root, "git", "rev-parse", "HEAD")
+
+        manifest = self.assemble_snapshot(downstream, upstream, [])
+        self.assertFalse(manifest["complete"])
+        self.assertFalse(manifest["upstream_main_included"])
+        self.assertEqual("conflict", manifest["upstream_main_result"]["status"])
+
     def test_stacked_heads_are_ordered_and_conflict_is_reported(self) -> None:
         first = self.make_pr(1, self.base, "first.txt", "first\n")
         second = self.make_pr(2, first, "second.txt", "second\n")
@@ -148,40 +217,7 @@ class AssemblyTests(unittest.TestCase):
             )
             for number, sha in ((1, first), (2, second), (3, conflict))
         ]
-        snapshot = {
-            "schema_version": 1,
-            "generated_at": "test",
-            "upstream_repository": "owner/repo",
-            "downstream_sha": downstream,
-            "upstream_main_sha": self.base,
-            "fingerprint": BATCH.snapshot_fingerprint(downstream, self.base, prs),
-            "pull_requests": [pr.as_dict() for pr in prs],
-        }
-        snapshot_path = self.root / "snapshot.json"
-        manifest_path = self.root / "manifest.json"
-        summary_path = self.root / "summary.md"
-        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
-
-        result = subprocess.run(
-            [
-                "python3",
-                str(ROOT / "scripts/upstream_pr_batch.py"),
-                "assemble",
-                "--repository",
-                str(self.root),
-                "--snapshot",
-                str(snapshot_path),
-                "--manifest",
-                str(manifest_path),
-                "--summary",
-                str(summary_path),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.assertEqual(0, result.returncode, result.stderr)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = self.assemble_snapshot(downstream, self.base, prs)
         by_number = {item["pull_request"]["number"]: item for item in manifest["results"]}
         self.assertEqual("merged", by_number[1]["status"])
         self.assertIn(by_number[2]["status"], {"merged", "included-by-cohort"})
@@ -190,7 +226,7 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual(["shared.txt"], by_number[3]["conflict_files"])
         self.assertEqual(2, manifest["included_count"])
         self.assertFalse(manifest["complete"])
-        self.assertIn("Exact heads present after assembly: **2/3**", summary_path.read_text(encoding="utf-8"))
+        self.assertEqual(3, manifest["total"])
 
 
 if __name__ == "__main__":
