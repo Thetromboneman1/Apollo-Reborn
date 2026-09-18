@@ -1467,6 +1467,16 @@ UIColor *ApolloThemeAccentColor(void) {
     return custom ?: ApolloThemeStockAccentColor();
 }
 
+// Stock tap feedback is independent of the selected accent (#743).
+UIColor *ApolloThemeRowHighlightColor(void) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenRowHighlight);
+    if (custom) return custom;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+        return ApolloThemeUIColorFromRGB(traits.userInterfaceStyle == UIUserInterfaceStyleDark
+            ? 0x34373F : 0xF0F1F3);
+    }];
+}
+
 // Dark-mode card override for a non-tinted stock theme, per Apollo's Pure
 // Black tier. PURER is only consulted when Pure Black is also on — Apollo
 // hides its toggle (and ignores the stored value) once Pure Black is off,
@@ -1558,6 +1568,31 @@ UIColor *ApolloThemePageBackgroundColor(void) {
     UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenBackground);
     return custom ?: ApolloThemeStockPageBackgroundColor();
 }
+
+// Settings labels share Apollo's stock text palette. Keep this in the theme
+// runtime so custom themes and both Pure Black modes follow the same rules as
+// native rows, without copying a possibly stale on-screen label color.
+static UIColor *ApolloThemeSettingsLabelColor(BOOL secondary) {
+    UIColor *custom = ApolloThemeRuntimeColor(secondary ? ApolloThemeTokenSecondaryLabel : ApolloThemeTokenLabel);
+    if (custom) return custom;
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw) || raw >= kStockThemeCount) return nil;
+    BOOL tinted = kStockThemes[raw].tinted;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+        BOOL dark = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
+        uint32_t black = 0;
+        BOOL pure = dark && !tinted && ApolloStockNonTintedDarkPageRGB(&black);
+        uint32_t rgb = secondary ? (dark ? 0x94969D : 0x666666)
+            : (dark ? (pure ? 0xD0D1D6 : 0xEEEFF5) : 0x000000);
+        sBypassHook++;
+        UIColor *color = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return color;
+    }];
+}
+
+UIColor *ApolloThemeSettingsTextColor(void) { return ApolloThemeSettingsLabelColor(NO); }
+UIColor *ApolloThemeSettingsSecondaryTextColor(void) { return ApolloThemeSettingsLabelColor(YES); }
 
 // Dark-mode separator override for a non-tinted stock theme. One "on" value
 // covers both Pure Black tiers — PURER doesn't push the separator any
@@ -2119,11 +2154,11 @@ void ApolloThemeRuntimeInvalidate(void) {
         sources[@(state)] = title ? [title copy] : NSNull.null;
         UIView *control = NavigationTitleControlForDescendant(self);
         // Recoloring this system button after attachment triggers UIKit's title
-        // fade-out/in. Apply the glass appearance on its first assignment;
-        // classic builds retain their attach path and the original button.
-        BOOL prepareGlassDualTitle = dualTitle && IsLiquidGlass() &&
-            NSClassFromString(@"UIGlassEffect") != Nil;
-        if (prepareGlassDualTitle ||
+        // fade-out/in. Apollo assigns the comments title before the button
+        // reaches the title control, so the attach path can only correct it
+        // afterwards — one white frame, then a 600ms fade, on every refresh
+        // that changes the count. Color it on its first assignment instead.
+        if (dualTitle ||
             (control && ChromeBarLooksApolloOwned(NavigationBarForDescendant(control)))) {
             %orig(NavigationTitleAttributedText(title, self, NavigationTitlePrimaryColor()), state);
             return;
@@ -2480,7 +2515,7 @@ static char kApolloNavigationDualTitleTintPinnedKey;
 
 - (void)setTintColor:(UIColor *)color {
     // System-button vibrancy uses tint even when attributed text is neutral.
-    UIColor *chrome = ApolloNavigationChromeColor();
+    UIColor *chrome = NavigationTitlePrimaryColor();
     // Install an explicit tint once; later native nil resets must not restart
     // UIKit's title transition or return the button to its inherited accent.
     if (objc_getAssociatedObject(self, &kApolloNavigationDualTitleTintPinnedKey) &&
@@ -2502,11 +2537,9 @@ static char kApolloNavigationDualTitleTintPinnedKey;
         FindRuntimeImages();
         BuildByteFilter();
         %init(ApolloThemeRuntimeHooks);
-        if (IsLiquidGlass() && NSClassFromString(@"UIGlassEffect")) {
-            Class dualTitleButton = NSClassFromString(@"Apollo.DualLabelTitleButton");
-            if (dualTitleButton) {
-                %init(ApolloNavigationDualTitleChrome, ApolloDualLabelTitleButton = dualTitleButton);
-            }
+        Class dualTitleButton = NSClassFromString(@"Apollo.DualLabelTitleButton");
+        if (dualTitleButton) {
+            %init(ApolloNavigationDualTitleChrome, ApolloDualLabelTitleButton = dualTitleButton);
         }
         BOOL haveTM = objc_getClass("_TtC6Apollo12ThemeManager") != nil;
         if (haveTM) %init(ApolloThemeRuntimeManagerHook);

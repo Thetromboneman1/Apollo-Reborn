@@ -1,3 +1,4 @@
+#import "ApolloSettingsShortcutsViewController.h"
 #import "settings/CustomAPIViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloFeedShortcutsAppearance.h"
@@ -434,6 +435,9 @@ static CGFloat ApolloFeedShortcutsPreviewSideBySideCenterOffset(ApolloFeedShortc
 
 @interface CustomAPIViewController ()
 @property (nonatomic) BOOL resolvingRestoreFolder;
+// Hub only: whether the Setup section last rendered its "add a Reddit key"
+// footer, so viewWillAppear reloads that section only when the answer flips.
+@property (nonatomic) BOOL setupFooterShowsKeyNudge;
 @end
 
 @implementation CustomAPIViewController
@@ -893,6 +897,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     self.title = [self apollo_screenTitle];
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     if (![self apollo_isHub]) return;
+    // What the first table load renders; viewWillAppear compares against it.
+    self.setupFooterShowsKeyNudge = sRedditClientId.length == 0;
 
     [[ApolloSubredditInfoCache sharedCache] requestInfoForSubreddit:kApolloRebornSubredditName completion:^(ApolloSubredditInfo *info) {
         (void)info;
@@ -930,9 +936,21 @@ typedef NS_ENUM(NSInteger, Tag) {
     // The Setup section footer (onboarding nudge) collapses once a Reddit key
     // exists, which may have just been entered on the pushed API Keys screen.
     // Section 0 is Setup on the hub; reloading it re-evaluates the footer.
-    if ([self apollo_isHub] && self.tableView.numberOfSections > 0) {
-        [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
-                      withRowAnimation:UITableViewRowAnimationNone];
+    // Only when the nudge actually flips, though: a section reload re-measures
+    // that section's header and footer, and this runs inside the pop transition
+    // on every return to the hub, so an unconditional reload left a settle for
+    // the transition to animate (the list came back a few points high and slid
+    // down into place). Same suppression as -reloadRowWithID: for the rare
+    // reload that is still needed.
+    BOOL showsKeyNudge = sRedditClientId.length == 0;
+    if ([self apollo_isHub] && self.tableView.numberOfSections > 0 &&
+        showsKeyNudge != self.setupFooterShowsKeyNudge) {
+        self.setupFooterShowsKeyNudge = showsKeyNudge;
+        [UIView performWithoutAnimation:^{
+            [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
+                          withRowAnimation:UITableViewRowAnimationNone];
+            [self.tableView layoutIfNeeded];
+        }];
     }
 }
 
@@ -1919,7 +1937,10 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             footer:footer
                                               rows:@[ profileTabAvatar, iconOnlyTabBar, hideUsernameTab,
                                                       hideBarsOnScroll, hideStyle, hideTopBarToo, tabBarScrollBehavior,
-                                                      iPadTabBarBottom, tabBarSwipeNavigation ]];
+                                                      iPadTabBarBottom, tabBarSwipeNavigation,
+                                                      [ApolloSettingsRow disclosureRowWithID:@"interface.settingsShortcuts" title:@"Settings Shortcuts" detail:nil push:^UIViewController *{
+                                                          return [[ApolloSettingsShortcutsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+                                                      }] ]];
 }
 
 // Interface → Menus: the ••• menus' item order and visibility live on their own
@@ -1944,7 +1965,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             return [[ApolloActionMenuSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
     return [ApolloSettingsSection sectionWithTitle:@"Menus"
-                                            footer:@"Reorder or hide the items in the ••• menus of feeds, posts and comments."
+                                            footer:@"Reorder or hide the items in the ••• menus of feeds, posts and comments, and in the moderator menus."
                                               rows:@[ actionMenus ]];
 }
 
@@ -3403,7 +3424,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
 // not position) so a buildForm reorder can never misfile a footer.
 - (NSAttributedString *)footerAttributedTextForSection:(NSInteger)section {
     NSString *sectionTitle = [self tableView:self.tableView titleForHeaderInSection:section];
-    NSDictionary *plainAttrs = @{NSFontAttributeName: [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote], NSForegroundColorAttributeName: [UIColor secondaryLabelColor]};
+    NSDictionary *plainAttrs = @{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [UIColor secondaryLabelColor]};
     NSMutableAttributedString *text;
 
     if ([sectionTitle isEqualToString:@"Setup"]) {
@@ -3425,7 +3446,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             initWithString:@"Reddit and Imgur no longer allow new API key creation. Existing keys still work if you have access. Image Chest is optional and improves album metadata when a personal token is configured. You may be able to use credentials from another 3rd-party app ("
             attributes:plainAttrs];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"more info"
-            attributes:@{NSFontAttributeName: [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote], NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/Apollo-Reborn/Apollo-Reborn?tab=readme-ov-file#dont-have-an-api-key"]}]];
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/Apollo-Reborn/Apollo-Reborn?tab=readme-ov-file#dont-have-an-api-key"]}]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"). The Reddit API Key/Secret/Redirect URI above are the default, used by any signed-in account that doesn't have its own key — set a different key per account from the account switcher."
             attributes:plainAttrs]];
     } else if ([sectionTitle isEqualToString:@"Sources"]) {
@@ -3433,11 +3454,11 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             initWithString:@"Configure custom subreddit sources by providing a URL to a plaintext file with line-separated subreddit names (without /r/). "
             attributes:plainAttrs];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Example file"
-            attributes:@{NSFontAttributeName: [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote], NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://jeffreyca.github.io/subreddits/popular.txt"]}]];
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://jeffreyca.github.io/subreddits/popular.txt"]}]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" ("
             attributes:plainAttrs]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"GitHub repo"
-            attributes:@{NSFontAttributeName: [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote], NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/JeffreyCA/subreddits"]}]];
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/JeffreyCA/subreddits"]}]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@")"
             attributes:plainAttrs]];
     } else if ([sectionTitle isEqualToString:@"Uploads"]) {
@@ -3453,7 +3474,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             initWithString:@"For users running their own "
             attributes:plainAttrs];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"forked apollo-backend"
-            attributes:@{NSFontAttributeName: [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/nickclyde/apollo-backend"]}]];
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/nickclyde/apollo-backend"]}]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" instance. APNs delivery requires a paid Apple Developer account on the signing side. Leave empty to disable."
             attributes:plainAttrs]];
         NSString *barkLead = ApolloPushNotificationsSupported()
@@ -3465,14 +3486,14 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         barkTail = [barkTail stringByAppendingString:@" Notifications show your selected app icon automatically; to also hear Apollo's notification sounds, import the matching .caf from the project's assets/bark-sounds via the Bark app's Service tab → Alert Sound → view all sounds → Upload Sound."];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkLead attributes:plainAttrs]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Bark app"
-            attributes:@{NSFontAttributeName: [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote], NSLinkAttributeName: [NSURL URLWithString:@"https://apps.apple.com/us/app/bark-custom-notifications/id1403753865"]}]];
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSLinkAttributeName: [NSURL URLWithString:@"https://apps.apple.com/us/app/bark-custom-notifications/id1403753865"]}]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkTail attributes:plainAttrs]];
     } else if ([sectionTitle isEqualToString:@"Privacy"]) {
         text = [[NSMutableAttributedString alloc]
             initWithString:@"Sends one anonymous heartbeat so we can estimate active Apollo Reborn installs. No Reddit activity, account details, or feature usage is collected. More details can be found in our "
             attributes:plainAttrs];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"privacy policy"
-            attributes:@{NSFontAttributeName: [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote], NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://apolloreborn.app/privacy"]}]];
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://apolloreborn.app/privacy"]}]];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"."
             attributes:plainAttrs]];
     } else {

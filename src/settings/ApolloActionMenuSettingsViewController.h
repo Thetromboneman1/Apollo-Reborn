@@ -1,12 +1,26 @@
 #import "ApolloSettingsForm.h"
 
-// "Action Menus" screen (Apollo Reborn → Interface): reorder and hide the rows
-// of Apollo's ••• menus — the feed's, a post's, a post's comments view's and a
-// comment's — with a live mock of the selected menu pinned above the list
-// (ApolloSettingsPinnedPreview; tap the card to pin/unpin). Touch and hold a
-// row to drag it into place; tap it to toggle the accent checkmark and hide or
-// restore the action.
-// Model, item catalogue and persistence live in ApolloActionMenuLayout.h; the
-// menus themselves read the saved layout in ApolloActionMenu.xm.
+NS_ASSUME_NONNULL_BEGIN
+
+// "Action Menus" (Apollo Reborn → Interface): the list of Apollo's menus whose
+// rows can be reordered and hidden — the ••• menus (feed, post, post's
+// comments, comment) and, for moderators, the shield menus — plus an "All
+// Menus" visibility overview. Each row pushes that menu's editor. Model, item
+// catalogue and persistence live in ApolloActionMenuLayout.h; the menus
+// themselves read the saved layout in ApolloActionMenu.xm.
 @interface ApolloActionMenuSettingsViewController : ApolloSettingsFormViewController
 @end
+
+// The context that edits visibility across every menu at once.
+extern NSString *const ApolloActionMenuEditorAllMenus;
+
+// One menu's editor (or the All Menus overview): its items in the saved order,
+// tap to check or uncheck (hide), touch and hold to drag into place. Each real
+// menu keeps the fork's live preview card pinned above the list; All Menus has
+// no preview because it is a cross-menu visibility overview.
+@interface ApolloActionMenuEditorViewController : ApolloSettingsFormViewController
+// `context` is an ApolloActionMenuContext or ApolloActionMenuEditorAllMenus.
+- (instancetype)initWithContext:(NSString *)context;
+@end
+
+NS_ASSUME_NONNULL_END

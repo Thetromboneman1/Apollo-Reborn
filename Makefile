@@ -56,6 +56,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
     $(SRC_DIR)/settings/ApolloSettingsTableViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsForm.m \
+    $(SRC_DIR)/settings/ApolloSettingsShortcutsViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsPinnedPreview.m \
     $(SRC_DIR)/settings/ApolloContributors.m \
     $(SRC_DIR)/settings/ApolloBackupRestore.m \
@@ -139,6 +140,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMediaMetadata.m \
     $(SRC_DIR)/ApolloMediaAutoplay.m \
     $(SRC_DIR)/ApolloCommentsCollapse.xm \
+    $(SRC_DIR)/ApolloCommentHeaderLayout.xm \
     $(SRC_DIR)/ApolloInboxCommentScroll.xm \
     $(SRC_DIR)/ApolloFindInComments.xm \
     $(SRC_DIR)/ApolloFindInCommentsGlass.xm \
@@ -217,6 +219,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAppleTranslateSheet.xm \
     $(SRC_DIR)/ApolloVideoUnmute.xm \
     $(SRC_DIR)/ApolloFeedVideoScrubber.xm \
+    $(SRC_DIR)/ApolloInlineVideoTimeObserver.xm \
     $(SRC_DIR)/ApolloForwardSwipeExpiry.xm \
     $(SRC_DIR)/ApolloForwardSwipeCancellation.xm \
     $(SRC_DIR)/ApolloVideoSwipeFix.xm \
@@ -279,6 +282,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloVisionOSMultiwindow.xm \
     $(SRC_DIR)/ApolloWebAuthViewController.m \
     $(SRC_DIR)/ApolloWebJSON.m \
+    $(SRC_DIR)/ApolloWebJSONWriteRepair.m \
     $(SRC_DIR)/ApolloWebJSONIdentity.xm \
     $(SRC_DIR)/ApolloWebSessionLoginViewController.m \
     $(SRC_DIR)/ApolloWebSessionStore.m \

@@ -85,6 +85,10 @@ typedef UITableViewCell *_Nonnull (^ApolloSettingsCellBlock)(UITableView *tableV
 // Insert/delete animation when `visible` flips (default UITableViewRowAnimationFade).
 @property (nonatomic) UITableViewRowAnimation showHideAnimation;
 
+// Disclosure rows only: show the detail as a subtitle under the title (it
+// wraps, never truncates) instead of a trailing value. Default NO.
+@property (nonatomic) BOOL detailAsSubtitle;
+
 // Optional post-configure hook (runs after the built-in configuration, before
 // theming). Use for one-off tweaks (fonts, detail color) without a custom row.
 @property (nonatomic, copy, nullable) void (^configure)(UITableViewCell *cell);
@@ -133,10 +137,16 @@ typedef UITableViewCell *_Nonnull (^ApolloSettingsCellBlock)(UITableView *tableV
 - (nullable UITableViewCell *)cellForRowID:(NSString *)rowID;
 
 - (nullable ApolloSettingsRow *)rowWithID:(NSString *)rowID;
+// Resolve native editing callbacks against the form's current snapshot.
+- (nullable ApolloSettingsRow *)rowAtIndexPath:(NSIndexPath *)indexPath;
 - (nullable NSIndexPath *)indexPathForRowID:(NSString *)rowID;
 
 // Rebuild the whole model (drops and re-requests -buildForm) and reloadData.
 - (void)rebuildForm;
+
+// After UIKit has moved a row, update only the model snapshot. The caller's
+// buildForm must preserve section membership/counts and only reorder rows.
+- (void)refreshFormAfterRowMove;
 
 // Rebuild the model but reload only the section containing rowID — for dynamic
 // sections whose rows are generated inside -buildForm (a full reloadData would

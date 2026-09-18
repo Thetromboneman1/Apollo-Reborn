@@ -28,8 +28,10 @@ cat > "$FAKE_BIN/gh" <<'SH'
 printf 'gh' >> "$FAKE_LOG"
 printf ' <%s>' "$@" >> "$FAKE_LOG"
 printf '\n' >> "$FAKE_LOG"
-if [[ "$*" == *"--method GET"* ]]; then
+if [[ "$*" == *"--method GET"* && "$*" == *"head="* ]]; then
   printf '%s\n' "${FAKE_EXISTING:-}"
+elif [[ "$*" == *"--method GET"* ]]; then
+  printf '%s\n' "${FAKE_SUPERSEDED:-}"
 elif [[ "$*" == *"--method POST"* ]]; then
   printf '%s\n' $'42\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/42\t'"${FAKE_CREATED_DRAFT:-false}"
 fi
@@ -59,6 +61,7 @@ run_publish() {
     PATH="$FAKE_BIN:$PATH" \
     FAKE_LOG="$FAKE_LOG" \
     FAKE_EXISTING="${FAKE_EXISTING:-}" \
+    FAKE_SUPERSEDED="${FAKE_SUPERSEDED:-}" \
     FAKE_CREATED_DRAFT="${FAKE_CREATED_DRAFT:-false}" \
     GH_TOKEN=test-token \
     BRANCH=Thetromboneman1/all-open-upstream-prs-0123456789ab \
@@ -77,10 +80,18 @@ run_publish() {
 write_manifest true false
 run_publish > "$TEST_ROOT/no-change.out"
 grep -F 'already present on main' "$TEST_ROOT/no-change.out" >/dev/null
-if [[ -s "$FAKE_LOG" ]]; then
-  printf 'no-change publication unexpectedly called GitHub\n' >&2
+grep -F 'gh <api> <--method> <GET>' "$FAKE_LOG" >/dev/null
+if grep -F '<state=closed>' "$FAKE_LOG" >/dev/null; then
+  printf 'no-change publication unexpectedly closed a non-existent batch PR\n' >&2
   exit 1
 fi
+
+: > "$FAKE_LOG"
+FAKE_SUPERSEDED=$'22\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/22' \
+run_publish > "$TEST_ROOT/no-change-superseded.out"
+grep -F '<PATCH> <repos/Thetromboneman1/Apollo-Reborn/pulls/22>' "$FAKE_LOG" >/dev/null
+grep -F '<state=closed>' "$FAKE_LOG" >/dev/null
+grep -F 'Closed superseded fork integration PR' "$TEST_ROOT/no-change-superseded.out" >/dev/null
 
 : > "$FAKE_LOG"
 write_manifest false true

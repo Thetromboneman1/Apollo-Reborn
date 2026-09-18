@@ -14,6 +14,7 @@
 #import "ApolloThemeRuntime.h"
 #import "ipad/ApolloPaneLayout.h"
 #import "ApolloWallpapersViewController.h"
+#import "ApolloSettingsTableViewController.h"
 
 // MARK: - Settings View Controller (Custom API row injection)
 
@@ -58,8 +59,6 @@ static char kApolloRootNativeSurfaceKey;
 
 static void ApolloRootSettingsPreparePaneText(UITableViewCell *cell, UIViewController *controller) {
     if (!ApolloPaneSplitControllerFor(controller)) return;
-    cell.textLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody compatibleWithTraitCollection:controller.traitCollection];
-    cell.textLabel.adjustsFontForContentSizeCategory = YES;
     cell.textLabel.numberOfLines = 0;
 }
 
@@ -294,8 +293,9 @@ static UITableView *ApolloRootSettingsTableInView(UIView *view) {
             cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseID];
         }
         cell.textLabel.text = indexPath.row == 0 ? @"Apollo Reborn" : @"Buy Us a Coffee";
+        ApolloSettingsApplyCellTypography(cell);
         ApolloRootSettingsPreparePaneText(cell, (UIViewController *)self);
-        UIColor *primaryText = ApolloThemeRuntimeColor(ApolloThemeTokenLabel);
+        UIColor *primaryText = ApolloSettingsPrimaryTextColor();
         if (primaryText) cell.textLabel.textColor = primaryText;
         cell.imageView.image = indexPath.row == 0
             ? (ApolloRebornOptionsSettingsIcon(29.0) ?: createSettingsIcon(@"key.fill", [UIColor systemTealColor]))
@@ -316,8 +316,9 @@ static UITableView *ApolloRootSettingsTableInView(UIView *view) {
             cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseID];
         }
         cell.textLabel.text = title;
+        ApolloSettingsApplyCellTypography(cell);
         ApolloRootSettingsPreparePaneText(cell, (UIViewController *)self);
-        UIColor *primaryText = ApolloThemeRuntimeColor(ApolloThemeTokenLabel);
+        UIColor *primaryText = ApolloSettingsPrimaryTextColor();
         if (primaryText) cell.textLabel.textColor = primaryText;
         cell.imageView.image = indexPath.row == 0
             ? createSettingsIcon(@"photo.on.rectangle.angled", UIColor.systemRedColor)
@@ -417,7 +418,7 @@ static UITableView *ApolloRootSettingsTableInView(UIView *view) {
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section == 0 || indexPath.section == 2) {
+    if (ApolloRootCellCopiesNativeSurface(indexPath)) {
         // Native cell text grows at accessibility sizes. Let UIKit measure the
         // multiline label instead of clipping it inside the ordinary 52pt row.
         // This is the existing single owner of the root table, not a second
@@ -425,7 +426,7 @@ static UITableView *ApolloRootSettingsTableInView(UIView *view) {
         if (ApolloPaneSplitControllerFor((UIViewController *)self) &&
             UIContentSizeCategoryIsAccessibilityCategory(tableView.traitCollection.preferredContentSizeCategory))
             return UITableViewAutomaticDimension;
-        return 52.0;
+        return MAX(52.0, ceil(ApolloSettingsFont(UIFontTextStyleBody, tableView.traitCollection).lineHeight) + 22.0);
     }
     return %orig;
 }
