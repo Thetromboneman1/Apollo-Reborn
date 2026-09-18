@@ -1,3 +1,4 @@
+#import "ApolloSettingsShortcutsViewController.h"
 #import "settings/CustomAPIViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloFeedShortcutsAppearance.h"
@@ -1919,7 +1920,10 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             footer:footer
                                               rows:@[ profileTabAvatar, iconOnlyTabBar, hideUsernameTab,
                                                       hideBarsOnScroll, hideStyle, hideTopBarToo, tabBarScrollBehavior,
-                                                      iPadTabBarBottom, tabBarSwipeNavigation ]];
+                                                      iPadTabBarBottom, tabBarSwipeNavigation,
+                                                      [ApolloSettingsRow disclosureRowWithID:@"interface.settingsShortcuts" title:@"Settings Shortcuts" detail:nil push:^UIViewController *{
+                                                          return [[ApolloSettingsShortcutsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+                                                      }] ]];
 }
 
 // Interface → Menus: the ••• menus' item order and visibility live on their own
