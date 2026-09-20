@@ -98,8 +98,20 @@ static NSString *ApolloAMModeratorShortTitle(ApolloActionMenuContext context) {
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    if (_appeared) [self rebuildForm];
+    // Back from an editor, only the visible summaries can have changed. Keep
+    // the existing cells in place so footer remeasurement cannot animate
+    // during an interactive swipe-back transition.
+    if (_appeared) [self refreshSummaries];
     _appeared = YES;
+}
+
+- (void)refreshSummaries {
+    NSArray<NSString *> *contexts = [@[ ApolloActionMenuEditorAllMenus ]
+        arrayByAddingObjectsFromArray:ApolloActionMenuAllContexts()];
+    for (NSString *context in contexts) {
+        UITableViewCell *cell = [self cellForRowID:[@"menu." stringByAppendingString:context]];
+        if (cell) cell.detailTextLabel.text = ApolloAMMenuSummary(context);
+    }
 }
 
 - (ApolloSettingsRow *)menuRowForContext:(NSString *)context title:(NSString *)title {
