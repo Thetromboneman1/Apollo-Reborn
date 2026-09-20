@@ -773,10 +773,24 @@ static UIImage *RecentlyReadNSFWBadgeImage(CGFloat fontSize) {
     }];
 }
 
-//Flair & link shared font colour helper
+//Cell and flair background colors
+static UIColor *RecentlyReadCellBackgroundColor(UITraitCollection *traits) {
+    BOOL darkMode = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
+    ApolloThemeToken token = darkMode
+        ? ApolloThemeTokenSecondaryBackground
+        : ApolloThemeTokenBackground;
+
+    if (ApolloThemeRuntimeIsActive()) {
+        return ApolloThemeRuntimeColor(token);
+    }
+
+    return [UIColor systemBackgroundColor];
+}
+
+//Flair & link shared font color helper
 static UIColor *RecentlyReadFlairTextColor(void) {
     if (ApolloThemeRuntimeIsActive()) {
-        return ApolloThemeRuntimeColor(ApolloThemeTokenTertiaryLabel);
+        return ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryLabel);
     }
 
     return [UIColor secondaryLabelColor];
@@ -810,10 +824,15 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
 
         UIColor *badgeBackgroundColor;
 
+        BOOL darkMode = [UITraitCollection currentTraitCollection].userInterfaceStyle == UIUserInterfaceStyleDark;
+
         if (ApolloThemeRuntimeIsActive()) {
-            badgeBackgroundColor = ApolloThemeRuntimeColor(ApolloThemeTokenElevatedBackground);
+            badgeBackgroundColor = ApolloThemeRuntimeColor(
+                darkMode
+                    ? ApolloThemeTokenBackground
+                    : ApolloThemeTokenElevatedBackground
+            );
         } else {
-            BOOL darkMode = [UITraitCollection currentTraitCollection].userInterfaceStyle == UIUserInterfaceStyleDark;
             badgeBackgroundColor = darkMode
                 ? [UIColor secondarySystemBackgroundColor]
                 : [UIColor systemGroupedBackgroundColor];
@@ -1418,16 +1437,23 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
     return result;
 }
 
-- (UIColor *)apollo_themeCellBackgroundColor {
-    if (ApolloThemeRuntimeIsActive()) {
-        return ApolloThemePageBackgroundColor();
-    }
-
-    return [UIColor systemBackgroundColor];
-}
-
 - (void)apollo_applyTheme {
     [super apollo_applyTheme];
+
+    for (UITableViewCell *cell in self.tableView.visibleCells) {
+        cell.backgroundColor = RecentlyReadCellBackgroundColor(cell.traitCollection);
+
+        UILabel *titleLabel = [cell.contentView viewWithTag:kTitleTag];
+        if (!titleLabel) continue;
+
+        NSIndexPath *indexPath = [self.tableView indexPathForCell:cell];
+        if (!indexPath) continue;
+
+        RDKLink *link = self.activePosts[indexPath.row];
+        if (link) {
+            [self applyTitleAppearanceToLabel:titleLabel forLink:link];
+        }
+    }
 }
 
 - (void)_navigateToAssociatedPath:(UIButton *)sender {
@@ -1640,16 +1666,8 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:cellID];
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        BOOL darkMode = [UITraitCollection currentTraitCollection].userInterfaceStyle == UIUserInterfaceStyleDark;
-        ApolloThemeToken cellBackgroundToken = darkMode
-            ? ApolloThemeTokenSecondaryBackground
-            : ApolloThemeTokenBackground;
+        cell.backgroundColor = RecentlyReadCellBackgroundColor(cell.traitCollection);
 
-        if (ApolloThemeRuntimeIsActive()) {
-            cell.backgroundColor = ApolloThemeRuntimeColor(cellBackgroundToken);
-        } else {
-            cell.backgroundColor = [UIColor systemBackgroundColor];
-        }
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         cell.tintColor = RecentlyReadMetaColor();
 
