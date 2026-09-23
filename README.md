@@ -391,8 +391,8 @@ See [repository maintenance](docs/repository-maintenance.md) before syncing.
 
 ![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
 
-- **Default branch:** `Thetromboneman1/all-open-upstream-prs-a8b7327a5394`
-- **Implementation fingerprint:** `b302434802a538df`
+- **Default branch:** `main`
+- **Implementation fingerprint:** `403e649ba5c77300`
 - **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.
