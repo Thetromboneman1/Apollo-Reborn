@@ -1132,7 +1132,9 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
             // Stacked title lines use the widest intrinsic line, not their sum.
             CGFloat width = ((UILabel *)view).intrinsicContentSize.width;
             if (isfinite(width) && width > 0) textWidth = MAX(textWidth, width);
-        } else if ([view isKindOfClass:UITextField.class]) {
+        } else if ([view isKindOfClass:UITextField.class] || [view isKindOfClass:UISegmentedControl.class]) {
+            // Composite titles publish one intrinsic size; do not measure the
+            // transient selector labels or images individually.
             CGFloat width = view.intrinsicContentSize.width;
             if (isfinite(width) && width > 0) textWidth = MAX(textWidth, width);
         } else if ([view isKindOfClass:UIImageView.class]) {
@@ -1262,6 +1264,14 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
 }
 
 - (void)updateGlassForHostView:(UIView *)hostView candidateViews:(NSArray<UIView *> *)candidateViews {
+    // Native segmented controls already supply their own capsule material.
+    // Keep shared title placement, but do not put a second glass pill behind it.
+    if (candidateViews.count == 1 && [candidateViews.firstObject isKindOfClass:UISegmentedControl.class]) {
+        [self.glassView removeFromSuperview];
+        self.glassView = nil;
+        self.glassHostView = nil;
+        return;
+    }
     // The capsule exists for title contrast, so it follows the header's
     // material: Hard paints a real band behind the title (a capsule on top
     // double-stacks into a button look — #836), while Soft's subtle clarity

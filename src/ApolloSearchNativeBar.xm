@@ -2058,9 +2058,16 @@ static void *NSBCommentJumpTableForController(UIViewController *vc) {
         ApolloLog(@"[NSBTrace] retarget animated -> %.1f (inTop=%.1f adjTop=%.1f)",
                   offset.y, self.contentInset.top, self.adjustedContentInset.top);
     }
-    // An animated scroll aimed exactly at the managed list's top is a
-    // programmatic request for the top. Arm one reveal while retaining the
-    // fork's controller-scoped session state and gesture guards.
+    // An animated scroll aimed EXACTLY at the top rest of a managed list is
+    // code asking for the top — the status-bar tap, a scroll-to-top of
+    // Apollo's own (the Posts tab's is armed at its source, in
+    // ApolloScrollToTop.xm) — so arm the reveal to bring the bar with it; it
+    // resolves once the animation has settled. Exactly, not "within reach":
+    // Apollo's comment collapse keeps the thread in place with an animated
+    // scroll whose target is the content clamp, and on a short thread that
+    // clamp lands a couple of points shy of the rest — a content correction,
+    // not a request for the top (#1138's second symptom). Never for a gesture
+    // in flight: UIKit routes its own palette settle through here too.
     if (ApolloNativeFeedSearchEnabled() && animated &&
         objc_getAssociatedObject(self, kNSBFeedTableKey) != nil &&
         !NSBUserIsScrolling((UIScrollView *)self) &&

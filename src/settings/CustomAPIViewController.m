@@ -706,6 +706,11 @@ typedef NS_ENUM(NSInteger, Tag) {
     [[NSUserDefaults standardUserDefaults] setBool:sFeedVideoScrubber forKey:UDKeyFeedVideoScrubber];
 }
 
+- (void)videoScrollSmoothingSwitchToggled:(UISwitch *)sender {
+    sFeedVideoScrollSmoothing = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedVideoScrollSmoothing forKey:UDKeyFeedVideoScrollSmoothing];
+}
+
 - (void)forwardSwipeForgetSwitchToggled:(UISwitch *)sender {
     sForwardSwipeForgetAfterScrolling = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sForwardSwipeForgetAfterScrolling
@@ -1663,7 +1668,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     ApolloSettingsRow *readThumbnails =
         [ApolloSettingsRow switchRowWithID:@"gen.readThumbnails"
-                                     title:@"Recently Read Thumbnails"
+                                     title:@"Show Thumbnails"
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRecentlyReadThumbnails]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf showRecentlyReadThumbnailsSwitchToggled:sender]; }];
 
@@ -1672,7 +1677,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             NSString *readPostMaxStr = sReadPostMaxCount > 0 ? [NSString stringWithFormat:@"%ld", (long)sReadPostMaxCount] : @"";
             return [weakSelf textFieldCellWithIdentifier:@"Cell_Gen_ReadMax"
-                                                   label:@"Recently Read Posts Limit"
+                                                   label:@"History Limit"
                                              placeholder:@"(unlimited)"
                                                     text:readPostMaxStr
                                                      tag:TagReadPostMaxCount
@@ -1683,13 +1688,13 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     ApolloSettingsRow *filterNSFWRR =
         [ApolloSettingsRow switchRowWithID:@"gen.filterNSFWRR"
-                                     title:@"Hide NSFW in Recently Read"
+                                     title:@"Hide NSFW Posts"
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFilterNSFWRecentlyRead]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf filterNSFWRecentlyReadSwitchToggled:sender]; }];
 
     return [ApolloSettingsSection sectionWithTitle:@"Recently Read"
-                                            footer:@"Show thumbnails on posts you've already read, and cap how many Apollo remembers."
-                                              rows:@[ readThumbnails, readPostMax, filterNSFWRR ]];
+                                            footer:@"Choose how posts appear in Recently Read and how many Apollo remembers."
+                                            rows:@[ readThumbnails, readPostMax, filterNSFWRR ]];
 }
 
 // The "Open in App" screen now lives in native General → Open Links — see
@@ -1740,6 +1745,12 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       isOn:^BOOL { return sFeedVideoScrubber; }
                                   onToggle:^(UISwitch *sender) { [weakSelf feedVideoScrubberSwitchToggled:sender]; }];
 
+    ApolloSettingsRow *videoScrollSmoothing =
+        [ApolloSettingsRow switchRowWithID:@"media.videoScrollSmoothing"
+                                     title:@"Smoother Video Scrolling"
+                                      isOn:^BOOL { return sFeedVideoScrollSmoothing; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf videoScrollSmoothingSwitchToggled:sender]; }];
+
     ApolloSettingsRow *forwardSwipeForget =
         [ApolloSettingsRow customRowWithID:@"gen.forwardSwipeForget"
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
@@ -1779,8 +1790,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     devvitFeedPosts.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Feed"
-                                             footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments."
-                                              rows:@[ textPostThumbnails, infoRow, feedScrubber, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts ]];
+                                             footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nSmoother Video Scrolling: prepares feed videos in the background and lets video posts finish drawing right after they scroll in instead of holding the frame for them. Turn off to get Apollo's original behavior back.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments."
+                                               rows:@[ textPostThumbnails, infoRow, feedScrubber, videoScrollSmoothing, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts ]];
 }
 
 - (ApolloSettingsSection *)buildPostsFloatingTabsSection {

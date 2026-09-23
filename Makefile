@@ -40,6 +40,8 @@ KSCRASH_FILES := \
     $(shell find $(KSCRASH_CORE_DIR) $(KSCRASH_RECORDING_CORE_DIR) $(KSCRASH_RECORDING_DIR) \
         -type f \( -name '*.c' -o -name '*.m' -o -name '*.mm' -o -name '*.cpp' \) | sort)
 
+# ApolloFavoriteConfirm.xm must stay after ApolloSubredditIndexPolish.xm and
+# ApolloFollowingSection.xm so its favoriteSubredditButtonTapped: hook is outermost.
 ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloFoundationModels.swift \
     $(SRC_DIR)/ApolloAISummary.xm \
@@ -184,6 +186,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloProgressiveBlur.xm \
     $(SRC_DIR)/settings/ApolloSettings.xm \
     $(SRC_DIR)/settings/ApolloSettingsTabMenu.xm \
+    $(SRC_DIR)/settings/ApolloShortcutListEditing.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloProfileMoreMenu.xm \
     $(SRC_DIR)/ApolloSaveAllMediaItems.m \
@@ -219,7 +222,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAppleTranslateSheet.xm \
     $(SRC_DIR)/ApolloVideoUnmute.xm \
     $(SRC_DIR)/ApolloFeedVideoScrubber.xm \
-    $(SRC_DIR)/ApolloInlineVideoTimeObserver.xm \
+    $(SRC_DIR)/ApolloFeedVideoScrolling.xm \
     $(SRC_DIR)/ApolloForwardSwipeExpiry.xm \
     $(SRC_DIR)/ApolloForwardSwipeCancellation.xm \
     $(SRC_DIR)/ApolloVideoSwipeFix.xm \

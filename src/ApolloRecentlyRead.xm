@@ -6,7 +6,6 @@
 #import <limits.h>
 
 #import "ApolloCommon.h"
-#import "ApolloMemoryDiagnostics.h"
 #import "ApolloPostReadState.h"
 #import "settings/ApolloSettingsTableViewController.h"
 #import "ApolloState.h"
@@ -317,7 +316,9 @@ void ApolloFlushReadPostIDsToDefaults(void) {
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) UIActivityIndicatorView *footerSpinner;
 @property (nonatomic, copy) NSString *lastTextSizeCategory;
-@property (nonatomic, strong) id textSizeDefaultsObserver;
+@property (nonatomic, assign) BOOL lastShowSubredditAtTop;
+@property (nonatomic, assign) BOOL lastAlwaysShowUsernames;
+@property (nonatomic, assign) BOOL hasCachedLayoutPreferences;
 @end
 
 static char kNavPathKey;
@@ -349,10 +350,7 @@ static NSCache<NSString *, UIImage *> *RecentlyReadThumbnailCache(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         cache = [[NSCache alloc] init];
-        // Row thumbnails are ~60pt squares, so this holds the whole list.
-        cache.countLimit = 150;
-        cache.totalCostLimit = 5 * 1024 * 1024;
-        ApolloMemoryRegisterPurgableCache(@"recently-read-thumbs", cache);
+        cache.countLimit = 300;
     });
     return cache;
 }
@@ -587,13 +585,13 @@ static const CGFloat kRecentlyReadInfoFontSize[] = {
 
 //Line height and letter spacing
 static const CGFloat kRecentlyReadTitleLineHeight[] = {
-    15.0,  // 1
-    16.0,  // 2
-    17.0,  // 3
-    18.0,  // 4
-    19.0,  // 5
-    22.0,  // 6
-    25.0   // 7
+    14.0,  // 1
+    15.0,  // 2
+    16.0,  // 3
+    17.0,  // 4
+    18.0,  // 5
+    21.0,  // 6
+    24.0   // 7
 };
 
 // Additional downward adjustment for info-row icons at each Text Size step.
@@ -694,6 +692,32 @@ static CGFloat RRScaledSpacing(CGFloat spacing, id node) {
     return spacing * (scaledFont.pointSize / 18.0);
 }
 
+// Title → metadata spacing.
+static CGFloat RRTitleMetadataSpacing(id node) {
+    return RRScaledSpacing(10, node);
+}
+
+// Experimental metadata → info spacing for the seven Text Size steps.
+static CGFloat RRMetadataInfoSpacing(id node) {
+    UIFont *referenceFont = [UIFont systemFontOfSize:18.0];
+    UIFont *scaledFont = RRScaledFont(
+        referenceFont,
+        UIFontTextStyleBody,
+        RRFontRoleTitle,
+        node
+    );
+
+    CGFloat size = scaledFont.pointSize;
+
+    if (size <= 14.0) return 0.0;
+    if (size <= 15.0) return 2.0;
+    if (size <= 16.0) return 1.0;
+    if (size <= 17.0) return 2.0;
+    if (size <= 19.0) return 5.0;
+    if (size <= 21.0) return 5.0;
+    return 6.0;
+}
+
 #pragma mark - Recently Read Fonts
 
 static UIFont *RRTitle3Font(id node) {
@@ -773,21 +797,13 @@ static UIImage *RecentlyReadNSFWBadgeImage(CGFloat fontSize) {
     }];
 }
 
-//Cell and flair background colors
-static UIColor *RecentlyReadCellBackgroundColor(UITraitCollection *traits) {
-    BOOL darkMode = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
-    ApolloThemeToken token = darkMode
-        ? ApolloThemeTokenSecondaryBackground
-        : ApolloThemeTokenBackground;
-
-    if (ApolloThemeRuntimeIsActive()) {
-        return ApolloThemeRuntimeColor(token);
-    }
-
-    return [UIColor systemBackgroundColor];
+// Resolve the cell background from the active custom or stock Apollo theme.
+static UIColor *RecentlyReadCellBackgroundColor(void) {
+    UIColor *color = ApolloThemeCardBackgroundColor();
+    return color ?: [UIColor systemBackgroundColor];
 }
 
-//Flair & link shared font color helper
+// Flair text color
 static UIColor *RecentlyReadFlairTextColor(void) {
     if (ApolloThemeRuntimeIsActive()) {
         return ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryLabel);
@@ -796,8 +812,10 @@ static UIColor *RecentlyReadFlairTextColor(void) {
     return [UIColor secondaryLabelColor];
 }
 
-//Flair badge creation
-static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
+// Create a flair badge using the traits of the cell that will display it.
+static UIImage *RecentlyReadFlairBadgeImage(NSString *text,
+                                            CGFloat fontSize,
+                                            UITraitCollection *traits) {
     UIFont *badgeFont = [UIFont systemFontOfSize:fontSize * 0.9 weight:UIFontWeightRegular];
     UIColor *flairTextColor = RecentlyReadFlairTextColor();
 
@@ -822,21 +840,15 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
             [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, badgeWidth, badgeHeight)
                                       cornerRadius:cornerRadius];
 
-        UIColor *badgeBackgroundColor;
-
-        BOOL darkMode = [UITraitCollection currentTraitCollection].userInterfaceStyle == UIUserInterfaceStyleDark;
-
-        if (ApolloThemeRuntimeIsActive()) {
-            badgeBackgroundColor = ApolloThemeRuntimeColor(
-                darkMode
-                    ? ApolloThemeTokenBackground
-                    : ApolloThemeTokenElevatedBackground
-            );
-        } else {
+        // Resolve the flair badge background from the active custom or stock Apollo theme.
+        UIColor *badgeBackgroundColor = ApolloThemePageBackgroundColor();
+        if (!badgeBackgroundColor) {
+            BOOL darkMode = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
             badgeBackgroundColor = darkMode
                 ? [UIColor secondarySystemBackgroundColor]
                 : [UIColor systemGroupedBackgroundColor];
         }
+
         [badgeBackgroundColor setFill];
         [path fill];
 
@@ -870,7 +882,6 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
     self.searchController.searchResultsUpdater = self;
     self.searchController.obscuresBackgroundDuringPresentation = NO;
     self.searchController.searchBar.placeholder = @"Search Recently Read";
-    ApolloHeaderStyleRegisterSearchBar(self.searchController.searchBar);
     self.navigationItem.searchController = self.searchController;
     self.navigationItem.hidesSearchBarWhenScrolling = YES;
     self.definesPresentationContext = YES;
@@ -894,26 +905,6 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
     [self.refreshControl addTarget:self
                             action:@selector(_pullToRefreshTriggered)
                   forControlEvents:UIControlEventValueChanged];
-            self.textSizeDefaultsObserver =
-        [[NSNotificationCenter defaultCenter] addObserverForName:NSUserDefaultsDidChangeNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification * _Nonnull __unused note) {
-        NSInteger textSizeIndex = RRTextSizeIndex(self);
-        //Debug alert
-        UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"Recently Read"
-                                                message:[NSString stringWithFormat:@"Text size index: %ld", (long)textSizeIndex]
-                                        preferredStyle:UIAlertControllerStyleAlert];
-
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                style:UIAlertActionStyleDefault
-                                                handler:nil]];
-
-        [self presentViewController:alert animated:YES completion:nil];
-        //End debug
-        [self softRefreshPosts];
-    }];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -925,11 +916,28 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
 
     self.lastTextSizeCategory = textSizeCategory;
 
+    // Detect changes to Apollo's shared post display preferences.
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL showSubredditAtTop = [defaults boolForKey:@"ShowSubredditAtTop"];
+    BOOL alwaysShowUsernames = [defaults boolForKey:@"AlwaysShowUsernames"];
+
+    BOOL layoutPreferencesChanged = self.hasCachedLayoutPreferences &&
+        (self.lastShowSubredditAtTop != showSubredditAtTop ||
+        self.lastAlwaysShowUsernames != alwaysShowUsernames);
+
+    // Cache the current values for the next appearance.
+    self.lastShowSubredditAtTop = showSubredditAtTop;
+    self.lastAlwaysShowUsernames = alwaysShowUsernames;
+    self.hasCachedLayoutPreferences = YES;
+
     if (!self.hasLoadedOnce) {
         self.hasLoadedOnce = YES;
         [self refreshPosts];
-    } else if (textSizeChanged) {
+    // Reload when either text size or the Recently Read layout preferences changed.
+    } else if (textSizeChanged || layoutPreferencesChanged) {
         [self.tableView reloadData];
+        [self.tableView setNeedsLayout];
+        [self.tableView layoutIfNeeded];
     } else {
         // Returning to the screen (a nav pop runs the top VC's
         // viewWillDisappear first, so a just-left post is already marked):
@@ -1441,7 +1449,7 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
     [super apollo_applyTheme];
 
     for (UITableViewCell *cell in self.tableView.visibleCells) {
-        cell.backgroundColor = RecentlyReadCellBackgroundColor(cell.traitCollection);
+        cell.backgroundColor = RecentlyReadCellBackgroundColor();
 
         UILabel *titleLabel = [cell.contentView viewWithTag:kTitleTag];
         if (!titleLabel) continue;
@@ -1453,6 +1461,15 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text, CGFloat fontSize) {
         if (link) {
             [self applyTitleAppearanceToLabel:titleLabel forLink:link];
         }
+    }
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+
+    if (previousTraitCollection &&
+        previousTraitCollection.userInterfaceStyle != self.traitCollection.userInterfaceStyle) {
+        [self apollo_applyTheme];
     }
 }
 
@@ -1605,8 +1622,11 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
     }
 
     if (flairText.length > 0) {
+        // Render the flair badge using the title label's trait environment.
         UIImage *flairBadge =
-            RecentlyReadFlairBadgeImage(flairText, titleFont.pointSize);
+            RecentlyReadFlairBadgeImage(flairText,
+                                        titleFont.pointSize,
+                                        titleLabel.traitCollection);
 
         NSTextAttachment *flairAtt =
             [[NSTextAttachment alloc] init];
@@ -1666,7 +1686,7 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:cellID];
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        cell.backgroundColor = RecentlyReadCellBackgroundColor(cell.traitCollection);
+        cell.backgroundColor = RecentlyReadCellBackgroundColor();
 
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         cell.tintColor = RecentlyReadMetaColor();
@@ -1711,14 +1731,7 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
         byLabel.tag = kSubFooterByTag;
         byLabel.text = @" by ";
         byLabel.textColor = metaColor;
-        UIFont *byFont = RRSubheadlineFont(self);
-
-        byLabel.attributedText =
-            [[NSAttributedString alloc] initWithString:byLabel.text ?: @""
-                                            attributes:@{
-                NSFontAttributeName: byFont,
-                NSForegroundColorAttributeName: metaColor,
-            }];
+        byLabel.font = RRSubheadlineFont(self);
         [byLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
 
         UIButton *authorFooterBtn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -1729,6 +1742,17 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
         authorFooterBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
         [authorFooterBtn.heightAnchor constraintEqualToConstant:metaLineHeight].active = YES;
         [authorFooterBtn addTarget:self action:@selector(_navigateToAssociatedPath:) forControlEvents:UIControlEventTouchUpInside];
+
+        // Prioritise the subreddit and make the author the flexible/truncating item.
+        subredditFooterBtn.titleLabel.numberOfLines = 1;
+        subredditFooterBtn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        [subredditFooterBtn setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                                            forAxis:UILayoutConstraintAxisHorizontal];
+
+        authorFooterBtn.titleLabel.numberOfLines = 1;
+        authorFooterBtn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        [authorFooterBtn setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+                                                        forAxis:UILayoutConstraintAxisHorizontal];
 
         UIStackView *footerStack = [[UIStackView alloc] initWithArrangedSubviews:@[subredditFooterBtn, byLabel, authorFooterBtn]];
         footerStack.tag = kSubFooterTag;
@@ -1772,12 +1796,14 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
         stack.alignment = UIStackViewAlignmentLeading;
         stack.translatesAutoresizingMaskIntoConstraints = NO;
         [stack setCustomSpacing:kRecentlyReadDefaultTopGap afterView:subHeaderBtn];
-        [stack setCustomSpacing:RRScaledSpacing(10, self)
-                    afterView:titleLabel];
-        [stack setCustomSpacing:RRScaledSpacing(5, self)
+        [stack setCustomSpacing:4.0
+            afterView:titleLabel];
+        // Use the same metadata → info spacing at every Text Size step.
+        [stack setCustomSpacing:RRMetadataInfoSpacing(self)
                     afterView:footerStack];
-        [stack setCustomSpacing:RRScaledSpacing(3, self)
-                afterView:authorTopBtn];
+        // Use the experimental seven-step author → info spacing.
+        [stack setCustomSpacing:RRMetadataInfoSpacing(self)
+                    afterView:authorTopBtn];
         [cell.contentView addSubview:stack];
 
         UIView *sep = [[UIView alloc] init];
@@ -1804,7 +1830,7 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
             [sep.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
             [sep.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor],
             [sep.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor],
-            [sep.heightAnchor constraintEqualToConstant:(2.0 / UIScreen.mainScreen.scale)]
+            [sep.heightAnchor constraintEqualToConstant:(1.0 / UIScreen.mainScreen.scale)]
         ]];
 
         objc_setAssociatedObject(cell, &kThumbWidthConstraintKey, thumbWidth, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1812,6 +1838,7 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
         objc_setAssociatedObject(cell, &kStackLeadingNoThumbConstraintKey, stackLeadingNoThumb, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
+    // Read Apollo's shared post display preferences.
     RDKLink *link = self.activePosts[indexPath.row];
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     BOOL subAtTop = [defaults boolForKey:@"ShowSubredditAtTop"];
@@ -1826,16 +1853,41 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
     UIButton *authorFooterBtn = (UIButton *)[cell.contentView viewWithTag:kSubFooterAuthorTag];
     UIButton *authorTopBtn = (UIButton *)[cell.contentView viewWithTag:kAuthorTopTag];
     UILabel *statsLabel = [cell.contentView viewWithTag:kBottomTag];
-    
-    //Explicit refresh on reuse
+    UIView *sep = [cell.contentView viewWithTag:kSepTag];
+
+    // Explicit refresh on reuse.
     UIFont *mediumFont = RRMediumSubheadlineFont(self);
     UIColor *metaColor = RecentlyReadMetaColor();
+    UIColor *separatorColor = ApolloThemeSeparatorColor();
+    sep.backgroundColor = separatorColor ?: [UIColor separatorColor];
+    UIColor *metaHighlight = [metaColor colorWithAlphaComponent:0.4];
+
     titleLabel.font = RRBodyFont(self);
     subHeaderBtn.titleLabel.font = RRCalloutFont(self);
     subredditFooterBtn.titleLabel.font = mediumFont;
     byLabel.font = RRSubheadlineFont(self);
     authorFooterBtn.titleLabel.font = mediumFont;
     authorTopBtn.titleLabel.font = mediumFont;
+
+    [subHeaderBtn setTitleColor:metaColor forState:UIControlStateNormal];
+    [subHeaderBtn setTitleColor:metaHighlight forState:UIControlStateHighlighted];
+
+    [subredditFooterBtn setTitleColor:metaColor forState:UIControlStateNormal];
+    [subredditFooterBtn setTitleColor:metaHighlight forState:UIControlStateHighlighted];
+
+    byLabel.textColor = metaColor;
+
+    [authorFooterBtn setTitleColor:metaColor forState:UIControlStateNormal];
+    [authorFooterBtn setTitleColor:metaHighlight forState:UIControlStateHighlighted];
+
+    [authorTopBtn setTitleColor:metaColor forState:UIControlStateNormal];
+    [authorTopBtn setTitleColor:metaHighlight forState:UIControlStateHighlighted];
+    // Keep the metadata → info spacing in sync with the current Text Size
+    // for both the normal footer and the Subreddit-at-Top layout.
+    [stack setCustomSpacing:RRMetadataInfoSpacing(self)
+                afterView:footerStack];
+    [stack setCustomSpacing:RRMetadataInfoSpacing(self)
+                afterView:authorTopBtn];
 
     UIImageView *thumbnailView = (UIImageView *)[cell.contentView viewWithTag:kThumbTag];
 
@@ -1869,8 +1921,9 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
 
     if (subAtTop) {
         [stack setCustomSpacing:kRecentlyReadExpandedTopGap afterView:subHeaderBtn];
-        [stack setCustomSpacing:RRScaledSpacing(kRecentlyReadExpandedTopGap, self)
-              afterView:titleLabel];
+    // Use the named title → metadata spacing.
+    [stack setCustomSpacing:RRTitleMetadataSpacing(self)
+                afterView:titleLabel];
         // Subreddit above title
         subHeaderBtn.hidden = NO;
         subHeaderBtn.titleLabel.font = RRCalloutFont(self);
@@ -1881,6 +1934,7 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
 
         if (showUsernames && link.author.length > 0) {
             authorTopBtn.hidden = NO;
+            // Show only the username when the author appears beneath the top subreddit.
             UIFont *authorTopFont = RRMediumSubheadlineFont(self);
 
             NSAttributedString *authorTopTitle =
@@ -1893,12 +1947,13 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
             [authorTopBtn setAttributedTitle:authorTopTitle
                                     forState:UIControlStateNormal];
             objc_setAssociatedObject(authorTopBtn, &kNavPathKey, authorPath, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } else {
-            authorTopBtn.hidden = YES;
-        }
-    } else {
+            } else {
+                authorTopBtn.hidden = YES;
+            }
+            } else {
         [stack setCustomSpacing:kRecentlyReadDefaultTopGap afterView:subHeaderBtn];
-        [stack setCustomSpacing:RRScaledSpacing(10, self)
+        // Use the named title → metadata spacing.
+        [stack setCustomSpacing:RRTitleMetadataSpacing(self)
                     afterView:titleLabel];
         // Subreddit below title with optional author
         subHeaderBtn.hidden = YES;
@@ -2226,9 +2281,8 @@ static void ApolloCommentsVCTryMarkRead(id commentsVC, const char *trigger) {
 
 %end
 
-// The install half of the swift_allocObject capture; hooked_swift_allocObject
-// above still owns the un-hook, which has to stay paired with the capture it
-// completes.
+// Register the temporary Swift allocation hook with the fork's centralized
+// fishhook install so every rebinding is applied in one atomic call.
 size_t ApolloRecentlyReadAppendRebindings(struct rebinding *out) {
     sTrackerTypeMetadata = (__bridge void *)objc_getClass("_TtC6Apollo16ReadPostsTracker");
     if (!sTrackerTypeMetadata) return 0;
