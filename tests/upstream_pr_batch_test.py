@@ -172,6 +172,47 @@ class AssemblyTests(unittest.TestCase):
             (self.root / "shared.txt").read_text(encoding="utf-8"),
         )
 
+    def test_squashed_upstream_conflict_reuses_exact_merged_source_heads(self) -> None:
+        command(self.root, "git", "switch", "--detach", self.base)
+        (self.root / "shared.txt").write_text("upstream part one\n", encoding="utf-8")
+        command(self.root, "git", "add", "shared.txt")
+        command(self.root, "git", "commit", "-m", "source part one")
+        (self.root / "shared.txt").write_text("upstream final\n", encoding="utf-8")
+        command(self.root, "git", "add", "shared.txt")
+        command(self.root, "git", "commit", "-m", "source part two")
+        source_92 = command(self.root, "git", "rev-parse", "HEAD")
+        command(self.root, "git", "push", "upstream", f"{source_92}:refs/pull/92/head")
+
+        source_93 = self.make_pr(93, self.base, "later.txt", "later source\n")
+
+        command(self.root, "git", "switch", "--detach", self.base)
+        (self.root / "shared.txt").write_text("upstream final\n", encoding="utf-8")
+        command(self.root, "git", "add", "shared.txt")
+        command(self.root, "git", "commit", "-m", "Shared feature (#92)")
+        (self.root / "later.txt").write_text("later source\n", encoding="utf-8")
+        command(self.root, "git", "add", "later.txt")
+        command(self.root, "git", "commit", "-m", "Later feature (#93)")
+        upstream_main = command(self.root, "git", "rev-parse", "HEAD")
+
+        command(self.root, "git", "switch", "--force-create", "main", self.base)
+        command(self.root, "git", "merge", "--no-ff", "-m", "integrate source 92", source_92)
+        (self.root / "shared.txt").write_text("fork-resolved final\n", encoding="utf-8")
+        command(self.root, "git", "add", "shared.txt")
+        command(self.root, "git", "commit", "-m", "fork customization")
+        downstream = command(self.root, "git", "rev-parse", "HEAD")
+
+        manifest = self.assemble_snapshot(downstream, upstream_main, [])
+        self.assertTrue(manifest["complete"])
+        self.assertTrue(manifest["upstream_main_included"])
+        self.assertEqual("source-pr-topology-merge", manifest["upstream_main_result"]["status"])
+        records = manifest["upstream_main_result"]["source_pr_commits"]
+        self.assertEqual([92, 93], [record["source_pr"] for record in records])
+        self.assertEqual("already-present", records[0]["status"])
+        self.assertEqual("merged", records[1]["status"])
+        self.assertTrue(BATCH.is_ancestor(self.root, source_93, "HEAD"))
+        self.assertEqual("fork-resolved final\n", (self.root / "shared.txt").read_text(encoding="utf-8"))
+        self.assertEqual("later source\n", (self.root / "later.txt").read_text(encoding="utf-8"))
+
     def test_non_equivalent_upstream_conflict_remains_blocked(self) -> None:
         upstream = self.make_pr(91, self.base, "shared.txt", "upstream only\n")
         command(self.root, "git", "switch", "--force-create", "main", self.base)
