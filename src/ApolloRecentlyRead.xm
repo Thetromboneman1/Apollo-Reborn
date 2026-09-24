@@ -797,10 +797,14 @@ static UIImage *RecentlyReadNSFWBadgeImage(CGFloat fontSize) {
     }];
 }
 
-// Resolve the cell background from the active custom or stock Apollo theme.
+/// Custom themes provide their own card background. For stock themes, keep
+// UIKit's system background so Apollo's native light/dark appearance is preserved.
 static UIColor *RecentlyReadCellBackgroundColor(void) {
-    UIColor *color = ApolloThemeCardBackgroundColor();
-    return color ?: [UIColor systemBackgroundColor];
+    if (ApolloThemeRuntimeIsActive()) {
+        return ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryBackground);
+    }
+
+    return [UIColor systemBackgroundColor];
 }
 
 // Flair text color
@@ -840,10 +844,15 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text,
             [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, badgeWidth, badgeHeight)
                                       cornerRadius:cornerRadius];
 
-        // Resolve the flair badge background from the active custom or stock Apollo theme.
-        UIColor *badgeBackgroundColor = ApolloThemePageBackgroundColor();
-        if (!badgeBackgroundColor) {
-            BOOL darkMode = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
+        // Custom themes use the page/background token for flair badges. For stock
+        // themes, use UIKit's grouped backgrounds to match the native light/dark appearance.
+        UIColor *badgeBackgroundColor;
+
+        BOOL darkMode = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
+
+        if (ApolloThemeRuntimeIsActive()) {
+            badgeBackgroundColor = ApolloThemeRuntimeColor(ApolloThemeTokenBackground);
+        } else {
             badgeBackgroundColor = darkMode
                 ? [UIColor secondarySystemBackgroundColor]
                 : [UIColor systemGroupedBackgroundColor];
@@ -1457,9 +1466,41 @@ static UIImage *RecentlyReadFlairBadgeImage(NSString *text,
         NSIndexPath *indexPath = [self.tableView indexPathForCell:cell];
         if (!indexPath) continue;
 
+        if ((NSUInteger)indexPath.row >= self.activePosts.count) continue;
         RDKLink *link = self.activePosts[indexPath.row];
         if (link) {
             [self applyTitleAppearanceToLabel:titleLabel forLink:link];
+
+            // Existing cells do not necessarily get reconfigured on a theme change.
+            // Refresh attributed metadata too: setTitleColor alone cannot replace
+            // the foreground colour stored in an attributed button title.
+            UIColor *metaColor =
+                [RecentlyReadMetaColor() resolvedColorWithTraitCollection:cell.traitCollection];
+            UIColor *metaHighlight = [metaColor colorWithAlphaComponent:0.4];
+            cell.tintColor = metaColor;
+            for (NSNumber *tag in @[@(kSubHeaderTag), @(kSubFooterSubredditTag),
+                                    @(kSubFooterAuthorTag), @(kAuthorTopTag)]) {
+                UIButton *button = (UIButton *)[cell.contentView viewWithTag:tag.integerValue];
+                [button setTitleColor:metaColor forState:UIControlStateNormal];
+                [button setTitleColor:metaHighlight forState:UIControlStateHighlighted];
+                NSMutableAttributedString *title =
+                    [[button attributedTitleForState:UIControlStateNormal] mutableCopy];
+                if (title.length) {
+                    [title addAttribute:NSForegroundColorAttributeName
+                                  value:metaColor
+                                  range:NSMakeRange(0, title.length)];
+                    [button setAttributedTitle:title forState:UIControlStateNormal];
+                }
+            }
+            UILabel *byLabel = (UILabel *)[cell.contentView viewWithTag:kSubFooterByTag];
+            byLabel.textColor = metaColor;
+
+            // The stats icons are rendered images, so regenerate them along with
+            // their attributed text instead of just changing the label colour.
+            UILabel *statsLabel = (UILabel *)[cell.contentView viewWithTag:kBottomTag];
+            statsLabel.attributedText = [self statsAttributedStringForLink:link];
+            UIView *separator = [cell.contentView viewWithTag:kSepTag];
+            separator.backgroundColor = ApolloThemeSeparatorColor() ?: [UIColor separatorColor];
         }
     }
 }
@@ -1921,9 +1962,9 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
 
     if (subAtTop) {
         [stack setCustomSpacing:kRecentlyReadExpandedTopGap afterView:subHeaderBtn];
-    // Use the named title → metadata spacing.
-    [stack setCustomSpacing:RRTitleMetadataSpacing(self)
-                afterView:titleLabel];
+        // Use the named title → metadata spacing.
+        [stack setCustomSpacing:RRTitleMetadataSpacing(self)
+                    afterView:titleLabel];
         // Subreddit above title
         subHeaderBtn.hidden = NO;
         subHeaderBtn.titleLabel.font = RRCalloutFont(self);
@@ -1947,10 +1988,10 @@ static void RecentlyReadClearThumbTask(UIImageView *thumbnailView, NSURLSessionD
             [authorTopBtn setAttributedTitle:authorTopTitle
                                     forState:UIControlStateNormal];
             objc_setAssociatedObject(authorTopBtn, &kNavPathKey, authorPath, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            } else {
-                authorTopBtn.hidden = YES;
-            }
-            } else {
+        } else {
+            authorTopBtn.hidden = YES;
+        }
+    } else {
         [stack setCustomSpacing:kRecentlyReadDefaultTopGap afterView:subHeaderBtn];
         // Use the named title → metadata spacing.
         [stack setCustomSpacing:RRTitleMetadataSpacing(self)

@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -284,6 +285,85 @@ def patch_equivalent_upstream_commits(root: Path, upstream_sha: str) -> list[str
     return [line[2:] for line in lines]
 
 
+def upstream_commit_source_pr(root: Path, commit_sha: str) -> int | None:
+    """Return the squash/merge PR number recorded in an upstream commit title."""
+    subject = git(root, "show", "-s", "--format=%s", commit_sha)
+    match = re.search(r"\(#(\d+)\)\s*$", subject)
+    return int(match.group(1)) if match else None
+
+
+def source_integrated_upstream_commits(
+    root: Path,
+    upstream_sha: str,
+    upstream_remote: str,
+    *,
+    merge_missing: bool,
+) -> list[dict[str, Any]] | None:
+    """Prove upstream-only commits are present through their exact merged PR heads.
+
+    GitHub squash commits often stop being patch-equivalent after this fork has
+    resolved the original PR head additively.  The upstream commit title still
+    records the source PR number.  Fetching that immutable merged PR ref and
+    proving its exact head is an ancestor gives us a stronger lineage check than
+    taking either side of a repeated text conflict.
+    """
+    cherry = run(["git", "cherry", "HEAD", upstream_sha], cwd=root, check=False)
+    if cherry.returncode != 0:
+        return None
+    records: list[dict[str, Any]] = []
+    for line in [value.strip() for value in cherry.stdout.splitlines() if value.strip()]:
+        sign, commit_sha = line.split(maxsplit=1)
+        if sign == "-":
+            records.append({"upstream_commit": commit_sha, "status": "patch-equivalent"})
+            continue
+        pr_number = upstream_commit_source_pr(root, commit_sha)
+        if pr_number is None:
+            return None
+        ref = f"refs/remotes/upstream-main-prs/{pr_number}"
+        try:
+            retry(
+                ["git", "fetch", "--force", upstream_remote, f"refs/pull/{pr_number}/head:{ref}"],
+                cwd=root,
+            )
+        except RuntimeError:
+            return None
+        pr_head = git(root, "rev-parse", ref)
+        status = "already-present"
+        merge_commit: str | None = None
+        if not is_ancestor(root, pr_head, "HEAD"):
+            if not merge_missing:
+                return None
+            merged = run(
+                [
+                    "git",
+                    "merge",
+                    "--no-ff",
+                    "-m",
+                    f"Merge exact source head for upstream main PR #{pr_number}",
+                    "-m",
+                    f"Source head: {pr_head}\nUpstream squash commit: {commit_sha}",
+                    pr_head,
+                ],
+                cwd=root,
+                check=False,
+            )
+            if merged.returncode != 0:
+                git(root, "merge", "--abort")
+                return None
+            status = "merged"
+            merge_commit = git(root, "rev-parse", "HEAD")
+        record: dict[str, Any] = {
+            "upstream_commit": commit_sha,
+            "source_pr": pr_number,
+            "source_head": pr_head,
+            "status": status,
+        }
+        if merge_commit:
+            record["merge_commit"] = merge_commit
+        records.append(record)
+    return records
+
+
 def markdown_escape(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
@@ -414,12 +494,54 @@ def command_assemble(args: argparse.Namespace) -> int:
                     "original_conflict_files": files,
                 }
             else:
-                upstream_main_result = {
-                    "status": "conflict",
-                    "conflict_files": files,
-                    "conflict_stages": stages,
-                    "error": ((merged_main.stdout or "") + (merged_main.stderr or ""))[-2000:].strip(),
-                }
+                source_records = source_integrated_upstream_commits(
+                    root,
+                    upstream_main_sha,
+                    args.upstream_remote,
+                    merge_missing=True,
+                )
+                source_proof = (
+                    source_records
+                    and source_integrated_upstream_commits(
+                        root,
+                        upstream_main_sha,
+                        args.upstream_remote,
+                        merge_missing=False,
+                    )
+                )
+                if source_proof:
+                    topology_merge = run(
+                        [
+                            "git",
+                            "merge",
+                            "--strategy=ours",
+                            "--no-ff",
+                            "-m",
+                            f"Bridge source-integrated {snapshot['upstream_repository']} main ancestry",
+                            "-m",
+                            "Every upstream-only squash commit is represented by its exact merged PR head "
+                            "in the fork; preserve the fork-resolved tree while recording upstream ancestry.",
+                            upstream_main_sha,
+                        ],
+                        cwd=root,
+                        check=False,
+                    )
+                    if topology_merge.returncode != 0 or not is_ancestor(root, upstream_main_sha, "HEAD"):
+                        raise RuntimeError("source-integrated upstream topology merge failed")
+                    upstream_main_result = {
+                        "status": "source-pr-topology-merge",
+                        "merge_commit": git(root, "rev-parse", "HEAD"),
+                        "source_pr_commits": source_records,
+                        "original_conflict_files": files,
+                    }
+                else:
+                    upstream_main_result = {
+                        "status": "conflict",
+                        "conflict_files": files,
+                        "conflict_stages": stages,
+                        "source_pr_commits": source_records or [],
+                        "error": ((merged_main.stdout or "") + (merged_main.stderr or ""))[-2000:].strip(),
+                    }
 
     fetch_errors: dict[int, str] = {}
     for pr in sorted(prs, key=lambda item: item.number):

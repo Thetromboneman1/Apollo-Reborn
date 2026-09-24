@@ -148,6 +148,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloFindInCommentsGlass.xm \
     $(SRC_DIR)/ApolloStatsRowTouch.xm \
     $(SRC_DIR)/ApolloCommentVoteFlicker.xm \
+    $(SRC_DIR)/ApolloPostedCommentInsert.xm \
     $(SRC_DIR)/ApolloLiveCommentsFollow.xm \
     $(SRC_DIR)/settings/ApolloSettingsGeneralTable.xm \
     $(SRC_DIR)/settings/ApolloSettingsNativeInjections.xm \
@@ -206,6 +207,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloBoldPostTitles.xm \
     $(SRC_DIR)/ApolloNativeActionMenus.xm \
     $(SRC_DIR)/ApolloContextMenuPreviewTheme.xm \
+    $(SRC_DIR)/ApolloPostPreviewWindowGuard.xm \
     $(SRC_DIR)/ApolloActionMenu.xm \
     $(SRC_DIR)/ApolloActionMenuLayout.m \
     $(SRC_DIR)/ApolloHostedVideo.m \
