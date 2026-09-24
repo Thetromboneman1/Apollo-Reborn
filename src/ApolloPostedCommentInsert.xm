@@ -158,7 +158,9 @@ static void ApolloPostedCommentDisplayPendingCell(UITableView *tableView, UITabl
 // it). ApolloOwnCommentFlair.xm hooks the same funnel to arm its flair backfill; both hooks only
 // observe and call %orig, so their order is irrelevant.
 - (id)submitComment:(id)body onThingWithFullName:(id)fullName completion:(ApolloPostedCommentCompletion)completion {
-    if (!completion) return %orig;
+    if (!completion) {
+        return %orig;
+    }
     ApolloPostedCommentCompletion wrapped = ^(id object, NSError *error) {
         BOOL previous = sApolloPostedCommentCompletionActive;
         // A failed submit shows an alert instead of inserting; an off-main delivery could not
@@ -178,7 +180,10 @@ static void ApolloPostedCommentDisplayPendingCell(UITableView *tableView, UITabl
 %hook ASTableNode
 
 - (void)performBatchAnimated:(BOOL)animated updates:(void (^)(void))updates completion:(void (^)(BOOL))completion {
-    if (!sApolloPostedCommentCompletionActive || animated) { %orig; return; }
+    if (!sApolloPostedCommentCompletionActive || animated) {
+        %orig;
+        return;
+    }
     if (!ApolloPostedCommentTableIsCommentsList(self)) {
         ApolloLog(@"[PostedCommentInsert] non-animated batch during a comment submit is not on a comments list — leaving it");
         %orig;
