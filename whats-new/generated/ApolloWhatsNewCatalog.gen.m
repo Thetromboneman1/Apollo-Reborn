@@ -19,6 +19,7 @@ static const ApolloWhatsNewReleaseEntry kWhatsNewReleases[] = {
     { "3.6.0", "What's New in Apollo Reborn" },
     { "3.7.0", "What's New in Apollo Reborn" },
     { "3.7.1", "What's New in Apollo Reborn" },
+    { "3.8.0", "What's New in Apollo Reborn" },
 };
 
 static const ApolloWhatsNewItemEntry kWhatsNewItems[] = {
@@ -55,6 +56,14 @@ static const ApolloWhatsNewItemEntry kWhatsNewItems[] = {
     { "3.7.1", "ellipsis.circle.fill", "Pill Stays Expanded", "The Liquid Glass action pill stays expanded again; turn on Collapse Navigation Actions if you preferred the collapsing one." },
     { "3.7.1", "menubar.rectangle", "Hide Header on Scroll", "Let the navigation bar follow the tab bar as it hides, and pick Hidden as a Header Style again." },
     { "3.7.1", "speaker.wave.2.fill", "Media & Menu Fixes", "Videos stay audible after rotating, adding to a multireddit no longer reports an error, and the \342\213\257 sheet gets along with other tweaks." },
+    { "3.8.0", "square.and.arrow.down.on.square.fill", "Save All Media", "Save every image, GIF, and video in a gallery or album at once, with a progress ring and Cancel." },
+    { "3.8.0", "person.2.circle.fill", "New Account Switcher", "A themed bottom sheet with bigger avatars, Add Account and Edit up top, and smoother reordering." },
+    { "3.8.0", "clock.arrow.circlepath", "Automatic Backups", "Back up your settings to a folder in Files on a schedule, and restore one by opening it from Files." },
+    { "3.8.0", "gearshape.fill", "Settings Shortcuts", "Press and hold the Settings tab to jump straight to the settings pages you use most." },
+    { "3.8.0", "arrow.uturn.backward.circle.fill", "Back to Where You Were", "After a status-bar tap takes you to the top, tap the Return Button or the status bar again to jump back." },
+    { "3.8.0", "person.crop.circle.fill", "Profiles, Refreshed", "Pick a profile picture shape, see Immersive profile art behind the bars, and browse Hidden & Deleted as one feed." },
+    { "3.8.0", "play.rectangle.fill", "Smoother Media", "Albums zoom open like single images, and Gallery View plays GIF and video tiles silently." },
+    { "3.8.0", "checkmark.shield.fill", "Stability & Fixes", "Fixes for a startup crash loop, Live Update and search crashes, glass search bar quirks, and settings scrolling." },
 };
 
 static NSString *S(const char *value) { return [NSString stringWithUTF8String:value]; }
