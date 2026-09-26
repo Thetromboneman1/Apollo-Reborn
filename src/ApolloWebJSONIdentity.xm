@@ -912,6 +912,30 @@ static id ApolloWebJSONThingProperty(id thing, SEL selector) {
 }
 %end
 
+// Validate at the request completion boundary, where the original endpoint
+// survives redirects and every serializer/cache path has already finished.
+%hook RDKClient
+- (id)taskWithMethod:(NSString *)method path:(NSString *)path parameters:(id)parameters
+    completion:(void (^)(NSHTTPURLResponse *, id, NSError *))completion {
+    if (!completion) return %orig;
+    NSString *requestMethod = [method copy];
+    NSString *requestPath = [path copy];
+    NSString *username = ApolloWebJSONShouldActForClient(self) ? ApolloWebJSONClientUsername(self) : nil;
+    ApolloWebJSONCheckAccountSession(username);
+    void (^wrapped)(NSHTTPURLResponse *, id, NSError *) = ^(NSHTTPURLResponse *response, id object, NSError *error) {
+        NSError *sessionError = ApolloWebJSONAccountSessionError(username);
+        if (sessionError) {
+            completion(response, nil, sessionError);
+            return;
+        }
+        id guarded = ApolloWebJSONGuardListingTaskResponse(requestMethod, requestPath, response, object, &error);
+        if (object && !guarded) ApolloWebJSONNoteMalformedAccountResponse(username, requestPath);
+        completion(response, guarded, error);
+    };
+    return %orig(method, path, parameters, wrapped);
+}
+%end
+
 // Comment writes (/api/editusertext, /api/comment) can come back in the legacy
 // old-reddit {parent, content:"<html>"} shape — always from www.reddit.com
 // (Web JSON mode), and intermittently from oauth.reddit.com for API-key
