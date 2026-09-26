@@ -941,18 +941,16 @@ static NSString *ApolloUserProfileChargedWebSessionUsername(void) {
 
 - (void)batchPrefetchProfilesForFullNames:(NSArray<NSString *> *)fullNames {
     if (fullNames.count == 0) return;
+
     dispatch_async(self.queue, ^{
-        // Resolve the active account's token on the cache queue so a rejected
-        // token from another account cannot poison this batch. API-Key-Free
-        // accounts intentionally fall through to the signed-in web session.
+        // API-Key-Free accounts have no bearer (ApolloActiveAccountRedditBearerToken
+        // returns nil for them): send the batch to www.reddit.com, where the
+        // chokepoint signs it in with the web session cookie. That's one request per
+        // 100 authors against the session's Reddit budget, where the per-cell path
+        // spends one per author. With neither a bearer nor a web session, the
+        // per-cell about.json path covers us. (Resolved here, not on the caller's
+        // main thread: both lookups read the keychain.)
         NSString *token = ApolloActiveAccountRedditBearerToken();
-        // API-Key-Free accounts have no bearer: send the batch to
-        // www.reddit.com, where the chokepoint signs it in with the web session
-        // cookie. That's one request per 100 authors against the session's
-        // Reddit budget, where the per-cell path spends one per author. With
-        // neither a bearer nor a web session, the per-cell about.json path
-        // covers us. (Resolved here, not on the caller's main thread: the
-        // session lookup reads the keychain.)
         NSString *webSessionUsername = token.length > 0 ? nil : ApolloUserProfileChargedWebSessionUsername();
         if (token.length == 0 && webSessionUsername.length == 0) return;
         // Nothing is marked as requested while held, so a later thread open
