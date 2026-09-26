@@ -56,7 +56,7 @@ static void ApolloUserFlairInitializeSharedState(void) {
     // Sheets must stay resident while the flair selector crops rows out of
     // them lazily, and one sheet can be arbitrarily large, so this is bounded
     // by count and emptied on a memory warning rather than by bytes.
-    sApolloUserFlairSheetCache.countLimit = 8;
+    sApolloUserFlairSheetCache.countLimit = 6;
     ApolloMemoryRegisterPurgableCache(@"flair-sprite-sheets", sApolloUserFlairSheetCache);
     sApolloUserFlairSpriteImageByPath = [NSMapTable strongToWeakObjectsMapTable];
 }
