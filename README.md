@@ -123,7 +123,7 @@ Finally, **don't copy these examples verbatim**. If everyone adopts the same "sa
 
 ### Self-hosted notifications (advanced)
 
-The legacy Apollo push backends went dark in June 2023 and are otherwise blocked by the tweak. If you run your own instance of [apollo-backend](https://github.com/Apollo-Reborn/apollo-backend), you can set the URL under **Settings > Custom API > Notification Backend** and the tweak will route all `apollopushserver.xyz`, `beta.apollonotifications.com`, and `apolloreq.com` traffic to that host instead. Leave the field empty to keep the current "silently dropped" behavior.
+The legacy Apollo push backends went dark in June 2023 and are otherwise blocked by the tweak. If you run your own instance of [apollo-backend](https://github.com/Apollo-Reborn/apollo-backend), you can set the URL under **Settings > Custom API > Notification Backend** and the tweak will route all `apollopushserver.xyz`, `apollonotifications.com`, and `beta.apollonotifications.com` traffic to that host instead. Leave the field empty to keep the current "silently dropped" behavior.
 
 Notifications can be delivered two ways — pick the one that matches your Apple account:
 
@@ -392,7 +392,7 @@ See [repository maintenance](docs/repository-maintenance.md) before syncing.
 ![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
 
 - **Default branch:** `main`
-- **Implementation fingerprint:** `91b97e410040395d`
+- **Implementation fingerprint:** `5c8ea5c6edf8f057`
 - **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.

@@ -56,20 +56,15 @@ NSData *ApolloWebJSONFixupListingMediaResponseData(NSURLResponse *response, NSDa
 // mode or for any other endpoint. Called from the RDKResponseSerializer hook.
 id ApolloWebJSONFixupModeratorsResponseObject(NSURLResponse *response, id responseObject);
 
-// Listing-shape guard for RDKResponseSerializer's output (#1135). Some of
-// RedditKit's listing completions (the moderated-subreddits one, at least)
-// index the parsed body as a dictionary with no class check, and the
-// serializer parses with NSJSONReadingAllowFragments, so a
-// Reddit body whose JSON root is an array / string / number / bare `null`
-// reaches them as NSArray / NSString / NSNumber / NSNull and crashes on
-// -objectForKeyedSubscript:. For a Reddit path whose valid root is a listing
-// dictionary, a non-dictionary object is returned as nil with `error` filled
-// so the completion takes its ordinary error path instead. Returns
-// `responseObject` untouched for dictionaries, nil, non-Reddit hosts, and the
-// path families whose root is legitimately an array (comments, duplicates,
-// /prefs/*, /api/*). Runs in every auth mode. Called from the
-// RDKResponseSerializer hook right after the original serializer.
-id ApolloWebJSONGuardListingResponseObject(NSURLResponse *response, id responseObject, NSError **error);
+// Guard RedditKit listing completions using their ORIGINAL request path.
+// Redirects can change response.URL to a non-listing path, so validating only
+// the serializer's response URL misses malformed login/error responses.
+// A non-dictionary listing result becomes nil + an error, even if an existing
+// error is already present (native completions inspect the object first).
+// Valid dictionary responses, nil, writes and array-rooted endpoints pass through.
+id ApolloWebJSONGuardListingTaskResponse(NSString *method, NSString *path,
+                                        NSHTTPURLResponse *response, id responseObject,
+                                        NSError **error);
 
 // YES if `response` is GET /api/v1/<sub>/moderators_invited and a cookie
 // session is active — this endpoint is OAuth2-only with no cookie-compatible
@@ -171,6 +166,13 @@ void ApolloWebJSONNoteSessionReauthenticationDeferred(NSString *username);
 // listens to offer re-login for that specific account.
 extern NSString *const ApolloWebJSONSessionExpiredNotification;
 
+// Posted (on the main thread) when Reddit starts refusing the ACTIVE web-session
+// account's requests with HTTP 429, so a feed that won't load gets an
+// explanation instead of an endless spinner. userInfo[@"username"] is the
+// lowercased account, userInfo[@"seconds"] the expected wait (see
+// ApolloWebJSONOptionalReadBackoff). Tweak.xm shows it as a toast.
+extern NSString *const ApolloWebJSONSessionRateLimitedNotification;
+
 // Sentinel access-token string the identity layer (ApolloWebJSONIdentity.xm)
 // installs as a synthetic OAuth credential so Apollo proceeds to issue requests
 // without real API keys. It's never sent to Reddit (the chokepoint strips
@@ -256,6 +258,23 @@ NSURL *ApolloWebJSONProbeURL(NSURL *url);
 // requests must pass through the network hooks completely untouched: no Web
 // JSON rewrite, no User-Agent stamping (they pick their UA deliberately).
 BOOL ApolloWebJSONURLIsProbe(NSURL *url);
+
+// Seconds the tweak's optional reads (author avatars, subreddit header info)
+// for `username`'s web session should wait, or 0 when they may go ahead.
+// Reddit doesn't report a web session's remaining request budget (cookie
+// responses carry no x-ratelimit headers); the only signal is the HTTP 429 it
+// sends once the budget is spent, and that 429 also stops Apollo's own feed and
+// comment loads until the window resets. After one, this returns the time left
+// until the reset so the optional reads stop adding to it. Fed by
+// ApolloWebJSONNoteResponse from every cookie-authenticated response. 0 for
+// API-key accounts, when Web JSON is off, or when no 429 has been seen. Any
+// thread.
+NSTimeInterval ApolloWebJSONOptionalReadBackoff(NSString *username);
+
+// Verify the requesting web account independently of public HTTP successes.
+void ApolloWebJSONCheckAccountSession(NSString *username);
+void ApolloWebJSONNoteMalformedAccountResponse(NSString *username, NSString *path);
+NSError *ApolloWebJSONAccountSessionError(NSString *username);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,7 @@
 #import "ApolloAccountSwitcherViewController.h"
 #import "ApolloAccountCredentials.h"
 #import "ApolloWebSessionStore.h"
+#import "ApolloMessageDraftStore.h"
 #import "ApolloWebSessionLoginViewController.h"
 #import "ApolloState.h"
 #import "ApolloThemeRuntime.h"
@@ -766,6 +767,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
         self.accountRemovalRefreshScheduled = YES;
         [self.pendingAccountRemovals removeAllObjects];
         ApolloAccountCredentialsRemove(username);
+        ApolloMessageDraftStoreMarkAccountPendingDelete(username);
         ApolloWebSessionRemove(username);
         NSMutableArray *updated = [self.rows mutableCopy];
         [updated removeObjectAtIndex:index];
@@ -1372,9 +1374,10 @@ static BOOL ApolloAccountReorderSchedulePersist(
 }
 
 // Starts Apollo's own OAuth add-account flow via the live instance's real "+"
-// bar button action (verified selector: -addBarButtonItemTapped:). The new
-// account is created with the default API key; set a custom key for it
-// afterward via the per-account editor (tap its row's › once it appears).
+// bar button action (verified selector: -addBarButtonItemTapped:). The sign-in
+// uses ApolloEffectiveRedditClientId(): the ACTIVE account's saved key when it
+// has one, otherwise the default API key. Set a custom key for the new account
+// afterward via the per-account editor (tap its row's ⋯ once it appears).
 - (void)driveLiveAddAccount {
     if (!self.liveManager) {
         ApolloLog(@"[AccountSwitcher] No live manager — cannot start add-account flow");

@@ -31,9 +31,11 @@
 #import "Defaults.h"
 #import "ApolloMarkdownToolbarGif.h"
 #import "ApolloWebAuthViewController.h"
+#import "ApolloToast.h"
 #import "ApolloWebJSON.h"
 #import "ApolloWebSessionStore.h"
 #import "ApolloWebSessionLoginViewController.h"
+#import "ApolloMessageDraftStore.h"
 #import "ApolloAccountCredentials.h"
 #import "ApolloRecommendedSettingsMigration.h"
 #import "ApolloPerAccountFavorites.h"
@@ -73,6 +75,15 @@ static BOOL IsValetQuery(NSDictionary *query) {
     NSString *service = query[(__bridge id)kSecAttrService];
     return service && [service containsString:kValetServiceSubstring];
 }
+
+#if APOLLO_SIM_BUILD
+// Simulator only: drafts use their own service so they never enter device
+// Valet self-heal. Route that exact service through the persisted simulator
+// shim because ad-hoc simulator apps have no Keychain entitlement.
+static BOOL IsMessageDraftQuery(NSDictionary *query) {
+    return [query[(__bridge id)kSecAttrService] isEqualToString:ApolloMessageDraftKeychainService];
+}
+#endif
 
 static BOOL IsUltraProOverrideKey(NSDictionary *query) {
     NSString *account = query[(__bridge id)kSecAttrAccount];
@@ -1214,7 +1225,7 @@ static void ApolloDeleteStaleKeychainItem(NSDictionary *query) {
 static OSStatus SecItemAdd_replacement(CFDictionaryRef query, CFTypeRef *result) {
     NSDictionary *strippedQuery = stripGroupAccessAttr(query);
 #if APOLLO_SIM_BUILD
-    if (IsValetQuery(strippedQuery)) {
+    if (IsValetQuery(strippedQuery) || IsMessageDraftQuery(strippedQuery)) {
         id value = strippedQuery[(__bridge id)kSecValueData];
         if ([value isKindOfClass:[NSData class]]) {
             SimKeychainStore()[SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount])] = value;
@@ -1300,7 +1311,7 @@ static OSStatus SecItemCopyMatching_replacement(CFDictionaryRef query, CFTypeRef
     }
 
 #if APOLLO_SIM_BUILD
-    if (IsValetQuery(strippedQuery)) {
+    if (IsValetQuery(strippedQuery) || IsMessageDraftQuery(strippedQuery)) {
         NSData *data = SimKeychainStore()[SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount])];
         if (data) return SimKeychainServe(strippedQuery, data, result);
         return errSecItemNotFound;
@@ -1418,7 +1429,7 @@ static OSStatus SecItemUpdate_replacement(CFDictionaryRef query, CFDictionaryRef
     }
 
 #if APOLLO_SIM_BUILD
-    if (IsValetQuery(strippedQuery)) {
+    if (IsValetQuery(strippedQuery) || IsMessageDraftQuery(strippedQuery)) {
         NSString *key = SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount]);
         id value = attrs[(__bridge id)kSecValueData];
         if ([value isKindOfClass:[NSData class]]) {
@@ -1501,7 +1512,7 @@ static OSStatus SecItemUpdate_replacement(CFDictionaryRef query, CFDictionaryRef
 static OSStatus SecItemDelete_replacement(CFDictionaryRef query) {
     NSDictionary *strippedQuery = stripGroupAccessAttr(query);
 #if APOLLO_SIM_BUILD
-    if (IsValetQuery(strippedQuery)) {
+    if (IsValetQuery(strippedQuery) || IsMessageDraftQuery(strippedQuery)) {
         NSString *key = SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount]);
         if (SimKeychainStore()[key]) {
             [SimKeychainStore() removeObjectForKey:key];
@@ -1969,8 +1980,9 @@ void ApolloPrepareRandomNSFWSubredditSource(
         });
 }
 // Replace Reddit API client ID. Resolved per-account (see
-// ApolloAccountCredentials.{h,m}): a pending add-account choice, else the
-// active account's stored override, else the global default — instead of
+// ApolloAccountCredentials.{h,m}): the active account's stored override, else
+// the global default — also for a new sign-in started while that account is
+// active (ApolloWebAuthViewController explains a rejected key) — instead of
 // unconditionally forcing the single global client id/redirect URI onto every
 // account, which broke a second account's login/refresh under a different key.
 %hook RDKOAuthCredential
@@ -3740,6 +3752,22 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
 }
 %end
 
+// Reddit refusing the active API-Key-Free session (#1163, #1225): say so, rather
+// than leave a feed that won't load spinning with no explanation. Shown when the
+// limit starts (ApolloWebJSONSessionRateLimitedNotification) and again when the
+// app comes back while it still holds. At most once every 30s, so the launch-time
+// notice and the didBecomeActive right after it don't both show. Main thread.
+static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
+    static NSTimeInterval sLastShownAt = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - sLastShownAt < 30.0) return;
+    sLastShownAt = now;
+    NSString *detail = seconds < 60.0
+        ? @"Try again in under a minute"
+        : [NSString stringWithFormat:@"Try again in about %lu min", (unsigned long)ceil(seconds / 60.0)];
+    ApolloShowToastWithStyle(@"Reddit Rate Limit Reached", detail, ApolloToastStyleError, @"exclamationmark.triangle");
+}
+
 // MARK: - Constructor
 %ctor {
     // Local crash recording installs before anything else in the tweak (and
@@ -4305,6 +4333,23 @@ static BOOL ApolloDefaultsKeyChangesNativeFavorites(NSString *key) {
                                                   usingBlock:^(NSNotification *note) {
         NSString *username = note.userInfo[@"username"];
         [ApolloWebSessionLoginViewController presentExpiredSessionPromptForUsername:username];
+    }];
+    // ...and a rate-limited one (HTTP 429 on every request until Reddit's
+    // window resets) as a toast, the moment it starts and on each return to
+    // the app while it lasts. Only web-session accounts ever record a limit,
+    // so API-key accounts never see this.
+    [[NSNotificationCenter defaultCenter] addObserverForName:ApolloWebJSONSessionRateLimitedNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        ApolloShowRedditRateLimitToast([note.userInfo[@"seconds"] doubleValue]);
+    }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(__unused NSNotification *note) {
+        NSTimeInterval wait = ApolloWebJSONOptionalReadBackoff(ApolloActiveWebSessionUsername());
+        if (wait > 0) ApolloShowRedditRateLimitToast(wait);
     }];
     // Picture-in-Picture hydration.
     sPiPEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPictureInPictureEnabled];

@@ -20,6 +20,7 @@ THEME_GALLERY_GEN_M := $(THEOS_PROJECT_DIR)/$(THEME_GALLERY_DIR)/generated/Apoll
 WHATS_NEW_DIR := whats-new
 WHATS_NEW_GEN_H := $(THEOS_PROJECT_DIR)/$(WHATS_NEW_DIR)/generated/ApolloWhatsNewCatalog.gen.h
 WHATS_NEW_GEN_M := $(THEOS_PROJECT_DIR)/$(WHATS_NEW_DIR)/generated/ApolloWhatsNewCatalog.gen.m
+BARK_ICON_NAMES_H := $(THEOS_PROJECT_DIR)/$(SRC_DIR)/generated/ApolloBarkIconNames.gen.h
 
 SSZIPARCHIVE_FILES = $(wildcard $(SSZIPARCHIVE_DIR)/*.m) \
     $(wildcard $(SSZIPARCHIVE_DIR)/minizip/*.c) \
@@ -78,6 +79,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloRedditMediaUpload.m \
     $(SRC_DIR)/ApolloNotificationBackendPath.m \
     $(SRC_DIR)/ApolloNotificationBackend.m \
+    $(SRC_DIR)/ApolloBarkIconResolver.m \
     $(SRC_DIR)/ApolloUsageHeartbeat.m \
     $(SRC_DIR)/ApolloPushNotifications.m \
     $(SRC_DIR)/ApolloLiquidGlassIconIDs.m \
@@ -114,6 +116,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSaveAllMediaBridge.swift \
     $(SRC_DIR)/ApolloSaveAllMediaMenus.xm \
     $(SRC_DIR)/ApolloGIFSaveActivity.xm \
+    $(SRC_DIR)/ApolloShareMediaHandoff.xm \
     $(SRC_DIR)/ApolloMediaDownloadActions.xm \
     $(SRC_DIR)/ApolloLinkedAlbumPostControls.xm \
     $(SRC_DIR)/ApolloFeedAlbumMenus.xm \
@@ -163,6 +166,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloLiquidGlassIconPicker.xm \
     $(SRC_DIR)/ApolloModmailLayout.xm \
     $(SRC_DIR)/ApolloModmailSubjectCounter.xm \
+    $(SRC_DIR)/ApolloMessagesKeyboardInset.xm \
     $(SRC_DIR)/ApolloAutoHideTabBar.xm \
     $(SRC_DIR)/ApolloTopBarScrollPresentation.m \
     $(SRC_DIR)/ApolloListBottomInsetGuard.xm \
@@ -279,6 +283,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloInlineLinkPreviews.xm \
     $(SRC_DIR)/ApolloChatInlineImages.xm \
     $(SRC_DIR)/ApolloChatComposer.xm \
+    $(SRC_DIR)/ApolloMessageDraftStore.m \
+    $(SRC_DIR)/ApolloMessagesReplyBarRestore.xm \
     $(SRC_DIR)/ApolloChatsFilter.xm \
     $(SRC_DIR)/ApolloDirectChatWeb.xm \
     $(SRC_DIR)/ApolloLinkCardTitleFallback.xm \
@@ -396,7 +402,7 @@ ApolloReborn_CFLAGS += \
 # the Swift module-interface build, where a C++ -std flag is a hard error.
 ApolloReborn_LIBRARIES += c++
 
-ApolloReborn_BUNDLE_RESOURCE_DIRS = resources
+ApolloReborn_BUNDLE_RESOURCE_DIRS = Resources
 ApolloReborn_BUNDLE_RESOURCES = \
     assets/bark-icons/low-battery.png \
     assets/bark-icons/palette.png \
@@ -435,6 +441,12 @@ ApolloReborn_CFLAGS += -Wno-deprecated-declarations
 # screenshots. Only ever compiled into the simulator build, never the device/
 # release build (this branch is under the APOLLO_SIM_BUILD ifeq).
 ApolloReborn_FILES += $(SRC_DIR)/ApolloSimOpenRoute.m
+# Sim-only: runs +[ASDisplayNode initialize] from +load, ahead of every Logos
+# %init, so the internal generator can find the Texture lifecycle callbacks a
+# node class inherits (didEnterVisibleState etc.) and those %hooks install.
+# Device builds hook through Substrate, which runs +initialize on its own. See
+# src/ApolloSimTextureInit.m.
+ApolloReborn_FILES += $(SRC_DIR)/ApolloSimTextureInit.m
 # Opt-in /api/comment write diagnostics + legacy-response-shape simulator
 # (APOLLO_COMMENT_DEBUG=1 scripts/run-in-sim.sh). Used to reproduce Reddit's
 # 2026-08 legacy write-response regression against the OAuth path on demand —
@@ -455,8 +467,8 @@ endif
 
 CONTROL_FILE = $(THEOS_PROJECT_DIR)/control
 
-# Generate Version.h, the theme gallery catalog, and the What's New catalog.
-before-all:: generate_version_h generate_theme_gallery_catalog generate_whats_new_catalog
+# Generate Version.h and the checked-in catalogs/asset manifests.
+before-all:: generate_version_h generate_theme_gallery_catalog generate_whats_new_catalog generate_bark_icon_names
 
 generate_version_h:
 	@echo "Generating Version.h from control file"
@@ -485,6 +497,15 @@ $(WHATS_NEW_GEN_H) $(WHATS_NEW_GEN_M): $(THEOS_PROJECT_DIR)/$(WHATS_NEW_DIR)/scr
 		$(THEOS_PROJECT_DIR)/$(WHATS_NEW_DIR)/releases \
 		$(WHATS_NEW_GEN_H) \
 		$(WHATS_NEW_GEN_M)
+
+BARK_ICON_PNGS := $(wildcard $(THEOS_PROJECT_DIR)/assets/bark-icons/*.png)
+
+generate_bark_icon_names: $(BARK_ICON_NAMES_H)
+
+$(BARK_ICON_NAMES_H): $(THEOS_PROJECT_DIR)/scripts/generate-bark-icon-names.py $(BARK_ICON_PNGS)
+	@python3 $(THEOS_PROJECT_DIR)/scripts/generate-bark-icon-names.py \
+		$(THEOS_PROJECT_DIR)/assets/bark-icons \
+		$(BARK_ICON_NAMES_H)
 
 # Liquid Glass icon metadata header is generated explicitly by running 'make lg-previews'
 LG_DIR = $(THEOS_PROJECT_DIR)/liquid-glass

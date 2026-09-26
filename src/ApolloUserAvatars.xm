@@ -1976,9 +1976,21 @@ static id ApolloBestAuthorTextNodeInRoot(id root, NSString *username) {
 static id ApolloBestAuthorTextNode(id cell, NSString *username) {
     id authorSubtree = ApolloResolveAuthorNodeSubtree(cell);
     if (authorSubtree) {
-        id node = ApolloBestAuthorTextNodeInRoot(authorSubtree, username);
-        if (node) return node;
+        // Once the cell has a known author node, the byline can only be in
+        // there, so never fall back to scanning the rest of the cell. Until
+        // the author button's first layout its title node is not in
+        // `subnodes`, so this finds nothing when -didLoad binds and the bind
+        // retry ladder picks the byline up once it lands. A cell-wide scan
+        // in that window matched post titles that name their own author: "by
+        // <name>" in "Rally Lutosus by Lowtrippy" (u/lowtrippy's post) scores
+        // exactly like the byline, so the avatar went into the title and
+        // stayed there (#977). The same scan hit every retry when a feed
+        // shows the subreddit instead of the author (no authorButtonNode, so
+        // this searches the whole PostInfoNode): with no author shown there
+        // is nothing to put an avatar on.
+        return ApolloBestAuthorTextNodeInRoot(authorSubtree, username);
     }
+    // No known author ivar on this cell: score every text node in it.
     return ApolloBestAuthorTextNodeInRoot(cell, username);
 }
 
@@ -2202,6 +2214,34 @@ static NSRange ApolloUsernameRangeInString(NSString *string, NSString *username)
     return ApolloUsernameWordRangeInString(string, normalized);
 }
 
+// A rewrite that rebuilds a byline from its plain string (feed translation did,
+// until it learned to skip the metadata row) keeps our avatar's U+FFFC and its
+// spacer as plain characters but drops the attachment: an invisible glyph plus a
+// visible space. Prepending a fresh avatar then leaves that residue in front of
+// it, so every such rewrite pushed the name one more space to the right (28
+// slots deep in the field log). Drop attachment-less slots directly in front of
+// the username so the byline carries exactly one avatar whoever rewrote it.
+static NSAttributedString *ApolloAttributedTextByRemovingOrphanedAvatarSlots(NSAttributedString *text, NSString *username) {
+    if (text.length < 2) return text;
+    NSString *string = text.string;
+    NSRange usernameRange = ApolloUsernameRangeInString(string, username);
+    if (usernameRange.location == NSNotFound) return text;
+
+    NSCharacterSet *whitespace = [NSCharacterSet whitespaceCharacterSet];
+    NSUInteger slotStart = usernameRange.location;
+    while (slotStart >= 2 &&
+           [whitespace characterIsMember:[string characterAtIndex:slotStart - 1]] &&
+           [string characterAtIndex:slotStart - 2] == NSAttachmentCharacter &&
+           ![text attribute:NSAttachmentAttributeName atIndex:slotStart - 2 effectiveRange:NULL]) {
+        slotStart -= 2;
+    }
+    if (slotStart == usernameRange.location) return text;
+
+    NSMutableAttributedString *cleaned = [text mutableCopy];
+    [cleaned deleteCharactersInRange:NSMakeRange(slotStart, usernameRange.location - slotStart)];
+    return [cleaned copy];
+}
+
 static NSAttributedString *ApolloAttributedTextByPrependingAvatar(NSAttributedString *baseText, NSString *username, UIImage *avatarImage, UIImage *decoratorImage, ApolloUserProfileInfo *info, CGFloat diameter) {
     if (!baseText.length) return baseText;
 
@@ -2336,6 +2376,7 @@ static BOOL ApolloSetAvatarImageOnTextNode(id textNode, NSString *username, UIIm
         baseText = current;
     }
     if (!baseText) baseText = current;
+    baseText = ApolloAttributedTextByRemovingOrphanedAvatarSlots(baseText, username);
     if (!ApolloAttributedTextContainsUsername(baseText, username)) return NO;
     if ([appliedToken isEqualToString:token] && ApolloTextLooksAvatarPrepended(current)) return NO;
 
@@ -2433,6 +2474,7 @@ static NSUInteger sApolloInlineAvatarMeasureBindLogCount = 0;
 static NSUInteger sApolloInlineAvatarGaveUpLogCount = 0;
 static NSUInteger sApolloInlineAvatarLateReapplyLogCount = 0;
 static NSUInteger sApolloInlineAvatarRewriteLogCount = 0;
+static NSUInteger sApolloInlineAvatarOrphanSlotLogCount = 0;
 static BOOL sApolloProfileTabSyncingView = NO;
 static NSUInteger sApolloInlineAvatarPlaceholderLogCount = 0;
 
@@ -2476,12 +2518,20 @@ static BOOL ApolloPrepareAvatarRewriteForTextNode(id textNode, NSAttributedStrin
         if (!decoratorImage && info.decoratorURL) decoratorImage = [cache cachedImageForURL:info.decoratorURL];
     }
 
+    // The incoming text becomes both the stored original and the base for the
+    // new avatar, so drop any slot a flattening rewrite left behind first.
+    NSAttributedString *baseText = ApolloAttributedTextByRemovingOrphanedAvatarSlots(incomingAttributedText, username);
+    if (baseText != incomingAttributedText && ApolloInlineAvatarShouldLog(&sApolloInlineAvatarOrphanSlotLogCount)) {
+        ApolloLog(@"[UserAvatars] Dropped %lu orphaned avatar slot(s) from a rewritten byline u/%@ node=%p",
+                  (unsigned long)((incomingAttributedText.length - baseText.length) / 2), username, textNode);
+    }
+
     CGFloat diameter = ApolloInlineAvatarDiameterForObject(textNode);
     NSString *token = ApolloAvatarTokenForInfo(info, avatarImage != nil, decoratorImage != nil, diameter);
-    NSAttributedString *updated = ApolloAttributedTextByPrependingAvatar(incomingAttributedText, username, avatarImage, decoratorImage, info, diameter);
-    if (!updated || updated == incomingAttributedText) return NO;
+    NSAttributedString *updated = ApolloAttributedTextByPrependingAvatar(baseText, username, avatarImage, decoratorImage, info, diameter);
+    if (!updated || updated == baseText) return NO;
 
-    objc_setAssociatedObject(textNode, kApolloAvatarOriginalAttributedTextKey, incomingAttributedText, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(textNode, kApolloAvatarOriginalAttributedTextKey, baseText, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(textNode, kApolloAvatarUsernameKey, username, OBJC_ASSOCIATION_COPY_NONATOMIC);
     objc_setAssociatedObject(textNode, kApolloAvatarAppliedTokenKey, token, OBJC_ASSOCIATION_COPY_NONATOMIC);
     objc_setAssociatedObject(textNode, kApolloAvatarOwnedTextNodeKey, (id)kCFBooleanTrue, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -2714,6 +2764,46 @@ static void ApolloApplyInlineAvatarInfoToCell(id cell, NSString *username, Apoll
     }];
 }
 
+// ---- API-Key-Free: wait for the batched lookup ----
+// With no captured OAuth bearer (an API-Key-Free account), every profile lookup
+// goes out on the web session's cookie, against the same Reddit request budget
+// as the feed and comment loads (see ApolloWebJSONOptionalReadBackoff). Comment
+// authors are queued for the batched lookup as their cells enter the preload
+// range (ApolloInlineAvatarBatchEnqueueFromCommentCell), and a batch lands within
+// a second or so. A cell whose author is still waiting on one holds off instead
+// of racing it with its own about.json; on a busy thread that race used to cost
+// one request per author on screen. Lowercased username -> when it was queued.
+// Main thread only; entries expire after ApolloInlineAvatarBatchWaitLimit.
+static NSMutableDictionary<NSString *, NSDate *> *sApolloInlineAvatarAwaitingBatchSince;
+static NSTimeInterval const ApolloInlineAvatarBatchWaitLimit = 3.0;
+
+static void ApolloInlineAvatarNoteQueuedForBatch(NSString *username) {
+    NSString *key = ApolloAvatarNormalizedUsername(username).lowercaseString;
+    if (key.length == 0) return;
+    // Only when the lookup would draw on a web session's budget (Web JSON on,
+    // no bearer); API-key lookups keep racing the batch as they always have.
+    if (!sWebJSONEnabled || sLatestRedditBearerToken.length > 0) return;
+    if (!sApolloInlineAvatarAwaitingBatchSince) sApolloInlineAvatarAwaitingBatchSince = [NSMutableDictionary dictionary];
+    if (sApolloInlineAvatarAwaitingBatchSince.count >= 256) {
+        NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-ApolloInlineAvatarBatchWaitLimit];
+        for (NSString *queued in sApolloInlineAvatarAwaitingBatchSince.allKeys) {
+            if ([sApolloInlineAvatarAwaitingBatchSince[queued] compare:cutoff] == NSOrderedAscending) {
+                [sApolloInlineAvatarAwaitingBatchSince removeObjectForKey:queued];
+            }
+        }
+    }
+    sApolloInlineAvatarAwaitingBatchSince[key] = [NSDate date];
+}
+
+static BOOL ApolloInlineAvatarShouldAwaitBatch(NSString *username) {
+    NSString *key = ApolloAvatarNormalizedUsername(username).lowercaseString;
+    NSDate *queuedAt = key.length > 0 ? sApolloInlineAvatarAwaitingBatchSince[key] : nil;
+    if (!queuedAt) return NO;
+    if (-[queuedAt timeIntervalSinceNow] < ApolloInlineAvatarBatchWaitLimit) return YES;
+    [sApolloInlineAvatarAwaitingBatchSince removeObjectForKey:key];
+    return NO;
+}
+
 static void ApolloScheduleInlineAvatarInfoFetchAttempt(id cell, NSString *username, NSUInteger attempt) {
     __weak id weakCell = cell;
     NSTimeInterval delay = ApolloInlineAvatarBindDelayForAttempt(attempt);
@@ -2752,6 +2842,14 @@ static void ApolloScheduleInlineAvatarInfoFetchAttempt(id cell, NSString *userna
         if (cachedInfo.iconURL) {
             ApolloClearPendingInlineAvatarFetch(strongCell, username);
             ApolloApplyInlineAvatarInfoToCell(strongCell, username, cachedInfo);
+            return;
+        }
+        // Still waiting on the batched lookup (API-Key-Free only, see above):
+        // check the cache again on the next rung instead of fetching now. The
+        // last rung falls through, so an author the batch didn't cover still
+        // gets their own lookup.
+        if (attempt + 1 < ApolloInlineAvatarMaxBindAttempts && ApolloInlineAvatarShouldAwaitBatch(username)) {
+            ApolloScheduleInlineAvatarInfoFetchAttempt(strongCell, username, attempt + 1);
             return;
         }
 
@@ -3058,6 +3156,33 @@ static void ApolloProfileApplySyntheticBanner(ApolloProfileHeaderView *header, A
     });
 }
 
+// Headers whose info lookup came back empty, by lowercased username. The lookup
+// can fail for a reason that says nothing about the user (Reddit rejecting an
+// expired bearer at launch, before Apollo refreshed it; a network error), and a
+// header only asks once, so it would sit on the placeholder until it reloads.
+// Whatever asks for that user next (opening the profile tab does) re-applies it
+// here. Main thread only. Weak values: an entry never keeps a header alive.
+static NSMapTable<NSString *, ApolloProfileHeaderView *> *ApolloProfileHeadersAwaitingInfo(void) {
+    static NSMapTable *headers;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ headers = [NSMapTable strongToWeakObjectsMapTable]; });
+    return headers;
+}
+
+// Runs from the ApolloUserProfileInfoUpdatedNotification observer (main queue).
+static void ApolloProfileReapplyInfoToAwaitingHeader(NSString *username) {
+    NSString *key = ApolloAvatarNormalizedUsername(username).lowercaseString;
+    if (key.length == 0) return;
+    NSMapTable<NSString *, ApolloProfileHeaderView *> *awaiting = ApolloProfileHeadersAwaitingInfo();
+    ApolloProfileHeaderView *header = [awaiting objectForKey:key];
+    if (!header) return;
+    [awaiting removeObjectForKey:key];
+    // Repointed to someone else since its lookup failed.
+    if (!ApolloAvatarUsernameMatches(header.username, key)) return;
+    ApolloLog(@"[UserAvatars] Profile info for u/%@ arrived after the header's lookup failed; applying it", key);
+    ApolloProfileLoadImages(header, header.username, NO);
+}
+
 static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *username, BOOL forceRefresh) {
     if (!header || username.length == 0) return;
     ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
@@ -3075,11 +3200,20 @@ static void ApolloProfileLoadImages(ApolloProfileHeaderView *header, NSString *u
     if (targetUsername.length == 0) return;
 
     void (^applyInfo)(ApolloUserProfileInfo *) = ^(ApolloUserProfileInfo *info) {
-        if (!info) return;
+        NSMapTable<NSString *, ApolloProfileHeaderView *> *awaiting = ApolloProfileHeadersAwaitingInfo();
+        if (!info) {
+            if (ApolloAvatarUsernameMatches(header.username, targetUsername)) {
+                [awaiting setObject:header forKey:targetUsername.lowercaseString];
+            }
+            return;
+        }
         // Dropped if the header was repointed to another user while this was in flight.
         if (!ApolloAvatarUsernameMatches(header.username, targetUsername)) {
             ApolloLog(@"[UserAvatars] Dropping stale profile info for u/%@ (header now u/%@)", targetUsername, header.username ?: @"nil");
             return;
+        }
+        if ([awaiting objectForKey:targetUsername.lowercaseString] == header) {
+            [awaiting removeObjectForKey:targetUsername.lowercaseString];
         }
         [header applyProfileInfo:info fallbackUsername:username];
 
@@ -4478,20 +4612,22 @@ static void ApolloInlineAvatarFireBatchNow(void) {
 // preload range at once → fire promptly once a burst accumulates; a slow trickle of
 // cells is gathered over a short window so it still collapses into one request rather
 // than many 1-id calls. Main-thread only, so the statics need no locking.
-static void ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
-    if (!sShowUserAvatars) return;
-    if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) return;
+// YES when `fullName` joined a batch (and will be looked up within ~0.6s).
+static BOOL ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
+    if (!sShowUserAvatars) return NO;
+    if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) return NO;
     if (!sApolloPendingBatchFullNames) sApolloPendingBatchFullNames = [NSMutableSet set];
     [sApolloPendingBatchFullNames addObject:fullName];
     if (sApolloPendingBatchFullNames.count >= 25) {
         ApolloInlineAvatarFireBatchNow();
-        return;
+        return YES;
     }
-    if (sApolloBatchFireScheduled) return;
+    if (sApolloBatchFireScheduled) return YES;
     sApolloBatchFireScheduled = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApolloInlineAvatarFireBatchNow();
     });
+    return YES;
 }
 
 // Read the comment cell's own RDKComment (the same safe ivar path the avatar binding
@@ -4506,7 +4642,7 @@ static void ApolloInlineAvatarBatchEnqueueFromCommentCell(id cell) {
     if (fullName.length == 0) return;
     NSString *username = ApolloUsernameFromModelObject(comment);
     if (username.length > 0 && [[ApolloUserProfileCache sharedCache] cachedInfoForUsername:username].iconURL) return;
-    ApolloInlineAvatarEnqueueFullNameForBatch(fullName);
+    if (ApolloInlineAvatarEnqueueFullNameForBatch(fullName)) ApolloInlineAvatarNoteQueuedForBatch(username);
 }
 
 // ASSizeRange { CGSize min; CGSize max; } — same -layoutSpecThatFits: ABI
@@ -5276,8 +5412,9 @@ static void ApolloInlineAvatarReapplyAfterModelUpdate(NSString *fullName) {
     [[NSNotificationCenter defaultCenter] addObserverForName:ApolloUserProfileInfoUpdatedNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
-                                                  usingBlock:^(__unused NSNotification *note) {
+                                                  usingBlock:^(NSNotification *note) {
         ApolloProfileScheduleTabAvatarRefresh(@"profile info update");
+        ApolloProfileReapplyInfoToAwaitingHeader(note.userInfo[ApolloUserProfileUsernameKey]);
     }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
                                                       object:nil
