@@ -6,6 +6,7 @@
 #import <limits.h>
 
 #import "ApolloCommon.h"
+#import "ApolloMemoryDiagnostics.h"
 #import "ApolloPostReadState.h"
 #import "settings/ApolloSettingsTableViewController.h"
 #import "ApolloState.h"
