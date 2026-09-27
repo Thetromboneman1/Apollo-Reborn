@@ -6,7 +6,7 @@ This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
 - Repository: `Thetromboneman1/Apollo-Reborn`
-- Default branch: `Thetromboneman1/all-open-upstream-prs-0caec4adab0d`
+- Default branch: `main`
 - Implementation fingerprint: `38927ddad0fef93f`
 - Maintained documents: 39
 - Architecture assets: 5
