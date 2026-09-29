@@ -80,6 +80,9 @@
 #import <sys/sysctl.h>
 
 #import "ApolloCommon.h"
+#import "ApolloDeviceGeometry.h"
+#import "ApolloDuoCompatibility.h"
+#import "ApolloDuoRail.h"
 
 // Apollo's stock strip height (sub_10030c494) and y (sub_10030c880).
 static const CGFloat kApolloPalStripHeight = 14.0;
@@ -97,6 +100,30 @@ static const CGFloat kApolloIslandWidenSlack = 4.0;
 // is the baseline all remaps are measured against. Main thread only.
 static CGRect sApolloPill;
 static BOOL sApolloPillKnown = NO;
+static char kApolloPixelPalsDuoHiddenKey;
+
+static BOOL ApolloPixelPalsDisabledForWindow(UIWindow *window) {
+    return ApolloDuoRailHasVisibleSideBar()
+        || ApolloDuoCurrentMode() != ApolloDuoModePhone
+        || (window && !ApolloShouldShowDynamicIslandChromeInWindow(window));
+}
+
+// Restore only views this module hid, leaving Apollo's own Pixel Pals setting
+// and lifecycle visibility untouched.
+static void ApolloPixelPalsApplyDuoHidden(UIView *view, BOOL hidden) {
+    if (!view) return;
+    if (hidden) {
+        if (!view.hidden) {
+            objc_setAssociatedObject(view, &kApolloPixelPalsDuoHiddenKey, @YES,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            view.hidden = YES;
+        }
+    } else if (objc_getAssociatedObject(view, &kApolloPixelPalsDuoHiddenKey)) {
+        view.hidden = NO;
+        objc_setAssociatedObject(view, &kApolloPixelPalsDuoHiddenKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
 
 #pragma mark - Geometry
 
@@ -242,6 +269,13 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
 // Apollo writes the stock pill here on every portrait layout. Capture it as the
 // baseline, then hand UIKit the island-aligned pill instead.
 - (void)setFrame:(CGRect)frame {
+    UIView *view = (UIView *)self;
+    BOOL duoDisabled = ApolloPixelPalsDisabledForWindow(ApolloPixelPalWindowForView(view));
+    ApolloPixelPalsApplyDuoHidden(view, duoDisabled);
+    if (duoDisabled) {
+        %orig;
+        return;
+    }
     BOOL plausiblePill = CGRectGetWidth(frame) >= 60.0 && CGRectGetWidth(frame) <= 200.0 &&
                          CGRectGetHeight(frame) >= 20.0 && CGRectGetHeight(frame) <= 60.0 &&
                          CGRectGetMinY(frame) >= 0.0 && CGRectGetMinY(frame) <= 40.0;
@@ -264,7 +298,6 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
         ApolloLog(@"[PixelPals] captured Apollo pill %@", ApolloRectString(frame));
     }
 
-    UIView *view = (UIView *)self;
     CGRect pill;
     if (ApolloPixelPalGeometry(ApolloPixelPalWindowForView(view.superview), NULL, &pill)) {
         sLastPill = pill;
@@ -291,6 +324,12 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
 - (void)setFrame:(CGRect)frame {
     CGRect apollo, pill;
     UIView *view = (UIView *)self;
+    BOOL duoDisabled = ApolloPixelPalsDisabledForWindow(ApolloPixelPalWindowForView(view));
+    ApolloPixelPalsApplyDuoHidden(view, duoDisabled);
+    if (duoDisabled) {
+        %orig;
+        return;
+    }
     if (fabs(CGRectGetHeight(frame) - kApolloPalStripHeight) < 0.5 &&
         ApolloPixelPalGeometry(ApolloPixelPalWindowForView(view.superview), &apollo, &pill) &&
         fabs(CGRectGetWidth(frame) - CGRectGetWidth(apollo)) < 0.5) {
@@ -394,17 +433,32 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 // (PixelPalAddedSceneElementImageView). Both are framed before being added.
 - (void)addSubview:(UIView *)view {
     UIWindow *window = (UIWindow *)self;
+    static Class elementCls;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        elementCls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView");
+    });
+    CGRect incomingFrame = view.frame;
+    BOOL tapOverlay = [view isMemberOfClass:[UIView class]]
+        && CGRectGetWidth(incomingFrame) >= 60.0
+        && CGRectGetWidth(incomingFrame) <= 200.0
+        && fabs(CGRectGetHeight(incomingFrame) - kApolloStockPillHeight) < 0.5
+        && view.clipsToBounds
+        && view.layer.cornerRadius >= CGRectGetHeight(incomingFrame) * 0.5 - 0.5;
+    BOOL sceneElement = elementCls && [view isKindOfClass:elementCls];
+    if (tapOverlay || sceneElement) {
+        BOOL duoDisabled = ApolloPixelPalsDisabledForWindow(window);
+        ApolloPixelPalsApplyDuoHidden(view, duoDisabled);
+        if (duoDisabled) {
+            %orig;
+            return;
+        }
+    }
     CGRect apollo, pill;
     if (view && ApolloPixelPalGeometry(window, &apollo, &pill)) {
         CGFloat dx = CGRectGetMinX(pill) - CGRectGetMinX(apollo);
         CGFloat dy = CGRectGetMinY(pill) - CGRectGetMinY(apollo);
         CGRect f = view.frame;
-
-        static Class elementCls;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            elementCls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView");
-        });
 
         BOOL stockFlashSize = fabs(CGRectGetWidth(f) - kApolloStockPillWidth) < 0.5 &&
                               fabs(CGRectGetHeight(f) - kApolloStockPillHeight) < 0.5;
@@ -437,6 +491,10 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 // Suppress the Pixel Pals menu while media / a website / any modal is open or
 // mid-transition — opening it then races UIKit and freezes the app (issue #305).
 - (void)pixelPalTappedWithTapGestureRecognizer:(id)recognizer {
+    if (ApolloPixelPalsDisabledForWindow((UIWindow *)self)) {
+        ApolloLog(@"[PixelPals] Tap ignored — Pixel Pals are disabled on iPhone Duo");
+        return;
+    }
     if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
         ApolloLog(@"[PixelPals] Tap ignored — a modal is open/transitioning (issue #305 freeze guard)");
         return;
@@ -446,6 +504,10 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 
 // Same guard for the auto-open path when a pal barks for attention.
 - (void)dogBarkedWithNotification:(id)notification {
+    if (ApolloPixelPalsDisabledForWindow((UIWindow *)self)) {
+        ApolloLog(@"[PixelPals] Bark menu suppressed — Pixel Pals are disabled on iPhone Duo");
+        return;
+    }
     if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
         ApolloLog(@"[PixelPals] Bark menu suppressed — a modal is open/transitioning (issue #305 freeze guard)");
         return;

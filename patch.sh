@@ -53,8 +53,10 @@ print_usage() {
     echo "Options:"
     echo "  -o, --output <file>           Output IPA filename (default: Apollo-Patched.ipa)"
     echo "  --remove-code-signature       Remove code signature from the binary"
-    echo "  --liquid-glass                Apply Liquid Glass patch for iOS 26"
-    echo "  --resizable                  Experimental iOS 27 resizing (includes Liquid Glass)"
+    echo "  --liquid-glass                Apply Liquid Glass patch (SDK 27.1:"
+    echo "                                iOS 26 chrome + iPhone Duo full-bleed)"
+    echo "  --resizable                   Experimental continuous resizing;"
+    echo "                                includes the Liquid Glass patch"
     echo "  --fix-safari-extension        Install the manual + legacy Safari extensions"
     echo "  --fix-openin-extension        Repair the bundled 'Open in Apollo' share-sheet action"
     echo "                                (needs the openin-extension dylib; run 'make package' first)"
@@ -130,7 +132,7 @@ if [ -z "$INPUT_IPA" ]; then
 fi
 
 # --liquid-glass and --liquid-glass-icons are mutually exclusive: the former
-# bumps LC_BUILD_VERSION to opt the app into the iOS 26 UI runtime, which is
+# bumps LC_BUILD_VERSION to sdk 27.1 (iOS 26 UI runtime + Duo full-bleed), which is
 # the exact behavior the icons-only build is meant to avoid.
 if [ "${LIQUID_GLASS}" == "true" ] && [ "${LIQUID_GLASS_ICONS_ONLY}" == "true" ]; then
     echo "Error: --liquid-glass and --liquid-glass-icons are mutually exclusive."
@@ -193,7 +195,7 @@ enable_promotion_in_app "$APP_BUNDLE"
 
 # 2a. Liquid Glass (binary + assets)
 if [ "${LIQUID_GLASS}" == "true" ]; then
-    echo "Applying Liquid Glass patch for iOS 26..."
+    echo "Applying Liquid Glass patch (SDK 27.1)..."
     # Convenience: auto-install vtool if missing (long-standing patch.sh behavior).
     if ! command -v vtool &>/dev/null; then
         echo "Installing vtool..."
@@ -203,8 +205,8 @@ if [ "${LIQUID_GLASS}" == "true" ]; then
     patch_liquid_glass_assets_in_app "$APP_BUNDLE"
 fi
 
-# Opt into the iOS 27 app-shell contract after the existing Glass preparation.
-# This is explicit: ordinary release variants keep their existing linked SDK.
+# Opt into the additional continuous-resizing plist/orientation contract after
+# Glass preparation. Both modes now carry SDK 27.1; this mode remains explicit.
 if [ "$RESIZABLE_APP" == "true" ]; then
     python3 "$SCRIPT_DIR/scripts/prepare-resizable-app.py" "$APP_BUNDLE"
 fi
