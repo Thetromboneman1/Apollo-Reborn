@@ -1163,10 +1163,12 @@ static NSString *ApolloAIFullNameForController(UIViewController *vc) {
     return fullName;
 }
 
-// Returns YES only when this is a newly captured comment. Texture can send the
-// same node through didLoad / preload / model-update callbacks repeatedly while
-// UITableView remeasures rows; callers must not schedule another full-tree AI
-// pass for a duplicate.
+// Set on a comments controller once a capture-driven pass has been scheduled
+// for it (see ApolloAIScheduleCommentGeneration).
+static char kApolloAIControllerPassScheduledKey;
+
+// Returns YES only for new work, except that a revisited controller is allowed
+// one pass even when its comments were captured during an earlier visit.
 static BOOL ApolloAICaptureCommentForController(id comment, UIViewController *vc) {
     if (!ApolloAICommentIsEligible(comment) || !vc) return NO;
     NSString *fullName = ApolloAIFullNameForController(vc);
@@ -1183,6 +1185,11 @@ static BOOL ApolloAICaptureCommentForController(id comment, UIViewController *vc
         keys = [NSMutableSet set];
         sCapturedCommentKeys[fullName] = keys;
     }
+    // A duplicate is not new work, except as this controller's first pass. On
+    // a revisit whose thread loads after viewDidAppear's last retry (8 s), every
+    // comment is a duplicate of the earlier visit; without that one pass the
+    // restored card never starts (auto mode: "Summarizing…" forever).
+    if ([keys containsObject:key] && !objc_getAssociatedObject(vc, &kApolloAIControllerPassScheduledKey)) return YES;
     if ([keys containsObject:key]) return NO;
     [keys addObject:key];
     [comments addObject:comment];
@@ -2666,12 +2673,15 @@ static void ApolloAIScheduleCommentGeneration(UIViewController *vc) {
     NSString *fullName = ApolloAIFullNameForController(vc);
     if (fullName.length == 0 || [sCommentGenerationScheduled containsObject:fullName]) return;
 
-    // In Tap-to-Summarize mode the first eligible pass installs an idle card and
-    // intentionally starts no request. Once that card exists, further comment
-    // preload callbacks have nothing to do until the user taps it. Previously
-    // every callback re-gathered/sorted the full comment model on the main queue
-    // and then forced two unchanged table remeasures (#863).
-    if (sEnableTapToSummarize) {
+    // In tap mode the first eligible pass installs the idle card without
+    // starting a request. Once that card exists, repeated Texture lifecycle
+    // callbacks have nothing to do until the user taps it. Re-gathering the
+    // same model here used to force a full header remeasure on every scroll
+    // callback, feeding the comment-section hitch reported in #863.
+    // A controller's first pass still runs: when the thread loaded after
+    // viewDidAppear's retries, it is the pass that installs the post card.
+    BOOL controllerHadPass = objc_getAssociatedObject(vc, &kApolloAIControllerPassScheduledKey) != nil;
+    if (sEnableTapToSummarize && controllerHadPass) {
         NSString *tapKey = [@"comment|" stringByAppendingString:fullName];
         if (![sTapRequested containsObject:tapKey]) {
             for (id headerNode in sHeaderNodes.allObjects) {
@@ -2684,6 +2694,7 @@ static void ApolloAIScheduleCommentGeneration(UIViewController *vc) {
         }
     }
     [sCommentGenerationScheduled addObject:fullName];
+    objc_setAssociatedObject(vc, &kApolloAIControllerPassScheduledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     __weak UIViewController *weakVC = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
