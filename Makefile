@@ -54,6 +54,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/Tweak.xm \
     $(SRC_DIR)/ApolloRecommendedSettingsMigration.m \
     $(SRC_DIR)/ApolloCommon.m \
+    $(SRC_DIR)/ApolloInlineImageMetadata.m \
     $(SRC_DIR)/ApolloProfilePagination.xm \
     $(SRC_DIR)/ApolloWebTextDecoding.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
