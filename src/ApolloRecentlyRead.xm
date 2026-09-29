@@ -2457,7 +2457,8 @@ static void ApolloCommentsVCTryMarkRead(id commentsVC, const char *trigger) {
 %end
 
 // Register the temporary Swift allocation hook with the fork's centralized
-// fishhook install so every rebinding is applied in one atomic call.
+// fishhook install so every rebinding is applied in one atomic call. The hook
+// above still owns the paired un-hook after it captures the tracker.
 size_t ApolloRecentlyReadAppendRebindings(struct rebinding *out) {
     sTrackerTypeMetadata = (__bridge void *)objc_getClass("_TtC6Apollo16ReadPostsTracker");
     if (!sTrackerTypeMetadata) return 0;
