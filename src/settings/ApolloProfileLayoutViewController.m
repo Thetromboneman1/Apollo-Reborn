@@ -370,6 +370,7 @@ static UIImage *ApolloProfilePreviewBanner(UITraitCollection *traits) {
 @property(nonatomic) CGFloat pinnedPreviewHeight;
 @property(nonatomic) BOOL updatingPinnedPreviewLayout;
 @property(nonatomic) BOOL previewHeightRefreshScheduled;
+@property(nonatomic) CGFloat previewRestingTopInset;
 @property(nonatomic, copy) NSString *scrollAnchorRowID;
 @property(nonatomic) CGFloat scrollAnchorScreenY;
 @property(nonatomic) CGFloat scrollAnchorPinnedBottom;
@@ -433,6 +434,8 @@ static UIImage *ApolloProfilePreviewBanner(UITraitCollection *traits) {
     [super apollo_applyTheme];
     self.pinnedPreviewHost.backgroundColor = self.tableView.backgroundColor
         ?: ApolloThemePageBackgroundColor() ?: UIColor.systemGroupedBackgroundColor;
+    self.pinnedPreviewTitleLabel.textColor = ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryLabel)
+        ?: UIColor.secondaryLabelColor;
     ApolloSettingsApplySectionHeaderTypography(self.pinnedPreviewTitleLabel);
     [self.pinnedPreviewCard apollo_applyCurrentAppearance];
 }
@@ -447,9 +450,18 @@ static UIImage *ApolloProfilePreviewBanner(UITraitCollection *traits) {
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section {
-    [super tableView:tableView willDisplayHeaderView:view forSection:section];
-    ApolloSettingsApplySectionHeaderTypography(self.pinnedPreviewTitleLabel);
-
+    if (@available(iOS 26.0, *)) {
+        [super tableView:tableView willDisplayHeaderView:view forSection:section];
+        ApolloSettingsApplySectionHeaderTypography(self.pinnedPreviewTitleLabel);
+    } else {
+        if (tableView != self.tableView || ![view isKindOfClass:UITableViewHeaderFooterView.class]) return;
+        UIFont *font = ((UITableViewHeaderFooterView *)view).textLabel.font;
+        if (font && ![self.pinnedPreviewTitleLabel.font isEqual:font]) {
+            // Match the real settings section headings, including Apollo fonts.
+            self.pinnedPreviewTitleLabel.font = font;
+            [self apollo_updatePinnedPreviewLayoutPreservingScroll:YES];
+        }
+    }
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
@@ -663,6 +675,8 @@ static UIImage *ApolloProfilePreviewBanner(UITraitCollection *traits) {
     self.pinnedPreviewHost.clipsToBounds = YES;
     self.pinnedPreviewTitleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     self.pinnedPreviewTitleLabel.text = @"Preview";
+    self.pinnedPreviewTitleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle3];
+    self.pinnedPreviewTitleLabel.adjustsFontForContentSizeCategory = YES;
     ApolloSettingsApplySectionHeaderTypography(self.pinnedPreviewTitleLabel);
     self.pinnedPreviewTitleLabel.accessibilityTraits = UIAccessibilityTraitHeader;
     [self.pinnedPreviewHost addSubview:self.pinnedPreviewTitleLabel];
@@ -690,8 +704,11 @@ static UIImage *ApolloProfilePreviewBanner(UITraitCollection *traits) {
 }
 
 - (BOOL)apollo_hasRoomToPinPreview {
+    // Hiding the navigation bar during a scroll must not suddenly enable
+    // pinning halfway through that gesture. Reserve its resting height.
+    CGFloat topInset = MAX(self.previewRestingTopInset, self.tableView.adjustedContentInset.top);
     CGFloat availableHeight = CGRectGetHeight(self.tableView.bounds)
-        - self.tableView.adjustedContentInset.top - self.tableView.adjustedContentInset.bottom;
+        - topInset - self.tableView.adjustedContentInset.bottom;
     // Preserve access to the controls on small phones, in landscape, and at
     // larger text sizes. The saved preference resumes when there is room.
     return self.traitCollection.verticalSizeClass != UIUserInterfaceSizeClassCompact &&
@@ -766,6 +783,10 @@ static UIImage *ApolloProfilePreviewBanner(UITraitCollection *traits) {
     CGFloat tableWidth = CGRectGetWidth(self.tableView.bounds);
     if (tableWidth <= 1.0) return;
     self.updatingPinnedPreviewLayout = YES;
+    CGFloat restingInset = self.tableView.adjustedContentInset.top;
+    if (self.tableView.contentOffset.y + restingInset <= 0.5 || self.previewRestingTopInset == 0) {
+        self.previewRestingTopInset = restingInset;
+    }
 
     CGRect readable = [self apollo_tableReadableFrame];
     CGFloat cardX = CGRectGetMinX(readable);

@@ -25,6 +25,7 @@
 #import "ApolloCommon.h"
 #import "ApolloFloatingTabs.h"
 #import "ApolloGalleryImageLoader.h"
+#import "ApolloGoogleSearch.h"
 #import "ApolloLinkPreviewFetcher.h"
 #import "ApolloTranslation.h"
 #import "ApolloWebTextDecoding.h"
@@ -2346,6 +2347,12 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
             ApolloSimDebugFieldProbe(tag.length ? tag : @"probe");
             return;
         }
+        if ([contents hasPrefix:@"tabselect "]) {
+            UITabBarController *tabs = (id)ApolloMainTabBarController();
+            NSUInteger index = [[contents substringFromIndex:10] integerValue];
+            if (index < tabs.viewControllers.count) tabs.selectedIndex = index;
+            return;
+        }
         if ([contents hasPrefix:@"dump"]) {
             ApolloSimDebugDumpHierarchy();
             return;
@@ -2657,6 +2664,24 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
                 ? url : ApolloURLByConvertingResolvedURLToApolloScheme(url);
             BOOL routed = apolloURL && ApolloRouteResolvedURLViaApolloScheme(apolloURL);
             ApolloLog(@"[SimDebugTap] openurl %@ -> %@", raw, routed ? @"routed" : @"NOT routed");
+            return;
+        }
+        // "gsearch [p=N t=d|w|m|y x=1 |] <query>": run a Google (Reddit-only)
+        // search the way the Search tab's Google mode does and log every result;
+        // "gsearchjs <js>": evaluate JS in the last results page (kept alive in
+        // sim builds); "gsearchdebug <knobs>": the Google mode test switches
+        // (verification sheet, Reddit read off, error, saved page, link delay).
+        // See ApolloGoogleSearch.{h,m}.
+        if ([contents hasPrefix:@"gsearch "]) {
+            ApolloGoogleSearchDebugRun([contents substringFromIndex:8]);
+            return;
+        }
+        if ([contents hasPrefix:@"gsearchdebug "]) {
+            ApolloGoogleSearchDebugConfigure([contents substringFromIndex:13]);
+            return;
+        }
+        if ([contents hasPrefix:@"gsearchjs "]) {
+            ApolloGoogleSearchDebugEvaluateJS([contents substringFromIndex:10]);
             return;
         }
         // "devvitjs <js>" command: evaluate JS in the live interactive-post

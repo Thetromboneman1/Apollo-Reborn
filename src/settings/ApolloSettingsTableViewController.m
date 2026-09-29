@@ -49,28 +49,24 @@ UIFont *ApolloSettingsFont(UIFontTextStyle style, UITraitCollection *traits) {
 
 static UIFont *ApolloSettingsSectionHeaderFont(UITraitCollection *traits) {
     return [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody]
-        scaledFontForFont:[UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold]
+        scaledFontForFont:[UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold]
         compatibleWithTraitCollection:ApolloSettingsTextTraits(traits)];
 }
 
-static NSString *ApolloSettingsSentenceCaseHeader(NSString *text) {
-    if (text.length == 0) return text;
-    // UIKit/native headers may already be uppercase. Normalize the whole
-    // title, then capitalize only its first composed character (not each word).
-    NSString *lowercase = text.lowercaseString;
-    NSRange first = [lowercase rangeOfComposedCharacterSequenceAtIndex:0];
-    return [lowercase stringByReplacingCharactersInRange:first
-        withString:[[lowercase substringWithRange:first] uppercaseString]];
+static NSString *ApolloSettingsTitleCaseHeader(NSString *text) {
+    return text.capitalizedString;
 }
 
 void ApolloSettingsApplySectionHeaderTypography(UIView *view) {
+    // Older iOS versions retain their original casing, fonts, and theme setup.
+    if (@available(iOS 26.0, *)) {} else { return; }
     if ([view isKindOfClass:UITableViewHeaderFooterView.class]) {
         UITableViewHeaderFooterView *header = (UITableViewHeaderFooterView *)view;
         // UIKit owns standard form headers. Configure their source of truth,
         // rather than only modifying labels that UIKit can recreate on update.
         if ([header.contentConfiguration isKindOfClass:UIListContentConfiguration.class]) {
             UIListContentConfiguration *configuration = [(UIListContentConfiguration *)header.contentConfiguration copy];
-            configuration.text = ApolloSettingsSentenceCaseHeader(configuration.text);
+            configuration.text = ApolloSettingsTitleCaseHeader(configuration.text);
             configuration.textProperties.font = ApolloSettingsSectionHeaderFont(view.traitCollection);
             configuration.textProperties.adjustsFontForContentSizeCategory = NO;
             configuration.textProperties.color = ApolloThemeSettingsSecondaryTextColor()
@@ -84,7 +80,7 @@ void ApolloSettingsApplySectionHeaderTypography(UIView *view) {
     }
     if ([view isKindOfClass:UILabel.class]) {
         UILabel *label = (UILabel *)view;
-        label.text = ApolloSettingsSentenceCaseHeader(label.text);
+        label.text = ApolloSettingsTitleCaseHeader(label.text);
         label.textColor = ApolloThemeSettingsSecondaryTextColor() ?: UIColor.secondaryLabelColor;
         label.font = ApolloSettingsSectionHeaderFont(view.traitCollection);
         label.adjustsFontForContentSizeCategory = NO;
@@ -233,7 +229,15 @@ void ApolloSettingsApplyCellTypography(UITableViewCell *cell) {
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section {
-    ApolloSettingsApplySectionHeaderTypography(view);
+    if (@available(iOS 26.0, *)) {
+        ApolloSettingsApplySectionHeaderTypography(view);
+    } else {
+        if ([view isKindOfClass:UITableViewHeaderFooterView.class]) {
+            UITableViewHeaderFooterView *sectionView = (UITableViewHeaderFooterView *)view;
+            sectionView.textLabel.font = ApolloSettingsFont(UIFontTextStyleCaption1, view.traitCollection);
+        }
+        ApolloSettingsApplyTextTypography(view);
+    }
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayFooterView:(UIView *)view forSection:(NSInteger)section {
@@ -246,6 +250,34 @@ void ApolloSettingsApplyCellTypography(UITableViewCell *cell) {
 
 - (void)tableView:(UITableView *)__unused tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)__unused indexPath {
     [self apollo_applyThemeToCell:cell];
+}
+
+@end
+
+@implementation ApolloSettingsLinkFooterView
+
+- (instancetype)initWithReuseIdentifier:(NSString *)reuseIdentifier {
+    self = [super initWithReuseIdentifier:reuseIdentifier];
+    if (!self) return nil;
+
+    // Let the table supply its final grouped/safe-area width before measuring
+    // the text. A bare UITextView footer initially receives the full table
+    // width, then rewraps when UIKit installs the grouped section insets.
+    _linkTextView = [[ApolloFooterLinkTextView alloc] init];
+    _linkTextView.translatesAutoresizingMaskIntoConstraints = NO;
+    _linkTextView.editable = NO;
+    _linkTextView.scrollEnabled = NO;
+    _linkTextView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    _linkTextView.backgroundColor = UIColor.clearColor;
+    _linkTextView.textContainerInset = UIEdgeInsetsMake(8, 16, 8, 16);
+    [self.contentView addSubview:_linkTextView];
+    [NSLayoutConstraint activateConstraints:@[
+        [_linkTextView.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor],
+        [_linkTextView.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor],
+        [_linkTextView.topAnchor constraintEqualToAnchor:self.contentView.topAnchor],
+        [_linkTextView.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor],
+    ]];
+    return self;
 }
 
 @end

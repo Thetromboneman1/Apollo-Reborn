@@ -1594,9 +1594,8 @@ static UIColor *ApolloThemeSettingsLabelColor(BOOL secondary) {
 UIColor *ApolloThemeSettingsTextColor(void) { return ApolloThemeSettingsLabelColor(NO); }
 UIColor *ApolloThemeSettingsSecondaryTextColor(void) { return ApolloThemeSettingsLabelColor(YES); }
 
-// Dark-mode separator override for a non-tinted stock theme. One "on" value
-// covers both Pure Black tiers — PURER doesn't push the separator any
-// further than plain Pure Black does (unlike the card).
+// Share custom-token and stock Pure Black handling across the list's row,
+// section header, primary text, and secondary text roles.
 static UIColor *ApolloThemeSubredditListColor(NSUInteger role) {
     ApolloThemeToken token = role == 0 ? ApolloThemeTokenSecondaryBackground
         : role == 1 ? ApolloThemeTokenBackground
@@ -1627,6 +1626,9 @@ UIColor *ApolloThemeSubredditListHeaderBackgroundColor(void) { return ApolloThem
 UIColor *ApolloThemeSubredditListTextColor(void) { return ApolloThemeSubredditListColor(2); }
 UIColor *ApolloThemeSubredditListSecondaryTextColor(void) { return ApolloThemeSubredditListColor(3); }
 
+// Dark-mode separator override for a non-tinted stock theme. One "on" value
+// covers both Pure Black tiers — PURER doesn't push the separator any
+// further than plain Pure Black does (unlike the card).
 static BOOL ApolloStockNonTintedDarkSeparatorRGB(uint32_t *outRGB) {
     NSUserDefaults *d = GroupDefaults();
     if (![d boolForKey:kUsePureBlackDarkModeKey]) return NO;
@@ -2258,7 +2260,20 @@ static ASImageNodeTintColorModificationBlockFn ASImageNodeTintColorModificationB
 %hook UINavigationItem
 
 - (void)setTitleView:(UIView *)view {
-    if (IsLiquidGlass() && view) {
+    if (IsLiquidGlass() && [view isKindOfClass:[UITextField class]]) {
+        // A text field is never a title. UIKit lends a titleView UISearchBar's
+        // own search field to its private _UISearchBarNavigationItem the first
+        // time the bar shows Cancel (setShowsCancelButton:animated: ->
+        // displayNavBarCancelButton:animated: -> searchNavigationItem ->
+        // setUpSearchNavigationItem -> setTitleView:field). The Search tab's
+        // bar is one: Apollo shows Cancel when editing begins, and the prep
+        // below baked the chrome colour into the field's placeholder label and
+        // tagged the field as a neutral title for good, so the dim placeholder
+        // came back in the title colour after Cancel until the screen was
+        // rebuilt.
+        ApolloLog(@"ThemeRuntime: setTitleView: %@ on %@ is a text field; skipping neutral title prep",
+                  NSStringFromClass(view.class), NSStringFromClass(object_getClass(self)));
+    } else if (IsLiquidGlass() && view) {
         // Prepare custom titles before UIKit snapshots the incoming page.
         objc_setAssociatedObject(view, &kApolloNeutralNavigationTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         view.tintColor = ApolloNavigationChromeColor();
