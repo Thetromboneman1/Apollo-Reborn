@@ -9,8 +9,22 @@
 #import "ApolloCommon.h"
 #import "UserDefaultConstants.h"
 
+// The dark-config swap below hooks +configForAppearance:inputMode:traitEnvironment:, which UIKit
+// added in iOS 15. iOS 14 only has +configForAppearance:inputMode:, so the hook never installs
+// there and a light app would get light keycaps on black; keep the stock keyboard in that case.
+static BOOL DarkConfigSwapAvailable(void) {
+    static BOOL available;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        available = class_getClassMethod(objc_getClass("UIKBRenderConfig"),
+            NSSelectorFromString(@"configForAppearance:inputMode:traitEnvironment:")) != NULL;
+    });
+    return available;
+}
+
 // 0 Off, 1 Dark Only, 2 Light Only, 3 Always.
 static BOOL TrueBlackKeyboardAppliesTo(UIUserInterfaceStyle style) {
+    if (style != UIUserInterfaceStyleDark && !DarkConfigSwapAvailable()) return NO;
     switch ([[NSUserDefaults standardUserDefaults] integerForKey:UDKeyTrueBlackKeyboardMode]) {
         case 1: return style == UIUserInterfaceStyleDark;
         case 2: return style != UIUserInterfaceStyleDark;
@@ -99,7 +113,45 @@ static void ApplyTrueBlack(UIVisualEffectView *backdrop) {
     // UIKit may install a fresh effect while applied; remember the latest one.
     if (backdrop.effect) {
         state.effect = backdrop.effect;
-        backdrop.effect = nil;
+static const void *kStockLookKey = &kStockLookKey;
+
+static BOOL IsOpaqueBlack(UIColor *color) {
+    CGFloat r = 1, g = 1, b = 1, a = 0;
+    return [color getRed:&r green:&g blue:&b alpha:&a] && r == 0 && g == 0 && b == 0 && a == 1;
+}
+
+// Puts UIKit's look back when the mode stops applying to a backdrop that's still up (Dark Mode
+// Only and the app flips to light while typing). UIKit's _setRenderConfig: re-sets its effect and
+// tint for the new config, but not the content view fill or the views hidden below, so the light
+// keycaps would sit on black and the return key, globe and mic glyphs would vanish.
+static void RevertTrueBlack(UIVisualEffectView *backdrop) {
+    NSDictionary *stock = objc_getAssociatedObject(backdrop, kStockLookKey);
+    if (!stock) return;
+    objc_setAssociatedObject(backdrop, kStockLookKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (IsOpaqueBlack(backdrop.backgroundColor)) backdrop.backgroundColor = stock[@"background"];
+    backdrop.contentView.backgroundColor = stock[@"content"];
+    for (UIView *sub in stock[@"hidden"]) sub.hidden = NO;
+}
+
+static void ApplyTrueBlack(UIVisualEffectView *backdrop) {
+    BOOL applies = TrueBlackKeyboardAppliesTo(AppInterfaceStyle());
+    UpdateEdgeFill(backdrop, applies);
+    if (!applies) {
+        RevertTrueBlack(backdrop);
+        return;
+    }
+    NSMutableDictionary *stock = objc_getAssociatedObject(backdrop, kStockLookKey);
+    if (!stock) {
+        stock = [NSMutableDictionary dictionaryWithObject:[NSHashTable weakObjectsHashTable] forKey:@"hidden"];
+        stock[@"content"] = backdrop.contentView.backgroundColor;
+        objc_setAssociatedObject(backdrop, kStockLookKey, stock, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // UIKit re-sets the tint on each render-config change; keep its latest before covering it.
+    if (!IsOpaqueBlack(backdrop.backgroundColor)) stock[@"background"] = backdrop.backgroundColor;
+    if (backdrop.effect) {
+        // Outside any running animation: a light/dark flip animates backgroundEffects on this view,
+        // and UIKit throws if .effect was animated next to it (UIVisualEffectView.m:1045).
+        [UIView performWithoutAnimation:^{ backdrop.effect = nil; }];
     }
     backdrop.backgroundColor = UIColor.blackColor;
     backdrop.contentView.backgroundColor = UIColor.blackColor;
@@ -107,7 +159,7 @@ static void ApplyTrueBlack(UIVisualEffectView *backdrop) {
         // Any private glass/blur layer view UIKit adds beside the content view.
         if (sub != backdrop.contentView && !sub.hidden) {
             sub.hidden = YES;
-            [state.hiddenSubviews addObject:sub];
+            [stock[@"hidden"] addObject:sub];
         }
     }
 }

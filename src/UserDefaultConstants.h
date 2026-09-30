@@ -327,8 +327,6 @@ static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
 // dock at the BOTTOM (classic tab bar) instead of the top-center pill, which on
 // iPad overlaps Apollo's search bar. Temporary stopgap for issue #387 until the
 // real iPad build lands. Opt-in; default OFF via registerDefaults. See ApolloIPadTabBarBottom.xm.
-// True Black Keyboard mode: 0 Off (default), 1 Dark Only, 2 Light Only, 3 Always.
-static NSString *const UDKeyTrueBlackKeyboardMode = @"TrueBlackKeyboardMode";
 static NSString *const UDKeyIPadTabBarBottom = @"IPadTabBarBottom";
 static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadTabBarBottomChangedNotification";
 // iPad only. When ON, replaces each tab's single navigation stack with a
@@ -339,6 +337,8 @@ static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadT
 // Supersedes UDKeyIPadTabBarBottom while active (the floating pill is hidden).
 // See src/ipad/ and docs/ipad-pane-layout-plan.md.
 static NSString *const UDKeyIPadPaneLayout = @"IPadPaneLayout";
+// True Black Keyboard mode: 0 Off (default), 1 Dark Only, 2 Light Only, 3 Always.
+static NSString *const UDKeyTrueBlackKeyboardMode = @"TrueBlackKeyboardMode";
 // Liquid Glass only. When ON, tab-bar swipe navigates back/forward instead of
 // dragging to switch tabs (an either/or; needs a relaunch to apply). Opt-in;
 // default OFF via registerDefaults. See ApolloLiquidGlass.xm.
