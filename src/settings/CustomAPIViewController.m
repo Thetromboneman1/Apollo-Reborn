@@ -3734,19 +3734,39 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     return [super tableView:tableView titleForFooterInSection:section];
 }
 
+- (void)apollo_configureFooterLinkTextView:(UITextView *)textView
+                                      text:(NSAttributedString *)text {
+    textView.editable = NO;
+    textView.scrollEnabled = NO;
+    textView.backgroundColor = [UIColor clearColor];
+    textView.textContainerInset = UIEdgeInsetsMake(8, 16, 8, 16);
+    textView.tintColor = [self apollo_themeAccentColor];
+    textView.linkTextAttributes = @{NSForegroundColorAttributeName: [self apollo_themeAccentColor]};
+    textView.attributedText = text;
+    ApolloSettingsApplyFooterTypography(textView);
+}
+
+// The width UIKit lays a footer view out at: insetGrouped places it inside the
+// section inset, which follows the table's layout margins.
+- (CGFloat)apollo_footerLinkWidthInTableView:(UITableView *)tableView {
+    CGFloat tableWidth = tableView.bounds.size.width;
+    if (tableWidth <= 0) tableWidth = [UIScreen mainScreen].bounds.size.width;
+
+    // Account for insetGrouped horizontal insets — footer is narrower than the table view
+    UIEdgeInsets margins = tableView.layoutMargins;
+    CGFloat footerWidth = tableWidth - margins.left - margins.right;
+    if (footerWidth <= 0) footerWidth = tableWidth - 40.0;
+    return footerWidth;
+}
+
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
     NSAttributedString *text = [self footerAttributedTextForSection:section];
     if (!text) return nil;
-
     static NSString *const reuseID = @"ApolloSettingsLinkFooter";
     ApolloSettingsLinkFooterView *footer =
         (ApolloSettingsLinkFooterView *)[tableView dequeueReusableHeaderFooterViewWithIdentifier:reuseID];
     if (!footer) footer = [[ApolloSettingsLinkFooterView alloc] initWithReuseIdentifier:reuseID];
-    UITextView *textView = footer.linkTextView;
-    textView.tintColor = [self apollo_themeAccentColor];
-    textView.linkTextAttributes = @{NSForegroundColorAttributeName: [self apollo_themeAccentColor]};
-    textView.attributedText = text;
-
+    [self apollo_configureFooterLinkTextView:footer.linkTextView text:text];
     return footer;
 }
 
@@ -3762,7 +3782,11 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         return plainFooter.length > 0 ? [super tableView:tableView heightForFooterInSection:section] : 12.0;
     }
 
-    return UITableViewAutomaticDimension;
+    CGFloat footerWidth = [self apollo_footerLinkWidthInTableView:tableView];
+    UITextView *measureView = [[ApolloFooterLinkTextView alloc] initWithFrame:CGRectMake(0, 0, footerWidth, 0)];
+    [self apollo_configureFooterLinkTextView:measureView text:text];
+    CGSize size = [measureView sizeThatFits:CGSizeMake(footerWidth, CGFLOAT_MAX)];
+    return ceil(size.height);
 }
 
 #pragma mark - Row Actions
