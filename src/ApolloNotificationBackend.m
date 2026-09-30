@@ -102,6 +102,12 @@ static BOOL ApolloPathIsAccountUpsertBulk(NSString *path) {
         && [parts[4] isEqualToString:@"accounts"];
 }
 
+// Match `/v1/live_activities` (Live Activity registration — the backend polls
+// the thread and pushes ActivityKit updates).
+static BOOL ApolloPathIsLiveActivityRegistration(NSString *path) {
+    return [path isEqualToString:@"/v1/live_activities"];
+}
+
 // MARK: - JSON body augmentation
 
 // Inject the four per-account Reddit OAuth fields the forked backend's
@@ -422,6 +428,18 @@ NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) 
             ApolloLog(@"[NotifBackend] Tagged /v1/device registration (transport=%@%@)",
                       bark ? @"bark" : @"apns",
                       augmented ? @", body augmented" : @", header-only");
+        } else if (ApolloPathIsLiveActivityRegistration(path)) {
+            // Opt the followed thread in to commenter avatars when Show User
+            // Profile Pictures (UDKeyShowUserAvatars) is on: the backend then
+            // embeds each comment author's picture in the Live Activity pushes
+            // (a Live Activity can't fetch images itself). Sent explicitly
+            // either way so a re-registration also turns it off. Read from the
+            // same defaults snapshot as the backend URL; a header because the
+            // body may be out of reach.
+            id showAvatars = configuration[UDKeyShowUserAvatars];
+            BOOL avatars = [showAvatars respondsToSelector:@selector(boolValue)] && [showAvatars boolValue];
+            [mutable setValue:(avatars ? @"1" : @"0") forHTTPHeaderField:@"X-Apollo-Live-Activity-Avatars"];
+            ApolloLog(@"[NotifBackend] Tagged /v1/live_activities registration (avatars=%d)", avatars);
         }
     }
 

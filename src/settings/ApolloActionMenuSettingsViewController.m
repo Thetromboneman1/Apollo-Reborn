@@ -143,7 +143,7 @@ static NSString *ApolloAMModeratorShortTitle(ApolloActionMenuContext context) {
                                          footer:@"Show or hide actions across every menu at once."
                                            rows:@[ all ]],
         [ApolloSettingsSection sectionWithTitle:@"••• Menus"
-                                         footer:@"Open a menu to reorder or hide actions while keeping its live preview pinned above the list."
+                                         footer:@"The ••• button’s menu in each place. Touching and holding a post or comment opens the same menu. Open one to reorder or hide actions while keeping its live preview pinned above the list."
                                            rows:regular],
         [ApolloSettingsSection sectionWithTitle:@"Moderator Menus"
                                          footer:@"The moderator shield’s menus. They only appear in subreddits you moderate."
