@@ -202,6 +202,7 @@ static NSString *ApolloRectString(CGRect r) {
 // layout untouched) until the pill has been captured, or when no correction is
 // needed.
 static BOOL ApolloPixelPalGeometry(UIWindow *window, CGRect *outApollo, CGRect *outPill) {
+    if (ApolloPixelPalsDisabledOnDuo()) return NO;
     if (!sApolloPillKnown) return NO;
     CGRect apollo = sApolloPill;
     CGRect pill = apollo;
@@ -427,6 +428,18 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 }
 
 %hook _TtC6Apollo15ThemeableWindow
+
+// Duo has no supported Pixel Pals surface. Keep upstream's island geometry
+// hooks intact for regular phones, and only hide Apollo's own views on Duo.
+- (void)layoutSubviews {
+    %orig;
+    if (!ApolloPixelPalsDisabledOnDuo()) return;
+    for (NSString *name in @[@"fauxCutOutView", @"pixelPalView"]) {
+        Ivar ivar = class_getInstanceVariable(object_getClass(self), name.UTF8String);
+        UIView *view = ivar ? object_getIvar(self, ivar) : nil;
+        view.hidden = YES;
+    }
+}
 
 // Views Apollo adds to the window positioned from the stock pill: the tap flash
 // (sub_10030d6c4) and the hearts / food / emotes placed next to the pal

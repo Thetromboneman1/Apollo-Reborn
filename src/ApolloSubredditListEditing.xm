@@ -35,14 +35,14 @@ static id ApolloEditingIvar(id object, const char *name) {
 static void ApolloEditingAlignStar(UITableViewCell *cell, BOOL editing) {
     UITableView *table = ApolloEditingTable(cell);
     NSNumber *original = objc_getAssociatedObject(cell, &kEditingRightMargin);
+    NSArray<NSNumber *> *priorities = objc_getAssociatedObject(cell, &kEditingStarPriorities);
     BOOL editingList = editing && ApolloEditingIsList(table)
         && !ApolloSubredditListIsSwipeEditing(table);
     // These lifecycle hooks also run for unrelated UIKit cells. Do not probe
     // Apollo's ivars unless this is an editing list row or a row we modified.
-    if (!editingList && !original) return;
+    if (!editingList && !original && !priorities) return;
     UIButton *star = ApolloEditingIvar(cell, "accessoryButton");
     if (![star isKindOfClass:UIButton.class]) return;
-    NSArray<NSNumber *> *priorities = objc_getAssociatedObject(cell, &kEditingStarPriorities);
     UIEdgeInsets margins = cell.contentView.layoutMargins;
     if (editingList) {
         // Keep the star button from stretching and shifting its glyph.
