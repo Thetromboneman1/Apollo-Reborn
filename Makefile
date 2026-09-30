@@ -199,6 +199,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloModmailSubjectCounter.xm \
     $(SRC_DIR)/ApolloCrosspostTitle.xm \
     $(SRC_DIR)/ApolloMessagesKeyboardInset.xm \
+    $(SRC_DIR)/ApolloTrueBlackKeyboard.xm \
     $(SRC_DIR)/ApolloAutoHideTabBar.xm \
     $(SRC_DIR)/ApolloTopBarScrollPresentation.m \
     $(SRC_DIR)/ApolloListBottomInsetGuard.xm \
@@ -225,6 +226,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSettingsTabMenu.xm \
     $(SRC_DIR)/settings/ApolloShortcutListEditing.xm \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
+    $(SRC_DIR)/ApolloIntelligenceBridge.xm \
+    $(SRC_DIR)/settings/ApolloSiriSettingsViewController.m \
     $(SRC_DIR)/ApolloProfileMoreMenu.xm \
     $(SRC_DIR)/ApolloHiddenContentData.m \
     $(SRC_DIR)/ApolloHiddenContentViewController.m \
@@ -313,6 +316,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloGoogleSearch.m \
     $(SRC_DIR)/ApolloGoogleSearchViewController.m \
     $(SRC_DIR)/ApolloGoogleSearchTab.m \
+    $(SRC_DIR)/ApolloKagiSearch.m \
+    $(SRC_DIR)/ApolloKagiSearchParsing.m \
     $(SRC_DIR)/ApolloImageChestResolver.m \
     $(SRC_DIR)/ApolloImgChestUpload.m \
     $(SRC_DIR)/ApolloLinkPreviewModel.m \
@@ -360,6 +365,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloActionMenuSettingsViewController.m \
     $(SRC_DIR)/settings/ApolloAISettingsViewController.m \
     $(SRC_DIR)/settings/ApolloDeletedCommentsSettingsViewController.m \
+    $(SRC_DIR)/settings/ApolloKagiSessionLinkViewController.m \
     $(SRC_DIR)/settings/ApolloProfileLayoutViewController.m \
     $(SRC_DIR)/settings/ApolloLayoutViewController.m \
     $(SRC_DIR)/settings/ApolloLayoutPreviewCard.m \

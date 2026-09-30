@@ -113,25 +113,14 @@ static const int32_t kApolloInlineVideoTimeObserverTimescale = 30;
 
 #if APOLLO_SIM_BUILD
 static void ApolloVideoTimingRecord(NSString *step, CFTimeInterval ms, id node);
-#endif
-
-static inline CFTimeInterval ApolloVideoTimingBegin(void) {
-#if APOLLO_SIM_BUILD
-    return CACurrentMediaTime();
+#define APOLLO_VIDEO_TIMED(step, node, call) do { \
+    CFTimeInterval _t0 = CACurrentMediaTime(); \
+    call; \
+    ApolloVideoTimingRecord(step, (CACurrentMediaTime() - _t0) * 1000.0, node); \
+} while (0)
 #else
-    return 0;
+#define APOLLO_VIDEO_TIMED(step, node, call) do { call; } while (0)
 #endif
-}
-
-static inline void ApolloVideoTimingEnd(NSString *step, id node, CFTimeInterval started) {
-#if APOLLO_SIM_BUILD
-    ApolloVideoTimingRecord(step, (CACurrentMediaTime() - started) * 1000.0, node);
-#else
-    (void)step;
-    (void)node;
-    (void)started;
-#endif
-}
 
 // The timescale to install. Simulator builds can override it from the launch
 // environment (SIMCTL_CHILD_APOLLOFIX_INLINE_VIDEO_TIMESCALE=10000 restores
@@ -320,9 +309,9 @@ static BOOL ApolloFeedCellHasInlineVideo(id cell) {
         && ApolloFeedVideoPrewarmPlayer(self, asset, keys)) {
         return;
     }
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"ASVideoNode.prepareToPlayAsset", self, started);
+    APOLLO_VIDEO_TIMED(@"ASVideoNode.prepareToPlayAsset", self,
+        %orig;
+    );
 }
 
 %end
@@ -496,15 +485,15 @@ static void ApolloLogRangeTuningOnce(void) {
 
 - (void)play {
     ApolloInlineVideoNotePlay(self);
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"ASVideoNode.play", self, started);
+    APOLLO_VIDEO_TIMED(@"ASVideoNode.play", self,
+        %orig;
+    );
 }
 
 - (void)pause {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"ASVideoNode.pause", self, started);
+    APOLLO_VIDEO_TIMED(@"ASVideoNode.pause", self,
+        %orig;
+    );
 }
 
 - (id)constructPlayerNode {
@@ -515,21 +504,21 @@ static void ApolloLogRangeTuningOnce(void) {
 }
 
 - (void)didEnterPreloadState {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"ASVideoNode.didEnterPreloadState", self, started);
+    APOLLO_VIDEO_TIMED(@"ASVideoNode.didEnterPreloadState", self,
+        %orig;
+    );
 }
 
 - (void)didExitPreloadState {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"ASVideoNode.didExitPreloadState", self, started);
+    APOLLO_VIDEO_TIMED(@"ASVideoNode.didExitPreloadState", self,
+        %orig;
+    );
 }
 
 - (void)didEnterVisibleState {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"ASVideoNode.didEnterVisibleState", self, started);
+    APOLLO_VIDEO_TIMED(@"ASVideoNode.didEnterVisibleState", self,
+        %orig;
+    );
 }
 
 %end
@@ -537,15 +526,15 @@ static void ApolloLogRangeTuningOnce(void) {
 %hook RichMediaNodeTiming
 
 - (void)didEnterPreloadState {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"RichMediaNode.didEnterPreloadState", self, started);
+    APOLLO_VIDEO_TIMED(@"RichMediaNode.didEnterPreloadState", self,
+        %orig;
+    );
 }
 
 - (void)didExitPreloadState {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"RichMediaNode.didExitPreloadState", self, started);
+    APOLLO_VIDEO_TIMED(@"RichMediaNode.didExitPreloadState", self,
+        %orig;
+    );
 }
 
 %end
@@ -557,21 +546,21 @@ static void ApolloLogRangeTuningOnce(void) {
     NSString *step = ApolloFeedCellHasInlineVideo(self)
         ? @"LargePostCellNode(video).didEnterVisibleState"
         : @"LargePostCellNode(other).didEnterVisibleState";
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(step, self, started);
+    APOLLO_VIDEO_TIMED(step, self,
+        %orig;
+    );
 }
 
 - (void)didEnterDisplayState {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"LargePostCellNode.didEnterDisplayState", self, started);
+    APOLLO_VIDEO_TIMED(@"LargePostCellNode.didEnterDisplayState", self,
+        %orig;
+    );
 }
 
 - (void)didEnterPreloadState {
-    CFTimeInterval started = ApolloVideoTimingBegin();
-    %orig;
-    ApolloVideoTimingEnd(@"LargePostCellNode.didEnterPreloadState", self, started);
+    APOLLO_VIDEO_TIMED(@"LargePostCellNode.didEnterPreloadState", self,
+        %orig;
+    );
     dispatch_async(dispatch_get_main_queue(), ^{ ApolloLogRangeTuningOnce(); });
 }
 

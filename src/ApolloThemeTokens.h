@@ -100,13 +100,20 @@ NSString *ApolloThemeFontDisplayName(ApolloThemeFont font);
 NSString *ApolloThemeFontDetailName(ApolloThemeFont font);
 
 #if __has_include(<UIKit/UIKit.h>)
-// Re-derive `base` in the theme font's design, preserving size, weight, and
-// italic. Rebuilds from a pristine system descriptor, so it works from ANY
-// base — including one already carrying a different design (System normalises
-// such a base back to SF Pro). Returns `base` only when nil or when the font
-// can't be built. Shared by the Runtime's UIFont hooks and the editor's
-// font/preview rows.
+// Re-derive `base` in the theme font's design, preserving size, weight,
+// italic, and its Dynamic Type text style (a font without one, such as a
+// systemFontOfSize: font, comes back as Body). Rebuilds from a pristine
+// system descriptor, so it works from ANY base — including one already
+// carrying a different design (System normalises such a base back to SF Pro).
+// Returns `base` only when nil or when the font can't be built. Shared by the
+// Runtime's UIFont hooks and the editor's font/preview rows.
 UIFont *ApolloThemeFontApply(ApolloThemeFont font, UIFont *base);
+
+// The design-free descriptor ApolloThemeFontApply rebuilds a font from, given
+// that font's UIFontDescriptorTextStyleAttribute: its own Dynamic Type style,
+// or for a systemFontOfSize: font (a CoreText usage) the plain system UI font,
+// italic when `italic`. Also used by the runtime's Rounded italic redirect.
+UIFontDescriptor *ApolloThemeFontPristineDescriptor(id textStyleAttribute, BOOL italic);
 #endif
 
 #pragma mark - Appearance mode index

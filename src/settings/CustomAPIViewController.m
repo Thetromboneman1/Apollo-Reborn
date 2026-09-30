@@ -1,5 +1,6 @@
 #import "ApolloSettingsShortcutsViewController.h"
 #import "settings/CustomAPIViewController.h"
+#import "settings/ApolloSiriSettingsViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloFeedShortcutsAppearance.h"
 #import "ApolloThemeRuntime.h"
@@ -18,6 +19,8 @@
 #import "ApolloFloatingTabs.h"       // close-all / fan-out entry points for the toggles
 #import "settings/ApolloAISettingsViewController.h"
 #import "ApolloWebSessionStore.h"
+#import "ApolloKagiSearch.h"         // Kagi Session Link (Search tab's Kagi mode)
+#import "ApolloKagiSearchParsing.h"  // ApolloKagiNormalizeSessionToken()
 #import "ApolloAccountCredentials.h"
 #import "ApolloWebJSON.h"           // ApolloWebJSONBearerIsSynthetic() — widget setup code
 #import "ApolloPerAccountFavorites.h"
@@ -445,6 +448,9 @@ static BOOL ApolloInterfaceSupportsPhoneTabBarControls(void) {
 // Hub only: whether the Setup section last rendered its "add a Reddit key"
 // footer, so viewWillAppear reloads that section only when the answer flips.
 @property (nonatomic) BOOL setupFooterShowsKeyNudge;
+// A height pass for restyled link footers is queued (see
+// -apollo_refreshFooterTextViews).
+@property (nonatomic) BOOL footerLinkHeightPassPending;
 @end
 
 @implementation CustomAPIViewController
@@ -465,6 +471,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     TagNotificationBackendURL,
     TagNotificationBackendRegistrationToken,
     TagBarkPushURL,
+    TagKagiSessionLink,
 };
 
 #pragma mark - Helpers
@@ -483,7 +490,8 @@ typedef NS_ENUM(NSInteger, Tag) {
         || tag == TagRedditClientSecret
         || tag == TagImgurClientId
         || tag == TagImageChestAPIToken
-        || tag == TagGiphyAPIKey;
+        || tag == TagGiphyAPIKey
+        || tag == TagKagiSessionLink;
 }
 
 - (void)apollo_applySecureTextEntry:(BOOL)secure toCell:(UITableViewCell *)cell {
@@ -576,23 +584,60 @@ typedef NS_ENUM(NSInteger, Tag) {
     cell.selectedBackgroundView = selectedBackground;
 }
 
+// Restyles the link footers the table is showing for the current theme, the way
+// they are built. A footer that was showing when the theme changed under a
+// pushed screen (Theme Manager is one of the hub's Shortcuts) otherwise came
+// back with the old theme's text colour, link colour and font. UIKit shows
+// these footers as plain views, and -footerViewForSection: only returns
+// UITableViewHeaderFooterViews, so they are found among the table's own
+// subviews by the section title each was tagged with in
+// -tableView:viewForFooterInSection:.
 - (void)apollo_refreshFooterTextViews {
-    UIColor *accentColor = [self apollo_themeAccentColor];
+    BOOL heightChanged = NO;
     NSInteger sectionCount = self.tableView.numberOfSections;
     for (NSInteger section = 0; section < sectionCount; section++) {
         UIView *footerView = [self.tableView footerViewForSection:section];
         if (![footerView isKindOfClass:[ApolloSettingsLinkFooterView class]]) continue;
 
         UITextView *textView = ((ApolloSettingsLinkFooterView *)footerView).linkTextView;
-        textView.tintColor = accentColor;
-        textView.linkTextAttributes = @{NSForegroundColorAttributeName: accentColor};
-        textView.attributedText = [self footerAttributedTextForSection:section];
+        NSAttributedString *text = [self footerAttributedTextForSection:section];
+        if (!text) continue;
+        [self apollo_styleFooterLinkTextView:textView withText:text];
+        CGFloat width = CGRectGetWidth(textView.bounds) ?: [self apollo_footerLinkWidthInTableView:self.tableView];
+        if (width <= 0) continue;
+        CGFloat fitted = ceil([textView sizeThatFits:CGSizeMake(width, CGFLOAT_MAX)].height);
+        if (fabs(fitted - CGRectGetHeight(footerView.bounds)) >= 0.5) heightChanged = YES;
     }
+    if (heightChanged) [self apollo_scheduleFooterLinkHeightPass];
 }
 
-- (void)apollo_applyTheme {
-    [super apollo_applyTheme];
-    [self apollo_refreshFooterTextViews];
+// A theme font change can leave a restyled link footer taller than the height
+// the table gave it (its last lines cut off) or shorter. An empty updates pass
+// makes the table ask -tableView:heightForFooterInSection: again, which
+// measures the same way. Run it once any transition is over (a pass during one
+// gets its settle captured), and keep the rows on screen where they are.
+- (void)apollo_scheduleFooterLinkHeightPass {
+    if (self.footerLinkHeightPassPending) return;
+    self.footerLinkHeightPassPending = YES;
+    __weak typeof(self) weakSelf = self;
+    void (^pass)(void) = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.footerLinkHeightPassPending = NO;
+        UITableView *tableView = strongSelf.tableView;
+        if (!tableView.window) return;
+        ApolloLog(@"[SettingsForm] link footers changed height with the theme — re-measuring");
+        [strongSelf performUpdateKeepingVisibleRowsInPlace:^{
+            [tableView beginUpdates];
+            [tableView endUpdates];
+        }];
+    };
+    id<UIViewControllerTransitionCoordinator> coordinator = self.transitionCoordinator;
+    if (coordinator && [coordinator animateAlongsideTransition:nil
+                                                   completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) { pass(); }]) {
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), pass);
 }
 
 - (UIImage *)roundedImage:(UIImage *)image size:(CGFloat)size cornerRadius:(CGFloat)radius {
@@ -920,6 +965,9 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     [self apollo_applyTheme];
+    // The theme may have changed while this screen was covered (Theme Manager
+    // is one of the hub's Shortcuts).
+    [self apollo_refreshFooterTextViews];
     // Refresh the Web Session Login status line after returning from the login
     // flow (signed-in user / write-token availability may have just changed).
     // No-ops while the row is hidden (API-Key-Free Mode off).
@@ -1120,14 +1168,14 @@ typedef NS_ENUM(NSInteger, Tag) {
     ApolloSettingsRow *apiKeys =
         [self hubDisclosureRowWithID:@"setup.apiKeys"
                                title:@"Accounts & API Keys"
-                            subtitle:^NSString * { return @"Reddit · Imgur · Giphy · Image Chest"; }
+                            subtitle:^NSString * { return @"Reddit · Imgur · Giphy · Image Chest · Kagi"; }
                                 push:^UIViewController * {
             return [[ApolloAccountsAPIKeysViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
     apiKeys.iconSystemName = @"key.fill";
     apiKeys.iconTileColor = [UIColor systemGrayColor];
     return [ApolloSettingsSection sectionWithTitle:@"Setup"
-                                            footer:@"Your Reddit sign-in credentials, plus optional Imgur, Giphy and Image Chest keys for uploads and GIFs."
+                                            footer:@"Your Reddit sign-in credentials, plus optional Imgur, Giphy and Image Chest keys for uploads and GIFs, and a Kagi Session Link for searching Reddit with Kagi."
                                               rows:@[ apiKeys ]];
 }
 
@@ -1410,6 +1458,72 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                       redirectURI, userAgent ]];
 }
 
+// The Search tab's Kagi mode (ApolloKagiSearch.m). The Session Link lives in
+// the Keychain, not NSUserDefaults; the Search tab asks for it the first time
+// Kagi is picked, and this field changes or removes it.
+- (ApolloSettingsSection *)buildAPIKeysKagiSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *kagiLink =
+        [ApolloSettingsRow customRowWithID:@"api.kagiSessionLink"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_KagiSessionLink"
+                                                                           label:@"Kagi Session Link"
+                                                                     placeholder:@"https://kagi.com/search?token=…"
+                                                                            text:ApolloKagiSessionToken() ?: @""
+                                                                             tag:TagKagiSessionLink
+                                                                          detail:@"Search Reddit with Kagi from the Search tab's magnifier. Copy it from Kagi → Settings → Account → Session Link."];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            [weakSelf apollo_textFieldInCell:cell].keyboardType = UIKeyboardTypeURL;
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Kagi Search"
+                                            footer:@"For Kagi subscribers. Each page of Kagi results counts as one search on your Kagi plan. Clear the field to remove the link."
+                                              rows:@[ kagiLink ]];
+}
+
+// Saves (or removes) the Kagi Session Link typed into the settings field.
+// Anything that isn't a Session Link is refused and the saved one shown again.
+- (void)apollo_saveKagiSessionLinkFromField:(UITextField *)textField {
+    NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *current = ApolloKagiSessionToken();
+    if (trimmed.length == 0) {
+        textField.text = @"";
+        if (current.length) ApolloKagiSetSessionToken(nil);
+        return;
+    }
+    NSString *token = ApolloKagiNormalizeSessionToken(trimmed);
+    if (!token) {
+        textField.text = current ?: @"";
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Not a Session Link"
+                                                                        message:@"Paste the whole Session Link from Kagi → Settings → Account. It starts with https://kagi.com/search?token="
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    textField.text = token;
+    if ([token isEqualToString:current]) return;
+    if (!ApolloKagiSetSessionToken(token)) {
+        textField.text = current ?: @"";
+        return;
+    }
+    // Saved either way; warn if Kagi turns it away, so a bad paste doesn't
+    // only show up later as "Kagi Session Expired" in the Search tab.
+    __weak typeof(self) weakSelf = self;
+    ApolloKagiCheckSessionToken(token, ^(ApolloKagiSessionCheck result, __unused NSError *error) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || result != ApolloKagiSessionCheckRejected || !strongSelf.view.window) return;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Kagi Didn't Accept This Link"
+                                                                        message:@"It may have expired or been reset. Copy a fresh Session Link from Kagi → Settings → Account."
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [strongSelf presentViewController:alert animated:YES completion:nil];
+    });
+}
+
 - (ApolloSettingsSection *)buildAPIKeysSignInSection {
     __weak typeof(self) weakSelf = self;
 
@@ -1630,7 +1744,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             return [weakSelf switchCellWithIdentifier:@"Cell_API_ModernModmail"
                                                 label:@"Use Modern Moderator Mail"
-                                               detail:@"On uses Reddit's current Modmail with the active web-session account. Off keeps Apollo's native Moderator Mail, which only works for accounts signed in with an API key."
+                                               detail:@"On uses Reddit's current Modmail with the active web-session account. Off keeps Apollo's native Moderator Mail."
                                                    on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseModernRedditModmail]
                                               enabled:YES
                                                action:@selector(modernRedditModmailSwitchToggled:)]
@@ -2019,29 +2133,16 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 // Interface → Menus: the ••• menus' item order and visibility live on their own
-// screen (ApolloActionMenuSettingsViewController); the hub row summarises how
-// many menus differ from Apollo's default.
-- (NSString *)actionMenusSummaryText {
-    NSMutableArray<NSString *> *customized = [NSMutableArray array];
-    for (ApolloActionMenuContext context in ApolloActionMenuAllContexts()) {
-        if (ApolloActionMenuContextIsCustomized(context)) [customized addObject:ApolloActionMenuContextTitle(context)];
-    }
-    if (customized.count == 0) return @"Default";
-    return [NSString stringWithFormat:@"Customized: %@", [customized componentsJoinedByString:@", "]];
-}
-
+// screen (ApolloActionMenuSettingsViewController).
 - (ApolloSettingsSection *)buildInterfaceMenusSection {
-    __weak typeof(self) weakSelf = self;
     ApolloSettingsRow *actionMenus =
         [self hubDisclosureRowWithID:@"interface.actionMenus"
-                               title:@"Action Menus"
-                            subtitle:^NSString * { return [weakSelf actionMenusSummaryText]; }
+                               title:@"Customize Action Menus"
+                            subtitle:nil
                                 push:^UIViewController * {
             return [[ApolloActionMenuSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
-    return [ApolloSettingsSection sectionWithTitle:@"Menus"
-                                            footer:@"Reorder or hide the items in the ••• menus of feeds, posts and comments, and in the moderator menus. Touching and holding a post or comment opens the same menu."
-                                              rows:@[ actionMenus ]];
+    return [ApolloSettingsSection sectionWithTitle:@"Menus" footer:nil rows:@[ actionMenus ]];
 }
 
 - (ApolloSettingsSection *)buildInterfaceDisplayNavigationSection {
@@ -2150,9 +2251,35 @@ typedef NS_ENUM(NSInteger, Tag) {
         return IsLiquidGlass() && !sCollapseNavigationActions && ApolloInterfaceSupportsPhoneTabBarControls();
     };
 
+    NSString *displayNavigationFooter =
+    @"User Profile Pictures adds avatars beside usernames in posts, comments, messages, inbox rows, and moderator lists. True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
+
+    if (IsLiquidGlass()) {
+        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:
+            @"\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."];
+    }
+
+    NSArray<NSString *> *trueBlackTitles = @[ @"Off", @"Dark Mode Only", @"Light Mode Only", @"Always" ];
+    ApolloSettingsRow *trueBlackKeyboard =
+        [ApolloSettingsRow valueRowWithID:@"interface.trueBlackKeyboard"
+                                    title:@"True Black Keyboard"
+                                   detail:^NSString * {
+            NSInteger mode = [NSUserDefaults.standardUserDefaults integerForKey:UDKeyTrueBlackKeyboardMode];
+            return trueBlackTitles[MAX(0, MIN(mode, (NSInteger)trueBlackTitles.count - 1))];
+        }
+                                 onSelect:^{
+            NSInteger mode = [NSUserDefaults.standardUserDefaults integerForKey:UDKeyTrueBlackKeyboardMode];
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.trueBlackKeyboard"],
+                @"True Black Keyboard", trueBlackTitles, MAX(0, MIN(mode, (NSInteger)trueBlackTitles.count - 1)),
+                ^(NSInteger picked) {
+                    [NSUserDefaults.standardUserDefaults setInteger:picked forKey:UDKeyTrueBlackKeyboardMode];
+                    [weakSelf reloadRowWithID:@"interface.trueBlackKeyboard"];
+                });
+        }];
+
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
-                                            footer:@"User Profile Pictures adds avatars beside usernames in posts, comments, messages, inbox rows, and moderator lists. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows. Liquid Glass is required for the remaining options.\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."
-                                              rows:@[ userAvatars, avatarShape, scrollReturnButton, collapseActions, centerBetween, iPadPaneLayout, scrollEdgeEffect ]];
+                                            footer:displayNavigationFooter
+                                              rows:@[ userAvatars, avatarShape, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, iPadPaneLayout, scrollEdgeEffect ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
@@ -3090,7 +3217,14 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     crashReports.iconSystemName = @"bandage";
     crashReports.iconTileColor = [UIColor systemOrangeColor];
 
-    return [ApolloSettingsSection sectionWithTitle:@"Privacy" footer:nil rows:@[ heartbeat, crashReports ]];
+    ApolloSettingsRow *siri = [ApolloSettingsRow disclosureRowWithID:@"privacy.siri" title:@"Siri & Spotlight"
+        detail:nil push:^UIViewController * {
+            return [[ApolloSiriSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    siri.visible = ^BOOL { return NSClassFromString(@"ApolloContentBridge") != Nil; };
+    siri.iconSystemName = @"sparkle.magnifyingglass";
+    siri.iconTileColor = UIColor.systemPurpleColor;
+    return [ApolloSettingsSection sectionWithTitle:@"Privacy" footer:nil rows:@[ heartbeat, crashReports, siri ]];
 }
 
 - (ApolloSettingsSection *)buildAboutSection {
@@ -3643,19 +3777,53 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     return [super tableView:tableView titleForFooterInSection:section];
 }
 
+// A link footer's text, fonts and colours exactly as the table shows them.
+// -tableView:heightForFooterInSection: measures a footer styled here and
+// -apollo_refreshFooterTextViews restyles the shown ones here, so everything
+// that sizes the text happens here. The settings base styles every footer again
+// in willDisplayFooterView:, after the table has taken the footer's height; a
+// view that got that styling only there was measured in one font and shown in
+// another (13pt text shown at 17pt under a Rounded, Serif or Mono theme font),
+// and the lines that didn't fit were cut off. Styled here, that second pass
+// changes nothing.
+- (void)apollo_styleFooterLinkTextView:(UITextView *)textView withText:(NSAttributedString *)text {
+    textView.tintColor = [self apollo_themeAccentColor];
+    textView.linkTextAttributes = @{NSForegroundColorAttributeName: [self apollo_themeAccentColor]};
+    textView.attributedText = text;
+    // The styling reads -font and -textColor, and once they have been set a
+    // UITextView keeps answering with those values rather than the new text's:
+    // restyling a shown footer after a theme change kept the old theme's font
+    // and never recoloured the text. Every run shares one font, and the styling
+    // gives the whole text one colour anyway (links draw in linkTextAttributes),
+    // so setting both from the first character changes nothing else.
+    if (text.length > 0) {
+        textView.font = [text attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
+        textView.textColor = [text attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL];
+    }
+    ApolloSettingsApplyFooterTypography(textView);
+}
+
+// The width UIKit lays a footer view out at: insetGrouped places it inside the
+// section inset, which follows the table's layout margins.
+- (CGFloat)apollo_footerLinkWidthInTableView:(UITableView *)tableView {
+    CGFloat tableWidth = tableView.bounds.size.width;
+    if (tableWidth <= 0) tableWidth = [UIScreen mainScreen].bounds.size.width;
+
+    // Account for insetGrouped horizontal insets — footer is narrower than the table view
+    UIEdgeInsets margins = tableView.layoutMargins;
+    CGFloat footerWidth = tableWidth - margins.left - margins.right;
+    if (footerWidth <= 0) footerWidth = tableWidth - 40.0;
+    return footerWidth;
+}
+
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
     NSAttributedString *text = [self footerAttributedTextForSection:section];
     if (!text) return nil;
-
     static NSString *const reuseID = @"ApolloSettingsLinkFooter";
     ApolloSettingsLinkFooterView *footer =
         (ApolloSettingsLinkFooterView *)[tableView dequeueReusableHeaderFooterViewWithIdentifier:reuseID];
     if (!footer) footer = [[ApolloSettingsLinkFooterView alloc] initWithReuseIdentifier:reuseID];
-    UITextView *textView = footer.linkTextView;
-    textView.tintColor = [self apollo_themeAccentColor];
-    textView.linkTextAttributes = @{NSForegroundColorAttributeName: [self apollo_themeAccentColor]};
-    textView.attributedText = text;
-
+    [self apollo_styleFooterLinkTextView:footer.linkTextView withText:text];
     return footer;
 }
 
@@ -3671,7 +3839,11 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         return plainFooter.length > 0 ? [super tableView:tableView heightForFooterInSection:section] : 12.0;
     }
 
-    return UITableViewAutomaticDimension;
+    CGFloat footerWidth = [self apollo_footerLinkWidthInTableView:tableView];
+    UITextView *measureView = [[ApolloFooterLinkTextView alloc] initWithFrame:CGRectMake(0, 0, footerWidth, 0)];
+    [self apollo_styleFooterLinkTextView:measureView withText:text];
+    CGSize size = [measureView sizeThatFits:CGSizeMake(footerWidth, CGFLOAT_MAX)];
+    return ceil(size.height);
 }
 
 #pragma mark - Row Actions
@@ -4162,6 +4334,8 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     } else if (textField.tag == TagGiphyAPIKey) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         [[NSUserDefaults standardUserDefaults] setValue:textField.text ?: @"" forKey:UDKeyGiphyAPIKey];
+    } else if (textField.tag == TagKagiSessionLink) {
+        [self apollo_saveKagiSessionLinkFromField:textField];
     } else if (textField.tag == TagRedirectURI) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sRedirectURI = textField.text;
@@ -4854,6 +5028,7 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 - (NSString *)apollo_screenTitle { return @"Accounts & API Keys"; }
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildAPIKeysDefaultSection],
+              [self buildAPIKeysKagiSection],
               [self buildAPIKeysSignInSection],
               [self buildAPIKeysExperimentalSection],
               [self buildAPIKeysExtrasSection] ];
@@ -4973,7 +5148,7 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
-    if (section != 0) return UITableViewAutomaticDimension;
+    if (section != 0) return [super tableView:tableView heightForHeaderInSection:section];
     UIFont *font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote
                            compatibleWithTraitCollection:self.traitCollection];
     return ceil(font.lineHeight) + 20.0;
@@ -5322,11 +5497,6 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     return @[ [self buildInterfaceTabBarSection],
               [self buildInterfaceDisplayNavigationSection],
               [self buildInterfaceMenusSection] ];
-}
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    // Refresh the Action Menus summary after returning from that screen.
-    [self reloadRowWithID:@"interface.actionMenus"];
 }
 @end
 
