@@ -113,25 +113,14 @@ static const int32_t kApolloInlineVideoTimeObserverTimescale = 30;
 
 #if APOLLO_SIM_BUILD
 static void ApolloVideoTimingRecord(NSString *step, CFTimeInterval ms, id node);
-#endif
-
-static inline CFTimeInterval ApolloVideoTimingBegin(void) {
-#if APOLLO_SIM_BUILD
-    return CACurrentMediaTime();
+#define APOLLO_VIDEO_TIMED(step, node, call) do { \
+    CFTimeInterval _t0 = CACurrentMediaTime(); \
+    call; \
+    ApolloVideoTimingRecord(step, (CACurrentMediaTime() - _t0) * 1000.0, node); \
+} while (0)
 #else
-    return 0;
+#define APOLLO_VIDEO_TIMED(step, node, call) do { call; } while (0)
 #endif
-}
-
-static inline void ApolloVideoTimingEnd(NSString *step, id node, CFTimeInterval started) {
-#if APOLLO_SIM_BUILD
-    ApolloVideoTimingRecord(step, (CACurrentMediaTime() - started) * 1000.0, node);
-#else
-    (void)step;
-    (void)node;
-    (void)started;
-#endif
-}
 
 // The timescale to install. Simulator builds can override it from the launch
 // environment (SIMCTL_CHILD_APOLLOFIX_INLINE_VIDEO_TIMESCALE=10000 restores
