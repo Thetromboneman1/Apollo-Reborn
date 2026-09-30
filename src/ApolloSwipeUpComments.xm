@@ -24,6 +24,7 @@
 #import "ApolloCommon.h"
 #import "ApolloSwipeCommentsMediaPolicy.h"
 #import "ApolloState.h"
+#import "ApolloSwiftRuntime.h"
 #import "ApolloThemeRuntime.h"
 
 // The PiP controller is the higher-priority owner. A pane session must never
@@ -132,18 +133,6 @@ static void *ApolloSwipeCommentsSwiftWeakSlot(id object, const char *name) {
     Ivar ivar = class_getInstanceVariable([object class], name);
     if (!ivar) return NULL;
     return (uint8_t *)(__bridge void *)object + ivar_getOffset(ivar);
-}
-
-static id ApolloSwipeCommentsLoadSwiftWeak(id object, const char *name) {
-    typedef void *(*LoadStrongFunction)(void *slot);
-    static LoadStrongFunction loadStrong;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        loadStrong = (LoadStrongFunction)dlsym(RTLD_DEFAULT, "swift_unknownObjectWeakLoadStrong");
-    });
-    void *slot = ApolloSwipeCommentsSwiftWeakSlot(object, name);
-    void *value = slot && loadStrong ? loadStrong(slot) : NULL;
-    return value ? CFBridgingRelease(value) : nil;
 }
 
 static BOOL ApolloSwipeCommentsAssignSwiftWeak(id object, const char *name, id value) {
@@ -412,7 +401,7 @@ static UINavigationController *ApolloSwipeCommentsNavigationInTree(UIViewControl
 
 static UINavigationController *ApolloSwipeCommentsEnsureNavigationController(UIViewController *page,
                                                                               BOOL *recoveredOut) {
-    UINavigationController *navigation = ApolloSwipeCommentsLoadSwiftWeak(
+    UINavigationController *navigation = ApolloReadSwiftWeakObjectIvar(
         page, "navigationControllerToPushCommentsOnto");
     if (navigation) return navigation;
 
