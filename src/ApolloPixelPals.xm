@@ -202,7 +202,7 @@ static NSString *ApolloRectString(CGRect r) {
 // layout untouched) until the pill has been captured, or when no correction is
 // needed.
 static BOOL ApolloPixelPalGeometry(UIWindow *window, CGRect *outApollo, CGRect *outPill) {
-    if (ApolloPixelPalsDisabledOnDuo()) return NO;
+    if (ApolloPixelPalsDisabledForWindow(window)) return NO;
     if (!sApolloPillKnown) return NO;
     CGRect apollo = sApolloPill;
     CGRect pill = apollo;
@@ -433,7 +433,7 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 // hooks intact for regular phones, and only hide Apollo's own views on Duo.
 - (void)layoutSubviews {
     %orig;
-    if (!ApolloPixelPalsDisabledOnDuo()) return;
+    if (!ApolloPixelPalsDisabledForWindow((UIWindow *)self)) return;
     for (NSString *name in @[@"fauxCutOutView", @"pixelPalView"]) {
         Ivar ivar = class_getInstanceVariable(object_getClass(self), name.UTF8String);
         UIView *view = ivar ? object_getIvar(self, ivar) : nil;
