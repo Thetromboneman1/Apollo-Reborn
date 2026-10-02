@@ -55,11 +55,59 @@ static const NSUInteger kApolloAMPreviewMaxRows = 8;
 
 #pragma mark - Action Menu hub
 
-@implementation ApolloActionMenuSettingsViewController
+static NSString *ApolloAMMenuSummary(NSString *context) {
+    if ([context isEqualToString:ApolloActionMenuEditorAllMenus]) {
+        NSMutableSet<NSString *> *hiddenActions = [NSMutableSet set];
+        for (NSString *menuContext in ApolloActionMenuAllContexts()) {
+            [hiddenActions unionSet:ApolloActionMenuHiddenItemIDs(menuContext)];
+        }
+        NSUInteger hidden = hiddenActions.count;
+        if (hidden == 0) return nil;
+        return [NSString stringWithFormat:@"%lu action%@ hidden",
+                (unsigned long)hidden, hidden == 1 ? @"" : @"s"];
+    }
+
+    BOOL order = ApolloActionMenuHasCustomOrder(context);
+    NSUInteger hidden = ApolloActionMenuHiddenItemIDs(context).count;
+    if (!order && hidden == 0) return nil;
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (order) [parts addObject:@"Custom order"];
+    if (hidden > 0) {
+        [parts addObject:[NSString stringWithFormat:@"%lu action%@ hidden",
+                          (unsigned long)hidden, hidden == 1 ? @"" : @"s"]];
+    }
+    return [parts componentsJoinedByString:@" · "];
+}
+
+@implementation ApolloActionMenuSettingsViewController {
+    BOOL _appeared;
+    NSMutableDictionary<NSString *, NSNumber *> *_menuRowHeights;
+    UITableViewCell *_measuringMenuCell;
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Customize Action Menus";
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    if (_appeared) [self refreshSummaries];
+    _appeared = YES;
+}
+
+- (void)refreshSummaries {
+    NSArray<NSString *> *contexts = [@[ ApolloActionMenuEditorAllMenus ]
+        arrayByAddingObjectsFromArray:ApolloActionMenuAllContexts()];
+    for (NSString *context in contexts) {
+        UITableViewCell *cell = [self cellForRowID:[@"menu." stringByAppendingString:context]];
+        if (cell) cell.detailTextLabel.text = ApolloAMMenuSummary(context);
+    }
+    [UIView performWithoutAnimation:^{
+        [self.tableView beginUpdates];
+        [self.tableView endUpdates];
+        [self.tableView layoutIfNeeded];
+    }];
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section {
@@ -89,13 +137,49 @@ static const NSUInteger kApolloAMPreviewMaxRows = 8;
     header.accessibilityLabel = accessibilityTitle;
 }
 
+- (CGFloat)menuRowHeightWithSubtitle:(BOOL)subtitle {
+    UITableView *table = self.tableView;
+    CGFloat width = CGRectGetWidth(table.bounds);
+    if (width <= 0.0) return UITableViewAutomaticDimension;
+    NSString *key = [NSString stringWithFormat:@"%d|%.0f|%@", subtitle, width,
+                     table.traitCollection.preferredContentSizeCategory ?: @""];
+    NSNumber *cached = _menuRowHeights[key];
+    if (cached) return cached.doubleValue;
+    if (!_measuringMenuCell) {
+        _measuringMenuCell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    }
+    UITableViewCell *cell = _measuringMenuCell;
+    cell.textLabel.text = @"Post";
+    cell.detailTextLabel.text = subtitle ? @"Custom order · 2 actions hidden" : nil;
+    cell.bounds = CGRectMake(0.0, 0.0, width, 100.0);
+    ApolloSettingsApplyCellTypography(cell);
+    [cell setNeedsLayout];
+    [cell layoutIfNeeded];
+    CGFloat height = ceil([cell systemLayoutSizeFittingSize:CGSizeMake(width, UILayoutFittingCompressedSize.height)
+                                  withHorizontalFittingPriority:UILayoutPriorityRequired
+                                        verticalFittingPriority:UILayoutPriorityFittingSizeLevel].height);
+    if (height <= 0.0) return UITableViewAutomaticDimension;
+    if (!_menuRowHeights) _menuRowHeights = [NSMutableDictionary dictionary];
+    _menuRowHeights[key] = @(height);
+    return height;
+}
+
 - (ApolloSettingsRow *)menuRowForContext:(NSString *)context title:(NSString *)title {
-    return [ApolloSettingsRow disclosureRowWithID:[@"menu." stringByAppendingString:context]
-                                             title:title
-                                            detail:nil
-                                              push:^UIViewController * {
+    ApolloSettingsRow *row =
+        [ApolloSettingsRow disclosureRowWithID:[@"menu." stringByAppendingString:context]
+                                         title:title
+                                        detail:^NSString * { return ApolloAMMenuSummary(context); }
+                                          push:^UIViewController * {
             return [[ApolloActionMenuEditorViewController alloc] initWithContext:context];
         }];
+    row.detailAsSubtitle = YES;
+    __weak __typeof(self) weakSelf = self;
+    row.height = ^CGFloat {
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return UITableViewAutomaticDimension;
+        return [strongSelf menuRowHeightWithSubtitle:ApolloAMMenuSummary(context).length > 0];
+    };
+    return row;
 }
 
 - (NSArray<ApolloSettingsSection *> *)buildForm {
@@ -969,9 +1053,8 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
     // a shown row is re-enabled, reset to the plain label colour and marked
     // for the theme's primary text like every other settings row.
     UIColor *accent = [self apollo_themeAccentColor] ?: ApolloThemeAccentColor() ?: self.view.tintColor;
-    BOOL fixedTweakRow = !self.editingAllMenus && !ApolloNativeActionMenusActive() && item.isTweakRow;
     cell.checkmark.tintColor = accent;
-    cell.checkmark.alpha = fixedTweakRow ? 0.0 : (hidden ? 0.0 : 1.0);
+    cell.checkmark.alpha = hidden ? 0.0 : 1.0;
     cell.imageView.tintColor = hidden ? UIColor.tertiaryLabelColor : accent;
     cell.textLabel.enabled = !hidden;
     cell.textLabel.textColor = hidden ? UIColor.secondaryLabelColor : UIColor.labelColor;
@@ -989,8 +1072,6 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
 
 - (void)toggleItemWithID:(NSString *)itemID {
     if (itemID.length == 0) return;
-    ApolloActionMenuItem *catalogItem = ApolloActionMenuCatalogItem(self.context, itemID);
-    if (!self.editingAllMenus && !ApolloNativeActionMenusActive() && catalogItem.isTweakRow) return;
     BOOL hide = ![self itemIsHidden:itemID];
     for (NSString *context in [self contextsForItem:itemID]) {
         ApolloActionMenuSetItemHidden(context, itemID, hide);
@@ -1094,17 +1175,31 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
 
 - (NSIndexPath *)tableView:(UITableView *)tableView targetIndexPathForMoveFromRowAtIndexPath:(NSIndexPath *)sourceIndexPath toProposedIndexPath:(NSIndexPath *)proposedDestinationIndexPath {
     if (![self indexPathIsItemRow:sourceIndexPath]) return sourceIndexPath;
-    if ([self indexPathIsItemRow:proposedDestinationIndexPath]) return proposedDestinationIndexPath;
     NSInteger itemsSection = [self itemsSectionIndex];
     NSInteger lastRow = MAX([tableView numberOfRowsInSection:itemsSection] - 1, 0);
+    if (!ApolloNativeActionMenusActive()) {
+        NSArray<ApolloActionMenuItem *> *items = [self editableItems];
+        for (NSUInteger i = 0; i < items.count; i++) {
+            if (items[i].isTweakRow) {
+                if (i == 0) return sourceIndexPath;
+                lastRow = (NSInteger)i - 1;
+                break;
+            }
+        }
+    }
+    if ([self indexPathIsItemRow:proposedDestinationIndexPath]) {
+        NSInteger row = MIN(proposedDestinationIndexPath.row, lastRow);
+        return [NSIndexPath indexPathForRow:row inSection:itemsSection];
+    }
     NSInteger row = proposedDestinationIndexPath.section < itemsSection ? 0 : lastRow;
     return [NSIndexPath indexPathForRow:row inSection:itemsSection];
 }
 
 - (NSArray<UIDragItem *> *)tableView:(UITableView *)tableView itemsForBeginningDragSession:(id<UIDragSession>)session atIndexPath:(NSIndexPath *)indexPath {
-    ApolloLog(@"[ActionMenuSettings] drag begin asked for %ld/%ld (item row: %d)",
-              (long)indexPath.section, (long)indexPath.row, [self indexPathIsItemRow:indexPath]);
-    if (![self indexPathIsItemRow:indexPath]) return @[];
+    BOOL movable = [self tableView:tableView canMoveRowAtIndexPath:indexPath];
+    ApolloLog(@"[ActionMenuSettings] drag begin asked for %ld/%ld (movable: %d)",
+              (long)indexPath.section, (long)indexPath.row, movable);
+    if (!movable) return @[];
     UIDragItem *item = [[UIDragItem alloc] initWithItemProvider:[NSItemProvider new]];
     item.localObject = indexPath;
     return @[ item ];
