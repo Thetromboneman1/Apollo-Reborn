@@ -1,5 +1,6 @@
 #import "ApolloSettingsShortcutsViewController.h"
 #import "ApolloSettingsRouter.h"
+#import "ApolloSiriSettingsViewController.h"
 
 #import <objc/message.h>
 
@@ -11,6 +12,7 @@
 #import "settings/ApolloActionMenuSettingsViewController.h"
 #import "ApolloActionMenuLayout.h"
 #import "settings/ApolloAutomaticBackupViewController.h"
+#import "settings/ApolloICloudBackupsViewController.h"
 #import "settings/ApolloDeletedCommentsSettingsViewController.h"
 #import "settings/ApolloLinkPreviewSettingsViewController.h"
 #import "settings/ApolloOpenInAppViewController.h"
@@ -62,6 +64,9 @@ static void ApolloSettingsRouterEnsureRegistry(void) {
             };
 
         add(@"reborn", @"Apollo Reborn", @"Settings", ApolloSettingsInsetGrouped([CustomAPIViewController class]));
+        if (NSClassFromString(@"ApolloContentBridge")) {
+            add(@"siri-spotlight", @"Siri & Spotlight", @"Apollo Reborn", ApolloSettingsInsetGrouped([ApolloSiriSettingsViewController class]));
+        }
         // The hub's group screens (settings IA restructure).
         add(@"accounts-api-keys", @"Accounts & API Keys", @"Apollo Reborn → Setup", ApolloSettingsInsetGrouped([ApolloAccountsAPIKeysViewController class]));
         add(@"posts-feeds", @"Posts & Feeds", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloPostsFeedsViewController class]));
@@ -91,6 +96,7 @@ static void ApolloSettingsRouterEnsureRegistry(void) {
         }
         add(@"notification-backend", @"Notification Backend", @"Apollo Reborn → Advanced", ApolloSettingsInsetGrouped([ApolloNotificationBackendViewController class]));
         add(@"automatic-backups", @"Automatic Backups", @"Apollo Reborn → Data", ApolloSettingsInsetGrouped([ApolloAutomaticBackupViewController class]));
+        add(@"icloud-backups", @"iCloud Backups", @"Apollo Reborn → Data → Backup Settings", ApolloSettingsInsetGrouped([ApolloICloudBackupsViewController class]));
         add(@"saved-categories", @"Saved Categories", @"General → Other", ApolloSettingsInsetGrouped([SavedCategoriesViewController class]));
         add(@"translation", @"Translation", @"General → Other", ApolloSettingsInsetGrouped([TranslationSettingsViewController class]));
         add(@"tag-filters", @"Tag Filters", @"Filters & Blocks", ApolloSettingsInsetGrouped([TagFiltersViewController class]));

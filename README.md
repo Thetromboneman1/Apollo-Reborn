@@ -114,12 +114,13 @@ Finally, **don't copy these examples verbatim**. If everyone adopts the same "sa
 ### Not seeing thumbnails or inline previews?
 
 > [!TIP]
-> If thumbnails or inline media previews aren't showing up, it's usually a Reddit account setting rather than a tweak issue. Open [old.reddit.com/prefs](https://old.reddit.com/prefs) and log in, then under the **Media** section:
+> Apollo Reborn loads preview metadata from Reddit's current authenticated JSON endpoints. If thumbnails or inline media previews stop appearing:
 >
-> - Set **Thumbnails** to *"show thumbnails next to links"*
-> - Set **Media previews** to *"auto-expand media previews"*
+> - Update Apollo Reborn and relaunch Apollo.
+> - For API-Key-Free Mode, open **Settings → Apollo Reborn → Accounts & API Keys** and reconnect the affected web session.
+> - For an API-key account, verify that account's Reddit API key and sign-in are still valid.
 >
-> Save your preferences and relaunch Apollo.
+> Reddit's legacy media-preference page is no longer used as a troubleshooting dependency.
 
 ### Self-hosted notifications (advanced)
 
@@ -395,7 +396,7 @@ See [repository maintenance](docs/repository-maintenance.md) before syncing.
 ![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
 
 - **Default branch:** `main`
-- **Implementation fingerprint:** `411afb8820762ad3`
+- **Implementation fingerprint:** `586fa657b7f96a2d`
 - **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.

@@ -24,14 +24,17 @@ static NSString *const UDKeyUseCustomOAuthSignIn = @"UseCustomOAuthSignIn";
 static NSString *const UDKeyUserAgent = @"UserAgent";
 static NSString *const UDKeyBlockAnnouncements = @"DisableApollonouncements";
 static NSString *const UDKeyEnableFLEX = @"EnableFlexDebugging";
-// Opt-in settings ZIPs, checked while Apollo is active. Default OFF, every 3
-// days; supported intervals are 1, 3, and 7 days in a user-selected Files folder.
-// Folder permission, installation identity and last-run state live separately
-// in Application Support, so exporting/restoring settings cannot transfer them.
+// Opt-in settings archives, checked while Apollo is active. Default OFF, every
+// 3 days; supported intervals are 1, 3, and 7 days. Archives are always local.
+// A separate installation-local consent can copy successful archives to iCloud.
+// Scheduling and iCloud consent state live outside exported settings.
 static NSString *const UDKeyAutomaticBackupsEnabled = @"AutomaticBackupsEnabled";
 static NSString *const UDKeyAutomaticBackupIntervalDays = @"AutomaticBackupIntervalDays";
 // Legacy destination value retained for compatibility with older builds.
 static NSString *const UDKeyAutomaticBackupDestination = @"AutomaticBackupDestination";
+// Opt-in cross-device read/unread and new-comment baseline sync. Runtime iCloud
+// access still depends on the current signing profile's KVS entitlement.
+static NSString *const UDKeyICloudReadStateSyncEnabled = @"ICloudReadStateSyncEnabled";
 // Version stamps for Apollo's own sideload-unlock flags, which the constructor
 // writes into two preference domains. Each stamp lives in the SAME domain as
 // the flags it guards, so anything that resets a domain (fresh install, a
@@ -189,8 +192,8 @@ static NSString *const UDKeyOpenVideosInYouTubeApp = @"OpenVideosInYouTubeApp";
 //   in-app-safari (In-App Safari), external-safari (Safari), chrome, firefox,
 //   firefox-focus, edge, dolphin, brave, duckduckgo, icab
 // Reborn's "Open in App" screen mirrors this key (same gather-and-hide pattern
-// as UDKeyOpenVideosInYouTubeApp above; the token literal is also read in
-// ApolloShareLinks.xm's ApolloOpensLinksInSystemBrowser()).
+// as UDKeyOpenVideosInYouTubeApp above; the key is also read in
+// ApolloShareLinks.xm's ApolloOpenLinksInToken()).
 static NSString *const UDKeyNativeOpenLinksIn = @"OpenLinksIn";
 // Apollo NATIVE key + change notification for its "Hide Username on Tab Bar"
 // switch. Apollo observes the notification (hideUsernameOnTabBarChangedWithNotification:)
@@ -209,6 +212,13 @@ static NSString *const UDKeyIconOnlySavedHideUsernameOnTabBar = @"IconOnlySavedH
 // key string literals are duplicated in ApolloShareLinks.xm; keep them in sync.
 static NSString *const UDKeyOpenLinksInGitHubApp  = @"OpenLinksInGitHubApp";
 static NSString *const UDKeyOpenLinksInBlueskyApp = @"OpenLinksInBlueskyApp";
+// "Open via Nitter": open tapped x.com / twitter.com links on a Nitter mirror
+// instead of X (BOOL, default OFF / unset), and the instance to use (bare
+// "host" or "host:port", as produced by ApolloNitterNormalizeHost; empty = none
+// picked, which leaves the feature inactive even when the toggle is on). Read
+// at tap time in ApolloShareLinks.xm; set in Settings > Open in App.
+static NSString *const UDKeyOpenTwitterLinksViaNitter = @"OpenTwitterLinksViaNitter";
+static NSString *const UDKeyNitterInstanceHost = @"NitterInstanceHost";
 static NSString *const UDKeyCollapsePinnedComments = @"CollapsePinnedComments";
 static NSString *const UDKeyShowDeletedComments = @"ShowDeletedComments";
 static NSString *const UDKeyTapToRevealDeletedComments = @"TapToRevealDeletedComments";
@@ -241,7 +251,7 @@ static NSString *const UDKeyCommentLinkPreferNative = @"CommentLinkPreferNative"
 // media-permission gating (the image button un-blocks while a link host is set).
 static NSString *const ApolloCommentLinkHostChangedNotification = @"ApolloCommentLinkHostChangedNotification";
 // Outgoing Reddit URL host for Apollo share sheets (ShareLinkHost enum). Default
-// keeps Apollo's stock reddit.com links; Old Reddit/vxReddit rewrite share URLs.
+// keeps Apollo's stock reddit.com links; vxReddit/fxReddit rewrite share URLs.
 static NSString *const UDKeyShareLinkHost = @"ShareLinkHost";
 static NSString *const UDKeyShowUserAvatars = @"ShowUserAvatars";
 static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon";
@@ -251,6 +261,13 @@ static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon"
 // Default OFF. See ApolloTabBarTitles.xm.
 static NSString *const UDKeyHideTabBarTitles = @"HideTabBarTitles";
 static NSString *const ApolloTabBarTitlesChangedNotification = @"ApolloTabBarTitlesChangedNotification";
+
+// Controls the Inbox tab's unread badge presentation.
+// Default YES preserves Apollo's numbered unread badge.
+static NSString *const UDKeyInboxBadgeShowUnreadCount = @"InboxBadgeShowUnreadCount";
+// Default NO preserves Apollo's standard red badge color.
+static NSString *const UDKeyInboxBadgeUseThemeAccent = @"InboxBadgeUseThemeAccent";
+static NSString *const ApolloInboxBadgeChangedNotification = @"ApolloInboxBadgeChangedNotification";
 // When ON (default), profile pages show Reborn's detailed profile — the banner,
 // large avatar/snoovatar, display name, bio, and the Social Links band. When OFF,
 // the profile page reverts to Apollo's compact stock layout: the detailed header is

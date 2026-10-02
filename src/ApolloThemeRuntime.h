@@ -55,6 +55,19 @@ UIColor *ApolloThemeCardBackgroundColor(void);
 // last-resort (typically systemGroupedBackgroundColor).
 UIColor *ApolloThemePageBackgroundColor(void);
 
+// Whether the current non-tinted stock Apollo theme is using Pure Black in
+// dark mode. Returns NO for custom/tinted themes and light appearance.
+BOOL ApolloThemeUsesPureBlackDarkMode(UITraitCollection *traits);
+
+// Apollo's secondary text colour for tweak-drawn metadata. Uses the custom
+// theme's SecondaryLabel token when active, otherwise Apollo's recovered stock
+// secondary palette, including its distinct Pure Black dark-mode value.
+UIColor *ApolloThemeSecondaryTextColor(UITraitCollection *traits);
+
+// Ordinary Pure Black's card surface, deliberately unaffected by the stronger
+// PURER setting. nil unless stock Pure Black dark mode is active.
+UIColor *ApolloThemePureBlackCardColor(UITraitCollection *traits);
+
 // The EFFECTIVE separator color for tweak-drawn UI: the custom theme's
 // separator when one is active, else the stock theme's (Pure Black Dark
 // Mode aware). nil only if neither can be determined — callers supply their
@@ -89,6 +102,10 @@ void ApolloThemeRuntimeSetFontPinned(id view, BOOL pinned);
 
 // Preserve a tweak-owned visual-effect fill on Apollo's custom search field.
 void ApolloThemeRuntimeSetBackgroundColorPassthrough(id view, BOOL enabled);
+
+// Performs intentional foreground assignments without remapping literal colors
+// through Apollo's themed text sinks.
+void ApolloThemeRuntimePerformTextSinkBypass(void (^block)(void));
 
 // Walk the app's windows and re-derive system-design fonts on Apollo-owned
 // labels / text fields / text views (plus vetted nav/tab-bar chrome) into the

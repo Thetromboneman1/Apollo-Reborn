@@ -24,6 +24,7 @@
 #import "ApolloAccountCredentials.h"
 #import "ApolloWebJSON.h"           // ApolloWebJSONBearerIsSynthetic() — widget setup code
 #import "ApolloPerAccountFavorites.h"
+#import "ApolloICloudReadState.h"
 #import "ApolloFavoritesSorting.h"
 #import "ApolloState.h"
 #import "ApolloScrollToTop.h"
@@ -58,6 +59,8 @@
 #import "settings/ApolloAutomaticBackup.h"
 #import "settings/ApolloAutomaticBackupViewController.h"
 #import "settings/ApolloLocalBackupsViewController.h"
+#import "settings/ApolloICloudBackupStore.h"
+#import "settings/ApolloICloudBackupsViewController.h"
 #import "settings/ApolloThanksToViewController.h"
 #import "settings/ApolloBuyUsACoffeeViewController.h"
 #import "settings/ApolloReportViewController.h"
@@ -704,6 +707,10 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (void)setShareLinkHost:(NSInteger)host {
+    if (host == ShareLinkHostRetiredOldReddit ||
+        host < ShareLinkHostDefault || host > ShareLinkHostFXReddit) {
+        host = ShareLinkHostDefault;
+    }
     sShareLinkHost = host;
     [[NSUserDefaults standardUserDefaults] setInteger:sShareLinkHost
                                                 forKey:UDKeyShareLinkHost];
@@ -712,19 +719,25 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)presentShareLinkHostSheetFromSourceView:(UIView *)sourceView {
     __weak typeof(self) weakSelf = self;
+    NSArray<NSNumber *> *hostValues = @[
+        @(ShareLinkHostDefault), @(ShareLinkHostVXReddit), @(ShareLinkHostFXReddit)
+    ];
+    NSUInteger currentIndex = [hostValues indexOfObject:@(sShareLinkHost)];
+    if (currentIndex == NSNotFound) currentIndex = 0;
     ApolloSettingsPresentPicker(
         self,
         sourceView,
         @"Share Link Host",
         @[
             ApolloShareLinkHostDisplayName(ShareLinkHostDefault),
-            ApolloShareLinkHostDisplayName(ShareLinkHostOldReddit),
             ApolloShareLinkHostDisplayName(ShareLinkHostVXReddit),
             ApolloShareLinkHostDisplayName(ShareLinkHostFXReddit)
         ],
-        sShareLinkHost,
+        (NSInteger)currentIndex,
         ^(NSInteger pickedIndex) {
-            [weakSelf setShareLinkHost:pickedIndex];
+            if (pickedIndex >= 0 && pickedIndex < (NSInteger)hostValues.count) {
+                [weakSelf setShareLinkHost:hostValues[(NSUInteger)pickedIndex].integerValue];
+            }
         });
 }
 
@@ -994,6 +1007,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     // Refresh the Profile Layout summary after returning from that screen
     // (Density/Avatar/band switches may have just changed).
     [self reloadRowWithID:@"feat.profileLayout"];
+    [self reloadRowWithID:@"siri.settings"];
     // The Setup section footer (onboarding nudge) collapses once a Reddit key
     // exists, which may have just been entered on the pushed API Keys screen.
     // Section 0 is Setup on the hub; reloading it re-evaluates the footer.
@@ -1058,6 +1072,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[
         [self buildSetupSection],
+        [self buildSiriSection],
         [self buildFeaturesSection],
         [self buildShortcutsSection],
         [self buildDataSection],
@@ -1852,9 +1867,71 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFilterNSFWRecentlyRead]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf filterNSFWRecentlyReadSwitchToggled:sender]; }];
 
+    ApolloSettingsRow *iCloudReadState =
+        [ApolloSettingsRow switchRowWithID:@"gen.iCloudReadState"
+                                     title:@"Sync Read State with iCloud"
+                                      isOn:^BOOL { return ApolloICloudReadState.sharedManager.enabled; }
+                                  onToggle:^(UISwitch *sender) {
+        if (sender.isOn) {
+            [sender setOn:NO animated:YES];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sync Read History with iCloud?"
+                message:@"Apollo will sync read post IDs, view times, and new-comment baselines. The cloud payload is encrypted with a key stored in iCloud Keychain. Sync only works across devices using the same iCloud account and compatible signing identity. Changing iCloud accounts turns sync off without changing local history."
+                preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Enable Sync" style:UIAlertActionStyleDefault
+                handler:^(__unused UIAlertAction *action) {
+                    NSError *enableError = nil;
+                    if (![ApolloICloudReadState.sharedManager setEnabled:YES error:&enableError]) {
+                        [weakSelf showAlertWithTitle:@"iCloud Sync Unavailable"
+                                             message:enableError.localizedDescription ?: @"This build cannot access iCloud."];
+                    }
+                    [weakSelf reloadRowWithID:@"gen.iCloudReadState"];
+                    [weakSelf reloadRowWithID:@"gen.iCloudReadStateStatus"];
+                }]];
+            [weakSelf presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+        NSError *error = nil;
+        if (![ApolloICloudReadState.sharedManager setEnabled:sender.isOn error:&error]) {
+            [sender setOn:NO animated:YES];
+            [weakSelf showAlertWithTitle:@"iCloud Sync Unavailable"
+                                 message:error.localizedDescription ?: @"This build cannot access iCloud."];
+        }
+        [weakSelf reloadRowWithID:@"gen.iCloudReadState"];
+        [weakSelf reloadRowWithID:@"gen.iCloudReadStateStatus"];
+    }];
+
+    ApolloSettingsRow *iCloudReadStateStatus =
+        [ApolloSettingsRow valueRowWithID:@"gen.iCloudReadStateStatus"
+                                    title:@"iCloud Sync Status"
+                                   detail:^NSString * {
+        ApolloICloudReadState *manager = ApolloICloudReadState.sharedManager;
+        if (!manager.enabled) return manager.availabilityMessage ?: @"Off";
+        return manager.available ? @"Encrypted · Active" : (manager.availabilityMessage ?: @"Unavailable");
+    } onSelect:^{
+        UIAlertController *reset = [UIAlertController alertControllerWithTitle:@"Reset Encrypted Cloud State?"
+            message:@"Use this only when devices created conflicting encryption keys. It deletes Apollo's encrypted read-state value and synchronized key from iCloud, but does not change local read history. After resetting, enable sync on one device first, then the others."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [reset addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [reset addAction:[UIAlertAction actionWithTitle:@"Reset Cloud Sync" style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *action) {
+                NSError *resetError = nil;
+                if (![ApolloICloudReadState.sharedManager resetEncryptedCloudState:&resetError]) {
+                    [weakSelf showAlertWithTitle:@"Reset Failed" message:resetError.localizedDescription];
+                }
+                [weakSelf reloadRowWithID:@"gen.iCloudReadState"];
+                [weakSelf reloadRowWithID:@"gen.iCloudReadStateStatus"];
+            }]];
+        [weakSelf presentViewController:reset animated:YES completion:nil];
+    }];
+    iCloudReadStateStatus.enabled = ^BOOL {
+        ApolloICloudReadState *manager = ApolloICloudReadState.sharedManager;
+        return manager.enabled || manager.recoveryNeeded;
+    };
+
     return [ApolloSettingsSection sectionWithTitle:@"Recently Read"
-                                            footer:@"Choose how posts appear in Recently Read and how many Apollo remembers."
-                                            rows:@[ readThumbnails, readPostMax, filterNSFWRR ]];
+                                             footer:@"Show thumbnails on posts you've already read, and cap how many Apollo remembers. iCloud sync is optional and requires usable iCloud key-value-store and iCloud Keychain access. Read state updates live; native comment highlighting uses received baselines after the next cold start."
+                                               rows:@[ readThumbnails, readPostMax, filterNSFWRR, iCloudReadState, iCloudReadStateStatus ]];
 }
 
 // The "Open in App" screen now lives in native General → Open Links — see
@@ -1999,6 +2076,37 @@ typedef NS_ENUM(NSInteger, Tag) {
         return !(IsLiquidGlass() && UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad);
     };
 
+    ApolloSettingsRow *inboxUnreadCount =
+        [ApolloSettingsRow switchRowWithID:@"interface.inboxUnreadCount"
+                                     title:@"Show Unread Count"
+                                      isOn:^BOOL { return [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeShowUnreadCount]; }
+                                  onToggle:^(UISwitch *sender) {
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyInboxBadgeShowUnreadCount];
+            [NSNotificationCenter.defaultCenter postNotificationName:ApolloInboxBadgeChangedNotification object:nil];
+        }];
+
+    ApolloSettingsRow *inboxBadgeColor =
+        [ApolloSettingsRow valueRowWithID:@"interface.inboxBadgeColor"
+                                    title:@"Unread Badge Color"
+                                   detail:^NSString * {
+            return [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? @"Theme Accent" : @"Red";
+        }
+                                 onSelect:^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            ApolloSettingsPresentPicker(self, [self cellForRowID:@"interface.inboxBadgeColor"],
+                                        @"Unread Badge Color", @[@"Red", @"Theme Accent"],
+                                        [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? 1 : 0,
+                                        ^(NSInteger pickedIndex) {
+                [NSUserDefaults.standardUserDefaults setBool:(pickedIndex == 1) forKey:UDKeyInboxBadgeUseThemeAccent];
+                [NSNotificationCenter.defaultCenter postNotificationName:ApolloInboxBadgeChangedNotification object:nil];
+                [weakSelf reloadRowWithID:@"interface.inboxBadgeColor"];
+            });
+        }];
+    inboxBadgeColor.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
     // Icon-Only already hides every tab label. Hide the narrower profile-only
     // option while it is active, then reinsert it with its remembered value.
     ApolloSettingsRow *hideUsernameTab =
@@ -2124,7 +2232,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
     return [ApolloSettingsSection sectionWithTitle:@"Tab Bar"
                                             footer:footer
-                                              rows:@[ profileTabAvatar, iconOnlyTabBar, hideUsernameTab,
+                                              rows:@[ profileTabAvatar, iconOnlyTabBar, inboxUnreadCount, inboxBadgeColor, hideUsernameTab,
                                                       hideBarsOnScroll, hideStyle, hideTopBarToo, tabBarScrollBehavior,
                                                       iPadTabBarBottom, tabBarSwipeNavigation,
                                                       [ApolloSettingsRow disclosureRowWithID:@"interface.settingsShortcuts" title:@"Settings Shortcuts" detail:nil push:^UIViewController *{
@@ -2142,7 +2250,10 @@ typedef NS_ENUM(NSInteger, Tag) {
                                 push:^UIViewController * {
             return [[ApolloActionMenuSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
-    return [ApolloSettingsSection sectionWithTitle:@"Menus" footer:nil rows:@[ actionMenus ]];
+    return [ApolloSettingsSection
+        sectionWithTitle:@"Menus"
+        footer:@"Reorder and hide actions in the ••• menus on posts and comments, as well as moderator menus."
+        rows:@[ actionMenus ]];
 }
 
 - (ApolloSettingsSection *)buildInterfaceDisplayNavigationSection {
@@ -2984,7 +3095,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   }];
 
     return [ApolloSettingsSection sectionWithTitle:@"Favorites"
-                                            footer:@"Per-Account Favorites saves a separate list and sorting preference for each account. First enable copies the current list to existing accounts; new accounts start empty. Turning it off restores the shared list.\nAlphabetical sorting keeps existing and new favorites in order. Turn it off to rearrange them manually while editing the subreddit list.\nConfirm Favorite Changes asks before adding or removing a favorite from the Subreddits list star."
+                                            footer:@"Per-Account Favorites keeps a separate favorites list for each account. Turning it off restores the shared list.\nConfirm Favorite Changes asks before adding or removing favorites."
                                               rows:@[ perAccountFavorites, sortFavoritesAlphabetically, confirmFavoriteToggle ]];
 }
 
@@ -3217,14 +3328,25 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     crashReports.iconSystemName = @"bandage";
     crashReports.iconTileColor = [UIColor systemOrangeColor];
 
-    ApolloSettingsRow *siri = [ApolloSettingsRow disclosureRowWithID:@"privacy.siri" title:@"Siri & Spotlight"
-        detail:nil push:^UIViewController * {
-            return [[ApolloSiriSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    return [ApolloSettingsSection sectionWithTitle:@"Privacy" footer:nil rows:@[ heartbeat, crashReports ]];
+}
+
+// An opt-in integration belongs near Setup, with its own explanation rather
+// than below crash reports and the unrelated anonymous-heartbeat footer.
+- (ApolloSettingsSection *)buildSiriSection {
+    ApolloSettingsRow *siri = [ApolloSettingsRow disclosureRowWithID:@"siri.settings" title:@"Siri & Spotlight"
+        detail:^NSString * {
+            return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySiriContentIndexing] ? @"On" : @"Off";
+        } push:^UIViewController * {
+            return ApolloSettingsRouteInstantiate(@"siri-spotlight");
         }];
-    siri.visible = ^BOOL { return NSClassFromString(@"ApolloContentBridge") != Nil; };
     siri.iconSystemName = @"sparkle.magnifyingglass";
     siri.iconTileColor = UIColor.systemPurpleColor;
-    return [ApolloSettingsSection sectionWithTitle:@"Privacy" footer:nil rows:@[ heartbeat, crashReports, siri ]];
+    ApolloSettingsSection *section = [ApolloSettingsSection sectionWithTitle:nil
+        footer:@"Find Apollo posts and communities with Siri, Spotlight and Shortcuts. Content indexing is off until you enable it."
+        rows:@[siri]];
+    section.visible = ^BOOL { return NSClassFromString(@"ApolloContentBridge") != Nil; };
+    return section;
 }
 
 - (ApolloSettingsSection *)buildAboutSection {
@@ -4816,7 +4938,14 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     // Icon-Only temporarily supersedes the narrower profile-only choice.
     // Preserve its preference while hiding the redundant row, then restore
     // both when tab labels return.
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL showUnreadCount = [defaults boolForKey:UDKeyInboxBadgeShowUnreadCount];
     ApolloSetHideTabBarTitlesEnabled(sender.isOn);
+    // Rebuilding the tab bar can cause Apollo/UIKit to re-register its tab
+    // defaults. Icon-Only and Inbox badge presentation are independent, so
+    // preserve the user's badge choice across that rebuild explicitly.
+    [defaults setBool:showUnreadCount forKey:UDKeyInboxBadgeShowUnreadCount];
+    [defaults synchronize];
     [self visibilityDidChange];
 }
 
@@ -4937,6 +5066,12 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 
 - (void)restoreSettings {
     if (self.resolvingRestoreFolder || self.presentedViewController) return;
+    ApolloICloudBackupStore *iCloudStore = ApolloICloudBackupStore.sharedStore;
+    if (iCloudStore.availability == ApolloICloudBackupAvailabilityUnknown && !iCloudStore.isWorking) {
+        __weak typeof(self) weakSelf = self;
+        [iCloudStore refreshAvailabilityWithCompletion:^{ [weakSelf restoreSettings]; }];
+        return;
+    }
     __weak typeof(self) weakSelf = self;
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Restore Settings"
         message:@"Choose where the backup is stored."
@@ -4947,7 +5082,15 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
                 [[ApolloLocalBackupsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
             [weakSelf.navigationController pushViewController:controller animated:YES];
         }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cloud Backup"
+    UIAlertAction *iCloud = [UIAlertAction actionWithTitle:@"iCloud Backup"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            ApolloICloudBackupsViewController *controller =
+                [[ApolloICloudBackupsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            [weakSelf.navigationController pushViewController:controller animated:YES];
+        }];
+    iCloud.enabled = iCloudStore.availability == ApolloICloudBackupAvailabilityAvailable;
+    [sheet addAction:iCloud];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Choose from Files"
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf presentRestorePickerAtDirectory:nil];
@@ -5036,6 +5179,11 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 @end
 
 @implementation ApolloPostsFeedsViewController
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self reloadRowWithID:@"gen.iCloudReadState"];
+    [self reloadRowWithID:@"gen.iCloudReadStateStatus"];
+}
 - (NSString *)apollo_screenTitle { return @"Posts & Feeds"; }
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildPostsRecentlyReadSection],

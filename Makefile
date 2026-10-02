@@ -86,6 +86,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloDuoSubsChromeHooks.xm \
     $(SRC_DIR)/ApolloProfilePagination.xm \
     $(SRC_DIR)/ApolloWebTextDecoding.m \
+    $(SRC_DIR)/ApolloNitterInstances.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
     $(SRC_DIR)/settings/ApolloSettingsTableViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsForm.m \
@@ -96,6 +97,9 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloBackupDocument.m \
     $(SRC_DIR)/settings/ApolloAutomaticBackup.m \
     $(SRC_DIR)/settings/ApolloAutomaticBackupViewController.m \
+    $(SRC_DIR)/settings/ApolloICloudBackupSupport.m \
+    $(SRC_DIR)/settings/ApolloICloudBackupStore.m \
+    $(SRC_DIR)/settings/ApolloICloudBackupsViewController.m \
     $(SRC_DIR)/settings/ApolloLocalBackupsViewController.m \
     $(SRC_DIR)/settings/ApolloBackupActionsCell.m \
     $(SRC_DIR)/settings/ApolloThanksToViewController.m \
@@ -192,6 +196,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloNavigationActions.xm \
     $(SRC_DIR)/ApolloNavigationTitlePresentation.xm \
     $(SRC_DIR)/ApolloTabBarTitles.xm \
+    $(SRC_DIR)/ApolloInboxBadge.xm \
     $(SRC_DIR)/ApolloScrollEdgePopFix.xm \
     $(SRC_DIR)/ApolloInterruptibleNavTransition.xm \
     $(SRC_DIR)/ApolloLiquidGlassIconPicker.xm \
@@ -228,6 +233,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloRecentlyRead.xm \
     $(SRC_DIR)/ApolloIntelligenceBridge.xm \
     $(SRC_DIR)/settings/ApolloSiriSettingsViewController.m \
+    $(SRC_DIR)/ApolloICloudReadState.m \
     $(SRC_DIR)/ApolloProfileMoreMenu.xm \
     $(SRC_DIR)/ApolloHiddenContentData.m \
     $(SRC_DIR)/ApolloHiddenContentViewController.m \
@@ -474,6 +480,16 @@ endif
 # run-in-sim.sh additionally builds with LOGOS_DEFAULT_GENERATOR=internal so the
 # dylib uses ObjC-runtime swizzling and has no CydiaSubstrate dependency.
 ifeq ($(APOLLO_SIM_BUILD),1)
+# The internal Logos generator cannot preprocess these device-only hooks: the
+# crosspost hook makes differently-parameterized %orig calls, while the posted
+# comment hook relies on Substrate's synchronous batch-update reentry, and the
+# video timing hook wraps a generated original call inside a C macro. None is
+# needed for simulator settings/auth validation; device builds keep all three.
+ApolloReborn_FILES := $(filter-out \
+    $(SRC_DIR)/ApolloCrosspostTitle.xm \
+    $(SRC_DIR)/ApolloPostedCommentInsert.xm \
+    $(SRC_DIR)/ApolloFeedVideoScrolling.xm, \
+    $(ApolloReborn_FILES))
 # The internal Logos generator does not auto-include <substrate.h> the way the
 # MobileSubstrate generator does, so force-include it for the MSHookIvar template
 # (a pure ObjC-runtime helper with no CydiaSubstrate link dependency).
