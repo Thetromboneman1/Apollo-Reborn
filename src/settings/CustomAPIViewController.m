@@ -447,6 +447,12 @@ static BOOL ApolloInterfaceSupportsPhoneTabBarControls(void) {
     return ApolloDuoCurrentMode() == ApolloDuoModePhone && !ApolloDuoRailHasVisibleSideBar();
 }
 
+static BOOL ApolloInterfaceSupportsBarScrollSettings(void) {
+    // Duo preferences stay configurable in every pose, even when the bottom
+    // tab bar is currently replaced by the always-visible side rail.
+    return ApolloDuoUsesAdaptiveBars() || ApolloInterfaceSupportsPhoneTabBarControls();
+}
+
 @interface CustomAPIViewController ()
 @property (nonatomic) BOOL resolvingRestoreFolder;
 // Hub only: whether the Setup section last rendered its "add a Reddit key"
@@ -2119,14 +2125,14 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     ApolloSettingsRow *hideBarsOnScroll =
         [ApolloSettingsRow switchRowWithID:@"interface.hideBarsOnScroll"
-                                     title:@"Hide Bars on Scroll"
+                                     title:ApolloDuoUsesAdaptiveBars() ? @"Hide Tab Bar on Scroll" : @"Hide Bars on Scroll"
                                       isOn:^BOOL { return ApolloTabBarHideBarsEnabled(); }
                                   onToggle:^(UISwitch *sender) {
             ApolloTabBarHideBarsSetEnabled(sender.isOn);
             [weakSelf visibilityDidChange];
         }];
     hideBarsOnScroll.visible = ^BOOL {
-        return ApolloInterfaceSupportsPhoneTabBarControls();
+        return ApolloInterfaceSupportsBarScrollSettings();
     };
 
     ApolloSettingsRow *hideStyle =
@@ -2147,11 +2153,12 @@ typedef NS_ENUM(NSInteger, Tag) {
             return cell;
         } onSelect:nil];
     hideStyle.visible = ^BOOL {
-        return ApolloInterfaceSupportsPhoneTabBarControls() &&
+        return ApolloInterfaceSupportsBarScrollSettings() &&
             ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled();
     };
 
-    // Keep the remembered choice while Hide Bars is off; only its row hides.
+    // On Duo the header has an independent preference in every pose. Phones
+    // keep their existing dependency on Hide Bars, including the stored choice.
     ApolloSettingsRow *hideTopBarToo =
         [ApolloSettingsRow switchRowWithID:@"interface.hideTopBarToo"
                                      title:@"Hide Header on Scroll"
@@ -2164,8 +2171,9 @@ typedef NS_ENUM(NSInteger, Tag) {
                 postNotificationName:ApolloTabBarScrollBehaviorChangedNotification object:nil];
         }];
     hideTopBarToo.visible = ^BOOL {
-        return ApolloInterfaceSupportsPhoneTabBarControls() &&
-            ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled();
+        return ApolloDuoUsesAdaptiveBars() ||
+            (ApolloInterfaceSupportsPhoneTabBarControls() &&
+             ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled());
     };
 
     // Both behavior choices include idle re-expansion. A single picker keeps
@@ -2189,7 +2197,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             return cell;
         } onSelect:nil];
     tabBarScrollBehavior.visible = ^BOOL {
-        return ApolloInterfaceSupportsPhoneTabBarControls() &&
+        return ApolloInterfaceSupportsBarScrollSettings() &&
             ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled();
     };
 
@@ -2220,16 +2228,19 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation]; }
                                   onToggle:^(UISwitch *sender) { [weakSelf tabBarSwipeNavigationSwitchToggled:sender]; }];
     tabBarSwipeNavigation.visible = ^BOOL {
-        return IsLiquidGlass() && ApolloInterfaceSupportsPhoneTabBarControls();
+        return IsLiquidGlass() && ApolloInterfaceSupportsBarScrollSettings();
     };
 
     NSString *footer = ApolloSupportsNativeTabBarScrollBehavior()
         ? @"After the tab bar reappears, Two-Gesture hides it on the second downward gesture; Classic hides it on the first. Both re-expand after 30 seconds of inactivity."
         : @"Hide Bars on Scroll uses the classic on/off behavior on this version of iOS.";
-    if (!ApolloInterfaceSupportsPhoneTabBarControls()) {
+    if (!ApolloInterfaceSupportsBarScrollSettings()) {
         footer = nil;
     } else if (IsLiquidGlass()) {
         footer = [footer stringByAppendingString:@"\n\nSwipe Tab Bar to Navigate disables the native drag-to-switch-tab gesture."];
+    }
+    if (ApolloDuoUsesAdaptiveBars()) {
+        footer = [footer stringByAppendingString:@"\n\nOn iPhone Duo, Hide Tab Bar on Scroll, Hide Style, Scroll Behavior, and Swipe Tab Bar to Navigate apply only while open in portrait. The side rail always stays visible. Hide Header on Scroll works independently in every pose."];
     }
     return [ApolloSettingsSection sectionWithTitle:@"Tab Bar"
                                             footer:footer
