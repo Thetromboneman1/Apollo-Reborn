@@ -1059,10 +1059,12 @@ void ApolloNativeFeedSearchSetDuoControls(UIViewController *vc, UIBarButtonItem 
 static void NSBUpdateSearchPlacement(UIViewController *vc) {
     if (@available(iOS 16.0, *)) {
         UINavigationItem *item = vc.navigationItem;
-        // Both unfolded orientations keep the search field below the title.
-        // Use the destination display size during folding, before UIKit has
-        // finished installing its split columns or trailing navigation rail.
+        // Every Duo pose keeps the field beneath the title. The live rail
+        // also identifies closed landscape, whose bounds classify as Phone.
         BOOL stacked = ApolloDuoSplitIsUnfolded();
+        if (@available(iOS 27.0, *)) {
+            stacked |= ApolloDuoCurrentMode() != ApolloDuoModePhone || ApolloDuoRailHasVisibleSideBar();
+        }
         NSNumber *original = objc_getAssociatedObject(item, &kNSBDuoSearchPlacementKey);
         if (stacked && !original) {
             original = @(item.preferredSearchBarPlacement);
@@ -1072,6 +1074,7 @@ static void NSBUpdateSearchPlacement(UIViewController *vc) {
         UINavigationItemSearchBarPlacement placement = stacked
             ? UINavigationItemSearchBarPlacementStacked : (UINavigationItemSearchBarPlacement)original.integerValue;
         if (item.preferredSearchBarPlacement != placement) item.preferredSearchBarPlacement = placement;
+        NSBUpdateDuoControls(vc);
         if (!stacked) objc_setAssociatedObject(item, &kNSBDuoSearchPlacementKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
@@ -1266,6 +1269,7 @@ static BOOL NSBHasSettledFeedGeometry(UIViewController *vc, UIScrollView *table)
     ApolloNativeSearchRestingState *state = NSBRestingStateForVC(vc);
     UINavigationController *nav = vc.navigationController;
     return state.visible && nav.topViewController == vc && nav.visibleViewController == vc &&
+           !ApolloNavTransitionInFlight() && !ApolloDuoSplitIsResizing() &&
            !nav.transitionCoordinator && !vc.transitionCoordinator;
 }
 
