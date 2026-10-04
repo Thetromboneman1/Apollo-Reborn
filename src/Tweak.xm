@@ -3935,6 +3935,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeyIPadPaneLayout: @NO,
                                     UDKeyTabBarSwipeNavigation: @NO,
+                                    UDKeyDuoLandscapeFeedLayout: @0,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyInfoRowTapUpvote: @YES,
                                     UDKeyInfoRowTapComments: @YES,
@@ -4251,6 +4252,13 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // scene connect, which happens after %ctor and never again for the process.
     sIPadPaneLayout = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout];
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
+    sDuoLandscapeFeedLayout = [standardDefaults integerForKey:UDKeyDuoLandscapeFeedLayout];
+    // Value 1 belonged to the removed side-by-side experiment. Keep Focused
+    // feed at 2 so existing selections survive this menu cleanup.
+    if (sDuoLandscapeFeedLayout != 0 && sDuoLandscapeFeedLayout != 2) {
+        sDuoLandscapeFeedLayout = 0;
+        [standardDefaults setInteger:0 forKey:UDKeyDuoLandscapeFeedLayout];
+    }
     sIconRowMagnifier = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIconRowMagnifier];
     sInfoRowTapUpvote = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapUpvote];
     sInfoRowTapComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapComments];
