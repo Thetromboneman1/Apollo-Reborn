@@ -85,6 +85,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloDuoSubsChrome.m \
     $(SRC_DIR)/ApolloDuoSubsChromeHooks.xm \
     $(SRC_DIR)/ApolloProfilePagination.xm \
+    $(SRC_DIR)/ApolloListEmptyState.xm \
     $(SRC_DIR)/ApolloWebTextDecoding.m \
     $(SRC_DIR)/ApolloNitterInstances.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
