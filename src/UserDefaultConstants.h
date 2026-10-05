@@ -24,6 +24,15 @@ static NSString *const UDKeyUseCustomOAuthSignIn = @"UseCustomOAuthSignIn";
 static NSString *const UDKeyUserAgent = @"UserAgent";
 static NSString *const UDKeyBlockAnnouncements = @"DisableApollonouncements";
 static NSString *const UDKeyEnableFLEX = @"EnableFlexDebugging";
+// Versioned Pal Home room/resident document. Absent = the cosy starter room.
+// Separate from Apollo's native PixelPalsDatabase; included in settings backups.
+static NSString *const UDKeyPalHome = @"ApolloRebornPalHome";
+// Pal Home replaces Apollo's Pixel Pals screens (island tap, Settings -> Pixel
+// Pals). Default OFF: Apollo's Classic Pixel Pals until you opt in.
+static NSString *const UDKeyPalHomeEnabled = @"ApolloRebornPalHomeEnabled";
+// The "Try Pal Home" prompt: dismissed for good / last shown (seconds since 1970).
+static NSString *const UDKeyPalHomePromptDismissed = @"ApolloRebornPalHomePromptDismissed";
+static NSString *const UDKeyPalHomePromptLastShown = @"ApolloRebornPalHomePromptLastShown";
 // Opt-in settings archives, checked while Apollo is active. Default OFF, every
 // 3 days; supported intervals are 1, 3, and 7 days. Archives are always local.
 // A separate installation-local consent can copy successful archives to iCloud.
@@ -86,6 +95,11 @@ static NSString *const UDKeyHideRPopularRedditList = @"HideRPopularRedditList";
 static NSString *const UDKeyHideRAllRedditList = @"HideRAllRedditList";
 static NSString *const UDKeyHideModeratorRedditList = @"HideModeratorRedditList";
 static NSString *const ApolloFeedShortcutsChangedNotification = @"ApolloFeedShortcutsChangedNotification";
+// A Pal Home shortcut beside Home / Popular / All / Moderator (feed index 4).
+// Shown only while Pal Home is on; default shown. Reborn-only (no native row):
+// Rows layout draws it as a footer row under Apollo's feed rows, the strip
+// layouts as one more tile. See ApolloFeedShortcutDisplayIndexes().
+static NSString *const UDKeyHidePalHomeShortcut = @"HidePalHomeShortcut";
 // Keep an independent FavoriteSubreddits list for each Reddit account. Opt-in:
 // default NO via registerDefaults. ApolloPerAccountFavorites projects the active
 // account's bucket back through Apollo's native FavoriteSubreddits key so every
