@@ -4,7 +4,6 @@
 #import <math.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
-#import "ApolloAutoHideTabBar.h"
 #import "ApolloCommon.h"
 #import "ApolloTopBarScrollPresentation.h"
 #import "ApolloCompactTabBarView.h"
