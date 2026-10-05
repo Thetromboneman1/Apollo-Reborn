@@ -1,3 +1,5 @@
+#import "palhome/ApolloPalHomeStore.h"
+#import "palhome/ApolloPalHomeWidgetRenderer.h"
 #import "ApolloSettingsShortcutsViewController.h"
 #import "settings/CustomAPIViewController.h"
 #import "settings/ApolloSiriSettingsViewController.h"
@@ -191,17 +193,14 @@ static ApolloFeedShortcutsPreviewState *ApolloFeedShortcutsCurrentPreviewState(
     UITraitCollection *traitCollection,
     CGFloat availableWidth) {
     ApolloFeedShortcutsPreviewState *state = [ApolloFeedShortcutsPreviewState new];
-    state.visibleIndexes = ApolloFeedShortcutVisibleIndexes();
+    state.visibleIndexes = ApolloFeedShortcutDisplayIndexes();
     state.iconStyle = (ApolloSubredditFeedIconStyle)sSubredditFeedIconStyle;
     state.traitCollection = traitCollection;
     state.layout = ApolloFeedShortcutEffectiveLayout(sSubredditFeedLayout,
                                                        state.visibleIndexes.count,
                                                        traitCollection);
-    BOOL supportsCompactFourUp = state.layout == ApolloSubredditFeedLayoutSideBySide ||
-        state.layout == ApolloSubredditFeedLayoutGrid;
-    state.usesCompactFourUp = supportsCompactFourUp &&
-        state.visibleIndexes.count == 4 &&
-        availableWidth <= 336.0;
+    state.usesCompactFourUp = ApolloFeedShortcutUsesCompactLayout(state.layout, state.visibleIndexes.count,
+                                                                  availableWidth, 336.0);
     state.hideDescriptions = sHideSubredditListDescriptions;
     if (state.layout == ApolloSubredditFeedLayoutRows) {
         NSUInteger count = state.visibleIndexes.count;
@@ -209,7 +208,8 @@ static ApolloFeedShortcutsPreviewState *ApolloFeedShortcutsCurrentPreviewState(
         CGFloat spacingHeight = count > 1 ? (CGFloat)(count - 1) * 8.0 : 0.0;
         state.previewHeight = rowsHeight + spacingHeight + 16.0;
     } else {
-        state.previewHeight = ApolloFeedShortcutLayoutHeight(state.layout, traitCollection);
+        state.previewHeight = ApolloFeedShortcutLayoutHeightForCount(state.layout, traitCollection,
+                                                                     state.visibleIndexes.count);
     }
     return state;
 }
@@ -219,7 +219,7 @@ static UIFont *ApolloFeedShortcutsPreviewTitleFont(ApolloFeedShortcutsPreviewSta
         return [UIFont preferredFontForTextStyle:UIFontTextStyleBody
                           compatibleWithTraitCollection:state.traitCollection];
     }
-    CGFloat pointSize = state.layout == ApolloSubredditFeedLayoutGrid ? 15.0 : 16.0;
+    CGFloat pointSize = ApolloFeedShortcutCompactTitlePointSize(state.layout, state.visibleIndexes.count);
     UIFont *baseFont = [UIFont systemFontOfSize:pointSize];
     return [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody]
         scaledFontForFont:baseFont
@@ -229,6 +229,7 @@ static UIFont *ApolloFeedShortcutsPreviewTitleFont(ApolloFeedShortcutsPreviewSta
 static CGFloat ApolloFeedShortcutsPreviewSideBySideCenterOffset(ApolloFeedShortcutsPreviewState *state) {
     NSUInteger itemCount = state.visibleIndexes.count;
     if (state.layout != ApolloSubredditFeedLayoutSideBySide || itemCount < 3) return 0.0;
+    if (ApolloFeedShortcutSplitsOntoTwoLines(state.layout, itemCount)) return 0.0; // each line centres itself
 
     NSInteger firstIndex = state.visibleIndexes.firstObject.integerValue;
     NSInteger lastIndex = state.visibleIndexes.lastObject.integerValue;
@@ -1239,6 +1240,11 @@ typedef NS_ENUM(NSInteger, Tag) {
     ApolloSettingsRow *linkPreviews = [self buildLinkPreviewsRow];
     ApolloSettingsRow *polls = [self buildPollsRow];
     ApolloSettingsRow *apolloAI = [self buildApolloAIRow];
+    ApolloSettingsRow *palHome = [self hubDisclosureRowWithID:@"feat.palHome" title:@"Pal Home"
+        subtitle:^NSString * { return ApolloPalHomeStore.isPalHomeEnabled ? @"A cosy home for every Pixel Pal" : @"Try a cosy home for your Pixel Pals"; }
+        push:^UIViewController * { return ApolloSettingsRouteInstantiate(@"pal-home-settings"); }];
+    palHome.iconSystemName = @"house.fill";
+    palHome.iconTileColor = [UIColor systemBrownColor];
 
     posts.iconSystemName        = @"newspaper.fill";              posts.iconTileColor        = [UIColor systemOrangeColor];
     comments.iconSystemName     = @"text.bubble.fill";            comments.iconTileColor     = [UIColor systemGreenColor];
@@ -1253,7 +1259,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     return [ApolloSettingsSection sectionWithTitle:@"Features"
                                             footer:@"Fine-tune posts, comments, media, subreddits, profile layout and the interface."
                                               rows:@[ posts, comments, media, subreddits, profileLayout, interface_,
-                                                      linkPreviews, polls, apolloAI ]];
+                                                      linkPreviews, polls, apolloAI, palHome ]];
 }
 
 - (ApolloSettingsSection *)buildAdvancedSection {
@@ -1860,7 +1866,7 @@ typedef NS_ENUM(NSInteger, Tag) {
             NSString *readPostMaxStr = sReadPostMaxCount > 0 ? [NSString stringWithFormat:@"%ld", (long)sReadPostMaxCount] : @"";
             return [weakSelf textFieldCellWithIdentifier:@"Cell_Gen_ReadMax"
                                                    label:@"History Limit"
-                                             placeholder:@"(unlimited)"
+                                              placeholder:@"Unlimited"
                                                     text:readPostMaxStr
                                                      tag:TagReadPostMaxCount
                                                numerical:YES]
@@ -2959,9 +2965,20 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   onToggle:^(UISwitch *sender) {
             [weakSelf setFeedShortcutVisible:sender.isOn defaultsKey:UDKeyHideModeratorRedditList];
         }];
+    ApolloSettingsRow *showPalHome =
+        [ApolloSettingsRow switchRowWithID:@"sub.showPalHomeShortcut"
+                                     title:@"Show Pal Home"
+                                      isOn:^BOOL {
+            return ![NSUserDefaults.standardUserDefaults boolForKey:UDKeyHidePalHomeShortcut];
+        }
+                                  onToggle:^(UISwitch *sender) {
+            [weakSelf setFeedShortcutVisible:sender.isOn defaultsKey:UDKeyHidePalHomeShortcut];
+        }];
+    // Only offered while Pal Home is on (it's where the shortcut goes).
+    showPalHome.visible = ^BOOL { return ApolloPalHomeStore.isPalHomeEnabled; };
     return [ApolloSettingsSection sectionWithTitle:@"Visible Shortcuts"
                                             footer:@"Home is always shown. Choose which other shortcuts appear."
-                                              rows:@[ showPopular, showAll, showModerator ]];
+                                              rows:@[ showPopular, showAll, showModerator, showPalHome ]];
 }
 
 - (ApolloSettingsSection *)buildFeedShortcutsControlsSection {
@@ -3137,7 +3154,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             return [weakSelf textFieldCellWithIdentifier:@"Cell_Sub_TrendLimit"
                                                    label:@"Trending Subreddits Limit"
-                                             placeholder:@"(unlimited)"
+                                             placeholder:@"Unlimited"
                                                     text:sTrendingSubredditsLimit
                                                      tag:TagTrendingLimit
                                                numerical:YES]
@@ -3524,7 +3541,15 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.text = label;
+        cell.textLabel.text = nil;
+
+        UILabel *titleLabel = [[UILabel alloc] init];
+        titleLabel.text = label;
+        titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        titleLabel.adjustsFontForContentSizeCategory = YES;
+        titleLabel.numberOfLines = 0;
+        titleLabel.lineBreakMode = NSLineBreakByWordWrapping;
+        titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
 
         UITextField *textField = [[UITextField alloc] init];
         textField.placeholder = placeholder;
@@ -3541,16 +3566,32 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             textField.keyboardType = UIKeyboardTypeNumberPad;
         }
 
+        CGFloat placeholderWidth = ceil([placeholder sizeWithAttributes:@{
+            NSFontAttributeName: textField.font
+        }].width);
+        CGFloat digitsWidth = ceil([@"99999" sizeWithAttributes:@{
+            NSFontAttributeName: textField.font
+        }].width);
+        CGFloat valueWidth = MAX(placeholderWidth, digitsWidth) + 24.0;
+
+        [textField.widthAnchor constraintEqualToConstant:valueWidth].active = YES;
+
         textField.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell.contentView addSubview:titleLabel];
         [cell.contentView addSubview:textField];
+
+        UILayoutGuide *margins = cell.contentView.layoutMarginsGuide;
         [NSLayoutConstraint activateConstraints:@[
-            [textField.trailingAnchor constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.trailingAnchor],
+            [titleLabel.leadingAnchor constraintEqualToAnchor:margins.leadingAnchor],
+            [titleLabel.topAnchor constraintEqualToAnchor:margins.topAnchor],
+            [titleLabel.bottomAnchor constraintEqualToAnchor:margins.bottomAnchor],
+
+            [textField.leadingAnchor constraintGreaterThanOrEqualToAnchor:titleLabel.trailingAnchor constant:8.0],
+            [textField.trailingAnchor constraintEqualToAnchor:margins.trailingAnchor],
             [textField.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
-            [textField.widthAnchor constraintEqualToAnchor:cell.contentView.widthAnchor multiplier:0.55],
         ]];
     }
 
-    // Update text value (handles cell reuse)
     UITextField *textField = nil;
     for (UIView *subview in cell.contentView.subviews) {
         if ([subview isKindOfClass:[UITextField class]]) {
@@ -3558,9 +3599,10 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             break;
         }
     }
+
     textField.text = text;
-    textField.accessibilityLabel = label;   // VoiceOver: tie the field to its caption
-    cell.textLabel.text = label;
+    textField.placeholder = placeholder;
+    textField.accessibilityLabel = label;
     [self apollo_applyPrimaryTextColorToCell:cell];
 
     return cell;
@@ -4137,6 +4179,9 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     if (sUserAgent.length > 0) payload[@"userAgent"] = sUserAgent;
     NSString *secret = ApolloSecretForClientId(clientID);
     if (secret.length > 0) payload[@"clientSecret"] = secret;
+    // Pal Home rides along, so one paste sets up the Pal Home widget too.
+    NSString *palCode = [[ApolloPalHomeStore new] widgetCodeWithRoom:nil];
+    if (palCode.length) payload[@"palHome"] = palCode;
     if (account) {
         payload[@"refreshToken"] = account[@"refreshToken"];
         if ([account[@"username"] length] > 0) payload[@"username"] = account[@"username"];
@@ -4460,6 +4505,18 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 }
 
 #pragma mark - UITextFieldDelegate
+
+- (BOOL)textField:(UITextField *)textField
+shouldChangeCharactersInRange:(NSRange)range
+replacementString:(NSString *)string {
+    if (textField.tag == TagReadPostMaxCount || textField.tag == TagTrendingLimit) {
+        NSString *updated = [textField.text stringByReplacingCharactersInRange:range
+                                                                    withString:string];
+        return updated.length <= 5;
+    }
+
+    return YES;
+}
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
     [textField resignFirstResponder];

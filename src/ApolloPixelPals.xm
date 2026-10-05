@@ -86,6 +86,14 @@
 #import "ApolloDuoRail.h"
 #import "ApolloDuoCompatibility.h"
 #import "ApolloDuoSplitView.h"
+#import "palhome/ApolloPalHomeViewController.h"
+#import "palhome/ApolloPalHomeChatHead.h"
+#import "palhome/ApolloPixelPalCoats.h"
+#import "palhome/ApolloPalHomeStore.h"
+#import "palhome/ApolloPalSpecies.h"
+#import "palhome/ApolloRebornPalSprites.h"
+#import "palhome/ApolloPalHomePrompt.h"
+#import <SpriteKit/SpriteKit.h>
 
 extern "C" bool ApolloSwiftEnableHostingPreferredContentSize(const void *controller);
 
@@ -667,11 +675,50 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
 
 #pragma mark - Pill and pal strip
 
+// The pill's "SIR SOAKS / the otter" caption. Apollo keeps it in
+// FauxCutOutView.nameTag, a (name: String, title: String) tuple, set in
+// sub_10030bae8 from PixelPal's title switch (sub_10074a6a8) and drawn in
+// -drawRect:. The name is right already (the borrowed slot's record carries
+// the guest's name); the title is the host species', so a Reborn guest gets
+// its own. Only ever swaps one *small* ASCII Swift string (<= 15 bytes,
+// stored inline in the two words, nothing to retain/release) for another.
+typedef struct { uint64_t lo, hi; } ApolloSwiftString;
+
+static BOOL ApolloSwiftSmallString(NSString *text, ApolloSwiftString *out) {
+    NSData *bytes = [text dataUsingEncoding:NSASCIIStringEncoding];
+    if (!bytes || bytes.length > 15) return NO;
+    uint8_t raw[16] = {0};
+    memcpy(raw, bytes.bytes, bytes.length);
+    raw[15] = (uint8_t)(0xE0 | bytes.length); // small + ASCII, count
+    memcpy(out, raw, 16);
+    return YES;
+}
+
+static void ApolloPalRetitleNameTag(UIView *view) {
+    NSDictionary<NSString *, NSString *> *channel = [ApolloPalHomeStore islandChannel];
+    if (!channel) return;
+    static Ivar nameTag;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ nameTag = class_getInstanceVariable(object_getClass(view), "nameTag"); });
+    if (!nameTag) return;
+    ApolloSwiftString hostTitle, guestTitle;
+    // Apollo's own title for the host (see APSpecies: the 9 host titles match).
+    if (!ApolloSwiftSmallString([APSpecies speciesWithID:channel[@"host"]].title ?: @"", &hostTitle) ||
+        !ApolloSwiftSmallString([APSpecies speciesWithID:channel[@"species"]].title ?: @"", &guestTitle)) return;
+    ApolloSwiftString *title = (ApolloSwiftString *)((uint8_t *)(__bridge void *)view + ivar_getOffset(nameTag) + sizeof(ApolloSwiftString));
+    if (title->lo == hostTitle.lo && title->hi == hostTitle.hi) *title = guestTitle;
+}
+
 %hook _TtC6Apollo14FauxCutOutView
 
 - (void)setHidden:(BOOL)hidden {
     if (ApolloPixelPalUsesDuoPlacement(((UIView *)self).window)) hidden = YES;
     %orig(hidden);
+}
+
+- (void)drawRect:(CGRect)rect {
+    ApolloPalRetitleNameTag((UIView *)self);
+    %orig;
 }
 
 // Apollo writes the stock pill here on every portrait layout. Capture it as the
@@ -896,6 +943,86 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
     return NO;
 }
 
+// NO while the floating Pal's iris wipe covers the screen (it does the show).
+static BOOL sApolloPalHomeOpenAnimated = YES;
+
+static BOOL ApolloPalHomeOpenFromIsland(UIWindow *window) {
+    UIViewController *root = window.rootViewController;
+    UITabBarController *tabs = [root isKindOfClass:UITabBarController.class] ? (UITabBarController *)root : nil;
+    UIViewController *selected = tabs ? tabs.selectedViewController : root;
+    UINavigationController *nav = [selected isKindOfClass:UINavigationController.class] ? (UINavigationController *)selected : selected.navigationController;
+    if (!nav || nav.transitionCoordinator) return NO;
+    if ([nav.topViewController isKindOfClass:ApolloPalHomeViewController.class]) return YES; // already home
+    for (UIViewController *screen in nav.viewControllers) {
+        if ([screen isKindOfClass:ApolloPalHomeViewController.class]) {
+            [nav popToViewController:screen animated:sApolloPalHomeOpenAnimated];
+            return YES;
+        }
+    }
+    [nav pushViewController:[ApolloPalHomeViewController new] animated:sApolloPalHomeOpenAnimated];
+    ApolloLog(@"[PixelPals] Island tap → Pal Home");
+    return YES;
+}
+
+// Pal Home from the island, whatever state the app is in: pushed onto the
+// current tab when it can be (so back returns you to where you were), else
+// presented full screen (its back button dismisses). Never Apollo's old sheet.
+static void ApolloPalHomeShowFromWindow(UIWindow *window) {
+    if (ApolloPalHomeOpenFromIsland(window)) return;
+    UIViewController *top = window.rootViewController;
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
+    if (!top || top.isBeingPresented || top.isBeingDismissed) {
+        // Mid-transition: try again once it settles.
+        __weak UIWindow *weakWindow = window;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIWindow *strongWindow = weakWindow;
+            if (strongWindow && ApolloPalHomeStore.isPalHomeEnabled) ApolloPalHomeShowFromWindow(strongWindow);
+        });
+        ApolloLog(@"[PixelPals] Pal Home deferred: mid-transition");
+        return;
+    }
+    if ([top isKindOfClass:UINavigationController.class] &&
+        [((UINavigationController *)top).topViewController isKindOfClass:ApolloPalHomeViewController.class]) return; // already open
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[ApolloPalHomeViewController new]];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [top presentViewController:nav animated:sApolloPalHomeOpenAnimated completion:nil];
+    ApolloLog(@"[PixelPals] Island tap → Pal Home (presented over %@)", NSStringFromClass(top.class));
+}
+
+// Pal Home → "Show your Pal: Bubble": Apollo's own Pal (island pill or tab-bar
+// strip, plus the hearts and food it drops) keeps running but out of sight, so
+// food and distance still count; the floating bubble is the Pal you see.
+static BOOL sApolloPalHomeCovering; // Pal Home is on screen: its own Pal, not Apollo's
+
+static BOOL ApolloPixelPalsHiddenForBubble(void) {
+    return ApolloPalHomeStore.isPalHomeEnabled && ApolloPalHomeStore.palDisplay == APPalDisplayBubble;
+}
+
+// Hearts, food and emotes Apollo drops by its own Pal: not over Pal Home, and
+// not while that Pal is hidden for the bubble.
+static BOOL ApolloPixelPalsHideDroppedElements(void) {
+    return sApolloPalHomeCovering || ApolloPixelPalsHiddenForBubble();
+}
+
+void ApolloPixelPalsSetPalHomeCovering(BOOL covering) { sApolloPalHomeCovering = covering; }
+
+void ApolloPixelPalsApplyDisplay(void) {
+    BOOL hide = ApolloPixelPalsHiddenForBubble();
+    Class themeable = objc_getClass("_TtC6Apollo15ThemeableWindow");
+    if (!themeable) return;
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (![window isKindOfClass:themeable]) continue;
+        for (const char *name : {"pixelPalView", "fauxCutOutView"}) {
+            Ivar ivar = class_getInstanceVariable(themeable, name);
+            UIView *view = ivar ? object_getIvar(window, ivar) : nil;
+            if ([view isKindOfClass:UIView.class] && (view.alpha < 0.5) != hide) {
+                view.alpha = hide ? 0 : 1;
+                ApolloLog(@"[PixelPals] %s %@ (bubble mode)", name, hide ? @"hidden" : @"shown");
+            }
+        }
+    }
+}
+
 %hook _TtC6Apollo15ThemeableWindow
 
 - (void)layoutSubviews {
@@ -903,11 +1030,13 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
     // Coalesce one deferred update and write only changed geometry outside
     // this hook, after the window has adopted its new orientation and display.
     ApolloDuoPalScheduleUpdate((UIWindow *)self);
+    if (ApolloPixelPalsHiddenForBubble()) ApolloPixelPalsApplyDisplay();
 }
 
 - (void)pixelPalSettingChangedWithNotification:(id)notification {
     %orig;
     ApolloDuoPalScheduleUpdate((UIWindow *)self);
+    if (ApolloPixelPalsHiddenForBubble()) ApolloPixelPalsApplyDisplay();
 }
 
 // Views Apollo adds to the window positioned from the stock pill: the tap flash
@@ -916,6 +1045,10 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 - (void)addSubview:(UIView *)view {
     UIWindow *window = (UIWindow *)self;
     CGRect apollo, pill;
+    static Class droppedCls;
+    static dispatch_once_t droppedOnce;
+    dispatch_once(&droppedOnce, ^{ droppedCls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView"); });
+    if (view && droppedCls && [view isKindOfClass:droppedCls] && ApolloPixelPalsHideDroppedElements()) view.alpha = 0;
     if (view && ApolloPixelPalGeometry(window, &apollo, &pill)) {
         CGFloat dx = CGRectGetMinX(pill) - CGRectGetMinX(apollo);
         CGFloat dy = CGRectGetMinY(pill) - CGRectGetMinY(apollo);
@@ -950,6 +1083,7 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
             f.origin.x += dx;
             f.origin.y += dy;
             view.frame = f;
+            if (ApolloPixelPalsHideDroppedElements()) view.alpha = 0;
         }
     }
     UIView *addedView = ApolloDuoPalStageAddedToy(window, view);
@@ -962,23 +1096,185 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 
 // Suppress the Pixel Pals menu while media / a website / any modal is open or
 // mid-transition — opening it then races UIKit and freezes the app (issue #305).
+// Pal Home replaces Apollo's Pixel Pals care sheet (PixelPalOverlayViewController):
+// tapping the island Pal opens Pal Home, pushed onto the tab you're on so
+// you come straight back to where you were.
 - (void)pixelPalTappedWithTapGestureRecognizer:(id)recognizer {
     if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
         ApolloLog(@"[PixelPals] Tap ignored — a modal is open/transitioning (issue #305 freeze guard)");
         return;
     }
-    %orig;
+    // With Pal Home on, the old sheet never opens (see the presentation hook
+    // below, which catches every other route to it too).
+    if (ApolloPalHomeStore.isPalHomeEnabled) { ApolloPalHomeShowFromWindow((UIWindow *)self); return; }
+    %orig; // Classic: Apollo's own sheet
 }
 
-// Same guard for the auto-open path when a pal barks for attention.
+// Tapping the Pal sprite itself (the scene posts "dog barked") opens the
+// care sheet too: same destination.
 - (void)dogBarkedWithNotification:(id)notification {
     if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
         ApolloLog(@"[PixelPals] Bark menu suppressed — a modal is open/transitioning (issue #305 freeze guard)");
         return;
     }
+    if (ApolloPalHomeStore.isPalHomeEnabled) { ApolloPalHomeShowFromWindow((UIWindow *)self); return; }
     %orig;
 }
 
+%end
+
+
+#pragma mark - Pal Home
+
+// With Pal Home on, it replaces Pixel Pals: Settings → Pixel Pals opens it
+// instead of Apollo's chooser. (Everything the chooser did lives in Pal Home:
+// the island on/off is on the Pal card, choosing is the household + shelter.)
+// With it off (Classic, the default) Apollo's screens are untouched apart from
+// the occasional "Try Pal Home" card (ApolloPalHomePrompt).
+%hook UINavigationController
+- (void)pushViewController:(UIViewController *)viewController animated:(BOOL)animated {
+    static Class chooser;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ chooser = objc_getClass("_TtC6Apollo29PixelPalChooserViewController"); });
+    if (chooser && [viewController isKindOfClass:chooser] && ApolloPalHomeStore.isPalHomeEnabled) {
+        ApolloLog(@"[PixelPals] Settings → Pixel Pals → Pal Home");
+        %orig([ApolloPalHomeViewController new], animated);
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook _TtC6Apollo29PixelPalChooserViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    UIViewController *chooser = (UIViewController *)self;
+    __weak UIViewController *weakChooser = chooser;
+    [ApolloPalHomePrompt showInView:chooser.view bottomInset:chooser.view.safeAreaInsets.bottom onTry:^{
+        UINavigationController *nav = weakChooser.navigationController;
+        if (nav) [nav pushViewController:[ApolloPalHomeViewController new] animated:YES];
+    }];
+}
+%end
+
+// Apollo's care sheet (Classic): the same card, floating at the bottom.
+// The definitive gate: with Pal Home on, anything that tries to present
+// Apollo's old care sheet gets Pal Home instead (the island taps above, and
+// any route we haven't found, e.g. a long press or a notification).
+%hook UIViewController
+- (void)presentViewController:(UIViewController *)viewController animated:(BOOL)animated completion:(void (^)(void))completion {
+    static Class overlay;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ overlay = objc_getClass("_TtC6Apollo29PixelPalOverlayViewController"); });
+    if (overlay && [viewController isKindOfClass:overlay] && ApolloPalHomeStore.isPalHomeEnabled) {
+        UIViewController *presenter = self;
+        UIWindow *window = presenter.view.window ?: presenter.viewIfLoaded.window;
+        ApolloLog(@"[PixelPals] Old care sheet blocked (Pal Home is on) → Pal Home");
+        if (window) ApolloPalHomeShowFromWindow(window);
+        if (completion) completion();
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook _TtC6Apollo29PixelPalOverlayViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    UIViewController *overlay = (UIViewController *)self;
+    UIView *host = overlay.view.window ?: overlay.view;
+    if (!host) return;
+    __weak UIViewController *weakOverlay = overlay;
+    // Clear of the tab bar under the sheet.
+    [ApolloPalHomePrompt showInView:host bottomInset:host.safeAreaInsets.bottom + 56 onTry:^{
+        UIViewController *sheet = weakOverlay;
+        UIWindow *window = sheet.view.window;
+        [sheet dismissViewControllerAnimated:YES completion:^{ if (window) ApolloPalHomeOpenFromIsland(window); }];
+    }];
+}
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    // The card belongs to the sheet: it leaves with it.
+    UIView *window = ((UIViewController *)self).view.window;
+    for (UIView *view in window.subviews) if ([view isKindOfClass:ApolloPalHomePrompt.class]) [view removeFromSuperview];
+}
+%end
+
+#pragma mark - Pal coats
+
+// Coat colours (see palhome/ApolloPixelPalCoats.h) and Reborn species on the
+// island. Apollo loads every Pal sprite by asset name ("<rawValue>-<action>",
+// Hopper: sub_10004a784 & co.) through +[SKTexture textureWithImageNamed:]
+// (the island/strip) or +[UIImage imageNamed:] (the chooser). Answering those
+// two lets us:
+//  - recolour an Apollo Pal to its coat, and
+//  - while a Reborn resident is borrowing a slot (ApolloPalHomeStore's island
+//    channel), draw that resident (e.g. a capybara) wherever Apollo asks for
+//    the slot's species. Apollo's island has no per-species behaviour beyond
+//    asset names (only superAI's tap sounds, and it's never a host), so the
+//    guest walks, sits and sleeps exactly like a native Pal.
+// Sheets are cached per asset + species + coat. Pal Home and the shelter load
+// through APPalCreateSheetForUI (not hooked) so they always get exactly the
+// resident they ask for.
+static UIImage *ApolloPixelPalCoatImage(NSString *name) {
+    // Classic Pixel Pals is Apollo's own: no coats, no Reborn guests.
+    if (!ApolloPalHomeStore.isPalHomeEnabled) return nil;
+    NSString *species = [APPixelPalCoats speciesForAssetName:name];
+    if (!species) return nil;
+    NSString *action = [name substringFromIndex:species.length + 1];
+    NSString *coat = nil;
+    NSDictionary<NSString *, NSString *> *channel = [ApolloPalHomeStore islandChannel];
+    if (channel && [species isEqualToString:channel[@"host"]]) {
+        if (!APRebornHasSprites(channel[@"species"]) && ![APSpecies isApolloSpecies:channel[@"species"]]) return nil;
+        species = channel[@"species"];
+        coat = channel[@"coat"];
+    } else {
+        coat = [APPixelPalCoats selectedCoatForSpecies:species];
+        if ([coat isEqualToString:@"original"] && !APRebornHasSprites(species)) return nil;
+    }
+    static NSCache<NSString *, UIImage *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSCache new]; });
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@", name, species, coat];
+    UIImage *hit = [cache objectForKey:key];
+    if (hit) return hit;
+    // A different selector from the one hooked below, so no recursion.
+    __block CGFloat scale = 1;
+    CGImageRef sheet = APPalCreateSheet(species, coat, action, ^CGImageRef(NSString *assetName) {
+        UIImage *original = [UIImage imageNamed:assetName inBundle:nil compatibleWithTraitCollection:nil];
+        scale = original.scale ?: 1;
+        return original.CGImage;
+    });
+    // A Reborn guest with no sheet for this action (e.g. "settings"): let
+    // Apollo's own image through rather than show nothing.
+    if (!sheet) return nil;
+    UIImage *image = [UIImage imageWithCGImage:sheet scale:scale orientation:UIImageOrientationUp];
+    CGImageRelease(sheet);
+    [cache setObject:image forKey:key];
+    return image;
+}
+
+// Apollo's own chooser can switch Pals behind our back; when it does, the
+// island channel gives its borrowed slot back (stats go home with the guest).
+static void ApolloPalHomeReconcileIsland(void) {
+    static BOOL busy = NO;
+    if (busy) return; // our own PixelPalSettingChanged post
+    busy = YES;
+    [[ApolloPalHomeStore new] reconcileIsland];
+    busy = NO;
+}
+
+%hook SKTexture
++ (instancetype)textureWithImageNamed:(NSString *)name {
+    UIImage *coat = ApolloPixelPalCoatImage(name);
+    return coat ? [SKTexture textureWithImage:coat] : %orig;
+}
+%end
+
+%hook UIImage
++ (UIImage *)imageNamed:(NSString *)name {
+    return ApolloPixelPalCoatImage(name) ?: %orig;
+}
 %end
 
 #pragma mark - Carrot Weather pal
@@ -992,3 +1288,57 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
     return %orig;
 }
 %end
+
+// The floating Pal (ApolloPalHomeChatHead) trots along as you scroll. This is
+// on every scroll view's hot path, so it's one cheap check unless it's showing.
+%hook UIScrollView
+- (void)setContentOffset:(CGPoint)offset {
+    CGFloat before = ((UIScrollView *)self).contentOffset.y;
+    %orig;
+    if (ApolloPalChatHeadIsShowing()) ApolloPalChatHeadNoteScroll((UIScrollView *)self, offset.y - before);
+}
+%end
+
+// From anywhere (the floating Pal): Pal Home on the main window.
+void ApolloPalHomeOpenFromAnywhere(BOOL animated) {
+    UIViewController *tabs = ApolloMainTabBarController();
+    UIWindow *window = tabs.viewIfLoaded.window;
+    if (!window) return;
+    sApolloPalHomeOpenAnimated = animated;
+    ApolloPalHomeShowFromWindow(window);
+    sApolloPalHomeOpenAnimated = YES;
+}
+
+%ctor {
+    %init; // this file's hooks (an explicit %ctor replaces Logos' implicit one)
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CGRect island;
+        ApolloPalHomeStore.deviceHasDynamicIsland = ApolloDynamicIslandRect(&island);
+        // Apollo's own tab-bar strip (phones without an island) is only offered
+        // on the classic tab bar: under Liquid Glass's floating, collapsing bar
+        // it has nowhere good to live, so there it's the island or the bubble.
+        ApolloPalHomeStore.tabBarSupported = !ApolloPalHomeStore.deviceHasDynamicIsland && !IsLiquidGlass();
+        ApolloLog(@"[PixelPals] Dynamic Island: %@", ApolloPalHomeStore.deviceHasDynamicIsland ? @"yes" : @"no");
+        ApolloPixelPalsApplyDisplay();
+        ApolloPalChatHeadRefresh();
+    });
+    [NSNotificationCenter.defaultCenter addObserverForName:@"PixelPalSettingChanged" object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) {
+        ApolloPalHomeReconcileIsland();
+        ApolloPixelPalsApplyDisplay();
+        ApolloPalChatHeadRefresh(); // the island Pal may have changed
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) {
+        ApolloPalHomeReconcileIsland();
+        ApolloPalChatHeadRefresh();
+        ApolloPalChatHeadWelcomeBack();
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:APPalDisplayDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) {
+        ApolloPixelPalsApplyDisplay();
+        ApolloPalChatHeadRefresh();
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) { ApolloPalChatHeadRefresh(); }];
+}
