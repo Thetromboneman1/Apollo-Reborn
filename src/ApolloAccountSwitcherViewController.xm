@@ -8,6 +8,7 @@
 #import "ApolloThemeRuntime.h"
 #import "ApolloNavigationActions.h"
 #import "ApolloCommon.h"
+#import "ApolloSwiftRuntime.h"
 #import "UserDefaultConstants.h"
 #import "ApolloUserProfileCache.h"
 #import "ApolloDuoRail.h"
@@ -53,10 +54,10 @@ static const void *kApolloSwitcherEditButtonUsernameKey = &kApolloSwitcherEditBu
 static const void *kApolloSwitcherFastEllipsisMenuKey = &kApolloSwitcherFastEllipsisMenuKey;
 
 // Match Profile Layout shape; Full uses a circle for compact user pictures.
-static UIImage *ApolloSwitcherCircularImage(UIImage *sourceImage, CGFloat diameter) {
+static UIImage *ApolloSwitcherCircularImage(UIImage *sourceImage, CGFloat diameter, UITraitCollection *traitCollection) {
     CGSize size = CGSizeMake(diameter, diameter);
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-    format.scale = [UIScreen mainScreen].scale;
+    format.scale = MAX(1.0, traitCollection.displayScale);
     format.opaque = NO;
     UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
     return [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
@@ -78,10 +79,10 @@ static UIImage *ApolloSwitcherCircularImage(UIImage *sourceImage, CGFloat diamet
     }];
 }
 
-static void ApolloSwitcherApplyAvatarToCell(UITableViewCell *cell, NSString *username) {
+static void ApolloSwitcherApplyAvatarToCell(UITableViewCell *cell, NSString *username, UITraitCollection *traitCollection) {
     if (username.length == 0) return;
     objc_setAssociatedObject(cell, kApolloSwitcherAvatarUsernameKey, username, OBJC_ASSOCIATION_COPY_NONATOMIC);
-    cell.imageView.image = ApolloSwitcherCircularImage(nil, kApolloSwitcherAvatarDiameter);
+    cell.imageView.image = ApolloSwitcherCircularImage(nil, kApolloSwitcherAvatarDiameter, traitCollection);
 
     ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
     __weak UITableViewCell *weakCell = cell;
@@ -94,7 +95,7 @@ static void ApolloSwitcherApplyAvatarToCell(UITableViewCell *cell, NSString *use
 
         [cache requestImageForURL:imageURL completion:^(UIImage *image) {
             if (!image) return;
-            UIImage *circular = ApolloSwitcherCircularImage(image, kApolloSwitcherAvatarDiameter);
+            UIImage *circular = ApolloSwitcherCircularImage(image, kApolloSwitcherAvatarDiameter, traitCollection);
             dispatch_async(dispatch_get_main_queue(), ^{
                 UITableViewCell *c2 = weakCell;
                 if (!c2 || ![objc_getAssociatedObject(c2, kApolloSwitcherAvatarUsernameKey) isEqualToString:username]) return;
@@ -398,14 +399,6 @@ static NSArray<ApolloSwitcherAccountRow *> *ApolloSwitcherLoadAccountRows(void) 
 - (BOOL)driveLiveMoveRowFromIndexPath:(NSIndexPath *)fromPath toIndexPath:(NSIndexPath *)toPath;
 - (void)updateDuoEditButton;
 @end
-
-// Fetches a private ivar of object type by name (e.g. the real `tableView`
-// ivar on the live AccountManagerViewController instance), defensively.
-static id _Nullable ApolloGetObjectIvar(id object, const char *name) {
-    if (!object) return nil;
-    Ivar ivar = class_getInstanceVariable([object class], name);
-    return ivar ? object_getIvar(object, ivar) : nil;
-}
 
 #pragma mark - Identity-preserving native account reorder
 
@@ -750,6 +743,12 @@ static BOOL ApolloAccountReorderSchedulePersist(
     self.accountReorderGesture.cancelsTouchesInView = YES;
     self.accountReorderGesture.delegate = self;
     [self.tableView addGestureRecognizer:self.accountReorderGesture];
+    if (@available(iOS 17.0, *)) {
+        [self.tableView registerForTraitChanges:@[UITraitDisplayScale.class]
+                                    withHandler:^(__kindof UITableView *v, __unused UITraitCollection *previous) {
+            [v reloadData];
+        }];
+    }
     self.pendingAccountRemovals = [NSMutableSet set];
     [[NSNotificationCenter defaultCenter] addObserver:self
         selector:@selector(accountStoreDidChange:) name:NSUserDefaultsDidChangeNotification object:nil];
@@ -960,7 +959,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
     cell.textLabel.text = row.username;
     cell.detailTextLabel.text = row.keyStatusText;
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-    ApolloSwitcherApplyAvatarToCell(cell, row.username);
+    ApolloSwitcherApplyAvatarToCell(cell, row.username, tableView.traitCollection);
     cell.accessoryView = [self accessoryViewForRow:row];
     UIImageView *reorderHandle = [[UIImageView alloc]
         initWithImage:[UIImage systemImageNamed:@"line.3.horizontal"]];
@@ -1318,7 +1317,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
     ApolloSwitcherAccountRow *row = self.rows[indexPath.row];
     [self.pendingAccountRemovals removeAllObjects];
     [self.pendingAccountRemovals addObject:row.username];
-    UITableView *nativeTable = ApolloGetObjectIvar(self.liveManager, "tableView");
+    UITableView *nativeTable = ApolloObjectIvar(self.liveManager, "tableView");
     __weak typeof(self) weakSelf = self;
     objc_setAssociatedObject(nativeTable, &kApolloNativeAccountTableChangedKey, ^{
         [weakSelf accountStoreDidChange:nil];
@@ -1381,7 +1380,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
     if (!sig) return;
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
     inv.selector = sel;
-    id tv = ApolloGetObjectIvar(self.liveManager, "tableView");
+    id tv = ApolloObjectIvar(self.liveManager, "tableView");
     NSIndexPath *path = [NSIndexPath indexPathForRow:row inSection:0];
     [inv setArgument:&tv atIndex:2];
     [inv setArgument:&path atIndex:3];
@@ -1408,7 +1407,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
     if (!sig) return;
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
     inv.selector = sel;
-    id tv = ApolloGetObjectIvar(self.liveManager, "tableView");
+    id tv = ApolloObjectIvar(self.liveManager, "tableView");
     NSIndexPath *path = [NSIndexPath indexPathForRow:row inSection:0];
     [inv setArgument:&tv atIndex:2];
     [inv setArgument:&style atIndex:3];
@@ -1433,7 +1432,7 @@ static BOOL ApolloAccountReorderSchedulePersist(
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
     inv.selector = sel;
-    id tv = ApolloGetObjectIvar(self.liveManager, "tableView");
+    id tv = ApolloObjectIvar(self.liveManager, "tableView");
     [inv setArgument:&tv atIndex:2];
     [inv setArgument:&fromPath atIndex:3];
     [inv setArgument:&toPath atIndex:4];
@@ -1733,7 +1732,7 @@ static void ApolloInstallAccountSwitcherOverlay(UIViewController *host) {
             ?: [UIColor systemGroupedBackgroundColor];
         [host.view addSubview:overlayNav.view];
         [overlayNav didMoveToParentViewController:host];
-        id realTableView = ApolloGetObjectIvar(host, "tableView");
+        id realTableView = ApolloObjectIvar(host, "tableView");
         if ([realTableView isKindOfClass:[UIView class]]) {
             ((UIView *)realTableView).hidden = YES;
         }

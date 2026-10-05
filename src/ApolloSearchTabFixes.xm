@@ -62,6 +62,7 @@
 #import "ApolloDuoSplitView.h"
 #import "ApolloDuoSearchLandingViewController.h"
 #import "ApolloDuoSearchRecents.h"
+#import "ApolloSwiftRuntime.h"
 #import "ApolloGoogleSearchTab.h"
 #import "ApolloState.h"
 #import "ApolloToast.h"
@@ -122,14 +123,8 @@ static NSString *const kApolloRandomNSFWTitle = @"Random NSFW Subreddit";
 // ApolloTableViewController, whose `tableView` ivar is ObjC-visible; fall back to a subview
 // scan if the ivar ever moves.
 static UITableView *ApolloSearchTabTableView(UIViewController *vc) {
-    for (Class cls = object_getClass(vc); cls; cls = class_getSuperclass(cls)) {
-        Ivar iv = class_getInstanceVariable(cls, "tableView");
-        if (iv) {
-            id tv = object_getIvar(vc, iv);
-            if ([tv isKindOfClass:[UITableView class]]) return (UITableView *)tv;
-            break;
-        }
-    }
+    id tv = ApolloObjectIvar(vc, "tableView");
+    if ([tv isKindOfClass:[UITableView class]]) return (UITableView *)tv;
     for (UIView *v in vc.viewIfLoaded.subviews) {
         if ([v isKindOfClass:[UITableView class]]) return (UITableView *)v;
     }
@@ -140,13 +135,8 @@ static UISearchBar *ApolloSearchTabSearchBar(UIViewController *vc) {
     UIView *titleView = vc.navigationItem.titleView;
     if ([titleView isKindOfClass:[UISearchBar class]]) return (UISearchBar *)titleView;
 
-    for (Class cls = object_getClass(vc); cls; cls = class_getSuperclass(cls)) {
-        Ivar ivar = class_getInstanceVariable(cls, "searchBar");
-        if (!ivar) continue;
-        id value = object_getIvar(vc, ivar);
-        return [value isKindOfClass:[UISearchBar class]] ? value : nil;
-    }
-    return nil;
+    id value = ApolloObjectIvar(vc, "searchBar");
+    return [value isKindOfClass:[UISearchBar class]] ? value : nil;
 }
 
 static UIRefreshControl *ApolloSearchTabRefreshControl(UIViewController *vc) {

@@ -88,6 +88,7 @@
 #import "ApolloFollowingSection.h"
 #import "ApolloMultiredditExpansion.h"
 #import "ApolloState.h"
+#import "ApolloSwiftRuntime.h"
 #import "UserDefaultConstants.h"
 
 @interface RedditListViewController : UIViewController // Apollo.RedditListViewController
@@ -525,8 +526,7 @@ static NSDictionary<NSString *, UIView *> *ApolloSubredditListVisibleSectionHead
     if (!headerClass || !tableView) return headers;
     for (UIView *subview in tableView.subviews) {
         if (subview.hidden || ![subview isKindOfClass:headerClass]) continue;
-        Ivar labelIvar = class_getInstanceVariable(object_getClass(subview), "label");
-        UILabel *label = labelIvar ? object_getIvar(subview, labelIvar) : nil;
+        UILabel *label = ApolloObjectIvar(subview, "label");
         NSString *title = [label isKindOfClass:[UILabel class]] ? label.text.uppercaseString : nil;
         if (title.length > 0) headers[title] = subview;
     }
@@ -879,9 +879,7 @@ static ApolloFollowingMap *ApolloFollowingPresentedMapForTable(UITableView *tabl
 // stored properties are real runtime ivars — read it that way (same approach
 // as ApolloHideModSubreddits/ApolloMultiredditEdit).
 static UITableView *ApolloFollowingTableViewOf(UIViewController *listVC) {
-    if (!listVC) return nil;
-    Ivar ivar = class_getInstanceVariable(object_getClass(listVC), "tableView");
-    UITableView *tableView = ivar ? object_getIvar(listVC, ivar) : nil;
+    UITableView *tableView = ApolloObjectIvar(listVC, "tableView");
     return [tableView isKindOfClass:[UITableView class]] ? tableView : nil;
 }
 
@@ -1094,8 +1092,7 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
         // label text and re-fitting is sufficient.
         UIView *header = %orig(tableView, kApolloNativeSectionModerator);
         if (!header) return nil;
-        Ivar labelIvar = class_getInstanceVariable(object_getClass(header), "label");
-        UILabel *label = labelIvar ? object_getIvar(header, labelIvar) : nil;
+        UILabel *label = ApolloObjectIvar(header, "label");
         if ([label isKindOfClass:[UILabel class]]) {
             label.text = @"FOLLOWING";
             [header sizeToFit];
