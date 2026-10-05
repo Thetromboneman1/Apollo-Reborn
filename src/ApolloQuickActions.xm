@@ -69,14 +69,6 @@ static NSString *ApolloQuickActionNameFromURL(NSURL *url) {
     return nil;
 }
 
-// The navigation controller of the tab bar's selected tab, or nil.
-static UINavigationController *ApolloQuickActionsSelectedNavigationController(id tabBarController) {
-    if (![tabBarController isKindOfClass:[UITabBarController class]]) return nil;
-    UIViewController *selected = [(UITabBarController *)tabBarController selectedViewController];
-    if ([selected isKindOfClass:[UINavigationController class]]) return (UINavigationController *)selected;
-    return selected.navigationController;
-}
-
 // Opens Apollo's front-page feed (the aggregated "Posts from subscriptions"
 // listing), NOT the subreddit picker list that goToHomeTab lands on.
 //
