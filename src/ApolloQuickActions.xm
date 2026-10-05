@@ -68,6 +68,14 @@ static NSString *ApolloQuickActionNameFromURL(NSURL *url) {
     return nil;
 }
 
+// The navigation controller of the tab bar's selected tab, or nil.
+static UINavigationController *ApolloQuickActionsSelectedNavigationController(id tabBarController) {
+    if (![tabBarController isKindOfClass:[UITabBarController class]]) return nil;
+    UIViewController *selected = [(UITabBarController *)tabBarController selectedViewController];
+    if ([selected isKindOfClass:[UINavigationController class]]) return (UINavigationController *)selected;
+    return selected.navigationController;
+}
+
 // Opens Apollo's front-page feed (the aggregated "Posts from subscriptions"
 // listing), NOT the subreddit picker list that goToHomeTab lands on.
 //
@@ -99,7 +107,7 @@ static BOOL ApolloQuickActionsOpenHomeFeed(id tabBarController) {
     // RedditListViewController assertion below expects.
     UINavigationController *nav = ApolloNavigationControllerForTabChild(selected);
     if (!nav) {
-        ApolloLog(@"[QuickActions] Home: no navigation controller for selected tab %@", selected);
+        ApolloLog(@"[QuickActions] Home: no navigation controller for selected tab of %@", tabBarController);
         return NO;
     }
 
@@ -227,7 +235,6 @@ static void ApolloQuickActionsPerformWithRetry(NSString *action, UIWindowScene *
         ApolloLog(@"[QuickActions] Gave up performing %@", action);
         return;
     }
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApolloQuickActionsPerformWithRetry(action, originatingScene, attempt + 1);
     });
