@@ -863,7 +863,7 @@ static void ApolloSetTabBarPresentationHidden(UITabBarController *tbc,
         ApolloSetMinimizePresentation(tbc, hidden && style == ApolloTabBarHideStyleMinimize, animated, reason);
         return;
     }
-    if (style == ApolloTabBarHideStyleDown) {
+    if (style == ApolloTabBarHideStyleDown && ApolloDuoAllowsTabBarScrollHiding()) {
         ApolloNormalizeDownTabBarGeometry(tbc);
     }
     ApolloTopBarSetScrollHidden(tbc, hidden, animated, reason);
