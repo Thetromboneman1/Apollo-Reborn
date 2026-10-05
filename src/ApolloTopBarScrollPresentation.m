@@ -464,6 +464,10 @@ static void ApolloTopBarSetNavigationHidden(UINavigationController *controller, 
         hidden ? @"hidden" : @"revealed", state.hiddenOffset, (unsigned long)state.headerParts.count, reason);
 }
 
+void ApolloTopBarRevealNavigationController(UINavigationController *controller, NSString *reason) {
+    ApolloTopBarSetNavigationHidden(controller, NO, YES, reason);
+}
+
 void ApolloTopBarSetScrollToTopActive(UINavigationController *controller, BOOL active) {
     if (!controller) return;
     objc_setAssociatedObject(controller, &kApolloTopBarScrollToTopActiveKey,
