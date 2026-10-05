@@ -3097,5 +3097,14 @@ static BOOL ApolloInboxShouldNoteMessageJSONForClass(Class modelClass) {
                 usingBlock:^(__unused NSNotification *notification) {
         ApolloApplyCombinedInboxBadge();
     }];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:ApolloInboxBadgeChangedNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(__unused NSNotification *notification) {
+        ApolloApplyCombinedInboxBadge();
+    }];
+
     ChatsFilterLog(@"module loaded");
 }
