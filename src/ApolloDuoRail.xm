@@ -144,7 +144,9 @@ static BOOL sApolloDuoClampingJumpButton;
         ApolloDuoRailSync();
     } completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
         (void)context;
-        ApolloDuoRailSync();
+        // Let the split host finish its resize before deciding whether the
+        // resulting bottom bar can minimize again.
+        dispatch_async(dispatch_get_main_queue(), ^{ ApolloDuoRailSync(); });
     }];
 }
 
@@ -197,6 +199,7 @@ static BOOL sApolloDuoClampingJumpButton;
 
 - (void)tableView:(UITableView *)table willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)path {
     %orig(table, cell, path);
+    ApolloDuoAccountGridDisplayCell((UITableView *)self, cell, path);
     if ([cell isKindOfClass:NSClassFromString(@"_ASTableViewCell")]) {
         ASCellNode *node = ((_ASTableViewCell *)cell).node;
         node.backgroundColor = ApolloDuoAccountFeedNodeBackground(node, node.backgroundColor);
@@ -206,6 +209,8 @@ static BOOL sApolloDuoClampingJumpButton;
 
 - (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path {
     if (ApolloDuoAccountHidesProfileRow((UITableView *)self, path)) return 0;
+    CGFloat gridHeight = ApolloDuoAccountGridRowHeight((UITableView *)self, path);
+    if (gridHeight >= 0) return gridHeight;
     return %orig(table, path);
 }
 

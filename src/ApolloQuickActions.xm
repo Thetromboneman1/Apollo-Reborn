@@ -1,3 +1,4 @@
+#import "palhome/ApolloPalHomeViewController.h"
 #import "ApolloCommon.h"
 #import "settings/ApolloBackupDocument.h"
 #import "ApolloDirectChatWeb.h"
@@ -99,7 +100,7 @@ static BOOL ApolloQuickActionsOpenHomeFeed(id tabBarController) {
     // RedditListViewController assertion below expects.
     UINavigationController *nav = ApolloNavigationControllerForTabChild(selected);
     if (!nav) {
-        ApolloLog(@"[QuickActions] Home: no navigation controller for selected tab %@", selected);
+        ApolloLog(@"[QuickActions] Home: no navigation controller for selected tab of %@", tabBarController);
         return NO;
     }
 
@@ -227,7 +228,6 @@ static void ApolloQuickActionsPerformWithRetry(NSString *action, UIWindowScene *
         ApolloLog(@"[QuickActions] Gave up performing %@", action);
         return;
     }
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         ApolloQuickActionsPerformWithRetry(action, originatingScene, attempt + 1);
     });
@@ -259,6 +259,14 @@ static BOOL ApolloQuickActionsHandleURL(NSURL *url, UIWindowScene *originatingSc
 
     NSString *action = ApolloQuickActionNameFromURL(url);
     if (!action) return NO;
+    // The Pal Home widget says whose home to open (?pal=<resident id>).
+    if ([action isEqualToString:@"settings/pal-home"]) {
+        NSString *pal = nil;
+        for (NSURLQueryItem *item in [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO].queryItems) {
+            if ([item.name isEqualToString:@"pal"]) pal = item.value;
+        }
+        [ApolloPalHomeViewController visitResidentOnOpen:pal];
+    }
 
     dispatch_async(dispatch_get_main_queue(), ^{
         ApolloQuickActionsPerformWithRetry(action, originatingScene, 0);

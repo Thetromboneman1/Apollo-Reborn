@@ -24,6 +24,15 @@ static NSString *const UDKeyUseCustomOAuthSignIn = @"UseCustomOAuthSignIn";
 static NSString *const UDKeyUserAgent = @"UserAgent";
 static NSString *const UDKeyBlockAnnouncements = @"DisableApollonouncements";
 static NSString *const UDKeyEnableFLEX = @"EnableFlexDebugging";
+// Versioned Pal Home room/resident document. Absent = the cosy starter room.
+// Separate from Apollo's native PixelPalsDatabase; included in settings backups.
+static NSString *const UDKeyPalHome = @"ApolloRebornPalHome";
+// Pal Home replaces Apollo's Pixel Pals screens (island tap, Settings -> Pixel
+// Pals). Default OFF: Apollo's Classic Pixel Pals until you opt in.
+static NSString *const UDKeyPalHomeEnabled = @"ApolloRebornPalHomeEnabled";
+// The "Try Pal Home" prompt: dismissed for good / last shown (seconds since 1970).
+static NSString *const UDKeyPalHomePromptDismissed = @"ApolloRebornPalHomePromptDismissed";
+static NSString *const UDKeyPalHomePromptLastShown = @"ApolloRebornPalHomePromptLastShown";
 // Opt-in settings archives, checked while Apollo is active. Default OFF, every
 // 3 days; supported intervals are 1, 3, and 7 days. Archives are always local.
 // A separate installation-local consent can copy successful archives to iCloud.
@@ -86,6 +95,11 @@ static NSString *const UDKeyHideRPopularRedditList = @"HideRPopularRedditList";
 static NSString *const UDKeyHideRAllRedditList = @"HideRAllRedditList";
 static NSString *const UDKeyHideModeratorRedditList = @"HideModeratorRedditList";
 static NSString *const ApolloFeedShortcutsChangedNotification = @"ApolloFeedShortcutsChangedNotification";
+// A Pal Home shortcut beside Home / Popular / All / Moderator (feed index 4).
+// Shown only while Pal Home is on; default shown. Reborn-only (no native row):
+// Rows layout draws it as a footer row under Apollo's feed rows, the strip
+// layouts as one more tile. See ApolloFeedShortcutDisplayIndexes().
+static NSString *const UDKeyHidePalHomeShortcut = @"HidePalHomeShortcut";
 // Keep an independent FavoriteSubreddits list for each Reddit account. Opt-in:
 // default NO via registerDefaults. ApolloPerAccountFavorites projects the active
 // account's bucket back through Apollo's native FavoriteSubreddits key so every
@@ -213,8 +227,9 @@ static NSString *const UDKeyIconOnlySavedHideUsernameOnTabBar = @"IconOnlySavedH
 static NSString *const UDKeyOpenLinksInGitHubApp  = @"OpenLinksInGitHubApp";
 static NSString *const UDKeyOpenLinksInBlueskyApp = @"OpenLinksInBlueskyApp";
 // "Open via Nitter": open tapped x.com / twitter.com links on a Nitter mirror
-// instead of X (BOOL, default OFF / unset), and the instance to use (bare
-// "host" or "host:port", as produced by ApolloNitterNormalizeHost; empty = none
+// instead of X (BOOL, default OFF / unset), and the instance to use ("host" or
+// "host:port" for https, "http://"-prefixed for a plain-http self-hosted
+// instance, as produced by ApolloNitterNormalizeHost; empty = none
 // picked, which leaves the feature inactive even when the toggle is on). Read
 // at tap time in ApolloShareLinks.xm; set in Settings > Open in App.
 static NSString *const UDKeyOpenTwitterLinksViaNitter = @"OpenTwitterLinksViaNitter";
@@ -226,7 +241,6 @@ static NSString *const UDKeyTapToRevealDeletedComments = @"TapToRevealDeletedCom
 // single comment thread from the comments "..." menu; the per-thread switch
 // resets when that thread is left. See ApolloDeletedCommentsMenu.xm.
 static NSString *const UDKeyPassiveDeletedComments = @"PassiveDeletedComments";
-static NSString *const UDKeyLegacyRevealDeletedComments = @"RevealDeletedComments";
 static NSString *const UDKeyFilterNSFWRecentlyRead = @"FilterNSFWRecentlyRead";
 static NSString *const UDKeyProxyImgurDDG = @"ProxyImgurDDG";
 // Allow non-DDG public text proxies (r.jina.ai, allorigins, codetabs) as a
@@ -331,7 +345,8 @@ static NSString *const UDKeyNativeHideBarsOnScroll = @"HideBarsOnScroll";
 static NSString *const UDKeyHideTopBarOnScroll = @"HideTopBarOnScroll";
 // Liquid Glass "Hide Bars on Scroll" presentation: 0 = collapsed pill on the
 // Left (system default), 1 = collapsed pill on the Right, 2 = fade the full tab
-// bar out, 3 = sink the full tab bar down while fading. The styles plus Off are
+// bar out, 3 = slide/fade down, 4 = minimize into a centered pill naming the
+// current tab. The styles plus Off are
 // surfaced on Reborn's Interface > Tab Bar row (Off = the native toggle off).
 // See ApolloTabBarHideStyle.xm and ApolloAutoHideTabBar.xm.
 static NSString *const UDKeyTabBarCollapseSide = @"TabBarCollapseSide";
@@ -360,6 +375,9 @@ static NSString *const UDKeyTrueBlackKeyboardMode = @"TrueBlackKeyboardMode";
 // dragging to switch tabs (an either/or; needs a relaunch to apply). Opt-in;
 // default OFF via registerDefaults. See ApolloLiquidGlass.xm.
 static NSString *const UDKeyTabBarSwipeNavigation = @"TabBarSwipeNavigation";
+// Experimental large post cards on Duo's opened landscape display:
+// 0 = Original (default), 2 = Focused feed; value 1 is retired.
+static NSString *const UDKeyDuoLandscapeFeedLayout = @"DuoLandscapeFeedLayout";
 // When ON, press-and-hold anywhere on a post info row (score, comments,
 // timestamp, 🌐 translation marker…) shows the glass-slider magnifier loupe: the
 // row is zoomed in a Liquid Glass card, sliding moves the selection pill
@@ -694,10 +712,14 @@ static NSString *const UDKeyBarkSelectedIconName = @"BarkSelectedIconName";
 // DisableApollonouncements pattern (a disable flag that defaults to NO gives us
 // on-by-default). See ApolloUsageHeartbeat.{h,m}.
 static NSString *const UDKeyDisableUsageHeartbeat = @"DisableUsageHeartbeat";
-// Internal bookkeeping for the heartbeat (not user-facing).
-static NSString *const UDKeyHeartbeatMonth   = @"UsageHeartbeatMonth";   // "2026-07"
-static NSString *const UDKeyHeartbeatToken   = @"UsageHeartbeatToken";   // monthly UUID
-static NSString *const UDKeyHeartbeatLastDay = @"UsageHeartbeatLastDay"; // "2026-07-05"
+
+// In-app update check (ApolloUpdateChecker.{h,m}). Once a day it reads
+// release-manifest.json from GitHub and offers to hand off to the user's
+// sideloader. Default ON; the Manual "Check for Updates" row works either way.
+static NSString *const UDKeyAutomaticUpdateChecks = @"AutomaticUpdateChecks";
+// Internal bookkeeping (not user-facing).
+static NSString *const UDKeyUpdateLastCheck = @"UpdateLastCheck";           // NSDate of the last good fetch
+static NSString *const UDKeyUpdateSkippedVersion = @"UpdateSkippedVersion"; // "3.9.0" the user chose to skip
 
 // Feed thumbnails for text posts with embedded images (off = native behavior).
 static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";

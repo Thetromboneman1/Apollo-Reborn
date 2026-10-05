@@ -20,6 +20,7 @@
 #import "ApolloRedgifsTokenRefresh.h"
 #import "ApolloNotificationBackend.h"
 #import "ApolloUsageHeartbeat.h"
+#import "ApolloUpdateChecker.h"
 #import "ApolloPushNotifications.h"
 #import "ApolloBarkNotifications.h"
 #import "ApolloLiquidGlassIconSelectionState.h"
@@ -921,9 +922,9 @@ static long ApolloMirrorAccountsBlobLength(void) {
 // Device lock state — "protected data available" is NO while the device is locked. A keychain
 // read that fails only when this is NO is the accessibility-class signature of the warm signout.
 static NSString *ApolloProtectedDataString(void) {
-    id app = [UIApplication respondsToSelector:@selector(sharedApplication)] ? [UIApplication sharedApplication] : nil;
-    if (![app respondsToSelector:@selector(isProtectedDataAvailable)]) return @"?";
-    return [app isProtectedDataAvailable] ? @"unlocked" : @"LOCKED";
+    UIApplication *app = UIApplication.sharedApplication;
+    if (!app) return @"?";
+    return app.isProtectedDataAvailable ? @"unlocked" : @"LOCKED";
 }
 
 // Every physical copy of the account item across access groups, with each copy's group, byte
@@ -2122,22 +2123,7 @@ static const char kARCompletion = '\0';
     id<ASWebAuthenticationPresentationContextProviding> provider = [self presentationContextProvider];
     UIWindow *window = [provider presentationAnchorForWebAuthenticationSession:self];
 
-    if (!window) {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive
-                    && [scene isKindOfClass:[UIWindowScene class]]) {
-                NSArray<UIWindow *> *sceneWindows = ((UIWindowScene *)scene).windows;
-                for (UIWindow *candidate in sceneWindows) {
-                    if (candidate.isKeyWindow) {
-                        window = candidate;
-                        break;
-                    }
-                }
-                window = window ?: sceneWindows.firstObject;
-                if (window) break;
-            }
-        }
-    }
+    if (!window) window = ApolloKeyWindow() ?: ApolloAllWindows().firstObject;
 
     ApolloLog(@"[WebAuth] presenting from window=%@", window);
 
@@ -3934,6 +3920,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeyIPadPaneLayout: @NO,
                                     UDKeyTabBarSwipeNavigation: @NO,
+                                    UDKeyDuoLandscapeFeedLayout: @0,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyInfoRowTapUpvote: @YES,
                                     UDKeyInfoRowTapComments: @YES,
@@ -3987,6 +3974,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyPostFilterSubreddits: @{},
                                     UDKeyPostFilterNameSubstrings: @[],
                                     UDKeyImgurAlbumFallbackProxies: @YES,
+                                    UDKeyAutomaticUpdateChecks: @YES,
                                     UDKeyWebJSONEnabled: @NO,
                                     UDKeyUseModernRedditChat: @NO,
                                     UDKeyUseModernRedditModmail: @NO,
@@ -4239,7 +4227,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     NSInteger storedTabBarHideStyle =
         [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyTabBarCollapseSide];
     if (storedTabBarHideStyle < ApolloTabBarHideStyleLeft ||
-        storedTabBarHideStyle > ApolloTabBarHideStyleDown) {
+        storedTabBarHideStyle > ApolloTabBarHideStyleMinimize) {
         storedTabBarHideStyle = ApolloTabBarHideStyleLeft;
     }
     sTabBarHideStyle = (ApolloTabBarHideStyle)storedTabBarHideStyle;
@@ -4249,6 +4237,13 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // scene connect, which happens after %ctor and never again for the process.
     sIPadPaneLayout = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout];
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
+    sDuoLandscapeFeedLayout = [standardDefaults integerForKey:UDKeyDuoLandscapeFeedLayout];
+    // Value 1 belonged to the removed side-by-side experiment. Keep Focused
+    // feed at 2 so existing selections survive this menu cleanup.
+    if (sDuoLandscapeFeedLayout != 0 && sDuoLandscapeFeedLayout != 2) {
+        sDuoLandscapeFeedLayout = 0;
+        [standardDefaults setInteger:0 forKey:UDKeyDuoLandscapeFeedLayout];
+    }
     sIconRowMagnifier = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIconRowMagnifier];
     sInfoRowTapUpvote = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapUpvote];
     sInfoRowTapComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapComments];
@@ -4714,6 +4709,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
         ApolloSendUsageHeartbeatIfNeeded();
+        ApolloUpdateCheckIfNeeded();
     }];
 
     // Login-persistence diagnostics: snapshot where the account lives at each lifecycle

@@ -45,10 +45,13 @@
 #import <objc/message.h>
 
 #import "ApolloCommon.h"
+#import "ApolloSwiftRuntime.h"
 #import "ApolloState.h"
 #import "ApolloThemeRuntime.h"
 #import "ApolloSearchNativeBar.h"
 #import "ApolloDuoSplitView.h"
+#import "ApolloDuoRail.h"
+#import "ApolloDuoCompatibility.h"
 #import "ApolloFindInCommentsGlass.h"
 #import "ipad/ApolloPaneChrome.h"
 #import "ipad/ApolloPaneLayout.h"
@@ -66,19 +69,6 @@ extern "C" BOOL ApolloSwipeCommentsIsPaneCommentsController(UIViewController *co
 - (BOOL)textFieldShouldReturn:(id)textField;
 - (void)dismissSearchBarButtonTappedWithSender:(id)sender;
 @end
-
-// Runtime ivar reader; walks the superclass chain so inherited ivars resolve.
-// (Deliberately duplicated per-module, matching the repo's existing pattern.)
-static id ApolloNSBObjectIvar(id object, const char *name) {
-    if (!object || !name) return nil;
-    Class cls = object_getClass(object);
-    while (cls) {
-        Ivar ivar = class_getInstanceVariable(cls, name);
-        if (ivar) return object_getIvar(object, ivar);
-        cls = class_getSuperclass(cls);
-    }
-    return nil;
-}
 
 static BOOL ApolloNSBReadBoolIvar(id object, const char *name, BOOL *outValue) {
     if (!object || !name) return NO;
@@ -294,7 +284,7 @@ static BOOL NSBRetargetApolloTopPark(UIScrollView *sv, CGFloat *y) {
 static NSString *NSBSessionQueryText(ApolloNativeFeedSession *session) {
     UIViewController *vc = session.controller;
     if (!vc) return nil;
-    UITextField *field = (UITextField *)ApolloNSBObjectIvar(vc, "searchTextField");
+    UITextField *field = (UITextField *)ApolloObjectIvar(vc, "searchTextField");
     return [field isKindOfClass:[UITextField class]] ? field.text : nil;
 }
 
@@ -311,8 +301,8 @@ static BOOL NSBIsNativeSearchFeedVC(UIViewController *vc) {
     if (![vc isKindOfClass:objc_getClass("_TtC6Apollo21ASTableViewController")]) return NO;
     BOOL stick = NO;
     if (ApolloNSBReadBoolIvar(vc, "searchBarShouldStickToKeyboard", &stick) && stick) return NO;
-    return ApolloNSBObjectIvar(vc, "upperToolbar") != nil &&
-           ApolloNSBObjectIvar(vc, "searchTextField") != nil;
+    return ApolloObjectIvar(vc, "upperToolbar") != nil &&
+           ApolloObjectIvar(vc, "searchTextField") != nil;
 }
 
 // A comments controller we manage the same way: Apollo's in-thread "Find in
@@ -326,8 +316,8 @@ static BOOL NSBIsNativeSearchCommentsVC(UIViewController *vc) {
     if (![vc isKindOfClass:objc_getClass("_TtC6Apollo22CommentsViewController")]) return NO;
     BOOL stick = NO;
     if (!ApolloNSBReadBoolIvar(vc, "searchBarShouldStickToKeyboard", &stick) || !stick) return NO;
-    if (ApolloNSBObjectIvar(vc, "upperToolbar") == nil ||
-        ApolloNSBObjectIvar(vc, "searchTextField") == nil) return NO;
+    if (ApolloObjectIvar(vc, "upperToolbar") == nil ||
+        ApolloObjectIvar(vc, "searchTextField") == nil) return NO;
     BOOL preview = NO;
     if (ApolloNSBReadBoolIvar(vc, "isShowingIn3DTouchPreview", &preview) && preview) return NO;
     return !ApolloSwipeCommentsIsPaneCommentsController(vc);
@@ -339,7 +329,7 @@ static BOOL NSBIsNativeSearchVC(UIViewController *vc) {
 }
 
 static UIScrollView *NSBTableForVC(UIViewController *vc) {
-    id tableNode = ApolloNSBObjectIvar(vc, "tableNode");
+    id tableNode = ApolloObjectIvar(vc, "tableNode");
     UIView *tv = [tableNode respondsToSelector:@selector(view)] ? [tableNode view] : nil;
     if (![tv isKindOfClass:objc_getClass("ASTableView")]) return nil;
     ApolloNativeFeedSession *session = NSBSessionForVC(vc);
@@ -368,7 +358,7 @@ static void NSBScrollBackAfterClear(UIViewController *vc, BOOL animated,
 
 static void NSBDriveApolloQuery(UIViewController *vc, NSString *text) {
     ApolloNativeFeedSession *session = NSBSessionForVC(vc);
-    UITextField *field = (UITextField *)ApolloNSBObjectIvar(vc, "searchTextField");
+    UITextField *field = (UITextField *)ApolloObjectIvar(vc, "searchTextField");
     if (![field isKindOfClass:[UITextField class]]) return;
     // A new query supersedes an in-flight dismiss: drop the geometry correction
     // AND bump the generation so a pending scroll-back completion can't tear
@@ -395,7 +385,7 @@ static void NSBDriveApolloQuery(UIViewController *vc, NSString *text) {
     void (^reload)(void) = ^{
         UIViewController *v = weakVC;
         if (!v) return;
-        id f = ApolloNSBObjectIvar(v, "searchTextField");
+        id f = ApolloObjectIvar(v, "searchTextField");
         if ([v respondsToSelector:@selector(textFieldEditingChangedWithSender:)]) {
             ((void (*)(id, SEL, id))objc_msgSend)(v, @selector(textFieldEditingChangedWithSender:), f);
         }
@@ -716,7 +706,7 @@ static void NSBApolloDismissNow(UIViewController *vc) {
     ApolloNativeFeedSession *session = NSBSessionForVC(vc);
     if (!vc) return;
     UIScrollView *table = NSBTableForVC(vc);
-    id field = ApolloNSBObjectIvar(vc, "searchTextField");
+    id field = ApolloObjectIvar(vc, "searchTextField");
     // Apollo's dismiss ends by restoring a `priorRefreshControl` ivar it stashes
     // when IT presents its own search UI. The native bar never runs that
     // presentation, so the ivar is nil and the restore reads as "put nil back":
@@ -966,7 +956,7 @@ static void NSBRestoreHeaderForTable(UIScrollView *sv) {
     // Mirror Apollo's return-key behavior (runs the full server search).
     UIViewController *vc = self.feedVC;
     if (!vc) return;
-    id field = ApolloNSBObjectIvar(vc, "searchTextField");
+    id field = ApolloObjectIvar(vc, "searchTextField");
     if ([vc respondsToSelector:@selector(textFieldShouldReturn:)]) {
         ((void (*)(id, SEL, id))objc_msgSend)(vc, @selector(textFieldShouldReturn:), field);
     }
@@ -988,14 +978,81 @@ static void NSBRestoreHeaderForTable(UIScrollView *sv) {
 
 static char kNSBDuoSearchPlacementKey;
 static char kNSBDuoSearchPlacementScheduledKey;
+static char kNSBDuoLeadingControlsKey;
+static char kNSBDuoTrailingControlsKey;
+static char kNSBDuoControlsSupplementBackKey;
+
+NSArray<UIBarButtonItem *> *ApolloNativeFeedSearchDuoTrailingItems(UINavigationItem *item,
+                                                                NSArray<UIBarButtonItem *> *items) {
+    NSArray *trailing = objc_getAssociatedObject(item, &kNSBDuoTrailingControlsKey);
+    if (!trailing) return items;
+    // Apollo rebuilds its trailing actions when comments appear or their sort
+    // changes. Keep the registered host control in that same update instead
+    // of removing it and adding it back on the next layout pass.
+    NSMutableArray *result = [trailing mutableCopy];
+    for (UIBarButtonItem *candidate in items) {
+        if (![candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"])
+            [result addObject:candidate];
+    }
+    return result;
+}
+
+static void NSBUpdateDuoControls(UIViewController *vc) {
+    // Keep the host's List/Split/Layout controls in the native navigation
+    // arrays, independent of the search field beneath the title.
+    if (@available(iOS 27.0, *)) {
+        UINavigationItem *item = vc.navigationItem;
+        NSMutableArray *left = [NSMutableArray array];
+        NSMutableArray *right = [NSMutableArray array];
+        for (UIBarButtonItem *candidate in item.leftBarButtonItems) {
+            if (![candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"])
+                [left addObject:candidate];
+        }
+        for (UIBarButtonItem *candidate in item.rightBarButtonItems) {
+            if (![candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"])
+                [right addObject:candidate];
+        }
+        NSArray *leading = objc_getAssociatedObject(vc, &kNSBDuoLeadingControlsKey) ?: @[];
+        [left addObjectsFromArray:leading];
+        NSArray *rightControls = ApolloNativeFeedSearchDuoTrailingItems(item, right);
+        NSNumber *supplementBack = objc_getAssociatedObject(item, &kNSBDuoControlsSupplementBackKey);
+        if (leading.count) {
+            if (!supplementBack) objc_setAssociatedObject(item, &kNSBDuoControlsSupplementBackKey,
+                @(item.leftItemsSupplementBackButton), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (!item.leftItemsSupplementBackButton) item.leftItemsSupplementBackButton = YES;
+        } else if (supplementBack) {
+            if (item.leftItemsSupplementBackButton != supplementBack.boolValue)
+                item.leftItemsSupplementBackButton = supplementBack.boolValue;
+            objc_setAssociatedObject(item, &kNSBDuoControlsSupplementBackKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (![(item.leftBarButtonItems ?: @[]) isEqualToArray:left]) item.leftBarButtonItems = left;
+        if (![(item.rightBarButtonItems ?: @[]) isEqualToArray:rightControls]) item.rightBarButtonItems = rightControls;
+    }
+}
+
+void ApolloNativeFeedSearchSetDuoControls(UIViewController *vc, UIBarButtonItem *list,
+                                        UIBarButtonItem *split, UIBarButtonItem *layout) {
+    if (!vc) return;
+    NSMutableArray *leading = [NSMutableArray array];
+    if (list) [leading addObject:list];
+    if (split) [leading addObject:split];
+    NSArray *trailing = layout ? @[layout] : @[];
+    for (UIBarButtonItem *control in [leading arrayByAddingObjectsFromArray:trailing])
+        control.accessibilityIdentifier = @"ApolloDuoFeedControl";
+    objc_setAssociatedObject(vc, &kNSBDuoLeadingControlsKey, [leading copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(vc.navigationItem, &kNSBDuoTrailingControlsKey, trailing, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSBUpdateDuoControls(vc);
+}
 
 static void NSBUpdateSearchPlacement(UIViewController *vc) {
     if (@available(iOS 16.0, *)) {
         UINavigationItem *item = vc.navigationItem;
-        // Both unfolded orientations keep the search field below the title.
-        // Use the destination display size during folding, before UIKit has
-        // finished installing its split columns or trailing navigation rail.
+        // Every Duo pose keeps the field beneath the title. The live rail
+        // also identifies closed landscape, whose bounds classify as Phone.
         BOOL stacked = ApolloDuoSplitIsUnfolded();
+        if (@available(iOS 27.0, *)) {
+            stacked |= ApolloDuoCurrentMode() != ApolloDuoModePhone || ApolloDuoRailHasVisibleSideBar();
+        }
         NSNumber *original = objc_getAssociatedObject(item, &kNSBDuoSearchPlacementKey);
         if (stacked && !original) {
             original = @(item.preferredSearchBarPlacement);
@@ -1005,6 +1062,7 @@ static void NSBUpdateSearchPlacement(UIViewController *vc) {
         UINavigationItemSearchBarPlacement placement = stacked
             ? UINavigationItemSearchBarPlacementStacked : (UINavigationItemSearchBarPlacement)original.integerValue;
         if (item.preferredSearchBarPlacement != placement) item.preferredSearchBarPlacement = placement;
+        NSBUpdateDuoControls(vc);
         if (!stacked) objc_setAssociatedObject(item, &kNSBDuoSearchPlacementKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
@@ -1103,7 +1161,7 @@ static void NSBAttachNativeSearch(UIViewController *vc) {
 // every layout pass — Apollo can recreate or re-show it across reloads.
 static void NSBHideApolloToolbar(UIViewController *vc) {
     ApolloNativeFeedSession *session = NSBSessionForVC(vc);
-    UIView *toolbar = (UIView *)ApolloNSBObjectIvar(vc, "upperToolbar");
+    UIView *toolbar = (UIView *)ApolloObjectIvar(vc, "upperToolbar");
     if (![toolbar isKindOfClass:[UIView class]]) return;
     if (!toolbar.hidden) {
         // Measure the band ONLY from the live (pre-hide) toolbar — once hidden
@@ -1199,6 +1257,7 @@ static BOOL NSBHasSettledFeedGeometry(UIViewController *vc, UIScrollView *table)
     ApolloNativeSearchRestingState *state = NSBRestingStateForVC(vc);
     UINavigationController *nav = vc.navigationController;
     return state.visible && nav.topViewController == vc && nav.visibleViewController == vc &&
+           !ApolloNavTransitionInFlight() && !ApolloDuoSplitIsResizing() &&
            !nav.transitionCoordinator && !vc.transitionCoordinator;
 }
 
@@ -1640,7 +1699,7 @@ static void NSBViewWillDisappear(UIViewController *vc) {
     // Returning to a live search (e.g. back from an opened result): keep the
     // native bar's text in step with Apollo's field so the query stays visible.
     UISearchBar *bar = navItem.searchController.searchBar;
-    UITextField *field = (UITextField *)ApolloNSBObjectIvar(self, "searchTextField");
+    UITextField *field = (UITextField *)ApolloObjectIvar(self, "searchTextField");
     if ([field isKindOfClass:[UITextField class]] && field.text.length > 0) {
         if (![bar.text isEqualToString:field.text]) bar.text = field.text;
         // Returning to a live query: Apollo's restore re-applies its

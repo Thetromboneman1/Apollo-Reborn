@@ -1,7 +1,8 @@
 // ApolloPixelPals
 //
 // Pixel Pals fixes: Dynamic Island geometry for devices newer than the iPhone 14
-// Pro, the menu freeze guard (issue #305), and the Carrot Weather pal unlock.
+// Pro, a top-centered pet on Duo, the menu freeze guard (issue #305), and the
+// Carrot Weather pal unlock.
 //
 // --- Dynamic Island geometry ---
 // Apollo only knows the iPhone 14 Pro island. One helper (sub_10030afa0) returns
@@ -75,14 +76,26 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <SpriteKit/SpriteKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <sys/sysctl.h>
+#import <float.h>
 
 #import "ApolloCommon.h"
-#import "ApolloDeviceGeometry.h"
-#import "ApolloDuoCompatibility.h"
 #import "ApolloDuoRail.h"
+#import "ApolloDuoCompatibility.h"
+#import "ApolloDuoSplitView.h"
+#import "palhome/ApolloPalHomeViewController.h"
+#import "palhome/ApolloPalHomeChatHead.h"
+#import "palhome/ApolloPixelPalCoats.h"
+#import "palhome/ApolloPalHomeStore.h"
+#import "palhome/ApolloPalSpecies.h"
+#import "palhome/ApolloRebornPalSprites.h"
+#import "palhome/ApolloPalHomePrompt.h"
+#import <SpriteKit/SpriteKit.h>
+
+extern "C" bool ApolloSwiftEnableHostingPreferredContentSize(const void *controller);
 
 // Apollo's stock strip height (sub_10030c494) and y (sub_10030c880).
 static const CGFloat kApolloPalStripHeight = 14.0;
@@ -100,28 +113,402 @@ static const CGFloat kApolloIslandWidenSlack = 4.0;
 // is the baseline all remaps are measured against. Main thread only.
 static CGRect sApolloPill;
 static BOOL sApolloPillKnown = NO;
-static char kApolloPixelPalsDuoHiddenKey;
 
-static BOOL ApolloPixelPalsDisabledForWindow(UIWindow *window) {
-    return ApolloDuoRailHasVisibleSideBar()
-        || ApolloDuoCurrentMode() != ApolloDuoModePhone
-        || (window && !ApolloShouldShowDynamicIslandChromeInWindow(window));
+#pragma mark - Duo top-center placement
+
+// Keep Apollo's SKView directly in ThemeableWindow: its feeding and game code
+// casts superview to that class. Only the native strip's coordinates change.
+@interface ApolloDuoPalPlacement : NSObject
+@property(nonatomic, strong) UIControl *tapTarget;
+@property(nonatomic) BOOL updatePending;
+@end
+@implementation ApolloDuoPalPlacement
+@end
+
+static char kApolloDuoPalPlacementKey;
+static __thread UIWindowScene *__unsafe_unretained sApolloPalSizingScene;
+static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window);
+
+static BOOL ApolloPixelPalUsesDuoPlacement(UIWindow *window) {
+    return window && (ApolloDuoCurrentMode() != ApolloDuoModePhone ||
+                      ApolloDuoSplitIsUnfolded() || ApolloDuoCoverChromeIsActive());
 }
 
-// Restore only views this module hid, leaving Apollo's own Pixel Pals setting
-// and lifecycle visibility untouched.
-static void ApolloPixelPalsApplyDuoHidden(UIView *view, BOOL hidden) {
-    if (!view) return;
-    if (hidden) {
-        if (!view.hidden) {
-            objc_setAssociatedObject(view, &kApolloPixelPalsDuoHiddenKey, @YES,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            view.hidden = YES;
+static id ApolloPixelPalWindowObject(UIWindow *window, const char *name) {
+    Ivar ivar = class_getInstanceVariable(object_getClass(window), name);
+    return ivar ? object_getIvar(window, ivar) : nil;
+}
+
+@interface ApolloDuoPalToyStageInfo : NSObject
+@property(nonatomic, weak) UIWindow *window;
+@property(nonatomic, weak) UIView *toy;
+@property(nonatomic, weak) UIDynamicAnimator *animator;
+@end
+@implementation ApolloDuoPalToyStageInfo
+@end
+
+static char kApolloDuoPalToyStageInfoKey;
+static char kApolloDuoPalToyAnimatorKey;
+
+static Class ApolloDuoPalToyClass(void) {
+    static Class cls;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView");
+    });
+    return cls;
+}
+
+static ApolloDuoPalToyStageInfo *ApolloDuoPalToyStageInfoForView(UIView *view) {
+    return objc_getAssociatedObject(view, &kApolloDuoPalToyStageInfoKey);
+}
+
+// Called after the existing initial stock-pill -> Duo-pill remap, immediately
+// before ThemeableWindow's %orig(view). Pass the returned view to %orig.
+static UIView *ApolloDuoPalStageAddedToy(UIWindow *window, UIView *view) {
+    Class cls = ApolloDuoPalToyClass();
+    if (!ApolloPixelPalUsesDuoPlacement(window) || !cls ||
+        ![view isKindOfClass:cls] || ApolloDuoPalToyStageInfoForView(view) ||
+        view.superview == window || ApolloDuoPalToyStageInfoForView(view.superview)) return view;
+    CGSize size = window.bounds.size;
+    if (!isfinite(size.width) || !isfinite(size.height) || size.width <= 0 || size.height <= 0) return view;
+
+    // This exact native class implements initWithImage:, used by its own ball
+    // and food creators, and has no additional stored ivars. Using its class
+    // also preserves native cleanup: 0x10004c320 removes every direct window
+    // subview of this class. It will remove our stage and its contained toy.
+    UIImageView *stage = [(UIImageView *)[cls alloc] initWithImage:nil];
+    if (!stage) return view;
+    stage.frame = (CGRect){CGPointZero, size};
+    stage.clipsToBounds = NO;
+    stage.userInteractionEnabled = NO;
+    stage.isAccessibilityElement = NO;
+    stage.accessibilityElementsHidden = YES;
+    stage.backgroundColor = UIColor.clearColor;
+    // Native toys set this same value after addSubview. A child's zPosition
+    // cannot escape its parent's sibling order, so preserve it on the stage.
+    stage.layer.zPosition = FLT_MAX;
+    ApolloDuoPalToyStageInfo *info = [ApolloDuoPalToyStageInfo new];
+    info.window = window;
+    info.toy = view;
+    objc_setAssociatedObject(stage, &kApolloDuoPalToyStageInfoKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [stage addSubview:view];
+    return stage;
+}
+
+// Call from the existing deferred ApolloDuoPalUpdate after reading pal, before
+// any visibility-related early return. Pass NO when pal is no longer attached
+// to the window (native preference switched off); this removes orphan stages.
+static void ApolloDuoPalUpdateToyStages(UIWindow *window, BOOL palAttached) {
+    for (UIView *stage in window.subviews) {
+        ApolloDuoPalToyStageInfo *info = ApolloDuoPalToyStageInfoForView(stage);
+        if (!info) continue;
+        if (!palAttached || !ApolloPixelPalUsesDuoPlacement(window)) {
+            [stage removeFromSuperview];
+            continue;
         }
-    } else if (objc_getAssociatedObject(view, &kApolloPixelPalsDuoHiddenKey)) {
-        view.hidden = NO;
-        objc_setAssociatedObject(view, &kApolloPixelPalsDuoHiddenKey, nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Never resize bounds: native captured coordinates and its dynamics
+        // remain valid. Move the whole coordinate space with the pet instead.
+        CGRect frame = (CGRect){CGPointMake((window.bounds.size.width - stage.bounds.size.width) * 0.5, 0),
+                                stage.bounds.size};
+        if (!CGRectEqualToRect(stage.frame, frame)) {
+            [UIView performWithoutAnimation:^{ stage.frame = frame; }];
+        }
+    }
+}
+
+static UIView *ApolloDuoPalToyStageForBehavior(UIDynamicBehavior *behavior) {
+    NSArray<id<UIDynamicItem>> *items = nil;
+    if ([behavior isKindOfClass:UIGravityBehavior.class]) items = ((UIGravityBehavior *)behavior).items;
+    else if ([behavior isKindOfClass:UICollisionBehavior.class]) items = ((UICollisionBehavior *)behavior).items;
+    else if ([behavior isKindOfClass:UIDynamicItemBehavior.class]) items = ((UIDynamicItemBehavior *)behavior).items;
+    if (items.count == 0) return nil;
+    UIView *stage = nil;
+    for (id<UIDynamicItem> item in items) {
+        if (![(id)item isKindOfClass:UIView.class]) return nil;
+        UIView *parent = ((UIView *)item).superview;
+        ApolloDuoPalToyStageInfo *info = ApolloDuoPalToyStageInfoForView(parent);
+        if (!info || info.toy != (UIView *)item || parent.superview != info.window ||
+            !ApolloPixelPalUsesDuoPlacement(info.window) || (stage && stage != parent)) return nil;
+        stage = parent;
+    }
+    return stage;
+}
+
+// The input is the final, already-Duo-remapped window rect. Its x must use
+// this toy's creation width even when native final-drop code just recomputed
+// an island rect using the NEW window width. Y remains top-anchored.
+static CGRect ApolloDuoPalToyStageBoundaryRect(UICollisionBehavior *behavior, CGRect rect) {
+    UIView *stage = ApolloDuoPalToyStageForBehavior(behavior);
+    if (stage) rect.origin.x = (stage.bounds.size.width - rect.size.width) * 0.5;
+    return rect;
+}
+
+static void ApolloDuoPalToyStageFloor(UICollisionBehavior *behavior, CGPoint *p1, CGPoint *p2) {
+    UIView *stage = ApolloDuoPalToyStageForBehavior(behavior);
+    if (!stage) return;
+    p1->x = 0;
+    p2->x = stage.bounds.size.width;
+}
+
+// No initWithReferenceView interception: native creates an empty animator for
+// the window. At the first addBehavior we can identify the actual staged toy
+// with certainty and give it an animator whose referenceView is the stage.
+// The original remains the native scene's owner/handle. Native action blocks
+// capture that handle and call removeAllBehaviors on it; forward that call to
+// preserve cleanup. This also covers the late second animator at ball drop.
+static UIDynamicAnimator *ApolloDuoPalToyAnimator(UIDynamicAnimator *owner) {
+    return objc_getAssociatedObject(owner, &kApolloDuoPalToyAnimatorKey);
+}
+
+static UIDynamicAnimator *ApolloDuoPalToyAnimatorForAddedBehavior(UIDynamicAnimator *owner,
+                                                               UIDynamicBehavior *behavior) {
+    UIDynamicAnimator *actual = ApolloDuoPalToyAnimator(owner);
+    if (actual) return actual;
+    UIView *stage = ApolloDuoPalToyStageForBehavior(behavior);
+    ApolloDuoPalToyStageInfo *info = ApolloDuoPalToyStageInfoForView(stage);
+    if (!stage || owner.referenceView != info.window || owner.behaviors.count != 0) return nil;
+    actual = [[UIDynamicAnimator alloc] initWithReferenceView:stage];
+    info.animator = actual;
+    objc_setAssociatedObject(owner, &kApolloDuoPalToyAnimatorKey, actual, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return actual;
+}
+
+%hook UIDynamicAnimator
+- (void)addBehavior:(UIDynamicBehavior *)behavior {
+    UIDynamicAnimator *actual = ApolloDuoPalToyAnimatorForAddedBehavior((UIDynamicAnimator *)self, behavior);
+    if (actual) { [actual addBehavior:behavior]; return; }
+    %orig;
+}
+- (void)removeBehavior:(UIDynamicBehavior *)behavior {
+    UIDynamicAnimator *actual = ApolloDuoPalToyAnimator((UIDynamicAnimator *)self);
+    if (actual) { [actual removeBehavior:behavior]; return; }
+    %orig;
+}
+- (void)removeAllBehaviors {
+    UIDynamicAnimator *actual = ApolloDuoPalToyAnimator((UIDynamicAnimator *)self);
+    if (actual) { [actual removeAllBehaviors]; return; }
+    %orig;
+}
+%end
+
+%hook _TtC6Apollo34PixelPalAddedSceneElementImageView
+- (void)removeFromSuperview {
+    // Native cleanup also removes the stage while a game is running. Stop
+    // its physics immediately so captured native actions cannot retain it.
+    [ApolloDuoPalToyStageInfoForView((UIView *)self).animator removeAllBehaviors];
+    UIView *parent = ((UIView *)self).superview;
+    BOOL stagedToy = ApolloDuoPalToyStageInfoForView(parent).toy == (UIView *)self;
+    %orig;
+    if (stagedToy && parent.subviews.count == 0) [parent removeFromSuperview];
+}
+%end
+
+static ApolloDuoPalPlacement *ApolloDuoPalState(UIWindow *window) {
+    ApolloDuoPalPlacement *state = objc_getAssociatedObject(window, &kApolloDuoPalPlacementKey);
+    if (!state) {
+        state = [ApolloDuoPalPlacement new];
+        objc_setAssociatedObject(window, &kApolloDuoPalPlacementKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return state;
+}
+
+static BOOL ApolloDuoPalStrip(UIWindow *window, CGRect *outStrip) {
+    if (!ApolloPixelPalUsesDuoPlacement(window)) return NO;
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    if (![tabs isKindOfClass:UITabBarController.class] || tabs.viewIfLoaded.window != window) return NO;
+    // Keep the native 125pt play coordinates in every Duo pose. The pet stays
+    // above the page title and no longer moves when its menu or game opens.
+    // Other fullscreen presentations retain Apollo's existing freeze guard.
+    UIViewController *presented = window.rootViewController.presentedViewController;
+    while (presented) {
+        if (![NSStringFromClass(presented.class) hasPrefix:@"Apollo.PixelPal"]) return NO;
+        presented = presented.presentedViewController;
+    }
+    if (outStrip) *outStrip = CGRectMake((window.bounds.size.width - kApolloStockPillWidth) * 0.5,
+                                       4, kApolloStockPillWidth, kApolloPalStripHeight);
+    return YES;
+}
+
+static void ApolloDuoPalUpdate(UIWindow *window) {
+    ApolloDuoPalPlacement *state = ApolloDuoPalState(window);
+    SKView *pal = ApolloPixelPalWindowObject(window, "pixelPalView");
+    ApolloDuoPalUpdateToyStages(window, pal.superview == window);
+    UIView *faux = ApolloPixelPalWindowObject(window, "fauxCutOutView");
+    CGRect strip;
+    BOOL visible = ApolloPixelPalUsesDuoPlacement(window) && pal.superview == window &&
+                   ApolloDuoPalStrip(window, &strip);
+    if (!ApolloPixelPalUsesDuoPlacement(window)) {
+        [state.tapTarget removeFromSuperview];
+        state.tapTarget = nil;
+        return;
+    }
+    if (!faux.hidden) faux.hidden = YES;
+    if (pal.hidden == visible) pal.hidden = !visible;
+    if (!visible) {
+        if (!state.tapTarget.hidden) state.tapTarget.hidden = YES;
+        return;
+    }
+
+    if (!CGRectEqualToRect(pal.frame, strip)) pal.frame = strip;
+    if (!CGSizeEqualToSize(pal.scene.size, strip.size)) pal.scene.size = strip.size;
+    // The native recognizer lives on the hidden faux island. Keep the pet
+    // tappable in the top strip without covering the page title below it.
+    if (!state.tapTarget) {
+        UIControl *target = [UIControl new];
+        target.isAccessibilityElement = YES;
+        target.accessibilityLabel = @"Pixel Pal";
+        target.accessibilityHint = @"Opens your Pixel Pal's controls";
+        target.accessibilityTraits = UIAccessibilityTraitButton;
+        [target addTarget:window action:NSSelectorFromString(@"pixelPalTappedWithTapGestureRecognizer:")
+         forControlEvents:UIControlEventTouchUpInside];
+        state.tapTarget = target;
+        [window addSubview:target];
+    }
+    CGRect targetRect = CGRectMake(strip.origin.x, 0, strip.size.width, 24);
+    if (!CGRectEqualToRect(state.tapTarget.frame, targetRect)) state.tapTarget.frame = targetRect;
+    BOOL menuVisible = window.rootViewController.presentedViewController != nil;
+    if (state.tapTarget.hidden != menuVisible) state.tapTarget.hidden = menuVisible;
+    NSArray<UIView *> *siblings = window.subviews;
+    if (siblings.lastObject != state.tapTarget || siblings.count < 2 || siblings[siblings.count - 2] != pal) {
+        [window bringSubviewToFront:pal];
+        [window bringSubviewToFront:state.tapTarget];
+    }
+}
+
+static void ApolloDuoPalScheduleUpdate(UIWindow *window) {
+    if (!ApolloPixelPalUsesDuoPlacement(window) &&
+        !objc_getAssociatedObject(window, &kApolloDuoPalPlacementKey)) return;
+    ApolloDuoPalPlacement *state = ApolloDuoPalState(window);
+    if (state.updatePending) return;
+    state.updatePending = YES;
+    __weak UIWindow *weakWindow = window;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *strongWindow = weakWindow;
+        if (!strongWindow) return;
+        state.updatePending = NO;
+        ApolloDuoPalUpdate(strongWindow);
+    });
+}
+
+#pragma mark - Duo native menu container
+
+// Apollo's SwiftUI menu is top-aligned with a fixed 63pt offset and ignores
+// safe areas. Keep its native width and controls, but center the fitted menu
+// in the screen. Only move below the status bar when the two would overlap.
+@interface ApolloDuoPalMenuContainer : UIView
+@property(nonatomic, weak) UIViewController *owner;
+@property(nonatomic, strong) UIView *hostingView;
+@property(nonatomic, strong) UIScrollView *viewport;
+@property(nonatomic, strong) UIControl *outsideTarget;
+@property(nonatomic, strong) CAShapeLayer *outsideDim;
+@end
+
+@implementation ApolloDuoPalMenuContainer
+- (instancetype)initWithHostingView:(UIView *)hostingView owner:(UIViewController *)owner {
+    if ((self = [super initWithFrame:owner.view.bounds])) {
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _owner = owner;
+        _hostingView = hostingView;
+        _outsideTarget = [UIControl new];
+        [_outsideTarget addTarget:self action:@selector(dismissMenu) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:_outsideTarget];
+        _outsideDim = [CAShapeLayer layer];
+        _outsideDim.fillRule = kCAFillRuleEvenOdd;
+        [_outsideTarget.layer addSublayer:_outsideDim];
+        _viewport = [UIScrollView new];
+        _viewport.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+        _viewport.showsVerticalScrollIndicator = NO;
+        [self addSubview:_viewport];
+        hostingView.translatesAutoresizingMaskIntoConstraints = YES;
+        [_viewport addSubview:hostingView];
+    }
+    return self;
+}
+
+- (void)dismissMenu {
+    // This is also the native SwiftUI outside-tap action.
+    [self.owner dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)safeAreaInsetsDidChange {
+    [super safeAreaInsetsDidChange];
+    [self setNeedsLayout];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    UIEdgeInsets insets = self.safeAreaInsets;
+    CGRect usable = UIEdgeInsetsInsetRect(self.bounds, UIEdgeInsetsMake(insets.top, 0, insets.bottom, 0));
+    CGFloat width = MIN(500.0, CGRectGetWidth(usable));
+    if (width <= 0 || CGRectGetHeight(usable) <= 0) return;
+    CGSize fitted = [self.hostingView sizeThatFits:CGSizeMake(width, 0)];
+    if (!isfinite(fitted.height) || fitted.height <= 0) return;
+    CGFloat height = fitted.height;
+    CGFloat visibleHeight = MIN(height, CGRectGetHeight(usable));
+    CGRect viewportFrame = CGRectMake(CGRectGetMidX(usable) - width * 0.5,
+                                      CGRectGetMidY(usable) - visibleHeight * 0.5,
+                                      width, visibleHeight);
+    // The legacy statusBarFrame is only a thin top strip on Duo. Its active
+    // occlusion regions describe the actual corner capsule and camera. Resolve
+    // this public 27.1 API dynamically so the device build retains its iOS 26 SDK.
+    if (@available(iOS 27.1, *)) {
+        Class kindClass = NSClassFromString(@"UIViewReservedRegionKind");
+        SEL query = NSSelectorFromString(@"reservedRegionsOfKind:");
+        if (kindClass && [self respondsToSelector:query]) {
+            id kind = ((id (*)(id, SEL))objc_msgSend)(kindClass, NSSelectorFromString(@"occlusionRegionKind"));
+            NSArray *regions = ((id (*)(id, SEL, id))objc_msgSend)(self, query, kind);
+            CGFloat top = CGRectGetMinY(viewportFrame);
+            for (id region in regions) {
+                if (!((BOOL (*)(id, SEL))objc_msgSend)(region, NSSelectorFromString(@"isActive"))) continue;
+                CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(region, NSSelectorFromString(@"frame"));
+                if (CGRectIntersectsRect(viewportFrame, frame)) top = MAX(top, CGRectGetMaxY(frame) + 12);
+            }
+            visibleHeight = MIN(height, MAX(0, CGRectGetMaxY(usable) - top));
+            viewportFrame.origin.y = top;
+            viewportFrame.size.height = visibleHeight;
+        }
+    }
+    if (!CGRectEqualToRect(self.viewport.frame, viewportFrame)) self.viewport.frame = viewportFrame;
+    CGSize contentSize = CGSizeMake(width, height);
+    if (!CGSizeEqualToSize(self.viewport.contentSize, contentSize)) self.viewport.contentSize = contentSize;
+    self.viewport.scrollEnabled = height > visibleHeight + 0.5;
+    CGPoint offset = CGPointMake(0, MIN(MAX(0, self.viewport.contentOffset.y), MAX(0, height - visibleHeight)));
+    if (!CGPointEqualToPoint(self.viewport.contentOffset, offset)) self.viewport.contentOffset = offset;
+    CGRect hostFrame = CGRectMake(0, -63, width, height + 63);
+    if (!CGRectEqualToRect(self.hostingView.frame, hostFrame)) self.hostingView.frame = hostFrame;
+    if (!CGRectEqualToRect(self.outsideTarget.frame, self.bounds)) self.outsideTarget.frame = self.bounds;
+    // SwiftUI already dims inside its viewport. Fill only the remaining area
+    // so its own dimming is neither clipped nor applied twice.
+    UIBezierPath *outside = [UIBezierPath bezierPathWithRect:self.bounds];
+    [outside appendPath:[UIBezierPath bezierPathWithRect:viewportFrame]];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.outsideDim.frame = self.bounds;
+    self.outsideDim.path = outside.CGPath;
+    self.outsideDim.fillColor = [UIColor colorWithWhite:0 alpha:
+        self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark ? 0.7 : 0.4].CGColor;
+    [CATransaction commit];
+}
+@end
+
+static void ApolloDuoPalCenterNativeMenu(UIViewController *controller) {
+    UIWindow *window = controller.viewIfLoaded.window ?: ApolloMainTabBarController().viewIfLoaded.window;
+    if (!ApolloPixelPalUsesDuoPlacement(window)) return;
+    for (UIViewController *child in controller.childViewControllers) {
+        if (![NSStringFromClass(child.class) containsString:@"PixelPalsOverlayView"]) continue;
+        UIView *host = child.view;
+        UIView *root = controller.view;
+        if (host.superview != root) return;
+        NSMutableArray<NSLayoutConstraint *> *pins = [NSMutableArray array];
+        for (NSLayoutConstraint *constraint in root.constraints) {
+            if (constraint.firstItem == host || constraint.secondItem == host) [pins addObject:constraint];
+        }
+        [NSLayoutConstraint deactivateConstraints:pins];
+        ApolloDuoPalMenuContainer *container = [[ApolloDuoPalMenuContainer alloc] initWithHostingView:host owner:controller];
+        [root addSubview:container];
+        ApolloSwiftEnableHostingPreferredContentSize((__bridge const void *)child);
+        return;
     }
 }
 
@@ -132,8 +519,7 @@ static void ApolloPixelPalsApplyDuoHidden(UIView *view, BOOL hidden) {
 // only — nil on notch/older hardware). This is the exact source and
 // conversion UIKit's status bar uses, so it tracks new devices and iOS
 // releases without a per-device table.
-static BOOL ApolloDynamicIslandRect(CGRect *outRect) {
-    UIScreen *screen = [UIScreen mainScreen];
+static BOOL ApolloDynamicIslandRect(UIScreen *screen, CGRect *outRect) {
     SEL exclusionSel = NSSelectorFromString(@"_exclusionArea");
     if (![screen respondsToSelector:exclusionSel]) return NO;
     id area = ((id (*)(id, SEL))objc_msgSend)(screen, exclusionSel);
@@ -167,17 +553,17 @@ static BOOL ApolloDynamicIslandRect(CGRect *outRect) {
     return YES;
 }
 
-static CGFloat ApolloNativeScale(void) {
-    CGFloat nativeScale = [UIScreen mainScreen].nativeScale;
+static CGFloat ApolloNativeScale(UIScreen *screen) {
+    CGFloat nativeScale = screen.nativeScale;
     return nativeScale > 0 ? nativeScale : 3.0;
 }
 
 // Rounds each edge (not origin + size) to the nearest physical pixel, so the
 // pill's top and bottom land on the same pixel rows as the island.
-static CGRect ApolloPixelAlignedRect(CGRect rect) {
+static CGRect ApolloPixelAlignedRect(CGRect rect, UIScreen *screen) {
     // Work in whole pixels and divide once, so a 375px width comes out as exactly
     // 125pt rather than 263.333 - 138.333 = 125.00000000000001.
-    CGFloat s = ApolloNativeScale();
+    CGFloat s = ApolloNativeScale(screen);
     CGFloat minX = round(CGRectGetMinX(rect) * s);
     CGFloat minY = round(CGRectGetMinY(rect) * s);
     CGFloat maxX = round(CGRectGetMaxX(rect) * s);
@@ -202,20 +588,44 @@ static NSString *ApolloRectString(CGRect r) {
 // layout untouched) until the pill has been captured, or when no correction is
 // needed.
 static BOOL ApolloPixelPalGeometry(UIWindow *window, CGRect *outApollo, CGRect *outPill) {
-    if (ApolloPixelPalsDisabledForWindow(window)) return NO;
+    // Native games calculate window coordinates from the 125pt island even
+    // when the scene is elsewhere. Reuse the existing element/physics remap.
+    UIWindow *duoWindow = window ?: ApolloMainTabBarController().viewIfLoaded.window;
+    if (ApolloPixelPalUsesDuoPlacement(duoWindow)) {
+        CGRect strip;
+        if (!ApolloDuoPalStrip(duoWindow, &strip)) return NO;
+        if (outApollo) *outApollo = CGRectMake((duoWindow.bounds.size.width - kApolloStockPillWidth) * 0.5,
+                                              kApolloStockPillY, kApolloStockPillWidth, kApolloStockPillHeight);
+        if (outPill) *outPill = CGRectMake(strip.origin.x, CGRectGetMaxY(strip) - 0.5,
+                                          strip.size.width, kApolloStockPillHeight);
+        return YES;
+    }
     if (!sApolloPillKnown) return NO;
     CGRect apollo = sApolloPill;
     CGRect pill = apollo;
-    CGFloat halfPx = 0.5 / ApolloNativeScale();
+    // The island belongs to the screen the pill's window is on.
+    UIScreen *screen = window.windowScene.screen;
+    // TODO: Modernization - the UICollisionBehavior hooks have no window in
+    // scope (the behavior is usually not attached to an animator yet), so they
+    // pass nil. Until a window can be threaded through, reuse the screen seen by
+    // the last window-backed call (the pill's own window, captured from
+    // FauxCutOutView/PixelPalView/ThemeableWindow) instead of the main screen.
+    static __weak UIScreen *sLastPixelPalScreen;
+    if (screen) {
+        sLastPixelPalScreen = screen;
+    } else {
+        screen = sLastPixelPalScreen;
+    }
+    CGFloat halfPx = 0.5 / ApolloNativeScale(screen);
 
     CGRect island;
-    BOOL haveIsland = ApolloDynamicIslandRect(&island);
+    BOOL haveIsland = ApolloDynamicIslandRect(screen, &island);
     if (haveIsland && CGRectGetWidth(island) <= CGRectGetWidth(apollo) + kApolloIslandWidenSlack) {
         // Take the island rect as-is, each edge on a whole physical pixel. Every
         // island measured so far is 36.667pt tall (16 Pro: {138.333, 14, 125,
         // 36.667}; 18 Pro: {153.667, 14, 94.667, 36.667}), so Apollo's 37pt pill
         // always overhangs it somewhere.
-        pill = ApolloPixelAlignedRect(island);
+        pill = ApolloPixelAlignedRect(island, screen);
     } else if (haveIsland) {
         // The island came back clearly wider than Apollo's pill — only seen as a
         // suspect Display Zoom conversion. Never widen: keep Apollo's size and
@@ -224,7 +634,7 @@ static BOOL ApolloPixelPalGeometry(UIWindow *window, CGRect *outApollo, CGRect *
         CGFloat correctY = floor((CGRectGetMidY(island) - CGRectGetHeight(pill) / 2.0) / halfPx) * halfPx;
         if (fabs(correctY - CGRectGetMinY(apollo)) >= 0.75) pill.origin.y = correctY;
     } else if (window &&
-               [UIScreen mainScreen].nativeScale == [UIScreen mainScreen].scale &&
+               screen.nativeScale == screen.scale &&
                fabs(CGRectGetMinY(apollo) - kApolloStockPillY) < 0.25 &&
                fabs(CGRectGetHeight(apollo) - kApolloStockPillHeight) < 0.25) {
         // Fallback (private API gone): proportional model — gap between DI
@@ -246,7 +656,7 @@ static BOOL ApolloPixelPalGeometry(UIWindow *window, CGRect *outApollo, CGRect *
         ApolloRealMachineIdentifier(),
         haveIsland ? ApolloRectString(island) : @"(unavailable)",
         ApolloRectString(apollo), ApolloRectString(pill),
-        [UIScreen mainScreen].nativeScale, [UIScreen mainScreen].scale];
+        screen.nativeScale, screen.scale];
     if (![summary isEqualToString:lastLogged]) {
         lastLogged = summary;
         ApolloLog(@"[PixelPals] geometry %@", summary);
@@ -265,15 +675,56 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
 
 #pragma mark - Pill and pal strip
 
+// The pill's "SIR SOAKS / the otter" caption. Apollo keeps it in
+// FauxCutOutView.nameTag, a (name: String, title: String) tuple, set in
+// sub_10030bae8 from PixelPal's title switch (sub_10074a6a8) and drawn in
+// -drawRect:. The name is right already (the borrowed slot's record carries
+// the guest's name); the title is the host species', so a Reborn guest gets
+// its own. Only ever swaps one *small* ASCII Swift string (<= 15 bytes,
+// stored inline in the two words, nothing to retain/release) for another.
+typedef struct { uint64_t lo, hi; } ApolloSwiftString;
+
+static BOOL ApolloSwiftSmallString(NSString *text, ApolloSwiftString *out) {
+    NSData *bytes = [text dataUsingEncoding:NSASCIIStringEncoding];
+    if (!bytes || bytes.length > 15) return NO;
+    uint8_t raw[16] = {0};
+    memcpy(raw, bytes.bytes, bytes.length);
+    raw[15] = (uint8_t)(0xE0 | bytes.length); // small + ASCII, count
+    memcpy(out, raw, 16);
+    return YES;
+}
+
+static void ApolloPalRetitleNameTag(UIView *view) {
+    NSDictionary<NSString *, NSString *> *channel = [ApolloPalHomeStore islandChannel];
+    if (!channel) return;
+    static Ivar nameTag;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ nameTag = class_getInstanceVariable(object_getClass(view), "nameTag"); });
+    if (!nameTag) return;
+    ApolloSwiftString hostTitle, guestTitle;
+    // Apollo's own title for the host (see APSpecies: the 9 host titles match).
+    if (!ApolloSwiftSmallString([APSpecies speciesWithID:channel[@"host"]].title ?: @"", &hostTitle) ||
+        !ApolloSwiftSmallString([APSpecies speciesWithID:channel[@"species"]].title ?: @"", &guestTitle)) return;
+    ApolloSwiftString *title = (ApolloSwiftString *)((uint8_t *)(__bridge void *)view + ivar_getOffset(nameTag) + sizeof(ApolloSwiftString));
+    if (title->lo == hostTitle.lo && title->hi == hostTitle.hi) *title = guestTitle;
+}
+
 %hook _TtC6Apollo14FauxCutOutView
+
+- (void)setHidden:(BOOL)hidden {
+    if (ApolloPixelPalUsesDuoPlacement(((UIView *)self).window)) hidden = YES;
+    %orig(hidden);
+}
+
+- (void)drawRect:(CGRect)rect {
+    ApolloPalRetitleNameTag((UIView *)self);
+    %orig;
+}
 
 // Apollo writes the stock pill here on every portrait layout. Capture it as the
 // baseline, then hand UIKit the island-aligned pill instead.
 - (void)setFrame:(CGRect)frame {
-    UIView *view = (UIView *)self;
-    BOOL duoDisabled = ApolloPixelPalsDisabledForWindow(ApolloPixelPalWindowForView(view));
-    ApolloPixelPalsApplyDuoHidden(view, duoDisabled);
-    if (duoDisabled) {
+    if (ApolloPixelPalUsesDuoPlacement(((UIView *)self).window)) {
         %orig;
         return;
     }
@@ -299,6 +750,7 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
         ApolloLog(@"[PixelPals] captured Apollo pill %@", ApolloRectString(frame));
     }
 
+    UIView *view = (UIView *)self;
     CGRect pill;
     if (ApolloPixelPalGeometry(ApolloPixelPalWindowForView(view.superview), NULL, &pill)) {
         sLastPill = pill;
@@ -319,16 +771,21 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
 
 %hook _TtC6Apollo12PixelPalView
 
+- (void)setHidden:(BOOL)hidden {
+    UIWindow *window = ((UIView *)self).window;
+    if (ApolloPixelPalUsesDuoPlacement(window)) hidden = !ApolloDuoPalStrip(window, NULL);
+    %orig(hidden);
+}
+
 // The strip the pals walk along. Apollo sizes it to the pill width and centres
 // it on the window; follow the pill so the pals stay on top of the real island.
 // PixelPalScene is resized from this frame right after.
 - (void)setFrame:(CGRect)frame {
     CGRect apollo, pill;
     UIView *view = (UIView *)self;
-    BOOL duoDisabled = ApolloPixelPalsDisabledForWindow(ApolloPixelPalWindowForView(view));
-    ApolloPixelPalsApplyDuoHidden(view, duoDisabled);
-    if (duoDisabled) {
-        %orig;
+    CGRect strip;
+    if (ApolloDuoPalStrip(view.window, &strip)) {
+        %orig(strip);
         return;
     }
     if (fabs(CGRectGetHeight(frame) - kApolloPalStripHeight) < 0.5 &&
@@ -355,6 +812,63 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
 
 %end
 
+%hook _TtC6Apollo13PixelPalScene
+
+- (void)didChangeSize:(CGSize)oldSize {
+    // Apollo's native resize callback stops every pet action outside portrait.
+    // Limit the compatibility answer to this callback and this window scene;
+    // UIKit and all other Apollo controllers retain the actual orientation.
+    UIWindow *window = ((SKScene *)self).view.window;
+    UIWindowScene *previous = sApolloPalSizingScene;
+    if (ApolloPixelPalUsesDuoPlacement(window)) sApolloPalSizingScene = window.windowScene;
+    @try {
+        %orig;
+    } @finally {
+        sApolloPalSizingScene = previous;
+    }
+}
+
+%end
+
+%hook UIWindowScene
+- (UIInterfaceOrientation)interfaceOrientation {
+    if (sApolloPalSizingScene == self) return UIInterfaceOrientationPortrait;
+    return %orig;
+}
+%end
+
+%hook _TtC6Apollo29PixelPalOverlayViewController
+- (void)viewDidLoad {
+    %orig;
+    ApolloDuoPalCenterNativeMenu((UIViewController *)self);
+}
+
+- (void)preferredContentSizeDidChangeForChildContentContainer:(id<UIContentContainer>)container {
+    %orig;
+    // SwiftUI changes the native card's height when Feed, Play, or the pet
+    // details open. Fit on that change rather than forcing work every layout.
+    for (UIView *view in ((UIViewController *)self).view.subviews) {
+        if ([view isKindOfClass:ApolloDuoPalMenuContainer.class]) [view setNeedsLayout];
+    }
+}
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    UIWindow *window = ((UIViewController *)self).viewIfLoaded.window ?: ApolloMainTabBarController().viewIfLoaded.window;
+    if (ApolloPixelPalUsesDuoPlacement(window)) {
+        return UIInterfaceOrientationMaskAll;
+    }
+    return %orig;
+}
+%end
+
+%hook _TtC6Apollo31PixelPalsWandGameViewController
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    UIWindow *window = ((UIViewController *)self).viewIfLoaded.window ?: ApolloMainTabBarController().viewIfLoaded.window;
+    if (ApolloPixelPalUsesDuoPlacement(window)) return UIInterfaceOrientationMaskAll;
+    return %orig;
+}
+%end
+
 #pragma mark - Food and ball collision boundaries
 
 %hook UICollisionBehavior
@@ -371,6 +885,7 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
                                   CGRectGetMinY(bounds) + (CGRectGetMinY(pill) - CGRectGetMinY(apollo)),
                                   CGRectGetWidth(pill),
                                   CGRectGetHeight(pill));
+        fixed = ApolloDuoPalToyStageBoundaryRect((UICollisionBehavior *)self, fixed);
         ApolloLog(@"[PixelPals] cutoutBoundary %@ → %@", ApolloRectString(bounds), ApolloRectString(fixed));
         %orig(identifier, [UIBezierPath bezierPathWithRoundedRect:fixed cornerRadius:CGRectGetHeight(fixed) * 0.5]);
         return;
@@ -390,6 +905,7 @@ static UIWindow *ApolloPixelPalWindowForView(UIView *view) {
         CGFloat dy = CGRectGetMinY(pill) - CGRectGetMinY(apollo);
         CGPoint fixed1 = CGPointMake(p1.x, p1.y + dy);
         CGPoint fixed2 = CGPointMake(p2.x, p2.y + dy);
+        ApolloDuoPalToyStageFloor((UICollisionBehavior *)self, &fixed1, &fixed2);
         ApolloLog(@"[PixelPals] ball floor y %.3f → %.3f (x %.1f…%.1f)", p1.y, fixed1.y, p1.x, p2.x);
         %orig(identifier, fixed1, fixed2);
         return;
@@ -427,18 +943,100 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
     return NO;
 }
 
+// NO while the floating Pal's iris wipe covers the screen (it does the show).
+static BOOL sApolloPalHomeOpenAnimated = YES;
+
+static BOOL ApolloPalHomeOpenFromIsland(UIWindow *window) {
+    UIViewController *root = window.rootViewController;
+    UITabBarController *tabs = [root isKindOfClass:UITabBarController.class] ? (UITabBarController *)root : nil;
+    UIViewController *selected = tabs ? tabs.selectedViewController : root;
+    UINavigationController *nav = [selected isKindOfClass:UINavigationController.class] ? (UINavigationController *)selected : selected.navigationController;
+    if (!nav || nav.transitionCoordinator) return NO;
+    if ([nav.topViewController isKindOfClass:ApolloPalHomeViewController.class]) return YES; // already home
+    for (UIViewController *screen in nav.viewControllers) {
+        if ([screen isKindOfClass:ApolloPalHomeViewController.class]) {
+            [nav popToViewController:screen animated:sApolloPalHomeOpenAnimated];
+            return YES;
+        }
+    }
+    [nav pushViewController:[ApolloPalHomeViewController new] animated:sApolloPalHomeOpenAnimated];
+    ApolloLog(@"[PixelPals] Island tap → Pal Home");
+    return YES;
+}
+
+// Pal Home from the island, whatever state the app is in: pushed onto the
+// current tab when it can be (so back returns you to where you were), else
+// presented full screen (its back button dismisses). Never Apollo's old sheet.
+static void ApolloPalHomeShowFromWindow(UIWindow *window) {
+    if (ApolloPalHomeOpenFromIsland(window)) return;
+    UIViewController *top = window.rootViewController;
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
+    if (!top || top.isBeingPresented || top.isBeingDismissed) {
+        // Mid-transition: try again once it settles.
+        __weak UIWindow *weakWindow = window;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIWindow *strongWindow = weakWindow;
+            if (strongWindow && ApolloPalHomeStore.isPalHomeEnabled) ApolloPalHomeShowFromWindow(strongWindow);
+        });
+        ApolloLog(@"[PixelPals] Pal Home deferred: mid-transition");
+        return;
+    }
+    if ([top isKindOfClass:UINavigationController.class] &&
+        [((UINavigationController *)top).topViewController isKindOfClass:ApolloPalHomeViewController.class]) return; // already open
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[ApolloPalHomeViewController new]];
+    nav.modalPresentationStyle = UIModalPresentationFullScreen;
+    [top presentViewController:nav animated:sApolloPalHomeOpenAnimated completion:nil];
+    ApolloLog(@"[PixelPals] Island tap → Pal Home (presented over %@)", NSStringFromClass(top.class));
+}
+
+// Pal Home → "Show your Pal: Bubble": Apollo's own Pal (island pill or tab-bar
+// strip, plus the hearts and food it drops) keeps running but out of sight, so
+// food and distance still count; the floating bubble is the Pal you see.
+static BOOL sApolloPalHomeCovering; // Pal Home is on screen: its own Pal, not Apollo's
+
+static BOOL ApolloPixelPalsHiddenForBubble(void) {
+    return ApolloPalHomeStore.isPalHomeEnabled && ApolloPalHomeStore.palDisplay == APPalDisplayBubble;
+}
+
+// Hearts, food and emotes Apollo drops by its own Pal: not over Pal Home, and
+// not while that Pal is hidden for the bubble.
+static BOOL ApolloPixelPalsHideDroppedElements(void) {
+    return sApolloPalHomeCovering || ApolloPixelPalsHiddenForBubble();
+}
+
+void ApolloPixelPalsSetPalHomeCovering(BOOL covering) { sApolloPalHomeCovering = covering; }
+
+void ApolloPixelPalsApplyDisplay(void) {
+    BOOL hide = ApolloPixelPalsHiddenForBubble();
+    Class themeable = objc_getClass("_TtC6Apollo15ThemeableWindow");
+    if (!themeable) return;
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (![window isKindOfClass:themeable]) continue;
+        for (const char *name : {"pixelPalView", "fauxCutOutView"}) {
+            Ivar ivar = class_getInstanceVariable(themeable, name);
+            UIView *view = ivar ? object_getIvar(window, ivar) : nil;
+            if ([view isKindOfClass:UIView.class] && (view.alpha < 0.5) != hide) {
+                view.alpha = hide ? 0 : 1;
+                ApolloLog(@"[PixelPals] %s %@ (bubble mode)", name, hide ? @"hidden" : @"shown");
+            }
+        }
+    }
+}
+
 %hook _TtC6Apollo15ThemeableWindow
 
-// Duo has no supported Pixel Pals surface. Keep upstream's island geometry
-// hooks intact for regular phones, and only hide Apollo's own views on Duo.
 - (void)layoutSubviews {
     %orig;
-    if (!ApolloPixelPalsDisabledForWindow((UIWindow *)self)) return;
-    for (NSString *name in @[@"fauxCutOutView", @"pixelPalView"]) {
-        Ivar ivar = class_getInstanceVariable(object_getClass(self), name.UTF8String);
-        UIView *view = ivar ? object_getIvar(self, ivar) : nil;
-        view.hidden = YES;
-    }
+    // Coalesce one deferred update and write only changed geometry outside
+    // this hook, after the window has adopted its new orientation and display.
+    ApolloDuoPalScheduleUpdate((UIWindow *)self);
+    if (ApolloPixelPalsHiddenForBubble()) ApolloPixelPalsApplyDisplay();
+}
+
+- (void)pixelPalSettingChangedWithNotification:(id)notification {
+    %orig;
+    ApolloDuoPalScheduleUpdate((UIWindow *)self);
+    if (ApolloPixelPalsHiddenForBubble()) ApolloPixelPalsApplyDisplay();
 }
 
 // Views Apollo adds to the window positioned from the stock pill: the tap flash
@@ -446,32 +1044,21 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
 // (PixelPalAddedSceneElementImageView). Both are framed before being added.
 - (void)addSubview:(UIView *)view {
     UIWindow *window = (UIWindow *)self;
-    static Class elementCls;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        elementCls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView");
-    });
-    CGRect incomingFrame = view.frame;
-    BOOL tapOverlay = [view isMemberOfClass:[UIView class]]
-        && CGRectGetWidth(incomingFrame) >= 60.0
-        && CGRectGetWidth(incomingFrame) <= 200.0
-        && fabs(CGRectGetHeight(incomingFrame) - kApolloStockPillHeight) < 0.5
-        && view.clipsToBounds
-        && view.layer.cornerRadius >= CGRectGetHeight(incomingFrame) * 0.5 - 0.5;
-    BOOL sceneElement = elementCls && [view isKindOfClass:elementCls];
-    if (tapOverlay || sceneElement) {
-        BOOL duoDisabled = ApolloPixelPalsDisabledForWindow(window);
-        ApolloPixelPalsApplyDuoHidden(view, duoDisabled);
-        if (duoDisabled) {
-            %orig;
-            return;
-        }
-    }
     CGRect apollo, pill;
+    static Class droppedCls;
+    static dispatch_once_t droppedOnce;
+    dispatch_once(&droppedOnce, ^{ droppedCls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView"); });
+    if (view && droppedCls && [view isKindOfClass:droppedCls] && ApolloPixelPalsHideDroppedElements()) view.alpha = 0;
     if (view && ApolloPixelPalGeometry(window, &apollo, &pill)) {
         CGFloat dx = CGRectGetMinX(pill) - CGRectGetMinX(apollo);
         CGFloat dy = CGRectGetMinY(pill) - CGRectGetMinY(apollo);
         CGRect f = view.frame;
+
+        static Class elementCls;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            elementCls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView");
+        });
 
         BOOL stockFlashSize = fabs(CGRectGetWidth(f) - kApolloStockPillWidth) < 0.5 &&
                               fabs(CGRectGetHeight(f) - kApolloStockPillHeight) < 0.5;
@@ -496,38 +1083,198 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
             f.origin.x += dx;
             f.origin.y += dy;
             view.frame = f;
+            if (ApolloPixelPalsHideDroppedElements()) view.alpha = 0;
         }
     }
-    %orig;
+    UIView *addedView = ApolloDuoPalStageAddedToy(window, view);
+    %orig(addedView);
+    if ([NSStringFromClass(view.class) isEqualToString:@"Apollo.PixelPalView"] ||
+        [NSStringFromClass(view.class) isEqualToString:@"Apollo.FauxCutOutView"]) {
+        ApolloDuoPalScheduleUpdate(window);
+    }
 }
 
 // Suppress the Pixel Pals menu while media / a website / any modal is open or
 // mid-transition — opening it then races UIKit and freezes the app (issue #305).
+// Pal Home replaces Apollo's Pixel Pals care sheet (PixelPalOverlayViewController):
+// tapping the island Pal opens Pal Home, pushed onto the tab you're on so
+// you come straight back to where you were.
 - (void)pixelPalTappedWithTapGestureRecognizer:(id)recognizer {
-    if (ApolloPixelPalsDisabledForWindow((UIWindow *)self)) {
-        ApolloLog(@"[PixelPals] Tap ignored — Pixel Pals are disabled on iPhone Duo");
-        return;
-    }
     if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
         ApolloLog(@"[PixelPals] Tap ignored — a modal is open/transitioning (issue #305 freeze guard)");
         return;
     }
-    %orig;
+    // With Pal Home on, the old sheet never opens (see the presentation hook
+    // below, which catches every other route to it too).
+    if (ApolloPalHomeStore.isPalHomeEnabled) { ApolloPalHomeShowFromWindow((UIWindow *)self); return; }
+    %orig; // Classic: Apollo's own sheet
 }
 
-// Same guard for the auto-open path when a pal barks for attention.
+// Tapping the Pal sprite itself (the scene posts "dog barked") opens the
+// care sheet too: same destination.
 - (void)dogBarkedWithNotification:(id)notification {
-    if (ApolloPixelPalsDisabledForWindow((UIWindow *)self)) {
-        ApolloLog(@"[PixelPals] Bark menu suppressed — Pixel Pals are disabled on iPhone Duo");
-        return;
-    }
     if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
         ApolloLog(@"[PixelPals] Bark menu suppressed — a modal is open/transitioning (issue #305 freeze guard)");
         return;
     }
+    if (ApolloPalHomeStore.isPalHomeEnabled) { ApolloPalHomeShowFromWindow((UIWindow *)self); return; }
     %orig;
 }
 
+%end
+
+
+#pragma mark - Pal Home
+
+// With Pal Home on, it replaces Pixel Pals: Settings → Pixel Pals opens it
+// instead of Apollo's chooser. (Everything the chooser did lives in Pal Home:
+// the island on/off is on the Pal card, choosing is the household + shelter.)
+// With it off (Classic, the default) Apollo's screens are untouched apart from
+// the occasional "Try Pal Home" card (ApolloPalHomePrompt).
+%hook UINavigationController
+- (void)pushViewController:(UIViewController *)viewController animated:(BOOL)animated {
+    static Class chooser;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ chooser = objc_getClass("_TtC6Apollo29PixelPalChooserViewController"); });
+    if (chooser && [viewController isKindOfClass:chooser] && ApolloPalHomeStore.isPalHomeEnabled) {
+        ApolloLog(@"[PixelPals] Settings → Pixel Pals → Pal Home");
+        %orig([ApolloPalHomeViewController new], animated);
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook _TtC6Apollo29PixelPalChooserViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    UIViewController *chooser = (UIViewController *)self;
+    __weak UIViewController *weakChooser = chooser;
+    [ApolloPalHomePrompt showInView:chooser.view bottomInset:chooser.view.safeAreaInsets.bottom onTry:^{
+        UINavigationController *nav = weakChooser.navigationController;
+        if (nav) [nav pushViewController:[ApolloPalHomeViewController new] animated:YES];
+    }];
+}
+%end
+
+// Apollo's care sheet (Classic): the same card, floating at the bottom.
+// The definitive gate: with Pal Home on, anything that tries to present
+// Apollo's old care sheet gets Pal Home instead (the island taps above, and
+// any route we haven't found, e.g. a long press or a notification).
+%hook UIViewController
+- (void)presentViewController:(UIViewController *)viewController animated:(BOOL)animated completion:(void (^)(void))completion {
+    static Class overlay;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ overlay = objc_getClass("_TtC6Apollo29PixelPalOverlayViewController"); });
+    if (overlay && [viewController isKindOfClass:overlay] && ApolloPalHomeStore.isPalHomeEnabled) {
+        UIViewController *presenter = self;
+        UIWindow *window = presenter.view.window ?: presenter.viewIfLoaded.window;
+        ApolloLog(@"[PixelPals] Old care sheet blocked (Pal Home is on) → Pal Home");
+        if (window) ApolloPalHomeShowFromWindow(window);
+        if (completion) completion();
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook _TtC6Apollo29PixelPalOverlayViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    UIViewController *overlay = (UIViewController *)self;
+    UIView *host = overlay.view.window ?: overlay.view;
+    if (!host) return;
+    __weak UIViewController *weakOverlay = overlay;
+    // Clear of the tab bar under the sheet.
+    [ApolloPalHomePrompt showInView:host bottomInset:host.safeAreaInsets.bottom + 56 onTry:^{
+        UIViewController *sheet = weakOverlay;
+        UIWindow *window = sheet.view.window;
+        [sheet dismissViewControllerAnimated:YES completion:^{ if (window) ApolloPalHomeOpenFromIsland(window); }];
+    }];
+}
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    // The card belongs to the sheet: it leaves with it.
+    UIView *window = ((UIViewController *)self).view.window;
+    for (UIView *view in window.subviews) if ([view isKindOfClass:ApolloPalHomePrompt.class]) [view removeFromSuperview];
+}
+%end
+
+#pragma mark - Pal coats
+
+// Coat colours (see palhome/ApolloPixelPalCoats.h) and Reborn species on the
+// island. Apollo loads every Pal sprite by asset name ("<rawValue>-<action>",
+// Hopper: sub_10004a784 & co.) through +[SKTexture textureWithImageNamed:]
+// (the island/strip) or +[UIImage imageNamed:] (the chooser). Answering those
+// two lets us:
+//  - recolour an Apollo Pal to its coat, and
+//  - while a Reborn resident is borrowing a slot (ApolloPalHomeStore's island
+//    channel), draw that resident (e.g. a capybara) wherever Apollo asks for
+//    the slot's species. Apollo's island has no per-species behaviour beyond
+//    asset names (only superAI's tap sounds, and it's never a host), so the
+//    guest walks, sits and sleeps exactly like a native Pal.
+// Sheets are cached per asset + species + coat. Pal Home and the shelter load
+// through APPalCreateSheetForUI (not hooked) so they always get exactly the
+// resident they ask for.
+static UIImage *ApolloPixelPalCoatImage(NSString *name) {
+    // Classic Pixel Pals is Apollo's own: no coats, no Reborn guests.
+    if (!ApolloPalHomeStore.isPalHomeEnabled) return nil;
+    NSString *species = [APPixelPalCoats speciesForAssetName:name];
+    if (!species) return nil;
+    NSString *action = [name substringFromIndex:species.length + 1];
+    NSString *coat = nil;
+    NSDictionary<NSString *, NSString *> *channel = [ApolloPalHomeStore islandChannel];
+    if (channel && [species isEqualToString:channel[@"host"]]) {
+        if (!APRebornHasSprites(channel[@"species"]) && ![APSpecies isApolloSpecies:channel[@"species"]]) return nil;
+        species = channel[@"species"];
+        coat = channel[@"coat"];
+    } else {
+        coat = [APPixelPalCoats selectedCoatForSpecies:species];
+        if ([coat isEqualToString:@"original"] && !APRebornHasSprites(species)) return nil;
+    }
+    static NSCache<NSString *, UIImage *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSCache new]; });
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@", name, species, coat];
+    UIImage *hit = [cache objectForKey:key];
+    if (hit) return hit;
+    // A different selector from the one hooked below, so no recursion.
+    __block CGFloat scale = 1;
+    CGImageRef sheet = APPalCreateSheet(species, coat, action, ^CGImageRef(NSString *assetName) {
+        UIImage *original = [UIImage imageNamed:assetName inBundle:nil compatibleWithTraitCollection:nil];
+        scale = original.scale ?: 1;
+        return original.CGImage;
+    });
+    // A Reborn guest with no sheet for this action (e.g. "settings"): let
+    // Apollo's own image through rather than show nothing.
+    if (!sheet) return nil;
+    UIImage *image = [UIImage imageWithCGImage:sheet scale:scale orientation:UIImageOrientationUp];
+    CGImageRelease(sheet);
+    [cache setObject:image forKey:key];
+    return image;
+}
+
+// Apollo's own chooser can switch Pals behind our back; when it does, the
+// island channel gives its borrowed slot back (stats go home with the guest).
+static void ApolloPalHomeReconcileIsland(void) {
+    static BOOL busy = NO;
+    if (busy) return; // our own PixelPalSettingChanged post
+    busy = YES;
+    [[ApolloPalHomeStore new] reconcileIsland];
+    busy = NO;
+}
+
+%hook SKTexture
++ (instancetype)textureWithImageNamed:(NSString *)name {
+    UIImage *coat = ApolloPixelPalCoatImage(name);
+    return coat ? [SKTexture textureWithImage:coat] : %orig;
+}
+%end
+
+%hook UIImage
++ (UIImage *)imageNamed:(NSString *)name {
+    return ApolloPixelPalCoatImage(name) ?: %orig;
+}
 %end
 
 #pragma mark - Carrot Weather pal
@@ -541,3 +1288,58 @@ static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
     return %orig;
 }
 %end
+
+// The floating Pal (ApolloPalHomeChatHead) trots along as you scroll. This is
+// on every scroll view's hot path, so it's one cheap check unless it's showing.
+%hook UIScrollView
+- (void)setContentOffset:(CGPoint)offset {
+    CGFloat before = ((UIScrollView *)self).contentOffset.y;
+    %orig;
+    if (ApolloPalChatHeadIsShowing()) ApolloPalChatHeadNoteScroll((UIScrollView *)self, offset.y - before);
+}
+%end
+
+// From anywhere (the floating Pal): Pal Home on the main window.
+void ApolloPalHomeOpenFromAnywhere(BOOL animated) {
+    UIViewController *tabs = ApolloMainTabBarController();
+    UIWindow *window = tabs.viewIfLoaded.window;
+    if (!window) return;
+    sApolloPalHomeOpenAnimated = animated;
+    ApolloPalHomeShowFromWindow(window);
+    sApolloPalHomeOpenAnimated = YES;
+}
+
+%ctor {
+    %init; // this file's hooks (an explicit %ctor replaces Logos' implicit one)
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CGRect island;
+        UIScreen *screen = ApolloMainTabBarController().viewIfLoaded.window.screen;
+        ApolloPalHomeStore.deviceHasDynamicIsland = screen && ApolloDynamicIslandRect(screen, &island);
+        // Apollo's own tab-bar strip (phones without an island) is only offered
+        // on the classic tab bar: under Liquid Glass's floating, collapsing bar
+        // it has nowhere good to live, so there it's the island or the bubble.
+        ApolloPalHomeStore.tabBarSupported = !ApolloPalHomeStore.deviceHasDynamicIsland && !IsLiquidGlass();
+        ApolloLog(@"[PixelPals] Dynamic Island: %@", ApolloPalHomeStore.deviceHasDynamicIsland ? @"yes" : @"no");
+        ApolloPixelPalsApplyDisplay();
+        ApolloPalChatHeadRefresh();
+    });
+    [NSNotificationCenter.defaultCenter addObserverForName:@"PixelPalSettingChanged" object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) {
+        ApolloPalHomeReconcileIsland();
+        ApolloPixelPalsApplyDisplay();
+        ApolloPalChatHeadRefresh(); // the island Pal may have changed
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) {
+        ApolloPalHomeReconcileIsland();
+        ApolloPalChatHeadRefresh();
+        ApolloPalChatHeadWelcomeBack();
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:APPalDisplayDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) {
+        ApolloPixelPalsApplyDisplay();
+        ApolloPalChatHeadRefresh();
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification *note) { ApolloPalChatHeadRefresh(); }];
+}

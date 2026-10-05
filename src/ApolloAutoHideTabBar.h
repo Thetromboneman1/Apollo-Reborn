@@ -1,5 +1,7 @@
 #import <UIKit/UIKit.h>
 
+__BEGIN_DECLS
+
 // Reveal scroll-hidden bottom chrome when a status-bar jump reaches the top.
 void ApolloTabBarRevealAfterScrollToTop(UITabBarController *controller);
 
@@ -12,3 +14,8 @@ void ApolloTabBarCancelScrollToTopReveal(UITabBarController *controller);
 NSString *ApolloAutoHideTabBarSimScanStatus(NSUInteger iterations);
 NSString *ApolloAutoHideTabBarSimSetPolicy(BOOL enabled);
 #endif
+
+// Reconcile native bottom-bar policy once after the Duo bar changes placement.
+void ApolloScheduleDuoBarPolicyUpdate(UITabBarController *controller);
+
+__END_DECLS

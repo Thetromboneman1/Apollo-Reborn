@@ -85,6 +85,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloDuoSubsChrome.m \
     $(SRC_DIR)/ApolloDuoSubsChromeHooks.xm \
     $(SRC_DIR)/ApolloProfilePagination.xm \
+    $(SRC_DIR)/ApolloListEmptyState.xm \
     $(SRC_DIR)/ApolloWebTextDecoding.m \
     $(SRC_DIR)/ApolloNitterInstances.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
@@ -115,6 +116,10 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloNotificationBackend.m \
     $(SRC_DIR)/ApolloBarkIconResolver.m \
     $(SRC_DIR)/ApolloUsageHeartbeat.m \
+    $(SRC_DIR)/ApolloAppIcon.m \
+    $(SRC_DIR)/ApolloUpdateManifest.m \
+    $(SRC_DIR)/ApolloUpdatePromptViewController.m \
+    $(SRC_DIR)/ApolloUpdateChecker.m \
     $(SRC_DIR)/ApolloPushNotifications.m \
     $(SRC_DIR)/ApolloLiquidGlassIconIDs.m \
     $(SRC_DIR)/ApolloBarkNotifications.m \
@@ -207,6 +212,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloTrueBlackKeyboard.xm \
     $(SRC_DIR)/ApolloAutoHideTabBar.xm \
     $(SRC_DIR)/ApolloTopBarScrollPresentation.m \
+    $(SRC_DIR)/ApolloCompactTabBarView.m \
     $(SRC_DIR)/ApolloListBottomInsetGuard.xm \
     $(SRC_DIR)/ApolloTabBarHideStyle.xm \
     $(SRC_DIR)/ApolloIPadTabBarBottom.xm \
@@ -319,6 +325,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSubredditSwitcherSheet.xm \
     $(SRC_DIR)/ApolloSearchHeaderOverlapFix.xm \
     $(SRC_DIR)/ApolloSearchTabFixes.xm \
+    $(SRC_DIR)/ApolloDuoSearchLandingViewController.m \
+    $(SRC_DIR)/ApolloDuoSearchRecents.m \
     $(SRC_DIR)/ApolloGoogleSearch.m \
     $(SRC_DIR)/ApolloGoogleSearchViewController.m \
     $(SRC_DIR)/ApolloGoogleSearchTab.m \
@@ -354,6 +362,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloPollVoting.xm \
     $(SRC_DIR)/ApolloPollCompose.xm \
     $(SRC_DIR)/settings/ApolloPollSettingsViewController.m \
+    $(SRC_DIR)/settings/ApolloPalHomeSettingsViewController.m \
     $(SRC_DIR)/ApolloSimDebugTap.xm \
     $(SRC_DIR)/ApolloManualSignInViewController.m \
     $(SRC_DIR)/ApolloAccountCredentials.m \
@@ -364,6 +373,33 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSignInSplash.xm \
     $(SRC_DIR)/ApolloHideSubscribePrompt.xm \
     $(SRC_DIR)/ApolloPixelPals.xm \
+    $(SRC_DIR)/palhome/ApolloPixelCanvas.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeCatalog.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeSurfaces.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeFurniture.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeWallItems.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeThemedItems.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeHalloween.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeChatHead.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeStyles.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeChrome.m \
+    $(SRC_DIR)/palhome/ApolloPixelPalCoats.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeWardrobe.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeShelter.m \
+    $(SRC_DIR)/palhome/ApolloPalSpecies.m \
+    $(SRC_DIR)/palhome/ApolloRebornPalSprites.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeShelterView.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeAmbience.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeChiptune.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeHaptics.m \
+    $(SRC_DIR)/palhome/ApolloPalHomePrompt.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeWidgetRenderer.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeRenderer.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeStore.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeScene.m \
+    $(SRC_DIR)/palhome/ApolloPalHomePixelUI.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeDrawer.m \
+    $(SRC_DIR)/palhome/ApolloPalHomeViewController.m \
     $(SRC_DIR)/settings/CustomAPIViewController.m \
     $(SRC_DIR)/settings/ApolloSubredditLayoutPreview.m \
     $(SRC_DIR)/settings/ApolloSubredditLayoutViewController.m \
@@ -402,7 +438,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/crash/ApolloCrashBugsnagNeutralize.xm \
     $(KSCRASH_FILES) \
     $(SSZIPARCHIVE_FILES)
-ApolloReborn_FRAMEWORKS = UIKit Security LocalAuthentication AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion
+ApolloReborn_FRAMEWORKS = UIKit Security LocalAuthentication AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion SpriteKit CoreText CoreHaptics
 ApolloReborn_LIBRARIES = z iconv
 # FoundationModels (Apple on-device AI) only ships in the iOS 26+ SDK. Weak-link
 # it so the dylib still loads on older OSes (the Swift bridge guards every call

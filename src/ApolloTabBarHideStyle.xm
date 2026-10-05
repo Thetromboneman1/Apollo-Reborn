@@ -2,11 +2,13 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "ApolloCommon.h"
+#import "ApolloSwiftRuntime.h"
 #import "ApolloState.h"
+#import "ApolloDuoRail.h"
 #import "ApolloTabBarHideStyle.h"
 #import "UserDefaultConstants.h"
 
-// MARK: - Tab Bar Hide Style (Left / Right / Fade / Down)
+// MARK: - Tab Bar Hide Style (Left / Right / Fade / Down / Minimize)
 //
 // On iOS 26 (Liquid Glass), Apollo's native "Hide Bars on Scroll" toggle is
 // rerouted by ApolloAutoHideTabBar.xm into UITabBarController's native
@@ -37,7 +39,7 @@ BOOL ApolloTabBarHideBarsEnabled(void) {
 }
 
 NSInteger ApolloTabBarHideStyleCurrentOptionIndex(void) {
-    return MIN(ApolloTabBarHideStyleDown,
+    return MIN(ApolloTabBarHideStyleMinimize,
                MAX(ApolloTabBarHideStyleLeft, sTabBarHideStyle));
 }
 
@@ -45,26 +47,17 @@ NSArray<NSString *> *ApolloTabBarHideStyleOptionTitles(void) {
     static NSArray<NSString *> *titles;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        titles = @[@"Left", @"Right", @"Fade", @"Down"];
+        titles = @[@"Left", @"Right", @"Fade", @"Down", @"Minimize"];
     });
     return titles;
 }
 
 NSString *ApolloTabBarHideStyleCurrentTitle(void) {
-    NSArray<NSString *> *titles = ApolloTabBarHideStyleOptionTitles();
-    NSInteger index = ApolloTabBarHideStyleCurrentOptionIndex();
-    return (index >= 0 && index < (NSInteger)titles.count) ? titles[index] : @"Left";
+    // The index is clamped to the enum range, which matches the titles array.
+    return ApolloTabBarHideStyleOptionTitles()[ApolloTabBarHideStyleCurrentOptionIndex()];
 }
 
 // MARK: Runtime pill mirroring
-
-static UIView *TabBarHideStyleProviderIvarView(id provider, const char *name) {
-    if (!provider) return nil;
-    Ivar ivar = class_getInstanceVariable([provider class], name);
-    if (!ivar) return nil;
-    id value = object_getIvar(provider, ivar);
-    return [value isKindOfClass:[UIView class]] ? (UIView *)value : nil;
-}
 
 // The post-layout mirror. UITabBar's layoutSubviews runs the provider's
 // layout FIRST (RE: UIKitCore UITabBar.mm), which docks the collapsed platter
@@ -87,11 +80,12 @@ static UIView *TabBarHideStyleProviderIvarView(id provider, const char *name) {
 // (currentMorphTarget != 0); re-register it with the mirrored pill frame so
 // the glass effect follows the pill.
 static void TabBarHideStyleApplyMirror(UITabBar *tabBar) {
-    if (!ApolloSupportsNativeTabBarScrollBehavior() ||
+    if (!ApolloDuoAllowsTabBarScrollHiding() || !ApolloSupportsNativeTabBarScrollBehavior() ||
         ApolloTabBarHideStyleUsesCustomPresentation(sTabBarHideStyle)) return;
     id provider = ApolloTabBarVisualProvider(tabBar);
     if (!provider) return;
-    UIView *collapsePlatter = TabBarHideStyleProviderIvarView(provider, "collapsePlatterView");
+    id platterValue = ApolloObjectIvar(provider, "collapsePlatterView");
+    UIView *collapsePlatter = [platterValue isKindOfClass:[UIView class]] ? (UIView *)platterValue : nil;
     if (!collapsePlatter || !collapsePlatter.superview) return;
 
     CGFloat width = collapsePlatter.superview.bounds.size.width;
@@ -109,9 +103,7 @@ static void TabBarHideStyleApplyMirror(UITabBar *tabBar) {
     NSInteger morphTarget = ApolloTabBarVisualMorphTarget(tabBar,
                                                            &morphTargetKnown);
     if (morphTargetKnown && morphTarget != 0) {
-        id pocket = nil;
-        Ivar pocketIvar = class_getInstanceVariable([provider class], "scrollPocketInteraction");
-        if (pocketIvar) pocket = object_getIvar(provider, pocketIvar);
+        id pocket = ApolloObjectIvar(provider, "scrollPocketInteraction");
         SEL setRect = NSSelectorFromString(@"_setRect:");
         if (pocket && [pocket respondsToSelector:setRect]) {
             ((void (*)(id, SEL, CGRect))objc_msgSend)(pocket, setRect, collapsePlatter.frame);
@@ -150,7 +142,7 @@ static void TabBarHideStyleRelayoutVisibleTabBars(void) {
 // MARK: Shared setting application (Interface > Tab Bar)
 
 static void TabBarHideStyleSet(ApolloTabBarHideStyle style) {
-    style = (ApolloTabBarHideStyle)MIN(ApolloTabBarHideStyleDown,
+    style = (ApolloTabBarHideStyle)MIN(ApolloTabBarHideStyleMinimize,
                                       MAX(ApolloTabBarHideStyleLeft, style));
     if (sTabBarHideStyle != style) {
         sTabBarHideStyle = style;
@@ -182,9 +174,7 @@ void ApolloTabBarHideBarsSetEnabled(BOOL enabled) {
 }
 
 void ApolloTabBarHideStyleApplyOptionIndex(NSInteger optionIndex) {
-    NSInteger mode = MIN(ApolloTabBarHideStyleDown,
-                         MAX(ApolloTabBarHideStyleLeft, optionIndex));
-    TabBarHideStyleSet((ApolloTabBarHideStyle)mode);
+    TabBarHideStyleSet((ApolloTabBarHideStyle)optionIndex);   // clamps
     TabBarHideStyleReconcileRuntime();
 }
 

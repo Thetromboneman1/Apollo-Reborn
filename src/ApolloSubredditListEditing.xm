@@ -2,6 +2,7 @@
 #import <objc/runtime.h>
 #import "ApolloCommon.h"
 #import "ApolloFollowingSection.h"
+#import "ApolloSwiftRuntime.h"
 
 // Overlay confirmation buttons without shifting or clearing the row.
 static char kListConfirmation, kCellConfirmation, kEditingRightMargin, kEditingStarPriorities, kEditingSelection;
@@ -16,11 +17,6 @@ static UITableView *ApolloEditingTable(UIView *view) {
 static BOOL ApolloEditingIsList(UITableView *table) {
     Class cls = NSClassFromString(@"Apollo.RedditListViewController");
     return cls && [(id)table.dataSource isKindOfClass:cls];
-}
-
-static id ApolloEditingIvar(id object, const char *name) {
-    Ivar ivar = object ? class_getInstanceVariable([object class], name) : NULL;
-    return ivar ? object_getIvar(object, ivar) : nil;
 }
 
 // Keep the stars in place while editing; restore on exit. Apply at lifecycle
@@ -41,7 +37,7 @@ static void ApolloEditingAlignStar(UITableViewCell *cell, BOOL editing) {
     // These lifecycle hooks also run for unrelated UIKit cells. Do not probe
     // Apollo's ivars unless this is an editing list row or a row we modified.
     if (!editingList && !original && !priorities) return;
-    UIButton *star = ApolloEditingIvar(cell, "accessoryButton");
+    UIButton *star = ApolloObjectIvar(cell, "accessoryButton");
     if (![star isKindOfClass:UIButton.class]) return;
     UIEdgeInsets margins = cell.contentView.layoutMargins;
     if (editingList) {
@@ -201,7 +197,7 @@ static BOOL ApolloEditingShowConfirmation(UIControl *control) {
     [surface addSubview:button];
     [cell addSubview:panel];
     // Preserve native button sizing, rounded to the display pixel.
-    CGFloat scale = MAX(1.0, cell.traitCollection.displayScale);
+    CGFloat scale = cell.traitCollection.displayScale;
     CGFloat textWidth = [title sizeWithAttributes:@{NSFontAttributeName: button.titleLabel.font}].width;
     CGFloat width = ceil((textWidth + 24.0) * scale) / scale;
     [NSLayoutConstraint activateConstraints:@[
@@ -242,7 +238,7 @@ static BOOL ApolloEditingShowConfirmation(UIControl *control) {
         }
     }
     [cell bringSubviewToFront:panel];
-    UIView *star = ApolloEditingIvar(cell, "accessoryButton");
+    UIView *star = ApolloObjectIvar(cell, "accessoryButton");
     state.contentMargins = cell.contentView.layoutMargins;
     CGRect starFrame = [star convertRect:star.bounds toView:cell];
     CGFloat starNudge = star ? MAX(16.0, CGRectGetMaxX(starFrame) - CGRectGetMinX(panel.frame) + 8.0) : 0.0;
@@ -283,7 +279,11 @@ static BOOL ApolloEditingShowConfirmation(UIControl *control) {
     %orig;
     if (list) {
         for (NSIndexPath *path in self.indexPathsForSelectedRows.copy) [self deselectRowAtIndexPath:path animated:NO];
-        for (UITableViewCell *cell in self.visibleCells) [cell setHighlighted:NO animated:NO];
+        // Most rows are already unhighlighted. Re-sending NO still enters the
+        // subreddit selection-chrome hooks for every row on each Edit/Done tap.
+        for (UITableViewCell *cell in self.visibleCells) {
+            if (cell.highlighted) [cell setHighlighted:NO animated:NO];
+        }
         if (!editing) {
             NSNumber *previous = objc_getAssociatedObject(self, &kEditingSelection);
             if (previous) self.allowsSelectionDuringEditing = previous.boolValue;
