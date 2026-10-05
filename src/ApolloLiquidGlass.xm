@@ -43,10 +43,6 @@ static void ApolloFinishAccountRailLongPress(void) {
     });
 }
 
-static BOOL ApolloDictionaryHasForegroundColor(NSDictionary *attributes) {
-    return [attributes isKindOfClass:[NSDictionary class]] && attributes[NSForegroundColorAttributeName] != nil;
-}
-
 static NSDictionary *ApolloTitleTextAttributesWithoutForegroundColor(NSDictionary *attributes) {
     if (!attributes[NSForegroundColorAttributeName]) {
         return attributes;
@@ -666,7 +662,7 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
                 if (hypot(current.x - sApolloAccountRailPressOrigin.x,
                           current.y - sApolloAccountRailPressOrigin.y) > 12.0) return;
                 ApolloLogDebug(@"[LiquidGlassTabBar] Profile touch hold opening account switcher");
-                OpenAccountManager();
+                OpenAccountManager(window);
             });
             break;
         }
