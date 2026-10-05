@@ -1313,7 +1313,8 @@ void ApolloPalHomeOpenFromAnywhere(BOOL animated) {
     %init; // this file's hooks (an explicit %ctor replaces Logos' implicit one)
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect island;
-        ApolloPalHomeStore.deviceHasDynamicIsland = ApolloDynamicIslandRect(&island);
+        UIScreen *screen = ApolloMainTabBarController().viewIfLoaded.window.screen;
+        ApolloPalHomeStore.deviceHasDynamicIsland = screen && ApolloDynamicIslandRect(screen, &island);
         // Apollo's own tab-bar strip (phones without an island) is only offered
         // on the classic tab bar: under Liquid Glass's floating, collapsing bar
         // it has nowhere good to live, so there it's the island or the bubble.
