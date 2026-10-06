@@ -476,6 +476,12 @@ static void ApolloImmersiveRequestBackdrop(UIImage *banner, void (^completion)(U
     [self setNeedsLayout];
 }
 
+- (void)setArtworkInsets:(UIEdgeInsets)artworkInsets {
+    if (UIEdgeInsetsEqualToEdgeInsets(_artworkInsets, artworkInsets)) return;
+    _artworkInsets = artworkInsets;
+    [self setNeedsLayout];
+}
+
 - (CGFloat)sharpArtworkHeight {
     CGFloat regionHeight = MIN(self.regionHeight, MAX(1.0, self.bounds.size.height));
     return self.usesProfileHero
@@ -485,12 +491,16 @@ static void ApolloImmersiveRequestBackdrop(UIImage *banner, void (^completion)(U
 
 - (void)layoutSubviews {
     [super layoutSubviews];
+    CGFloat fullWidth = self.bounds.size.width;
     CGRect contentFrame = self.bounds;
     CGRect column = ApolloDuoSplitContentFrame(self.contentViewController, self);
     if (!CGRectIsNull(column) && column.size.width > 0) {
         contentFrame.origin.x = CGRectGetMinX(column);
         contentFrame.size.width = CGRectGetWidth(column);
     }
+    contentFrame.origin.x += self.artworkInsets.left;
+    contentFrame.size.width = MAX(1.0, contentFrame.size.width -
+        self.artworkInsets.left - self.artworkInsets.right);
     CGFloat width = contentFrame.size.width;
     CGFloat totalHeight = MAX(1.0, self.bounds.size.height);
     CGFloat regionHeight = MIN(self.regionHeight, totalHeight);
@@ -502,7 +512,7 @@ static void ApolloImmersiveRequestBackdrop(UIImage *banner, void (^completion)(U
     BOOL hideCover = boundary <= 0.0;
     if (self.paneChromeCover.hidden != hideCover) self.paneChromeCover.hidden = hideCover;
     if (![self.paneChromeCover.backgroundColor isEqual:pageColor]) self.paneChromeCover.backgroundColor = pageColor;
-    CGRect coverFrame = CGRectMake(0, 0, width, MIN(totalHeight, boundary));
+    CGRect coverFrame = CGRectMake(0, 0, fullWidth, MIN(totalHeight, boundary));
     if (!CGRectEqualToRect(self.paneChromeCover.frame, coverFrame)) self.paneChromeCover.frame = coverFrame;
 
     CGAffineTransform transform = self.contentContainer.transform;
