@@ -1682,12 +1682,7 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
         return;
     }
     UIView *jumpBar = ApolloFindJumpBar(self.titleControl);
-    if (!jumpBar && ApolloPaneUsesUnifiedChrome(self.titleControl)) {
-        [self.glassView removeFromSuperview];
-        self.glassView = nil;
-        self.observationValid = NO;
-        return;
-    }
+    BOOL plainPaneTitle = !jumpBar && ApolloPaneUsesUnifiedChrome(self.titleControl);
     UIView *hostView = jumpBar ?: self.titleControl;
 
     if (ApolloNavigationTitleContainsNativeSearchSurface(self.titleControl)) {
@@ -1724,7 +1719,14 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
     // observations only after recentering succeeds, so skipped work retries.
     BOOL recenterSettled = ApolloRecenterTitleControl(self);
     if (recenterSettled && jumpBar) ApolloLayoutJumpBarSearchContent(jumpBar);
-    [self updateGlassForHostView:hostView candidateViews:[self titleContentViews]];
+    if (plainPaneTitle) {
+        // A plain pane title still needs safe-area fitting; suppress only its
+        // decorative capsule, not the geometry work that keeps it visible.
+        [self.glassView removeFromSuperview];
+        self.glassView = nil;
+    } else {
+        [self updateGlassForHostView:hostView candidateViews:[self titleContentViews]];
+    }
     if (animateSearch && oldGlass && self.glassView == oldGlass &&
         !CGRectEqualToRect(oldBounds, oldGlass.bounds)) {
         // The host already keeps the capsule centered. Animate only its size;
@@ -1786,10 +1788,6 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
         return;
     }
     UIView *jumpBar = ApolloFindJumpBar(titleControl);
-    if (!jumpBar && ApolloPaneUsesUnifiedChrome(titleControl)) {
-        if (self.glassView) [self scheduleTargetRefresh];
-        return;
-    }
     BOOL unchanged = self.observationValid &&
         (!self.glassView || (self.glassHostView && self.glassView.superview == self.glassHostView)) &&
         self.preservesNativeSearchLayout == ApolloNavigationTitleContainsNativeSearchSurface(titleControl) &&
@@ -2093,7 +2091,7 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     }
     CGRect collapsedActions = ApolloNavigationActionsCollapsedFrame(bar);
     if (!searchActions && !CGRectIsNull(collapsedActions)) {
-        if (CGRectGetMidX(collapsedActions) >= CGRectGetMidX(bar.bounds)) {
+        if (CGRectGetMidX(collapsedActions) >= CGRectGetMidX(titleBounds)) {
             rightLimit = MIN(rightLimit, CGRectGetMinX(collapsedActions));
         } else {
             leftLimit = MAX(leftLimit, CGRectGetMaxX(collapsedActions));
@@ -2137,7 +2135,7 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
             if (CGRectGetMaxY(sibInBar) <= CGRectGetMinY(titleBand) ||
                 CGRectGetMinY(sibInBar) >= CGRectGetMaxY(titleBand) ||
                 CGRectGetWidth(sibInBar) >= CGRectGetWidth(bar.bounds) - 1.0) continue;
-            if (CGRectGetMidX(sibInBar) < CGRectGetMidX(bar.bounds)) {
+            if (CGRectGetMidX(sibInBar) < CGRectGetMidX(titleBounds)) {
                 leftLimit = MAX(leftLimit, CGRectGetMaxX(sibInBar));
             } else {
                 if (!searchActions) rightLimit = MIN(rightLimit, CGRectGetMinX(sibInBar));
@@ -2147,11 +2145,18 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
 
     const CGFloat kEdgePadding = kApolloTitleButtonSpacing;
 
-    CGFloat capsulePadding = !searching &&
+    CGFloat capsulePadding = !searching && (jumpBar || !ApolloPaneUsesUnifiedChrome(bar)) &&
         ApolloResolvedScrollEdgeEffectStyle() != ApolloScrollEdgeEffectStyleHard
         ? kApolloTitleCapsuleHorizontalPadding : 0.0;
     CGRect columnBounds = ApolloDuoSplitContentFrame(topVC, bar);
     CGRect titleBounds = CGRectIsNull(columnBounds) ? bar.bounds : columnBounds;
+    // A pane's primary navigation bar can extend underneath UIKit's sidebar.
+    // Its physical midpoint is then inside the occluded region. Fit and center
+    // within the usable header unless Duo already supplied a narrower column.
+    if (CGRectIsNull(columnBounds) && ApolloPaneUsesUnifiedChrome(bar)) {
+        titleBounds.origin.x = leftLimit;
+        titleBounds.size.width = MAX(0.0, rightLimit - leftLimit);
+    }
     CGRect floatingTabs = ApolloIPadFloatingTabsFrame(bar, topVC);
     BOOL lowerIPadTitle = CGRectIsNull(columnBounds) && !CGRectIsNull(floatingTabs);
     // Short bars (e.g. Settings) have no search/large-title space beneath the
@@ -2246,7 +2251,7 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
         CGRect centered = CGRectOffset(contentFrame,
             geometry.center - CGRectGetMidX(contentFrame), 0);
         centered = CGRectInset(centered, -capsulePadding, 0);
-        targetCenter += ApolloNavigationTitleExpandedActionsOffset(bar.bounds,
+        targetCenter += ApolloNavigationTitleExpandedActionsOffset(titleBounds,
             centered, leftLimit, CGRectGetMinX(expandedActions), kEdgePadding);
     }
     CGFloat delta = targetCenter - CGRectGetMidX(contentFrame);

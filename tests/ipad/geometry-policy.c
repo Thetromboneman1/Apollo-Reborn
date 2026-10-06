@@ -12,6 +12,16 @@ int main(void) {
     assert(ApolloPanePhoneHasRoomForColumns(1161, 680));
     assert(!ApolloPanePhoneHasRoomForColumns(NAN, 900));
     assert(!ApolloPanePhoneHasRoomForColumns(900, INFINITY));
+    assert(!ApolloPaneHasRoomForColumns(744));
+    assert(!ApolloPaneHasRoomForColumns(759.9));
+    assert(ApolloPaneHasRoomForColumns(760));
+    assert(ApolloPaneHasRoomForColumns(810));
+    assert(!ApolloPaneHasRoomForSidebar(1133));
+    assert(!ApolloPaneHasRoomForSidebar(1179.9));
+    assert(ApolloPaneHasRoomForSidebar(1180));
+    assert(ApolloPaneHasRoomForSidebar(1376));
+    assert(!ApolloPaneHasRoomForSidebar(NAN));
+    assert(!ApolloPaneHasRoomForSidebar(INFINITY));
     assert(ApolloPanePreferredWidth(NAN) == 420);
     assert(ApolloPanePreferredWidth(INFINITY) == 420);
     assert(ApolloPanePreferredWidth(-1) == 340);
