@@ -368,6 +368,9 @@ static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadT
 // Supersedes UDKeyIPadTabBarBottom while active (the floating pill is hidden).
 // See src/ipad/ and docs/ipad-pane-layout-plan.md.
 static NSString *const UDKeyIPadPaneLayout = @"IPadPaneLayout";
+// Consumed after the one-time iPad Layout invitation is actually presented.
+// Independent of the layout toggle: declining never enables or re-prompts.
+static NSString *const UDKeyIPadLayoutWelcomeSeen = @"IPadLayoutWelcomeSeen";
 // True Black Keyboard mode: 0 Off (default), 1 Dark Only, 2 Light Only, 3 Always.
 static NSString *const UDKeyTrueBlackKeyboardMode = @"TrueBlackKeyboardMode";
 // Settings icons: 0 = System, 1 = Light (default), 2 = Dark.

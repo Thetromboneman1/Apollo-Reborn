@@ -26,6 +26,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import "ApolloPaneLayout.h"
+#import "ApolloIPadLayoutWelcome.h"
 #import "ApolloPaneSidebar.h"
 #import "ApolloPaneChrome.h"
 #import "ApolloPaneSplitViewController.h"
@@ -486,6 +487,8 @@ static BOOL ApolloPaneInstallIntoTabBarController(UITabBarController *tabBarCont
 %ctor {
     // Install only on supported OS/device combinations and explicit opt-in.
     if (!ApolloPaneLayoutSupported()) return;
+    // The invitation must run while the layout is still off.
+    ApolloIPadLayoutWelcomeStart();
 
     if (!ApolloPaneLayoutEnabled()) {
         ApolloLog(@"[PaneInstall] supported device, pane layout off (UDKeyIPadPaneLayout); hook not installed");

@@ -42,6 +42,7 @@
 #import "UIWindow+Apollo.h"
 #import "ipad/ApolloPaneSplitViewController.h"
 #import "ipad/ApolloPaneLayout.h"
+#import "ipad/ApolloIPadLayoutWelcome.h"
 #import "ipad/ApolloPaneSidebar.h"
 #import <mach-o/dyld.h>
 
@@ -2692,6 +2693,19 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
             NSString *mode = [[contents substringFromIndex:8] stringByTrimmingCharactersInSet:
                 NSCharacterSet.whitespaceAndNewlineCharacterSet];
             ApolloSimDebugNavChurn(mode);
+            return;
+        }
+        // Reset just the invitation marker for cold-launch QA. The tester
+        // controls the real layout switch separately; no preferences/account
+        // reset or fake launch-time layout state is involved.
+        if ([contents isEqualToString:@"ipadwelcomereset"]) {
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:UDKeyIPadLayoutWelcomeSeen];
+            ApolloLog(@"[iPadWelcome] reset invitation marker for simulator QA");
+            return;
+        }
+        // Replay only: never clears first-run history or toggles the layout.
+        if ([contents isEqualToString:@"ipadwelcome"]) {
+            ApolloIPadLayoutWelcomePresentForDebug(nil);
             return;
         }
         // "openurl <url>" command: route a reddit / apollo:// URL through

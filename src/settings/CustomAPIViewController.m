@@ -83,6 +83,7 @@
 #import "PictureInPictureViewController.h"
 #import "TagFiltersViewController.h"
 #import "ipad/ApolloPaneLayout.h"
+#import "ipad/ApolloIPadLayoutWelcome.h"
 
 // The six speeds the "Hold for Video Speed" picker offers, in display order. They
 // mirror the video player's own speed menu minus 1.0× (holding at normal speed
@@ -262,9 +263,9 @@ static NSString *ApolloIPadPaneLayoutSettingDetail(void) {
     if (desired != active) {
         return desired
             ? @"Will turn on after Apollo quits and reopens. The current single-column layout remains active until then."
-            : @"Will turn off after Apollo quits and reopens. The current multi-column layout remains active until then.";
+            : @"Will turn off after Apollo quits and reopens. The current iPad Layout remains active until then.";
     }
-    return @"Experimental on iPadOS 18+ and iOS 27. Opens detail beside the list when space allows, and returns to one column in narrow windows. Apollo restarts to apply changes.";
+    return @"Beta on iPadOS 18 or newer. Keep favourites in the sidebar and read posts and comments side by side. You can switch back anytime. Reopen Apollo to apply changes.";
 }
 
 @interface ApolloFeedShortcutsPreviewState : NSObject
@@ -1437,9 +1438,20 @@ typedef NS_ENUM(NSInteger, Tag) {
     loginPersistenceDebug.iconSystemName = @"wrench.and.screwdriver.fill"; loginPersistenceDebug.iconTileColor = [UIColor systemGrayColor];
     whatsNewDebug.iconSystemName = @"sparkles"; whatsNewDebug.iconTileColor = [UIColor systemGrayColor];
 
+    ApolloSettingsRow *iPadWelcomeDebug =
+        [ApolloSettingsRow buttonRowWithID:@"adv.iPadWelcomeDebug"
+                                     title:@"Preview iPad Layout Welcome"
+                                    action:^{ ApolloIPadLayoutWelcomePresentForDebug(weakSelf); }];
+    iPadWelcomeDebug.visible = ^BOOL {
+        return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad &&
+            ApolloPaneLayoutSupported() && [NSUserDefaults.standardUserDefaults boolForKey:UDKeyEnableFLEX];
+    };
+    iPadWelcomeDebug.iconSystemName = @"ipad.landscape";
+    iPadWelcomeDebug.iconTileColor = UIColor.systemGrayColor;
+
     return [ApolloSettingsSection sectionWithTitle:@"Advanced"
                                             footer:@"Notification backend, developer tools and diagnostics."
-                                              rows:@[ backend, flex, exportLogs, loginPersistenceDebug, whatsNewDebug ]];
+                                              rows:@[ backend, flex, exportLogs, loginPersistenceDebug, whatsNewDebug, iPadWelcomeDebug ]];
 }
 
 - (ApolloSettingsSection *)buildDataSection {
@@ -2496,11 +2508,15 @@ typedef NS_ENUM(NSInteger, Tag) {
         [ApolloSettingsRow customRowWithID:@"gen.iPadPaneLayout"
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             UITableViewCell *cell = [weakSelf switchCellWithIdentifier:@"Cell_Gen_IPadPaneLayout"
-                                                                 label:@"Multi-Column Layout (Experimental)"
+                                                                 label:@"iPad Layout"
                                                                 detail:ApolloIPadPaneLayoutSettingDetail()
                                                                     on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout]
                                                                enabled:YES
                                                                 action:@selector(iPadPaneLayoutSwitchToggled:)];
+            UILabel *title = [cell.contentView viewWithTag:7001];
+            title.attributedText = ApolloIPadLayoutBetaTitle(title.font, weakSelf.traitCollection);
+            title.accessibilityLabel = @"iPad Layout, Beta";
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
             return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
         }
                                   onSelect:nil];
@@ -5079,13 +5095,16 @@ replacementString:(NSString *)string {
 - (void)iPadPaneLayoutSwitchToggled:(UISwitch *)sender {
     BOOL on = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:UDKeyIPadPaneLayout];
+    [NSUserDefaults.standardUserDefaults setBool:YES forKey:UDKeyIPadLayoutWelcomeSeen];
+    // Dependent rows describe the hierarchy that is active in THIS process,
+    // while this switch and its pending subtitle describe the saved choice.
     [self visibilityDidChange];
     [self reloadRowWithID:@"gen.iPadPaneLayout"];
 
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Restart to Apply"
                          message:on
-            ? @"The multi-column layout is set up when Apollo launches, so it needs to quit and reopen to take effect."
+            ? @"iPad Layout is set up when Apollo launches, so it needs to quit and reopen to take effect."
             : @"Apollo needs to quit and reopen to return to the single-column layout."
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Quit Apollo"
