@@ -29,6 +29,7 @@
 #import "ApolloDuoCompatibility.h"
 #import "ApolloTranslation.h"
 #import "ApolloRedgifsMissingDuration.h"
+#import "ApolloRedgifsErrorCards.h"
 #import "Tweak.h"
 #import "settings/CustomAPIViewController.h"
 #import "settings/ApolloAutomaticBackup.h"
@@ -2881,6 +2882,10 @@ static void ApolloImgurRetryAlbumViaTextProxy(NSString *albumID,
     // ApolloRedgifsMissingDuration.h). Rebinding the parameter hands the
     // repaired completion to every RedGIFs path below.
     if (completionHandler && [host isEqualToString:@"api.redgifs.com"] && [path hasPrefix:@"/v2/gifs/"]) {
+        // Innermost, so it sees the response Apollo finally gets (after the
+        // token retry and the duration fill): a failed lookup's card then says
+        // why (see ApolloRedgifsErrorCards.xm).
+        completionHandler = ApolloRedgifsCompletionRecordingLookupResult(self, request, completionHandler);
         completionHandler = ApolloRedgifsCompletionFillingMissingDuration(self, request, completionHandler,
             ^NSURLSessionDataTask *(NSURLRequest *headerRequest, ApolloRedgifsLookupCompletion headerCompletion) {
                 return %orig(headerRequest, headerCompletion);
@@ -2915,6 +2920,9 @@ static void ApolloImgurRetryAlbumViaTextProxy(NSString *albumID,
         [modifiedRequest setValue:nil forHTTPHeaderField:@"Content-Length"];
 
         void (^newCompletionHandler)(NSData *data, NSURLResponse *response, NSError *error) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            // When minting fails Apollo fails its queued lookups unsent; their
+            // cards say why (see ApolloRedgifsErrorCards.xm).
+            ApolloRedgifsRecordTokenMintResult(data, response, error);
             if (!error && data) {
                 NSError *jsonError = nil;
                 NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
