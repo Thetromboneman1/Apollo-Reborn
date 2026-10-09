@@ -378,7 +378,7 @@ static UITableView *ApolloRootSettingsTableInView(UIView *view) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 2;
-    if (section == 2) return 3;
+    if (section == 2) return 2;
     NSInteger count = %orig;
     if (section == 1) {
         objc_setAssociatedObject(self, &kApolloRootHasPixelPalsRowKey, @(count == 8),
