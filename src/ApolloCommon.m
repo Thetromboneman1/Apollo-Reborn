@@ -745,7 +745,7 @@ BOOL ApolloRouteURLThroughAppInScene(NSURL *url, UIWindowScene *scene) {
     @try {
         return ((BOOL (*)(id, SEL, id, id, id))objc_msgSend)(appDelegate, selector, application, url, @{});
     } @catch (__unused NSException *exception) {
-        ApolloLog(@"[ApolloRouteURL] native route failed");
+        ApolloLogError(@"[ApolloRouteURL] native route failed");
         return NO;
     } @finally {
         __unused id replaced = (__bridge_transfer id)ApolloSwiftExchangePaneTabs(storage, (__bridge const void *)previous);

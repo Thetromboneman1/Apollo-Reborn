@@ -3392,8 +3392,8 @@ static void ApolloSubredditSettleBlockedTableToTop(UITableView *tableView) {
         ApolloLog(@"[SubredditHeaders] reactivating retained vc=%p on appearance", self);
     }
     %orig(animated);
-    ApolloSubredditWatchFeedTable((UIViewController *)self);
     ApolloSubredditUpdateCompactChrome((UIViewController *)self, nil);
+    ApolloSubredditWatchFeedTable((UIViewController *)self);
     ApolloSubredditScheduleInstallIfNeeded((UIViewController *)self);
 }
 

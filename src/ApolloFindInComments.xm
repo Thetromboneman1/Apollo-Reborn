@@ -469,12 +469,9 @@ API_AVAILABLE(ios(16.0))
     return self.nativeField ? self : nil;
 }
 - (void)findInteraction:(UIFindInteraction *)interaction didBeginFindSession:(UIFindSession *)session {
+    self.previousSearching = ApolloReadBoolIvar(self.controller, "isSearching", NO);
     ptrdiff_t offset = ApolloIvarOffset(object_getClass(self.controller), "isSearching");
-    if (offset >= 0) {
-        uint8_t *flag = (uint8_t *)(__bridge void *)self.controller + offset;
-        self.previousSearching = *flag != 0;
-        *flag = 1;
-    }
+    if (offset >= 0) *((uint8_t *)(__bridge void *)self.controller + offset) = 1;
     UIView *toolbar = ApolloObjectIvar(self.controller, "upperToolbar");
     self.previousToolbarHidden = toolbar.hidden;
     toolbar.hidden = YES;
