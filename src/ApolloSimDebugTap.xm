@@ -30,6 +30,7 @@
 #import "ApolloKagiSearch.h"
 #import "ApolloGoogleSearchTab.h"
 #import "ApolloLinkPreviewFetcher.h"
+#import "ApolloProfileEditorWebViewController.h"
 #import "ApolloTranslation.h"
 #import "ApolloWebTextDecoding.h"
 #import "ApolloState.h"
@@ -2734,6 +2735,12 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
         // WebKit never produces — e.g. `chatjs history.replaceState(null,"",
         // "/chat")` inside a room mimics the device's room-under-a-list-URL
         // desync. See ApolloDirectChatDebugEvaluateJS in ApolloDirectChatWeb.xm.
+        // "profilejs <js>": the same for the open Edit Profile web view
+        // (ApolloProfileEditorWebViewController.m).
+        if ([contents hasPrefix:@"profilejs "]) {
+            ApolloProfileEditorDebugEvaluateJS([contents substringFromIndex:10]);
+            return;
+        }
         if ([contents hasPrefix:@"chatjs "]) {
             extern void ApolloDirectChatDebugEvaluateJS(NSString *js);
             ApolloDirectChatDebugEvaluateJS([contents substringFromIndex:7]);
