@@ -3928,6 +3928,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyKeepSearchBarInPlace: @NO,
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeyIPadPaneLayout: @NO,
+                                    UDKeySettingsIconAppearance: @(ApolloSettingsIconAppearanceLight),
                                     UDKeyTabBarSwipeNavigation: @NO,
                                     UDKeyDuoLandscapeFeedLayout: @0,
                                     UDKeyIconRowMagnifier: @YES,
@@ -4251,6 +4252,9 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // Read once here: ApolloPaneInstall.xm builds the split controllers during
     // scene connect, which happens after %ctor and never again for the process.
     sIPadPaneLayout = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout];
+    NSInteger settingsIconAppearance = [standardDefaults integerForKey:UDKeySettingsIconAppearance];
+    sSettingsIconAppearance = settingsIconAppearance >= ApolloSettingsIconAppearanceSystem && settingsIconAppearance <= ApolloSettingsIconAppearanceDark
+        ? (ApolloSettingsIconAppearance)settingsIconAppearance : ApolloSettingsIconAppearanceLight;
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
     sDuoLandscapeFeedLayout = [standardDefaults integerForKey:UDKeyDuoLandscapeFeedLayout];
     // Value 1 belonged to the removed side-by-side experiment. Keep Focused

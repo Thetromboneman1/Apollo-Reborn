@@ -219,6 +219,12 @@ extern BOOL sIPadTabBarBottom;
 // (UDKeyIPadPaneLayout). Read once at %ctor — installation happens at scene
 // connect, so changing it needs a relaunch. See src/ipad/ApolloPaneLayout.h.
 extern BOOL sIPadPaneLayout;
+typedef NS_ENUM(NSInteger, ApolloSettingsIconAppearance) {
+    ApolloSettingsIconAppearanceSystem = 0,
+    ApolloSettingsIconAppearanceLight,
+    ApolloSettingsIconAppearanceDark,
+};
+extern ApolloSettingsIconAppearance sSettingsIconAppearance;
 // Liquid Glass only. When ON, tab-bar swipe navigates back/forward instead of
 // switching tabs; needs a relaunch to apply. See ApolloLiquidGlass.xm.
 extern BOOL sTabBarSwipeNavigation;
