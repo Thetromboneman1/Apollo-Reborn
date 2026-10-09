@@ -19,6 +19,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "ApolloCommon.h"
+#import "ApolloClasses.h"
 
 @interface ASDisplayNode : NSObject
 - (BOOL)isNodeLoaded;
@@ -41,16 +42,9 @@ static BOOL sApolloPostedCommentCompletionActive = NO;
 // swap `.none` for a fade. Main-thread only.
 static NSUInteger sApolloPostedCommentBatchDepth = 0;
 
-static Class ApolloPostedCommentCommentsClass(void) {
-    static Class cls = Nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ cls = objc_getClass("_TtC6Apollo22CommentsViewController"); });
-    return cls;
-}
-
 // The batch must belong to a comments thread: walk the responder chain from the table view.
 static BOOL ApolloPostedCommentTableIsCommentsList(ASTableNode *tableNode) {
-    Class commentsClass = ApolloPostedCommentCommentsClass();
+    Class commentsClass = ApolloClassCommentsViewController;
     if (!commentsClass) return NO;
     if (![tableNode isNodeLoaded]) return NO;
     UIResponder *responder = [tableNode view];
@@ -60,7 +54,6 @@ static BOOL ApolloPostedCommentTableIsCommentsList(ASTableNode *tableNode) {
     }
     return NO;
 }
-
 
 // Rows the promoted batch inserts or reloads. Their cells are created a moment later, and
 // Texture rasterises a fresh cell's text nodes asynchronously — the body lands a frame before
@@ -141,13 +134,13 @@ static void ApolloPostedCommentDisplayPendingCell(UITableView *tableView, UITabl
     if ([cell respondsToSelector:@selector(node)]) {
         node = ((id (*)(id, SEL))objc_msgSend)(cell, @selector(node));
     }
-    if (![node isKindOfClass:objc_getClass("ASCellNode")]) {
-        ApolloLogDebug(@"[PostedCommentInsert] row %ld has no cell node to draw (%@)", (long)indexPath.row, NSStringFromClass([cell class]));
+    if (![node isKindOfClass:ApolloClassASCellNode]) {
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] row %ld has no cell node to draw (%{public}@)", (long)indexPath.row, NSStringFromClass([cell class]));
         return;
     }
     [node layoutIfNeeded];
     [node recursivelyEnsureDisplaySynchronously:YES];
-    ApolloLogDebug(@"[PostedCommentInsert] drew fresh cell synchronously for row %ld", (long)indexPath.row);
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] drew fresh cell synchronously for row %ld", (long)indexPath.row);
 }
 
 %hook RDKClient
@@ -220,7 +213,7 @@ static void ApolloPostedCommentDisplayPendingCell(UITableView *tableView, UITabl
 - (void)insertRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
     if (sApolloPostedCommentBatchDepth > 0 && animation == UITableViewRowAnimationNone) {
         [sApolloPostedCommentInsertedRows addObjectsFromArray:indexPaths];
-        ApolloLogDebug(@"[PostedCommentInsert] insert %lu row(s) → fade", (unsigned long)indexPaths.count);
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] insert %lu row(s) → fade", (unsigned long)indexPaths.count);
         %orig(indexPaths, UITableViewRowAnimationFade);
         return;
     }
@@ -230,7 +223,7 @@ static void ApolloPostedCommentDisplayPendingCell(UITableView *tableView, UITabl
 - (void)reloadRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
     if (sApolloPostedCommentBatchDepth > 0 && animation == UITableViewRowAnimationNone) {
         [sApolloPostedCommentReloadedRows addObjectsFromArray:indexPaths];
-        ApolloLogDebug(@"[PostedCommentInsert] reload %lu row(s) → fade", (unsigned long)indexPaths.count);
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] reload %lu row(s) → fade", (unsigned long)indexPaths.count);
         %orig(indexPaths, UITableViewRowAnimationFade);
         return;
     }
@@ -240,7 +233,7 @@ static void ApolloPostedCommentDisplayPendingCell(UITableView *tableView, UITabl
 - (void)deleteRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
     if (sApolloPostedCommentBatchDepth > 0 && animation == UITableViewRowAnimationNone) {
         [sApolloPostedCommentDeletedRows addObjectsFromArray:indexPaths];
-        ApolloLogDebug(@"[PostedCommentInsert] delete %lu row(s) → fade", (unsigned long)indexPaths.count);
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] delete %lu row(s) → fade", (unsigned long)indexPaths.count);
         %orig(indexPaths, UITableViewRowAnimationFade);
         return;
     }

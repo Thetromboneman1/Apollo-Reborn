@@ -178,7 +178,7 @@ BOOL ApolloSettingsRouteOpenNowInScene(NSString *routeId, UIWindowScene *scene) 
         @try {
             ((void (*)(id, SEL))objc_msgSend)(tabBarController, @selector(goToSettingsTab));
         } @catch (NSException *exception) {
-            ApolloLog(@"[SettingsRouter] goToSettingsTab threw: %@", exception);
+            ApolloLogError(@"[SettingsRouter] goToSettingsTab threw: %@", exception);
         }
     }
 

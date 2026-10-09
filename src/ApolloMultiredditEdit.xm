@@ -12,6 +12,7 @@
 #import "UserDefaultConstants.h"
 #import "ApolloAccountCredentials.h"
 #import "ApolloSubredditCustomIconCache.h"
+#import "ApolloClasses.h"
 
 // MARK: - Multireddit Rename & Descriptions
 //
@@ -201,15 +202,6 @@ static UITableView *ApolloMultiEditTableView(UIViewController *viewController) {
 static UILabel *ApolloMultiEditCellLabel(UITableViewCell *cell, const char *name) {
     UILabel *label = (UILabel *)ApolloObjectIvar(cell, name);
     return [label isKindOfClass:[UILabel class]] ? label : nil;
-}
-
-static Class ApolloMultiEditListCellClass(void) {
-    static Class cls = Nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        cls = objc_getClass("_TtC6Apollo23RedditListTableViewCell");
-    });
-    return cls;
 }
 
 // MARK: - Custom icons
@@ -546,7 +538,7 @@ static BOOL ApolloMultiEditCanBuildEnvelope(id entry, NSString *expectedKind,
     // exception boundary, so both a thrown transformer and a nil model are
     // filtered before the private parser sees the envelope.
     @try {
-        Class builderClass = objc_getClass("RDKObjectBuilder");
+        Class builderClass = ApolloClassRDKObjectBuilder;
         SEL builderSelector = @selector(objectFromJSON:);
         if (!builderClass || ![builderClass respondsToSelector:builderSelector]) {
             if (reasonOut) *reasonOut = @"builder:unavailable";
@@ -554,8 +546,8 @@ static BOOL ApolloMultiEditCanBuildEnvelope(id entry, NSString *expectedKind,
         }
         id model = ((id (*)(id, SEL, id))objc_msgSend)(builderClass, builderSelector, envelope);
         Class expectedClass = [expectedKind isEqualToString:@"LabeledMultiDescription"]
-            ? NSClassFromString(@"RDKMultiredditDescription")
-            : NSClassFromString(@"RDKMultireddit");
+            ? ApolloClassRDKMultiredditDescription
+            : ApolloClassRDKMultireddit;
         if (model && (!expectedClass || [model isKindOfClass:expectedClass])) return YES;
         if (reasonOut) *reasonOut = @"builder:nil-or-wrong-class";
     } @catch (__unused NSException *exception) {
@@ -861,7 +853,7 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
     UITableViewCell *cell = %orig;
     sMultiEditListTable = tableView;
 
-    Class cellClass = ApolloMultiEditListCellClass();
+    Class cellClass = ApolloClassRedditListTableViewCell;
     if (!cellClass || ![cell isKindOfClass:cellClass]) return cell;
 
     UILabel *subtitleLabel = ApolloMultiEditCellLabel(cell, "subtitleLabel");
@@ -1021,10 +1013,10 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
                         ApolloLog(@"[MultiEdit] saved custom icon for %@ (%.0fx%.0f)", [multireddit path], scaled.size.width, scaled.size.height);
                         [(ApolloMultiEditTableView((UIViewController *)weakSelf) ?: sMultiEditListTable) reloadData];
                     } else {
-                        ApolloLog(@"[MultiEdit] icon save failed for %@: %@", [multireddit path], saveError);
+                        ApolloLogError(@"[MultiEdit] icon save failed for %@: %@", [multireddit path], saveError);
                     }
                 } else {
-                    ApolloLog(@"[MultiEdit] icon load failed: %@", error);
+                    ApolloLogError(@"[MultiEdit] icon load failed: %@", error);
                 }
                 reopenEditor();
             });
@@ -1061,7 +1053,7 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
     void (^completion)(NSHTTPURLResponse *, id, NSError *) = ^(NSHTTPURLResponse *response, id responseObject, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (error) {
-                ApolloLog(@"[MultiEdit] save failed for %@: %@", path, error);
+                ApolloLogError(@"[MultiEdit] save failed for %@: %@", path, error);
                 [(RedditListViewController *)weakSelf apolloMultiEditShowError:@"Reddit rejected the change. Please try again."];
                 return;
             }
@@ -1133,7 +1125,7 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
         ApolloLog(@"[MultiEdit] RedditListViewController class missing; multireddit editing unavailable");
     }
 
-    Class cellClass = ApolloMultiEditListCellClass();
+    Class cellClass = ApolloClassRedditListTableViewCell;
     if (cellClass) {
         %init(ApolloMultiEditCell, RedditListTableViewCell = cellClass);
     } else {

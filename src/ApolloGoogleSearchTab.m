@@ -36,8 +36,8 @@
 #import "ApolloCommon.h"
 #import "ApolloGoogleSearchViewController.h"
 #import "ApolloKagiSearch.h"
-#import "settings/ApolloKagiSessionLinkViewController.h"
 #import "ApolloSwiftRuntime.h"
+#import "settings/ApolloKagiSessionLinkViewController.h"
 
 @interface _TtC6Apollo20SearchViewController : UIViewController
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText;

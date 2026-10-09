@@ -2917,18 +2917,6 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                               rows:@[ proxyImgur, albumFallback ]];
 }
 
-- (NSString *)profileLayoutSummaryText {
-    if (!sShowDetailedProfiles) return @"Native (Apollo)";
-    NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    [parts addObject:sProfileHeaderImmersive ? @"Immersive" : @"Compact"];
-    switch (sProfileAvatarStyle) {
-        case 1:  [parts addObject:@"Circle"]; break;
-        case 2:  [parts addObject:@"Square"]; break;
-        default: [parts addObject:@"Full"]; break;
-    }
-    return [parts componentsJoinedByString:@" · "];
-}
-
 - (NSString *)profilePictureShapeText {
     switch (sProfileAvatarStyle) {
         case 1:  return @"Circle";

@@ -104,9 +104,9 @@ static void TabBarHideStyleApplyMirror(UITabBar *tabBar) {
                                                            &morphTargetKnown);
     if (morphTargetKnown && morphTarget != 0) {
         id pocket = ApolloObjectIvar(provider, "scrollPocketInteraction");
-        SEL setRect = NSSelectorFromString(@"_setRect:");
-        if (pocket && [pocket respondsToSelector:setRect]) {
-            ((void (*)(id, SEL, CGRect))objc_msgSend)(pocket, setRect, collapsePlatter.frame);
+        SEL setRectSelector = @selector(_setRect:);
+        if ([pocket respondsToSelector:setRectSelector]) {
+            ((void (*)(id, SEL, CGRect))objc_msgSend)(pocket, setRectSelector, collapsePlatter.frame);
         }
     }
 }
@@ -134,7 +134,7 @@ static void TabBarHideStyleRelayoutVisibleTabBars(void) {
                 [view layoutIfNeeded];
                 continue;
             }
-            for (UIView *sub in view.subviews) [stack addObject:sub];
+            [stack addObjectsFromArray:view.subviews];
         }
     }
 }

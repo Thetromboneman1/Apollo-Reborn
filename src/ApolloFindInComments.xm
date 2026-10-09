@@ -58,6 +58,7 @@
 #import "ApolloCommon.h"
 #import "ipad/ApolloPaneLayout.h"
 #import "ApolloSwiftRuntime.h"
+#import "ApolloClasses.h"
 
 // MARK: - minimal local Texture declarations
 //
@@ -144,18 +145,12 @@ static NSString *sFICMultiQuery = nil;            // full query the native code 
 
 // MARK: - helpers
 
-static ptrdiff_t FICIvarOffset(id obj, const char *name) {
-    if (!obj) return -1;
-    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
-    return iv ? ivar_getOffset(iv) : -1;
-}
-
 // The comments search state Swift struct stored inline in ASTableViewController:
 // { Int currentIndex; [CommentsSearchMatch] matches } — matches' storage pointer
 // is NULL when no search is active (verified against sub_1002bbe18, which
 // renders the "index+1/count" label from these exact two words).
 static BOOL FICSearchIsActive(id vc) {
-    ptrdiff_t off = FICIvarOffset(vc, "commentsSearch");
+    ptrdiff_t off = ApolloIvarOffset(object_getClass(vc), "commentsSearch");
     if (off < 0) return NO;
     uintptr_t matches = *(uintptr_t *)((char *)(__bridge void *)vc + off + sizeof(intptr_t));
     return matches != 0;
@@ -165,9 +160,7 @@ static BOOL FICSearchIsActive(id vc) {
 // bar; searchBarShouldStickToKeyboard is what the app itself uses to tell them
 // apart (YES == the comments find bar).
 static BOOL FICIsCommentsSearchVC(id vc) {
-    ptrdiff_t off = FICIvarOffset(vc, "searchBarShouldStickToKeyboard");
-    if (off < 0) return NO;
-    return *((char *)(__bridge void *)vc + off) != 0;
+    return ApolloReadBoolIvar(vc, "searchBarShouldStickToKeyboard", NO);
 }
 
 // Split "a, b, c" into trimmed non-empty terms. Only comma queries qualify;
@@ -226,7 +219,7 @@ static BOOL FICVerifyOnce(ApolloCommentsFindSession *session, NSUInteger gen) {
     // Locate the match's row from live geometry: text node -> owning cell node
     // -> index path -> row rect (all current, unlike the native one-shot math).
     ASDisplayNode *cellNode = node;
-    Class cellClass = objc_getClass("ASCellNode");
+    Class cellClass = ApolloClassASCellNode;
     while (cellNode && ![cellNode isKindOfClass:cellClass]) cellNode = cellNode.supernode;
     if (!cellNode) return NO;
     NSIndexPath *indexPath = [tableNode indexPathForNode:(ASCellNode *)cellNode];
@@ -637,7 +630,7 @@ extern "C" NSDictionary *ApolloPaneSimFind(UIViewController *controller, NSStrin
 
 %ctor {
     %init;
-    BOOL stringHookInstalled = FICInstallStringHook(objc_getClass("NSString"));
+    BOOL stringHookInstalled = FICInstallStringHook([NSString class]);
     ApolloLog(@"[FindInComments] scroll watchdog installed; comma multi-term search %@",
               stringHookInstalled ? @"installed" : @"unavailable (NSString method missing)");
 }

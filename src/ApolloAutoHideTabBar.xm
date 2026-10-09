@@ -14,6 +14,7 @@
 #import "ApolloDuoRail.h"
 #import "ApolloUserAvatars.h"
 #import "UserDefaultConstants.h"
+#import "ApolloClasses.h"
 
 // MARK: - Tab Bar Auto-Hide Reveal Fix
 //
@@ -218,7 +219,7 @@ static BOOL ApolloAccumulatePresentationScrollIntent(ApolloTabBarScrollRuntimeSt
 }
 
 static SEL ApolloMinimizeBehaviorSetter(void) {
-    return NSSelectorFromString(@"setTabBarMinimizeBehavior:");
+    return @selector(setTabBarMinimizeBehavior:);
 }
 
 BOOL ApolloSupportsNativeTabBarScrollBehavior(void) {
@@ -232,7 +233,7 @@ BOOL ApolloSupportsNativeTabBarScrollBehavior(void) {
 }
 
 static NSInteger ApolloCurrentMinimizeBehavior(UITabBarController *tbc) {
-    SEL getter = NSSelectorFromString(@"tabBarMinimizeBehavior");
+    SEL getter = @selector(tabBarMinimizeBehavior);
     if (!tbc || ![tbc respondsToSelector:getter]) return NSNotFound;
     return ((NSInteger (*)(id, SEL))objc_msgSend)(tbc, getter);
 }
@@ -1143,12 +1144,12 @@ static void ApolloScheduleMinimizePresentationRevalidation(UITabBarController *t
     id provider = self.provider;
     id interaction = self.interaction;
     if (provider && interaction) {
-        SEL selector = NSSelectorFromString(@"scrollAwayInteraction:progressDidChange:tracking:");
+        SEL selector = @selector(scrollAwayInteraction:progressDidChange:tracking:);
         @try {
             ((void (*)(id, SEL, id, double, BOOL))objc_msgSend)(
                 provider, selector, interaction, (double)self.providerProgress, NO);
         } @catch (NSException *exception) {
-            ApolloLog(@"[AutoHideTabBarFix] Ending animated reveal tracking failed: %@",
+            ApolloLogError(@"[AutoHideTabBarFix] Ending animated reveal tracking failed: %@",
                       exception.name);
         }
     }
@@ -1188,14 +1189,14 @@ static void ApolloScheduleMinimizePresentationRevalidation(UITabBarController *t
     CGFloat providerProgress = self.startProgress +
         (self.targetProgress - self.startProgress) * eased;
     self.providerProgress = providerProgress;
-    SEL selector = NSSelectorFromString(@"scrollAwayInteraction:progressDidChange:tracking:");
+    SEL selector = @selector(scrollAwayInteraction:progressDidChange:tracking:);
 
     @try {
         ((void (*)(id, SEL, id, double, BOOL))objc_msgSend)(
             self.provider, selector, self.interaction, (double)providerProgress,
             fraction < 1.0);
     } @catch (NSException *exception) {
-        ApolloLog(@"[AutoHideTabBarFix] Animated reveal provider call failed: %@", exception.name);
+        ApolloLogError(@"[AutoHideTabBarFix] Animated reveal provider call failed: %@", exception.name);
         // Earlier frames used tracking=YES. Always attempt the matching final
         // tracking=NO callback before tearing the driver down.
         [self finishProviderTracking];
@@ -1480,11 +1481,11 @@ static BOOL ApolloInstallScrollAwayBottomGuard(id interaction) {
     @synchronized ([UITabBar class]) {
         if (!sApolloScrollAwayInteractionHookedClass) {
             Method didScrollMethod = class_getInstanceMethod(cls,
-                NSSelectorFromString(@"_observeScrollViewDidScroll:"));
+                @selector(_observeScrollViewDidScroll:));
             Method didEndDeceleratingMethod = class_getInstanceMethod(cls,
-                NSSelectorFromString(@"_observeScrollViewDidEndDecelerating:"));
+                @selector(_observeScrollViewDidEndDecelerating:));
             Method didEndDraggingMethod = class_getInstanceMethod(cls,
-                NSSelectorFromString(@"_observeScrollViewDidEndDragging:willDecelerate:"));
+                @selector(_observeScrollViewDidEndDragging:willDecelerate:));
             Ivar contentScrollViewIvar = class_getInstanceVariable(cls, "contentScrollView");
             if (!ApolloScrollAwayObserverHasExpectedABI(didScrollMethod) ||
                 !ApolloScrollAwayObserverHasExpectedABI(didEndDeceleratingMethod) ||
@@ -1502,11 +1503,11 @@ static BOOL ApolloInstallScrollAwayBottomGuard(id interaction) {
             sApolloScrollAwayDidEndDraggingOriginal =
                 (ApolloScrollAwayDidEndDraggingIMP)method_getImplementation(
                     didEndDraggingMethod);
-            method_setImplementation(didScrollMethod, (IMP)ApolloScrollAwayDidScroll);
-            method_setImplementation(didEndDeceleratingMethod,
-                                     (IMP)ApolloScrollAwayDidEndDecelerating);
-            method_setImplementation(didEndDraggingMethod,
-                                     (IMP)ApolloScrollAwayDidEndDragging);
+            ApolloSetMethodImplementation(cls, didScrollMethod, (IMP)ApolloScrollAwayDidScroll);
+            ApolloSetMethodImplementation(cls, didEndDeceleratingMethod,
+                                          (IMP)ApolloScrollAwayDidEndDecelerating);
+            ApolloSetMethodImplementation(cls, didEndDraggingMethod,
+                                          (IMP)ApolloScrollAwayDidEndDragging);
             sApolloScrollAwayContentScrollViewIvar = contentScrollViewIvar;
             sApolloScrollAwayInteractionHookedClass = cls;
             ApolloLog(@"[AutoHideTabBarFix] Installed bottom-only scroll-away guard on %@",
@@ -1522,7 +1523,7 @@ static BOOL ApolloInstallScrollAwayBottomGuard(id interaction) {
 static void ApolloPrepareNativeScrollAwayBottomGuard(UITabBarController *tbc) {
     if (!tbc || !ApolloTabBarManualNativeMorphEnabled()) return;
     id provider = ApolloTabBarVisualProvider(tbc.tabBar);
-    SEL callback = NSSelectorFromString(@"scrollAwayInteraction:progressDidChange:tracking:");
+    SEL callback = @selector(scrollAwayInteraction:progressDidChange:tracking:);
     if (!ApolloResolveRevealProviderBridge(provider, callback)) return;
     ApolloPrepareNativeTopBarObserver(tbc, provider, callback);
     id interaction = sApolloRevealInteractionIvar
@@ -1581,7 +1582,7 @@ static ApolloTabBarRevealResult ApolloSetNativeTabBarManuallyHidden(
     }
 
     id provider = ApolloTabBarVisualProvider(tbc.tabBar);
-    SEL callback = NSSelectorFromString(@"scrollAwayInteraction:progressDidChange:tracking:");
+    SEL callback = @selector(scrollAwayInteraction:progressDidChange:tracking:);
     if (!ApolloResolveRevealProviderBridge(provider, callback)) {
         return ApolloTabBarRevealResultUnsupported;
     }
@@ -1599,7 +1600,7 @@ static ApolloTabBarRevealResult ApolloSetNativeTabBarManuallyHidden(
             if (drivesHeader) ApolloTopBarSetScrollHidden(tbc, hidden, NO, reason);
             return ApolloTabBarRevealResultStarted;
         } @catch (NSException *exception) {
-            ApolloLog(@"[AutoHideTabBarFix] Manual native morph failed: %@", exception.name);
+            ApolloLogError(@"[AutoHideTabBarFix] Manual native morph failed: %@", exception.name);
             return ApolloTabBarRevealResultUnsupported;
         }
     }
@@ -1900,7 +1901,7 @@ static void ApolloShowTabBar(UITabBarController *tbc, BOOL animated) {
     // gesture-end handler writes the bar's model state right after us, which
     // cancels or re-anchors it (see the hide path).
     if (tabBar.hidden) {
-        SEL setHiddenSelector = NSSelectorFromString(@"setTabBarHidden:animated:");
+        SEL setHiddenSelector = @selector(setTabBarHidden:animated:);
         if ([tbc respondsToSelector:setHiddenSelector]) {
             ((void (*)(id, SEL, BOOL, BOOL))objc_msgSend)(tbc, setHiddenSelector, NO, NO);
         } else {
@@ -1992,7 +1993,7 @@ static void ApolloHideTabBar(UITabBarController *tbc, BOOL animated) {
 
     ApolloLog(@"[AutoHideTabBarFix] Hide (animated=%d)", animated);
 
-    SEL setHiddenSelector = NSSelectorFromString(@"setTabBarHidden:animated:");
+    SEL setHiddenSelector = @selector(setTabBarHidden:animated:);
     BOOL canSystemHide = [tbc respondsToSelector:setHiddenSelector];
 
     void (^commitHidden)(void) = ^{
@@ -2448,14 +2449,13 @@ static BOOL sApolloInBarHideSwipeHandler = NO;
 
 - (UITabBarController *)tabBarController {
     if (sApolloInBarHideSwipeHandler &&
-        [self isMemberOfClass:objc_getClass("_TtC6Apollo26ApolloNavigationController")]) {
+        [self isMemberOfClass:ApolloClassApolloNavigationController]) {
         return nil;
     }
     return %orig;
 }
 
 %end
-
 
 // hidesBarsOnSwipe entry point. Two modes:
 //   iOS 26+: suppress the native nav-bar swipe driver and configure the
@@ -2748,7 +2748,8 @@ static void ApolloRevealBarsForTopScrollView(UIScrollView *scroll) {
     BOOL userDriven = self.tracking || self.dragging;
     if (mainList && userDriven && contentOffset.y > self.contentOffset.y + 0.5 &&
         contentOffset.y > -self.adjustedContentInset.top + 1.0) {
-        UITabBarController *owner = ApolloResolveTabBarControllerForScrollView(self);
+        UITabBarController *owner = ApolloCachedTabBarControllerForScrollView(
+            self, ApolloScrollRuntimeState(self, YES));
         ApolloTabBarRuntimeState *runtime = ApolloRuntimeState(owner, NO);
         if (runtime.scrollToTopOwner) {
             runtime.scrollToTopOwner = nil;

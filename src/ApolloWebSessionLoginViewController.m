@@ -799,13 +799,13 @@ static void ApolloWebSessionHarvestFromCookieStore(WKHTTPCookieStore *cookieStor
     // decisionHandler cancels — expected, not failures.
     if (error.code == NSURLErrorCancelled) return;
     if ([error.domain isEqualToString:@"WebKitErrorDomain"] && error.code == 102) return;
-    ApolloLog(@"[WebJSON] Provisional navigation failed: %@", error);
+    ApolloLogError(@"[WebJSON] Provisional navigation failed: %@", error);
 }
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
     [self.spinner stopAnimating];
     if (error.code == NSURLErrorCancelled) return;
-    ApolloLog(@"[WebJSON] Navigation failed: %@", error);
+    ApolloLogError(@"[WebJSON] Navigation failed: %@", error);
 }
 
 @end
@@ -864,12 +864,12 @@ static void ApolloWebSessionHarvestFromCookieStore(WKHTTPCookieStore *cookieStor
 }
 
 - (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)error {
-    ApolloLog(@"[WebJSON] Silent re-harvest navigation failed for u/%@: %@", self.username, error.localizedDescription);
+    ApolloLogError(@"[WebJSON] Silent re-harvest navigation failed for u/%@: %@", self.username, error.localizedDescription);
     [self _finish:NO];
 }
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
-    ApolloLog(@"[WebJSON] Silent re-harvest navigation failed for u/%@: %@", self.username, error.localizedDescription);
+    ApolloLogError(@"[WebJSON] Silent re-harvest navigation failed for u/%@: %@", self.username, error.localizedDescription);
     [self _finish:NO];
 }
 

@@ -1822,7 +1822,7 @@ static void ApolloRefreshSubredditListSourceAsync(
                         NSURLErrorBadServerResponse,
                         @"The source returned no valid subreddit entries.");
                 }
-                ApolloLog(@"[RandomSources] Refresh failed for %@: HTTP %ld bytes=%lu error=%@",
+                ApolloLogError(@"[RandomSources] Refresh failed for %@: HTTP %ld bytes=%lu error=%@",
                           key, (long)http.statusCode, (unsigned long)data.length,
                           resultError.localizedDescription ?: @"invalid/empty response");
             }
@@ -2413,7 +2413,7 @@ static NSURL *ApolloWriteTrendingPlist(NSDictionary *table) {
         uint8_t bytes[] = {0x30, 0x01, 0x00};
         [[NSData dataWithBytes:bytes length:sizeof(bytes)] writeToFile:dummyPath atomically:YES];
     }
-    ApolloLogDebug(@"[StoreKit] Spoofing appStoreReceiptURL -> %@", dummyPath);
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [StoreKit] Spoofing appStoreReceiptURL -> %{public}@", dummyPath);
     return [NSURL fileURLWithPath:dummyPath isDirectory:NO];
 }
 %end
@@ -2424,7 +2424,7 @@ static NSURL *ApolloWriteTrendingPlist(NSDictionary *table) {
 // Rewrite x.com links as twitter.com
 - (NSString *)host {
     NSString *originalHost = %orig;
-    if (originalHost && [originalHost isEqualToString:@"x.com"]) {
+    if ([originalHost isEqualToString:@"x.com"]) {
         return @"twitter.com";
     }
     return originalHost;
@@ -3628,10 +3628,10 @@ static void ApolloInstallNotificationsUnavailableOverlay(UIViewController *contr
 // and fire repeatedly without the App Store's rate limiting. Suppress both APIs.
 %hook SKStoreReviewController
 + (void)requestReview {
-    ApolloLogDebug(@"[StoreKit] Suppressing SKStoreReviewController requestReview");
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [StoreKit] Suppressing SKStoreReviewController requestReview");
 }
 + (void)requestReviewInScene:(UIWindowScene *)windowScene {
-    ApolloLogDebug(@"[StoreKit] Suppressing SKStoreReviewController requestReviewInScene:");
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [StoreKit] Suppressing SKStoreReviewController requestReviewInScene:");
 }
 %end
 
@@ -4582,8 +4582,9 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // walks all ~2k loaded images per call, and four separate calls paid that
     // walk four times. The Security bindings have to be installed here, before
     // the Web JSON keychain hydration below, so this is the call the others join.
-    // (ApolloSwiftSingletonCapture and ApolloRedgifsQueuedFetchesLock rebind
-    // only Apollo's own image with rebind_symbols_image, which skips that walk.)
+    // (ApolloSwiftSingletonCapture, ApolloRedgifsQueuedFetchesLock and
+    // ApolloImageUploadHost rebind only Apollo's own image with
+    // rebind_symbols_image, which skips that walk.)
     struct rebinding rebindings[5 + 2 * ApolloRebornMaxAppendedRebindings] = {
         {"SecItemAdd", (void *)SecItemAdd_replacement, (void **)&SecItemAdd_orig},
         {"SecItemCopyMatching", (void *)SecItemCopyMatching_replacement, (void **)&SecItemCopyMatching_orig},
@@ -4592,9 +4593,9 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
         {"uname", (void *)uname_replacement, (void **)&uname_orig},
     };
     size_t rebindingCount = 5;
-    rebindingCount += ApolloImageUploadHostAppendRebindings(&rebindings[rebindingCount]);
     rebindingCount += ApolloPhotoComposerAppendRebindings(&rebindings[rebindingCount]);
     rebind_symbols(rebindings, rebindingCount);
+    ApolloImageUploadHostInstallRebindings();
 
     if ([[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFLEX]) {
         if (!%c(FLEXManager)) {

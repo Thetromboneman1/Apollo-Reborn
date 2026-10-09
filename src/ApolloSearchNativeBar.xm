@@ -55,6 +55,7 @@
 #import "ApolloFindInCommentsGlass.h"
 #import "ipad/ApolloPaneChrome.h"
 #import "ipad/ApolloPaneLayout.h"
+#import "ApolloClasses.h"
 
 // ApolloSwipeUpComments.xm: YES for the CommentsViewController hosted in the
 // media viewer's swipe-up comments sheet.
@@ -201,7 +202,7 @@ static UIViewController *NSBFeedVCForView(UIView *view);
 // at the view's bottom edge then (ApolloListBottomInsetGuard normalises a
 // no-overlap frame to that same sentinel).
 static BOOL NSBCommentsKeyboardHeight(UIViewController *vc, CGFloat *outHeight) {
-    if (![vc isKindOfClass:objc_getClass("_TtC6Apollo22CommentsViewController")]) return NO;
+    if (![vc isKindOfClass:ApolloClassCommentsViewController]) return NO;
     Ivar ivar = class_getInstanceVariable(object_getClass(vc), "keyboardFrame");
     if (!ivar) return NO;
     const char *base = (const char *)(__bridge void *)vc + ivar_getOffset(ivar);
@@ -298,7 +299,7 @@ BOOL ApolloNativeFeedSearchActiveQuery(UIScrollView *tableView) {
 // A feed controller we manage: an ASTableViewController with Apollo's search
 // toolbar, excluding the comments in-thread search (stick-to-keyboard layout).
 static BOOL NSBIsNativeSearchFeedVC(UIViewController *vc) {
-    if (![vc isKindOfClass:objc_getClass("_TtC6Apollo21ASTableViewController")]) return NO;
+    if (![vc isKindOfClass:ApolloClassASTableViewController]) return NO;
     BOOL stick = NO;
     if (ApolloNSBReadBoolIvar(vc, "searchBarShouldStickToKeyboard", &stick) && stick) return NO;
     return ApolloObjectIvar(vc, "upperToolbar") != nil &&
@@ -313,7 +314,7 @@ static BOOL NSBIsNativeSearchFeedVC(UIViewController *vc) {
 // comments sheet (its chrome is the sheet's glass, not a navigation bar) and a
 // 3D-touch preview (no navigation bar to host a palette).
 static BOOL NSBIsNativeSearchCommentsVC(UIViewController *vc) {
-    if (![vc isKindOfClass:objc_getClass("_TtC6Apollo22CommentsViewController")]) return NO;
+    if (![vc isKindOfClass:ApolloClassCommentsViewController]) return NO;
     BOOL stick = NO;
     if (!ApolloNSBReadBoolIvar(vc, "searchBarShouldStickToKeyboard", &stick) || !stick) return NO;
     if (ApolloObjectIvar(vc, "upperToolbar") == nil ||
@@ -331,7 +332,7 @@ static BOOL NSBIsNativeSearchVC(UIViewController *vc) {
 static UIScrollView *NSBTableForVC(UIViewController *vc) {
     id tableNode = ApolloObjectIvar(vc, "tableNode");
     UIView *tv = [tableNode respondsToSelector:@selector(view)] ? [tableNode view] : nil;
-    if (![tv isKindOfClass:objc_getClass("ASTableView")]) return nil;
+    if (![tv isKindOfClass:ApolloClassASTableView]) return nil;
     ApolloNativeFeedSession *session = NSBSessionForVC(vc);
     session.table = (UIScrollView *)tv;
     NSBMarkSessionView(tv, session);
@@ -627,7 +628,6 @@ static CGFloat NSBNavBottomForTable(UIScrollView *table, UIViewController *vc);
 static void NSBApolloDismissNow(UIViewController *vc);
 static void NSBReleaseDismissWindowForUserScroll(UIScrollView *sv, const char *why);
 
-
 static void NSBApolloDismiss(UIViewController *vc) {
     ApolloNativeFeedSession *session = NSBSessionForVC(vc);
     if (!vc) return;
@@ -837,7 +837,7 @@ static void NSBReleaseDismissWindowForUserScroll(UIScrollView *sv, const char *w
 
 static BOOL NSBManagedHeader(UIScrollView *sv) {
     UIView *hdr = [sv respondsToSelector:@selector(tableHeaderView)] ? [(UITableView *)sv tableHeaderView] : nil;
-    return [hdr isMemberOfClass:objc_getClass("ApolloSubredditHeaderWrapperView")];
+    return [hdr isMemberOfClass:ApolloClassApolloSubredditHeaderWrapperView];
 }
 
 static CGFloat NSBDesiredOffsetY(UIScrollView *sv) {
@@ -1140,7 +1140,7 @@ static void NSBAttachNativeSearch(UIViewController *vc) {
     UIScrollView *table = NSBTableForVC(vc);
     if (table) {
         objc_setAssociatedObject(table, kNSBFeedTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [table.panGestureRecognizer addTarget:table action:NSSelectorFromString(@"apollo_nativeSearchPanBegan:")];
+        [table.panGestureRecognizer addTarget:table action:@selector(apollo_nativeSearchPanBegan:)];
         if (@available(iOS 15.0, *)) {
             [vc setContentScrollView:table forEdge:NSDirectionalRectEdgeTop];
         }
@@ -1714,7 +1714,6 @@ static void NSBViewWillDisappear(UIViewController *vc) {
         session.typed = YES;
     }
 }
-
 
 - (void)viewDidAppear:(BOOL)animated {
     ApolloNativeFeedSession *session = (ApolloNativeFeedSearchEnabled() && NSBIsNativeSearchVC((id)self))
@@ -2422,7 +2421,7 @@ static __attribute__((constructor)) void NSBCancelStandInInstall(void) {
     state.pullFromCollapsedRest = NO;
     CGFloat y = scrollView.contentOffset.y;
     if (y >= state.pullRestOffset - 0.5) return;               // not pulled past the collapsed rest
-    SEL detentsSel = NSSelectorFromString(@"_scrollDetentOffsetsForScrollView:");
+    SEL detentsSel = @selector(_scrollDetentOffsetsForScrollView:);
     if (![self respondsToSelector:detentsSel]) return;
     NSArray<NSNumber *> *detents = ((id (*)(id, SEL, id))objc_msgSend)(self, detentsSel, scrollView);
     if (![detents isKindOfClass:NSArray.class] || detents.count < 2) return;
