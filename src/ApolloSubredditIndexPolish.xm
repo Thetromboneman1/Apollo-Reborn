@@ -3908,6 +3908,8 @@ static void ApolloSubredditIndexRestoreCellNativeState(UITableViewCell *cell) {
         }
     }
 
+    // Restoration is one-shot; a later enable must capture fresh native state.
+    objc_setAssociatedObject(cell, &kApolloSubredditCellNativeStateKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(cell, &kApolloSubredditCellMarginsAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(cell, &kApolloSubredditRowPolishAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(cell, &kApolloSubredditMultiredditChildStyledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
