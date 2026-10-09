@@ -849,6 +849,7 @@ static BOOL ApolloSFIsPlainTitleHeader(UIView *view) {
 
 - (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section {
     [super tableView:tableView willDisplayHeaderView:view forSection:section];
+    [self apollo_sf_runDisplayBlockForView:view section:section footer:NO];
     if (!ApolloSFIsPlainTitleHeader(view)) return;
     if (!_shownHeaderViews) _shownHeaderViews = [NSHashTable weakObjectsHashTable];
     [_shownHeaderViews addObject:view];
@@ -1038,11 +1039,6 @@ static BOOL ApolloSFIsPlainTitleHeader(UIView *view) {
     if (!display) return;
     display(titleView);
     objc_setAssociatedObject(titleView, kApolloSFDisplayStyledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-- (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section {
-    [super tableView:tableView willDisplayHeaderView:view forSection:section];
-    [self apollo_sf_runDisplayBlockForView:view section:section footer:NO];
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayFooterView:(UIView *)view forSection:(NSInteger)section {
