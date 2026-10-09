@@ -30,6 +30,7 @@
 #import "ApolloKagiSearch.h"
 #import "ApolloGoogleSearchTab.h"
 #import "ApolloLinkPreviewFetcher.h"
+#import "ApolloProfileEditorWebViewController.h"
 #import "ApolloTranslation.h"
 #import "ApolloWebTextDecoding.h"
 #import "ApolloState.h"
@@ -47,6 +48,7 @@ void ApolloSubredditIndexDebugDescribeTables(void); // ApolloSubredditIndexPolis
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
+#import "ApolloClasses.h"
 
 @interface UITouch (ApolloSimDebugTap)
 - (void)setPhase:(UITouchPhase)phase;
@@ -144,11 +146,11 @@ static void ApolloSimDebugDumpMediaState(void) {
             id node = [cell respondsToSelector:@selector(node)] ? [(id)cell node] : nil;
             id rich = ApolloObjectIvar(node, "richMediaNode");
             id videoNode = ApolloObjectIvar(rich, "videoNode");
-            SEL layerSel = NSSelectorFromString(@"playerLayer");
+            SEL layerSel = @selector(playerLayer);
             id layer = [videoNode respondsToSelector:layerSel]
                 ? ((id (*)(id, SEL))objc_msgSend)(videoNode, layerSel) : nil;
             AVPlayer *player = [layer isKindOfClass:[AVPlayerLayer class]] ? [(AVPlayerLayer *)layer player] : nil;
-            SEL playerSel = NSSelectorFromString(@"player");
+            SEL playerSel = @selector(player);
             if (!player && [videoNode respondsToSelector:playerSel]) {
                 player = ((id (*)(id, SEL))objc_msgSend)(videoNode, playerSel);
             }
@@ -733,7 +735,7 @@ static void ApolloSimDebugPerformCrash(NSString *type) {
 // without depending on the simulator exhibiting the upstream lifecycle bug.
 // ApolloListBottomInsetGuard should guard the zero and log the correction.
 static void ApolloSimDebugForceBottomInsetInView(UIView *view, CGFloat bottom) {
-    if ([view isKindOfClass:objc_getClass("ASTableView")] && view.window) {
+    if ([view isKindOfClass:ApolloClassASTableView] && view.window) {
         UIScrollView *scrollView = (UIScrollView *)view;
         UIEdgeInsets inset = scrollView.contentInset;
         CGFloat before = inset.bottom;
@@ -761,12 +763,12 @@ const void *ApolloScrollEdgeEffectForcedHiddenStampKey(void);
 
 static void ApolloSimDebugDumpHeaderEffectsInView(UIView *view) {
     if ([view isKindOfClass:[UIScrollView class]]) {
-        SEL topSelector = NSSelectorFromString(@"topEdgeEffect");
+        SEL topSelector = @selector(topEdgeEffect);
         if ([view respondsToSelector:topSelector]) {
             id effect = ((id (*)(id, SEL))objc_msgSend)(view, topSelector);
             if (effect) {
-                BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(effect, NSSelectorFromString(@"isHidden"));
-                id style = ((id (*)(id, SEL))objc_msgSend)(effect, NSSelectorFromString(@"style"));
+                BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(effect, @selector(isHidden));
+                id style = ((id (*)(id, SEL))objc_msgSend)(effect, @selector(style));
                 ApolloLog(@"[SimDebugTap][headerdump] scroll=%@ window=%d effect=%p hidden=%d style=%@ topStamp=%d forcedStamp=%d",
                           NSStringFromClass(view.class), view.window != nil, effect, hidden, style,
                           objc_getAssociatedObject(effect, ApolloScrollEdgeEffectTopStampKey()) != nil,
@@ -1976,7 +1978,7 @@ static void ApolloSimDebugMeasureGIFMemory(NSString *source) {
         // Mounted exactly the way a viewer page mounts it, so the sample covers
         // the frame traffic UIKit generates during playback and not just the
         // decode.
-        Class viewClass = NSClassFromString(@"FLAnimatedImageView") ?: UIImageView.class;
+        Class viewClass = objc_getClass("FLAnimatedImageView") ?: UIImageView.class;
         UIImageView *view = [[viewClass alloc] initWithFrame:window.bounds];
         if (decoded.animatedImage && [view respondsToSelector:@selector(setAnimatedImage:)]) {
             [view setValue:decoded.animatedImage forKey:@"animatedImage"];
@@ -2154,7 +2156,7 @@ static void ApolloSimInstallLowPowerModeOverride(void) {
         return;
     }
     sApolloSimOrigIsLowPowerModeEnabled = (BOOL (*)(id, SEL))method_getImplementation(m);
-    method_setImplementation(m, (IMP)ApolloSimHookedIsLowPowerModeEnabled);
+    ApolloSetMethodImplementation(cls, m, (IMP)ApolloSimHookedIsLowPowerModeEnabled);
     ApolloLog(@"[SimDebugTap] lpm override installed on %@", NSStringFromClass(cls));
 }
 
@@ -2733,6 +2735,12 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
         // WebKit never produces — e.g. `chatjs history.replaceState(null,"",
         // "/chat")` inside a room mimics the device's room-under-a-list-URL
         // desync. See ApolloDirectChatDebugEvaluateJS in ApolloDirectChatWeb.xm.
+        // "profilejs <js>": the same for the open Edit Profile web view
+        // (ApolloProfileEditorWebViewController.m).
+        if ([contents hasPrefix:@"profilejs "]) {
+            ApolloProfileEditorDebugEvaluateJS([contents substringFromIndex:10]);
+            return;
+        }
         if ([contents hasPrefix:@"chatjs "]) {
             extern void ApolloDirectChatDebugEvaluateJS(NSString *js);
             ApolloDirectChatDebugEvaluateJS([contents substringFromIndex:7]);
@@ -2775,7 +2783,7 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
             dispatch_async(dispatch_get_main_queue(), ^{
                 Class clientClass = objc_getClass("RDKClient");
                 id client = useShared
-                    ? ((id (*)(id, SEL))objc_msgSend)(clientClass, NSSelectorFromString(@"sharedClient"))
+                    ? ((id (*)(id, SEL))objc_msgSend)(clientClass, @selector(sharedClient))
                     : ApolloActiveAccountClient();
                 SEL selector = NSSelectorFromString(unread ? @"markMessageWithFullNameAsUnread:completion:"
                                                            : @"markMessageWithFullNameAsRead:completion:");
@@ -2816,7 +2824,7 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
         }
         // "memwarn": simulate a memory warning in-process.
         if ([contents hasPrefix:@"memwarn"]) {
-            SEL sel = NSSelectorFromString(@"_performMemoryWarning");
+            SEL sel = @selector(_performMemoryWarning);
             UIApplication *app = UIApplication.sharedApplication;
             if ([app respondsToSelector:sel]) {
                 ((void (*)(id, SEL))objc_msgSend)(app, sel);
@@ -2998,7 +3006,6 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
         ApolloSimDebugPerformTap(CGPointMake(numbers[0].doubleValue, numbers[1].doubleValue));
     });
 }
-
 
 %ctor {
     %init(ApolloSimNavChurn);

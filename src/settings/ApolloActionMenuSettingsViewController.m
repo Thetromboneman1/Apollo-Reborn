@@ -110,49 +110,53 @@ static NSString *ApolloAMMenuSummary(NSString *context) {
     }];
 }
 
-- (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section {
-    [super tableView:tableView willDisplayHeaderView:view forSection:section];
-    if (![view isKindOfClass:UITableViewHeaderFooterView.class] || (section != 1 && section != 2)) return;
-    UITableViewHeaderFooterView *header = (UITableViewHeaderFooterView *)view;
+static void ApolloAMStyleHubHeading(UITableViewHeaderFooterView *header, BOOL moderator) {
+    if (![header isKindOfClass:UITableViewHeaderFooterView.class]) return;
     UILabel *label = header.textLabel;
-    NSString *imageName = section == 1 ? @"option-more" : @"option-moderator";
-    NSString *title = section == 1 ? @"Menus" : @"Moderator Menus";
+    NSString *imageName = moderator ? @"option-moderator" : @"option-more";
+    NSString *title = moderator ? @"Moderator Menus" : @"Menus";
     if (@available(iOS 18.0, *)) {} else title = title.uppercaseString;
     UIImage *image = [[UIImage imageNamed:imageName inBundle:NSBundle.mainBundle
-            compatibleWithTraitCollection:view.traitCollection]
+            compatibleWithTraitCollection:header.traitCollection]
         imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
     if (!image || !label) return;
     NSTextAttachment *attachment = [NSTextAttachment new];
     attachment.image = image;
     CGFloat iconWidth = label.font.capHeight * 1.8;
-    attachment.bounds = CGRectMake(0.0, section == 1 ? 2.0 : -2.5,
+    attachment.bounds = CGRectMake(0.0, moderator ? -2.5 : 2.0,
                                    iconWidth, iconWidth / (image.size.width / image.size.height));
     NSMutableAttributedString *text = [[NSMutableAttributedString alloc]
         initWithAttributedString:[NSAttributedString attributedStringWithAttachment:attachment]];
     [text appendAttributedString:[[NSAttributedString alloc] initWithString:[@"  " stringByAppendingString:title]]];
     label.attributedText = text;
-    NSString *accessibilityTitle = section == 1 ? @"Action Menus" : @"Moderator Action Menus";
+    NSString *accessibilityTitle = moderator ? @"Moderator Action Menus" : @"Action Menus";
     label.accessibilityLabel = accessibilityTitle;
     header.isAccessibilityElement = YES;
     header.accessibilityLabel = accessibilityTitle;
 }
 
-- (CGFloat)menuRowHeightWithSubtitle:(BOOL)subtitle {
+- (CGFloat)menuRowHeightWithSummary:(NSString *)summary {
     UITableView *table = self.tableView;
     CGFloat width = CGRectGetWidth(table.bounds);
     if (width <= 0.0) return UITableViewAutomaticDimension;
-    NSString *key = [NSString stringWithFormat:@"%d|%.0f|%@", subtitle, width,
-                     table.traitCollection.preferredContentSizeCategory ?: @""];
-    NSNumber *cached = _menuRowHeights[key];
-    if (cached) return cached.doubleValue;
     if (!_measuringMenuCell) {
         _measuringMenuCell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        _measuringMenuCell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     }
     UITableViewCell *cell = _measuringMenuCell;
-    cell.textLabel.text = @"Post";
-    cell.detailTextLabel.text = subtitle ? @"Custom order · 2 actions hidden" : nil;
-    cell.bounds = CGRectMake(0.0, 0.0, width, 100.0);
+    cell.textLabel.text = @"Post with Comments";
+    cell.detailTextLabel.text = summary;
+    cell.detailTextLabel.numberOfLines = 0;
+    cell.textLabel.font = [UIFont systemFontOfSize:17.0];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:12.0];
     ApolloSettingsApplyCellTypography(cell);
+
+    NSString *key = [NSString stringWithFormat:@"%@|%.0f|%.1f|%.1f", summary ?: @"", width,
+                     cell.textLabel.font.pointSize, cell.detailTextLabel.font.pointSize];
+    NSNumber *cached = _menuRowHeights[key];
+    if (cached) return cached.doubleValue;
+
+    cell.bounds = CGRectMake(0.0, 0.0, width, 100.0);
     [cell setNeedsLayout];
     [cell layoutIfNeeded];
     CGFloat height = ceil([cell systemLayoutSizeFittingSize:CGSizeMake(width, UILayoutFittingCompressedSize.height)
@@ -177,9 +181,16 @@ static NSString *ApolloAMMenuSummary(NSString *context) {
     row.height = ^CGFloat {
         __strong __typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return UITableViewAutomaticDimension;
-        return [strongSelf menuRowHeightWithSubtitle:ApolloAMMenuSummary(context).length > 0];
+        return [strongSelf menuRowHeightWithSummary:ApolloAMMenuSummary(context)];
     };
     return row;
+}
+
+static NSString *ApolloAMHubRowTitle(ApolloActionMenuContext context) {
+    if ([context isEqualToString:ApolloActionMenuContextModeratorSubreddit]) return @"Subreddit";
+    if ([context isEqualToString:ApolloActionMenuContextModeratorPost]) return @"Post";
+    if ([context isEqualToString:ApolloActionMenuContextModeratorComment]) return @"Comment";
+    return ApolloActionMenuContextTitle(context);
 }
 
 - (NSArray<ApolloSettingsSection *> *)buildForm {
@@ -188,19 +199,27 @@ static NSString *ApolloAMMenuSummary(NSString *context) {
     for (ApolloActionMenuContext context in ApolloActionMenuAllContexts()) {
         BOOL mod = ApolloActionMenuContextIsModerator(context);
         [(mod ? moderator : regular) addObject:[self menuRowForContext:context
-                                                                 title:ApolloActionMenuContextTitle(context)]];
+                                                                 title:ApolloAMHubRowTitle(context)]];
     }
     ApolloSettingsRow *all = [self menuRowForContext:ApolloActionMenuEditorAllMenus title:@"All Menus"];
+    ApolloSettingsSection *menus = [ApolloSettingsSection sectionWithTitle:@"Menus"
+                                                                     footer:@"Touching and holding a post or comment opens the same menu."
+                                                                       rows:regular];
+    menus.headerDisplay = ^(UITableViewHeaderFooterView *view) {
+        ApolloAMStyleHubHeading(view, NO);
+    };
+    ApolloSettingsSection *moderatorMenus = [ApolloSettingsSection sectionWithTitle:@"Moderator Menus"
+                                                                              footer:@"Shown in subreddits you moderate."
+                                                                                rows:moderator];
+    moderatorMenus.headerDisplay = ^(UITableViewHeaderFooterView *view) {
+        ApolloAMStyleHubHeading(view, YES);
+    };
     return @[
         [ApolloSettingsSection sectionWithTitle:nil
                                          footer:@"Show or hide actions across every menu at once."
                                            rows:@[ all ]],
-        [ApolloSettingsSection sectionWithTitle:@"Menus"
-                                         footer:nil
-                                           rows:regular],
-        [ApolloSettingsSection sectionWithTitle:@"Moderator Menus"
-                                         footer:@"Shown in subreddits you moderate."
-                                           rows:moderator],
+        menus,
+        moderatorMenus,
     ];
 }
 
@@ -653,6 +672,7 @@ static BOOL ApolloAMItemDrawsAsPalette(ApolloActionMenuItem *item, BOOL glass) {
 @property (nonatomic, strong, readonly) UIImageView *checkmark;
 @property (nonatomic, strong, readonly) UIImageView *grip;
 @property (nonatomic) BOOL showsGrip;
+@property (nonatomic) BOOL reservesGripSpace;
 @end
 
 static const CGFloat kApolloAMCheckmarkWidth = 22.0;
@@ -695,8 +715,15 @@ static const CGFloat kApolloAMAccessoryHeight = 28.0;
     [self layoutAccessory];
 }
 
+- (void)setReservesGripSpace:(BOOL)reservesGripSpace {
+    if (_reservesGripSpace == reservesGripSpace) return;
+    _reservesGripSpace = reservesGripSpace;
+    [self layoutAccessory];
+}
+
 - (void)layoutAccessory {
-    CGFloat width = kApolloAMCheckmarkWidth + (self.showsGrip ? kApolloAMAccessoryGap + kApolloAMGripWidth : 0.0);
+    BOOL hasGripSlot = self.showsGrip || self.reservesGripSpace;
+    CGFloat width = kApolloAMCheckmarkWidth + (hasGripSlot ? kApolloAMAccessoryGap + kApolloAMGripWidth : 0.0);
     _accessory.bounds = CGRectMake(0.0, 0.0, width, kApolloAMAccessoryHeight);
     self.checkmark.frame = CGRectMake(0.0, 0.0, kApolloAMCheckmarkWidth, kApolloAMAccessoryHeight);
     self.grip.frame = CGRectMake(width - kApolloAMGripWidth, 0.0, kApolloAMGripWidth, kApolloAMAccessoryHeight);
@@ -923,16 +950,12 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
         ApolloSettingsRow *row =
             [ApolloSettingsRow customRowWithID:[self itemRowIDForItemID:itemID]
                                           cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *r) {
-            return [weakSelf itemCellForItem:item
-                                      hidden:[weakSelf itemIsHidden:item.itemID]
-                                     inTable:tableView];
+            return [weakSelf itemCellForItem:item inTable:tableView];
         }
                                       onSelect:^{ [weakSelf toggleItemWithID:itemID]; }];
         row.height = ^CGFloat {
             __strong __typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return UITableViewAutomaticDimension;
-            BOOL subtitle = strongSelf.editingAllMenus || !ApolloActionMenuItemWasOffered(strongSelf.context, itemID);
-            return [strongSelf itemRowHeightWithSubtitle:subtitle itemID:itemID];
+            return strongSelf ? [strongSelf itemRowHeightForItem:item] : UITableViewAutomaticDimension;
         };
         [itemRows addObject:row];
     }
@@ -970,40 +993,49 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
     return sections;
 }
 
-- (UITableViewCell *)itemCellForItem:(ApolloActionMenuItem *)item hidden:(BOOL)hidden inTable:(UITableView *)tableView {
-    static NSString *const reuseID = @"Cell_ActionMenuItem";
-    ApolloAMItemCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
-    if (!cell) cell = [[ApolloAMItemCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
+- (void)configureItemCell:(ApolloAMItemCell *)cell forItem:(ApolloActionMenuItem *)item {
     cell.itemID = item.itemID;
     cell.textLabel.text = item.title;
     cell.imageView.image = [item icon];
     BOOL fixedTweakRow = !self.editingAllMenus && !ApolloNativeActionMenusActive() && item.isTweakRow;
     cell.showsGrip = !self.editingAllMenus && !fixedTweakRow;
-    [self styleItemCell:cell forItem:item hidden:hidden];
+    cell.reservesGripSpace = fixedTweakRow;
+    [self styleItemCell:cell forItem:item hidden:[self itemIsHidden:item.itemID]];
+}
+
+- (UITableViewCell *)itemCellForItem:(ApolloActionMenuItem *)item inTable:(UITableView *)tableView {
+    static NSString *const reuseID = @"Cell_ActionMenuItem";
+    ApolloAMItemCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+    if (!cell) cell = [[ApolloAMItemCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
+    [self configureItemCell:cell forItem:item];
     return cell;
 }
 
-- (CGFloat)itemRowHeightWithSubtitle:(BOOL)subtitle itemID:(NSString *)itemID {
+- (CGFloat)itemRowHeightForItem:(ApolloActionMenuItem *)item {
     UITableView *table = self.tableView;
     CGFloat width = CGRectGetWidth(table.bounds) - table.layoutMargins.left - table.layoutMargins.right;
     UITableViewCell *sample = table.visibleCells.firstObject;
     if (sample && sample.superview) width = CGRectGetWidth([sample.superview convertRect:sample.frame toView:table]);
     if (width <= 0.0) return UITableViewAutomaticDimension;
-    NSString *key = [NSString stringWithFormat:@"%d|%@|%.0f|%@", subtitle, itemID ?: @"", width,
-                     table.traitCollection.preferredContentSizeCategory ?: @""];
-    NSNumber *cached = self.itemRowHeights[key];
-    if (cached) return cached.doubleValue;
     if (!self.measuringItemCell) {
         self.measuringItemCell = [[ApolloAMItemCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
     }
     ApolloAMItemCell *cell = self.measuringItemCell;
-    cell.textLabel.text = @"Measure";
-    if (!subtitle) cell.detailTextLabel.text = nil;
-    else if ([itemID isEqualToString:@"moderator"]) cell.detailTextLabel.text = @"Shown in subreddits you moderate";
-    else cell.detailTextLabel.text = @"Shown when relevant";
-    cell.imageView.image = [UIImage systemImageNamed:@"square"
-                                   withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:19.0
-                                                                                                   weight:UIImageSymbolWeightRegular]];
+    [self configureItemCell:cell forItem:item];
+    cell.textLabel.font = [UIFont systemFontOfSize:17.0];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:12.0];
+    ApolloSettingsApplyCellTypography(cell);
+
+    NSString *key = [NSString stringWithFormat:@"%@|%d|%.0f|%.0f|%.1f|%.1f",
+                     cell.detailTextLabel.text ?: @"",
+                     cell.showsGrip || cell.reservesGripSpace,
+                     cell.imageView.image.size.width,
+                     width,
+                     cell.textLabel.font.pointSize,
+                     cell.detailTextLabel.font.pointSize];
+    NSNumber *cached = self.itemRowHeights[key];
+    if (cached) return cached.doubleValue;
+
     cell.bounds = CGRectMake(0.0, 0.0, width, 100.0);
     [cell setNeedsLayout];
     [cell layoutIfNeeded];
@@ -1031,7 +1063,6 @@ static NSString *const kApolloAMItemRowPrefix = @"item.";
         for (NSString *context in contexts) {
             if (!ApolloActionMenuIsItemHidden(context, item.itemID)) continue;
             NSString *name = ApolloActionMenuContextTitle(context);
-            if (ApolloActionMenuContextIsModerator(context)) name = [@"Moderator " stringByAppendingString:name];
             [hiddenNames addObject:name];
         }
         if (hiddenNames.count == 0) {

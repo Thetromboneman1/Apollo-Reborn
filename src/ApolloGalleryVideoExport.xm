@@ -172,7 +172,7 @@ static void ApolloGalleryExportDownload(NSURL *url, NSString *extension,
         ^(NSURL *location, NSHTTPURLResponse *response, NSError *error) {
         NSInteger status = response.statusCode;
         if (!location || error || (status > 0 && (status < 200 || status >= 300))) {
-            ApolloLog(@"[GalleryExport] download failed (%ld) %@: %@",
+            ApolloLogError(@"[GalleryExport] download failed (%ld) %@: %@",
                       (long)status, url.lastPathComponent, error.localizedDescription ?: @"");
             completion(nil);
             return;
@@ -267,7 +267,7 @@ static void ApolloGalleryExportMux(NSURL *videoFile, NSURL *audioFile, BOOL stri
         [composition addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
     NSError *error = nil;
     if (![videoTrack insertTimeRange:range ofTrack:sourceVideo atTime:kCMTimeZero error:&error]) {
-        ApolloLog(@"[GalleryExport] mux: video insert failed: %@", error.localizedDescription);
+        ApolloLogError(@"[GalleryExport] mux: video insert failed: %@", error.localizedDescription);
         completion(nil);
         return;
     }
@@ -277,7 +277,7 @@ static void ApolloGalleryExportMux(NSURL *videoFile, NSURL *audioFile, BOOL stri
         [composition addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
     if (![audioTrack insertTimeRange:range ofTrack:sourceAudio atTime:kCMTimeZero error:&error]) {
         // Only the legacy single-save path permits an audio-less fallback.
-        ApolloLog(@"[GalleryExport] mux: audio insert failed: %@", error.localizedDescription);
+        ApolloLogError(@"[GalleryExport] mux: audio insert failed: %@", error.localizedDescription);
         if (strict) {
             completion(nil);
             return;

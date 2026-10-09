@@ -3,6 +3,7 @@
 #import "ApolloCommon.h"
 #import "ApolloFollowingSection.h"
 #import "ApolloSwiftRuntime.h"
+#import "ApolloClasses.h"
 
 // Overlay confirmation buttons without shifting or clearing the row.
 static char kListConfirmation, kCellConfirmation, kEditingRightMargin, kEditingStarPriorities, kEditingSelection;
@@ -15,7 +16,7 @@ static UITableView *ApolloEditingTable(UIView *view) {
 }
 
 static BOOL ApolloEditingIsList(UITableView *table) {
-    Class cls = NSClassFromString(@"Apollo.RedditListViewController");
+    Class cls = ApolloClassRedditListViewController;
     return cls && [(id)table.dataSource isKindOfClass:cls];
 }
 
@@ -142,7 +143,9 @@ static void ApolloEditingAlignStar(UITableViewCell *cell, BOOL editing) {
 - (void)confirm {
     UITableView *table = self.table;
     NSIndexPath *path = [table indexPathForCell:self.cell];
-    ApolloLogDebug(@"[ListEditing] confirmation tapped editing=%d validRow=%d", table.editing, path != nil);
+    os_log_debug(ApolloFixLog(),
+        "[ApolloFix] [ListEditing] confirmation tapped editing=%{public}d validRow=%{public}d",
+        table.editing, path != nil);
     [self dismiss];
     // Resolve the current row before the remapping hooks translate its index.
     if (table.editing && path && [table.dataSource respondsToSelector:@selector(tableView:commitEditingStyle:forRowAtIndexPath:)]) {
@@ -214,7 +217,8 @@ static BOOL ApolloEditingShowConfirmation(UIControl *control) {
         [button.centerYAnchor constraintEqualToAnchor:surface.centerYAnchor],
         [button.heightAnchor constraintEqualToAnchor:surface.heightAnchor constant:-8.0]
     ]];
-    ApolloLogDebug(@"[ListEditing] showing confirmation %@", title);
+    os_log_debug(ApolloFixLog(),
+        "[ApolloFix] [ListEditing] showing confirmation %{public}@", title);
     state.cell = cell;
     objc_setAssociatedObject(cell, &kCellConfirmation, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     state.panel = panel;
@@ -260,8 +264,8 @@ static BOOL ApolloEditingShowConfirmation(UIControl *control) {
 %hook UIControl
 - (void)sendAction:(SEL)action to:(id)target forEvent:(UIEvent *)event {
     // The minus sends rotation and confirmation actions; only the latter toggles the panel.
-    if (action == NSSelectorFromString(@"editControlWasClicked:") && ApolloEditingShowConfirmation(self)) return;
-    if (action == NSSelectorFromString(@"_toggleRotate") &&
+    if (action == @selector(editControlWasClicked:) && ApolloEditingShowConfirmation(self)) return;
+    if (action == @selector(_toggleRotate) &&
         [NSStringFromClass(self.class) isEqualToString:@"UITableViewCellEditControl"] &&
         ApolloEditingIsList(ApolloEditingTable(self))) return;
     %orig;
@@ -427,11 +431,11 @@ static BOOL ApolloEditingTouchHitsReorder(UIView *view, UITouch *touch) {
 
 %ctor {
     %init;
-    Class listClass = NSClassFromString(@"Apollo.RedditListViewController");
+    Class listClass = objc_getClass("_TtC6Apollo24RedditListViewController");
     if (listClass) {
         %init(ApolloListEditingController, ApolloEditListController = listClass);
     }
-    Class cellClass = NSClassFromString(@"Apollo.RedditListTableViewCell");
+    Class cellClass = objc_getClass("_TtC6Apollo23RedditListTableViewCell");
     if (cellClass) {
         %init(ApolloListEditingCells, ApolloEditListCell = cellClass);
     }

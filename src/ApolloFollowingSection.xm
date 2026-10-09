@@ -64,8 +64,9 @@
 // reloadData hook before the table re-queries anything.
 //
 // When "Separate Followed Users" is OFF and the section order is the default,
-// every hook is a straight %orig passthrough (one static + pointer check), so
-// the module is inert for anyone not using the feature.
+// the remapping hooks are straight %orig passthroughs (one static + pointer
+// check). The two crash guards on this list still run for everyone: the
+// multireddit expansion deferral and the favorite star's stale-count check.
 //
 // ============================ Reading the model ==============================
 // The u_ rows' native positions come from the sectionedSubreddits ivar. It's a
@@ -85,6 +86,7 @@
 #import <mach-o/loader.h>
 
 #import "ApolloCommon.h"
+#import "ApolloClasses.h"
 #import "ApolloFollowingSection.h"
 #import "ApolloMultiredditExpansion.h"
 #import "ApolloState.h"
@@ -516,12 +518,7 @@ void ApolloFollowingAnimateNextRemoval(UITableView *table, NSIndexPath *path) {
 static NSString *const kApolloListHeaderParkKey = @"apolloListHeaderPark";
 
 static NSDictionary<NSString *, UIView *> *ApolloSubredditListVisibleSectionHeaders(UITableView *tableView) {
-    static Class headerClass = Nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        headerClass = objc_getClass("_TtC6Apollo31RecreatedTableSectionHeaderView");
-        if (!headerClass) ApolloLog(@"[ListEditing] RecreatedTableSectionHeaderView missing — headers won't animate");
-    });
+    Class headerClass = ApolloClassRecreatedTableSectionHeaderView;
     NSMutableDictionary<NSString *, UIView *> *headers = [NSMutableDictionary dictionary];
     if (!headerClass || !tableView) return headers;
     for (UIView *subview in tableView.subviews) {
@@ -684,7 +681,8 @@ static BOOL ApolloFollowingApplyRemovalAnimation(UITableView *table) {
             if (current) [animator startAnimation];
         });
     }
-    ApolloLogDebug(@"[ListEditing] animated confirmed row removal");
+    os_log_debug(ApolloFixLog(),
+        "[ApolloFix] [ListEditing] animated confirmed row removal");
     return YES;
 }
 
@@ -1395,7 +1393,8 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
 - (void)reloadData {
     // Defer additional reloads until the removal animation completes.
     if (objc_getAssociatedObject(self, &kApolloRemovalTransition)) {
-        ApolloLogDebug(@"[ListEditing] deferring reload until removal animation completes");
+        os_log_debug(ApolloFixLog(),
+            "[ApolloFix] [ListEditing] deferring reload until removal animation completes");
         return;
     }
     if (ApolloDeferMultiredditTableUpdate((UITableView *)self)) return;
@@ -1421,9 +1420,10 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
 // before the block, while UIKit's cached counts and the model should still
 // agree. When they don't, no row the block names can pass UIKit's validation,
 // so the favorite change lands and one reload presents it. The star resolved
-// its row from the on-screen layout before this call, so the tapped subreddit
-// is still the one toggled. No caller gate: a stale snapshot fails every batch,
-// whoever submits it.
+// its row from the on-screen layout and reads the name from the current model,
+// so the tapped subreddit is the one toggled as long as the stale change is in
+// another section (the #1335 case: Moderator Posts, MODERATOR, Multireddits).
+// No caller gate: a stale snapshot fails every batch, whoever submits it.
 - (void)performBatchUpdates:(void (^)(void))updates completion:(void (^)(BOOL))completion {
     UITableView *table = (UITableView *)self;
     if (!ApolloFollowingTableIsList(table)) {
@@ -1481,8 +1481,9 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
     NSIndexPath *visible = ApolloFollowingVisiblePathForNative(map, indexPath);
     if (!visible) return %orig(indexPath);
     if (visible.section != indexPath.section || visible.row != indexPath.row) {
-        ApolloLog(@"[FollowingSection] cell lookup native %ld/%ld -> visible %ld/%ld (caller %p)",
-                  (long)indexPath.section, (long)indexPath.row, (long)visible.section, (long)visible.row, caller);
+        // Every remapped lookup Apollo makes: debug level.
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [FollowingSection] cell lookup native %ld/%ld -> visible %ld/%ld (caller %p)",
+                     (long)indexPath.section, (long)indexPath.row, (long)visible.section, (long)visible.row, caller);
     }
     return %orig(visible);
 }

@@ -29,6 +29,7 @@
 #import "ApolloThemeRuntime.h"
 #import "Tweak.h"
 #import "UserDefaultConstants.h"
+#import "ApolloClasses.h"
 
 struct ApolloFeedGallerySizeRange { CGSize min; CGSize max; };
 
@@ -209,7 +210,7 @@ static id ApolloFeedGalleryRichMediaNode(id albumNode) {
     id node = albumNode;
     for (NSInteger depth = 0; node && depth < 4; depth++) {
         node = [node respondsToSelector:@selector(supernode)] ? [node supernode] : nil;
-        if ([NSStringFromClass([node class]) isEqualToString:@"_TtC6Apollo13RichMediaNode"]) return node;
+        if ([node isKindOfClass:ApolloClassRichMediaNode]) return node;
     }
     return nil;
 }
@@ -241,7 +242,7 @@ static NSURL *ApolloFeedGalleryPreviewURL(RDKGalleryItem *item) {
 // safe to carry from Texture's background layout thread onto the main thread.
 static NSArray<NSDictionary *> *ApolloFeedGalleryItems(id albumNode) {
     RDKGallery *gallery = ApolloObjectIvar(albumNode, "redditGallery");
-    if (![gallery isKindOfClass:NSClassFromString(@"RDKGallery")]) return nil;
+    if (![gallery isKindOfClass:ApolloClassRDKGallery]) return nil;
     if (![gallery.items isKindOfClass:[NSArray class]] || gallery.items.count < 2) return nil;
 
     // RDKGallery is immutable for a post. Texture may measure the same node
@@ -253,24 +254,21 @@ static NSArray<NSDictionary *> *ApolloFeedGalleryItems(id albumNode) {
     NSMutableArray<NSDictionary *> *result = [NSMutableArray arrayWithCapacity:gallery.items.count];
     for (id rawItem in gallery.items) {
         if (![rawItem respondsToSelector:@selector(image)]) {
-            objc_setAssociatedObject(gallery, &kApolloFeedGalleryItemsCacheKey, NSNull.null,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            return nil;
+            result = nil;
+            break;
         }
         RDKGalleryItem *item = rawItem;
         RDKGalleryItemImage *source = item.image;
         // Mixed/video galleries stay native for this first scope. A static
         // poster is not an honest representation of a playable gallery page.
-        if (![source isKindOfClass:NSClassFromString(@"RDKGalleryItemImage")] || source.mp4URL) {
-            objc_setAssociatedObject(gallery, &kApolloFeedGalleryItemsCacheKey, NSNull.null,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            return nil;
+        if (![source isKindOfClass:ApolloClassRDKGalleryItemImage] || source.mp4URL) {
+            result = nil;
+            break;
         }
         NSURL *previewURL = ApolloFeedGalleryPreviewURL(item);
         if (![previewURL isKindOfClass:[NSURL class]]) {
-            objc_setAssociatedObject(gallery, &kApolloFeedGalleryItemsCacheKey, NSNull.null,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            return nil;
+            result = nil;
+            break;
         }
         double aspect = (source.width > 0.0 && source.height > 0.0)
             ? source.height / source.width : 0.0;
@@ -404,8 +402,9 @@ static BOOL ApolloFeedGalleryCanGoForward(UINavigationController *navigationCont
             preferredOver++;
         }
     }
-    ApolloLog(@"[FeedGallery] carousel attached; preferred over %lu ancestor pans",
-              (unsigned long)preferredOver);
+    // Once per gallery cell shown: debug level.
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [FeedGallery] carousel attached; preferred over %lu ancestor pans",
+                 (unsigned long)preferredOver);
 }
 
 @end
@@ -899,7 +898,7 @@ static BOOL ApolloFeedGalleryCanGoForward(UINavigationController *navigationCont
 // here leaves the dots' own gestures, which never depended on forwarding,
 // working as before.
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    ApolloLogDebug(@"[FeedGallery] kept a carousel touch from the feed row (%@)",
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [FeedGallery] kept a carousel touch from the feed row (%{public}@)",
                    NSStringFromClass(touches.anyObject.view.class));
 }
 
@@ -932,7 +931,7 @@ static ASDisplayNode *ApolloFeedGalleryEnsureHostNode(id albumNode) {
     @synchronized (albumNode) {
         host = objc_getAssociatedObject(albumNode, &kApolloFeedGalleryHostNodeKey);
         if (!host) {
-            Class nodeClass = NSClassFromString(@"ASDisplayNode");
+            Class nodeClass = ApolloClassASDisplayNode;
             if (!nodeClass) return nil;
             host = [[nodeClass alloc] init];
             host.userInteractionEnabled = YES;
@@ -995,7 +994,7 @@ static void ApolloFeedGalleryScheduleApply(ASDisplayNode *host,
         for (NSString *name in @[ @"thumbnailNode1", @"thumbnailNode2", @"thumbnailNode3",
                                   @"totalImagesNode", @"obscuredContentInfoOverlayNode" ]) {
             ASDisplayNode *node = ApolloObjectIvar(albumNode, name.UTF8String);
-            if (node) node.hidden = enabled;
+            node.hidden = enabled;
         }
         host.hidden = !enabled;
         if (!enabled) {
@@ -1099,14 +1098,14 @@ static void ApolloFeedGallerySettingChanged(void) {
     }
 
     ASDisplayNode *host = existingHost ?: ApolloFeedGalleryEnsureHostNode(self);
-    Class ratioClass = NSClassFromString(@"ASRatioLayoutSpec");
+    Class ratioClass = ApolloClassASRatioLayoutSpec;
     if (!host || !ratioClass) return %orig;
 
     BOOL nsfw = ApolloFeedGalleryBoolIvar(self, "isNSFW");
     BOOL spoiler = ApolloFeedGalleryBoolIvar(self, "isSpoiler");
     if (!existingHost) {
-        ApolloLog(@"[FeedGallery] installing carousel count=%lu obscured=%d",
-                  (unsigned long)items.count, (int)(nsfw || spoiler));
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [FeedGallery] installing carousel count=%lu obscured=%d",
+                     (unsigned long)items.count, (int)(nsfw || spoiler));
     }
     ApolloFeedGalleryScheduleApply(host, self, items, YES, nsfw, spoiler);
 
@@ -1140,7 +1139,7 @@ static void ApolloFeedGalleryRememberViewerPage(UIPageViewController *pager) {
     UIViewController *child = pager.viewControllers.firstObject;
     // NSStringFromClass demangles Swift names ("Apollo.MediaViewerController"),
     // so comparing it with the encoded runtime name rejects every native page.
-    Class viewerClass = NSClassFromString(@"_TtC6Apollo21MediaViewerController");
+    Class viewerClass = ApolloClassMediaViewerController;
     if (!viewerClass || ![child isKindOfClass:viewerClass]) return;
     Ivar ivar = class_getInstanceVariable(child.class, "index");
     if (!ivar) return;
@@ -1154,7 +1153,7 @@ static void ApolloFeedGalleryRememberViewerPage(UIPageViewController *pager) {
     if (carousel && index >= (NSInteger)carousel.items.count) return;
     objc_setAssociatedObject(link, &kApolloFeedGalleryRememberedIndexKey, @(index), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [carousel apollo_restoreViewedIndex:index];
-    ApolloLogDebug(@"[FeedGallery] restored viewed album page=%ld", (long)index);
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [FeedGallery] restored viewed album page=%ld", (long)index);
 }
 
 %hook _TtC6Apollo23MediaPageViewController
@@ -1177,7 +1176,7 @@ static void ApolloFeedGalleryRememberViewerPage(UIPageViewController *pager) {
     if (sApolloFeedGalleryOpeningCarousel) {
         objc_setAssociatedObject(self, &kApolloFeedGalleryReturnCarouselKey,
                                  sApolloFeedGalleryOpeningCarousel, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        ApolloLogDebug(@"[FeedGallery] bound fullscreen return carousel");
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [FeedGallery] bound fullscreen return carousel");
     }
     RDKLink *link = ApolloObjectIvar(self, "link");
     ApolloFeedGalleryPendingSelection *selection = objc_getAssociatedObject(

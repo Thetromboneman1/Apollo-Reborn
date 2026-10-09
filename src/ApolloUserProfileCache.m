@@ -807,7 +807,7 @@ static NSString *ApolloUserProfileChargedWebSessionUsername(void) {
                 retryOrGiveUp([NSString stringWithFormat:@"network error (%@)", error.localizedDescription]);
                 return;
             }
-            ApolloLog(@"[UserAvatars] Failed to fetch u/%@: %@", key, error.localizedDescription);
+            ApolloLogError(@"[UserAvatars] Failed to fetch u/%@: %@", key, error.localizedDescription);
             [self finishInfoRequestForKey:key info:nil];
             return;
         }
@@ -1013,7 +1013,7 @@ static NSString *ApolloUserProfileChargedWebSessionUsername(void) {
         NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
         BOOL ok = (!error && data.length > 0 && (!http || (http.statusCode >= 200 && http.statusCode < 300)));
         if (!ok) {
-            ApolloLog(@"[UserAvatars] Batch profile fetch failed (HTTP %ld, err %@) for %lu ids",
+            ApolloLogError(@"[UserAvatars] Batch profile fetch failed (HTTP %ld, err %@) for %lu ids",
                       (long)(http ? http.statusCode : -1), error.localizedDescription ?: @"none", (unsigned long)chunk.count);
             // Un-mark so a later thread open can retry; per-cell about.json still covers these users now.
             dispatch_async(self.queue, ^{ for (NSString *fn in chunk) [self.batchRequestedFullNames removeObject:fn]; });
@@ -1096,6 +1096,43 @@ static NSString *ApolloUserProfileChargedWebSessionUsername(void) {
         ApolloLog(@"[UserAvatars] Apollo's user_data_by_account_ids: %lu ids -> %lu new avatars cached",
                   (unsigned long)records.count, (unsigned long)applied);
     });
+}
+
+// Lowercased username -> t2_ fullname, from feed listings (see the header).
+// Guarded by its own lock rather than self.queue: it's read on the main thread
+// as feed cells enter the preload range, where waiting on the queue's network
+// work would stall scrolling.
+static NSMutableDictionary<NSString *, NSString *> *sApolloAuthorFullNames;
+
+- (void)noteAuthorFullNamesFromListing:(NSDictionary *)listing {
+    if (![listing isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *data = [listing[@"data"] isKindOfClass:[NSDictionary class]] ? listing[@"data"] : nil;
+    NSArray *children = [data[@"children"] isKindOfClass:[NSArray class]] ? data[@"children"] : nil;
+    if (children.count == 0) return;
+    NSMutableDictionary<NSString *, NSString *> *found = [NSMutableDictionary dictionary];
+    for (id child in children) {
+        if (![child isKindOfClass:[NSDictionary class]] || ![child[@"kind"] isEqual:@"t3"]) continue;
+        NSDictionary *post = [child[@"data"] isKindOfClass:[NSDictionary class]] ? child[@"data"] : nil;
+        NSString *author = [post[@"author"] isKindOfClass:[NSString class]] ? post[@"author"] : nil;
+        NSString *fullName = [post[@"author_fullname"] isKindOfClass:[NSString class]] ? post[@"author_fullname"] : nil;
+        NSString *key = [self normalizedUsername:author];
+        if (key && [fullName hasPrefix:@"t2_"]) found[key] = [fullName copy];
+    }
+    if (found.count == 0) return;
+    @synchronized ([ApolloUserProfileCache class]) {
+        if (!sApolloAuthorFullNames || sApolloAuthorFullNames.count + found.count > 4096) {
+            sApolloAuthorFullNames = [NSMutableDictionary dictionary];
+        }
+        [sApolloAuthorFullNames addEntriesFromDictionary:found];
+    }
+}
+
+- (NSString *)authorFullNameForUsername:(NSString *)username {
+    NSString *key = [self normalizedUsername:username];
+    if (!key) return nil;
+    @synchronized ([ApolloUserProfileCache class]) {
+        return sApolloAuthorFullNames[key];
+    }
 }
 
 - (UIImage *)cachedImageForURL:(NSURL *)url {
@@ -1238,7 +1275,7 @@ static NSString *ApolloUserProfileChargedWebSessionUsername(void) {
                     if (image) persistData = data;
                 }
                 if (!image && error) {
-                    ApolloLog(@"[UserAvatars] Failed to load image %@: %@", key, error.localizedDescription);
+                    ApolloLogError(@"[UserAvatars] Failed to load image %@: %@", key, error.localizedDescription);
                 }
                 if (!image) {
                     // Negative-cache only permanent failures — transient
@@ -1412,7 +1449,7 @@ static BOOL ApolloImageHasAlphaChannel(UIImage *image) {
             return;
         }
         if (!image && error) {
-            ApolloLog(@"[UserAvatars] Failed to load banner (error %ld)", (long)error.code);
+            ApolloLogError(@"[UserAvatars] Failed to load banner (error %ld)", (long)error.code);
         }
         if (!image) {
             NSInteger statusCode = http ? http.statusCode : 0;

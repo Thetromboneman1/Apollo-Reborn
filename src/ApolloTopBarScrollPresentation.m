@@ -8,6 +8,7 @@
 #import <objc/message.h>
 #import <math.h>
 #import <string.h>
+#import "ApolloClasses.h"
 
 static char kApolloTopBarScrollStateKey;
 static char kApolloTopBarScrollToTopActiveKey;
@@ -78,7 +79,7 @@ static BOOL ApolloTopBarScrollEnabled(void) {
 
 BOOL ApolloSubredditListIsEditing(UINavigationController *controller) {
     UIViewController *top = controller.topViewController;
-    Class listClass = objc_getClass("_TtC6Apollo24RedditListViewController");
+    Class listClass = ApolloClassRedditListViewController;
     return listClass && [top isKindOfClass:listClass] && top.isEditing;
 }
 

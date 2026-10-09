@@ -26,12 +26,13 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import "ApolloClasses.h"
 
 // ---- diagnostics toggle ----------------------------------------------------
 // Off by default; flip to 1 for verbose per-render snoomoji/image/tap tracing.
 #define APOLLO_CHAT_IMG_DEBUG 0
 #if APOLLO_CHAT_IMG_DEBUG
-  #define ChatImgLog(fmt, ...) ApolloLogDebug(@"[ChatImg] " fmt, ##__VA_ARGS__)
+  #define ChatImgLog(fmt, ...) os_log_debug(ApolloFixLog(), "[ApolloFix] [ChatImg] " fmt, ##__VA_ARGS__)
 #else
   #define ChatImgLog(fmt, ...) do {} while (0)
 #endif
@@ -204,16 +205,6 @@ static const CGFloat kApolloChatSnoomojiInset      = 9.0;    // breathing room s
 // Apollo bundles Flipboard's FLAnimatedImage (FLAnimatedImage + FLAnimatedImageView,
 // a UIImageView subclass). We render gif messages with it so they animate; static
 // images use the same view's -image. Resolved at runtime to avoid a link dependency.
-static Class ApolloFLAnimatedImageClass(void) {
-    static Class c; static dispatch_once_t once;
-    dispatch_once(&once, ^{ c = objc_getClass("FLAnimatedImage"); });
-    return c;
-}
-static Class ApolloFLAnimatedImageViewClass(void) {
-    static Class c; static dispatch_once_t once;
-    dispatch_once(&once, ^{ c = objc_getClass("FLAnimatedImageView"); });
-    return c;
-}
 
 // URL -> loaded media (an FLAnimatedImage for animated GIFs, else UIImage).
 // NSCache makes decoded residency pressure-aware and bounds the normal case.
@@ -244,7 +235,7 @@ static NSUInteger ApolloChatDecodedMediaCost(id media, NSUInteger sourceBytes) {
     if ([media isKindOfClass:[UIImage class]]) {
         return ApolloImageByteCost((UIImage *)media);
     }
-    Class animatedClass = ApolloFLAnimatedImageClass();
+    Class animatedClass = ApolloClassFLAnimatedImage;
     if (!animatedClass || ![media isKindOfClass:animatedClass]) return sourceBytes;
 
     NSUInteger frameCount = [media respondsToSelector:@selector(frameCount)]
@@ -437,7 +428,7 @@ static id ApolloChatDecodeMediaData(NSData *data) {
     }
 
     id media = nil;
-    Class animatedClass = ApolloFLAnimatedImageClass();
+    Class animatedClass = ApolloClassFLAnimatedImage;
     if (animatedClass && frameCount > 1 && ApolloDataIsGIF(data)) {
         id (*initFn)(id, SEL, NSData *, NSUInteger, BOOL) =
             (id (*)(id, SEL, NSData *, NSUInteger, BOOL))objc_msgSend;
@@ -463,7 +454,7 @@ static void ApolloChatSetMedia(UIImageView *iv, id media) {
     // Keep a direct handle to the media so the tap-to-fullscreen handler doesn't have to read it
     // back through FLAnimatedImageView's image/animatedImage getters (unreliable for static images).
     objc_setAssociatedObject(iv, &kApolloChatIvMediaKey, media, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    Class fl = ApolloFLAnimatedImageClass();
+    Class fl = ApolloClassFLAnimatedImage;
     if (fl && [media isKindOfClass:fl]) {
         // FLAnimatedImageView setter; clearing -image first avoids a stale poster frame.
         iv.image = nil;
@@ -711,9 +702,9 @@ static UIViewController *ApolloChatHostVC(UIView *view) {
     _scroll.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     [self.view addSubview:_scroll];
 
-    Class fl = ApolloFLAnimatedImageClass();
+    Class fl = ApolloClassFLAnimatedImage;
     BOOL animated = fl && [self.media isKindOfClass:fl];
-    Class ivClass = animated ? (ApolloFLAnimatedImageViewClass() ?: [UIImageView class]) : [UIImageView class];
+    Class ivClass = animated ? (ApolloClassFLAnimatedImageView ?: [UIImageView class]) : [UIImageView class];
     _imageView = [[ivClass alloc] initWithFrame:_scroll.bounds];
     _imageView.contentMode = UIViewContentModeScaleAspectFit;
     _imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -793,7 +784,7 @@ static UIViewController *ApolloChatHostVC(UIView *view) {
         if (m && v.userInteractionEnabled) { media = m; break; }
         [q addObjectsFromArray:v.subviews];
     }
-    ChatImgLog(@"BUBBLE TAP fired media=%@", media ? @"y" : @"NIL");
+    ChatImgLog("BUBBLE TAP fired media=%{public}@", media ? @"y" : @"NIL");
     if (!media) return;
     ApolloChatImageViewerVC *viewer = [ApolloChatImageViewerVC new];
     viewer.media = media;
@@ -835,7 +826,7 @@ static void ApolloChatRenderImageInCell(id vc, id cell, NSURL *url, NSIndexPath 
 
     UIImageView *iv = objc_getAssociatedObject(cell, &kApolloChatImgViewKey);
     if (!iv) {
-        Class ivClass = ApolloFLAnimatedImageViewClass() ?: [UIImageView class];   // animates gifs
+        Class ivClass = ApolloClassFLAnimatedImageView ?: [UIImageView class];   // animates gifs
         iv = [[ivClass alloc] initWithFrame:container.bounds];
         iv.clipsToBounds = YES;
         iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -998,7 +989,7 @@ static void ApolloChatProcessCell(id vc, id collectionView, id cell, NSIndexPath
             }
         }
         if (imgURL) {
-            ChatImgLog(@"detected %@ %@ -> %@", sticker ? @"snoomoji" : @"image", ApolloChatIndexKey(indexPath), imgURL.absoluteString);
+            ChatImgLog("detected %{public}@ %{public}@ -> %{public}@", sticker ? @"snoomoji" : @"image", ApolloChatIndexKey(indexPath), imgURL.absoluteString);
             ApolloChatRenderImageInCell(vc, cell, imgURL, indexPath, collectionView, sticker);
         } else {
             if (cell && objc_getAssociatedObject(cell, &kApolloChatImgViewKey)) ApolloChatClearImageInCell(cell);
@@ -1265,7 +1256,7 @@ static void ApolloChatLoadSnoomoji(id collectionView) {
         // is only ever mutated on the same thread ApolloChatSnoomojiStickerURL reads it on.
         dispatch_async(dispatch_get_main_queue(), ^{
             sInFlight = NO;
-            ChatImgLog(@"snoomoji fetch: %lu entries (sample orly=%@)",
+            ChatImgLog("snoomoji fetch: %lu entries (sample orly=%{public}@)",
                        (unsigned long)parsed.count, parsed[@"orly"] ? @"y" : @"-");
             if (parsed.count == 0) return;   // transient failure: leave sLoaded NO so the next open retries
             [ApolloChatSnoomojiMap() addEntriesFromDictionary:parsed];
@@ -1395,7 +1386,7 @@ static CGFloat ApolloChatBubbleDrawnTextHeight(NSAttributedString *text, CGFloat
         [cache setObject:heights forKey:[text copy]];
     }
     heights[key] = @(height);
-    ApolloLogDebug(@"[ChatBubble] %lu-char message at %.0f pt: measured %.1f pt, drawn %.0f pt (avatars %d)",
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [ChatBubble] %lu-char message at %.0f pt: measured %.1f pt, drawn %.0f pt (avatars %d)",
                    (unsigned long)text.length, width, measuredHeight, height, avatarPrefix);
     return height;
 }
@@ -1423,7 +1414,7 @@ static CGFloat ApolloChatBubbleDrawnTextHeight(NSAttributedString *text, CGFloat
 // flow-layout attributes object. Shared by both flow-layout attribute queries below.
 static void ApolloChatAdjustLayoutAttributes(NSDictionary *map, UICollectionViewLayoutAttributes *la,
                                              NSIndexPath *indexPath) {
-    NSValue *mv = map[ApolloChatIndexKey(indexPath)];
+    NSValue *mv = map.count ? map[ApolloChatIndexKey(indexPath)] : nil;
     if (mv) {
         ApolloChatSetCGSizeIvar(la, "messageContainerSize", mv.CGSizeValue);
     } else if (sShowUserAvatars) {

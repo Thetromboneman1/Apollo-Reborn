@@ -219,6 +219,12 @@ extern BOOL sIPadTabBarBottom;
 // (UDKeyIPadPaneLayout). Read once at %ctor — installation happens at scene
 // connect, so changing it needs a relaunch. See src/ipad/ApolloPaneLayout.h.
 extern BOOL sIPadPaneLayout;
+typedef NS_ENUM(NSInteger, ApolloSettingsIconAppearance) {
+    ApolloSettingsIconAppearanceSystem = 0,
+    ApolloSettingsIconAppearanceLight,
+    ApolloSettingsIconAppearanceDark,
+};
+extern ApolloSettingsIconAppearance sSettingsIconAppearance;
 // Liquid Glass only. When ON, tab-bar swipe navigates back/forward instead of
 // switching tabs; needs a relaunch to apply. See ApolloLiquidGlass.xm.
 extern BOOL sTabBarSwipeNavigation;
@@ -314,6 +320,16 @@ void ApolloHeaderStyleRegisterSearchBar(UISearchBar *searchBar);
 // Called from ApolloThemeRuntime.xm's UISearchBar didMoveToWindow hook (the one
 // hook that class gets); applies the Hard-style insets to registered bars.
 void ApolloHeaderStyleSearchBarDidMoveToWindow(UISearchBar *searchBar);
+// Registers a navigation-bar search bar that scrolls away with the list but
+// whose item pins it (hidesSearchBarWhenScrolling = NO) for moments like the
+// push that brings the screen in. Under Hard, UIKit draws a pinned bar inside
+// the band with a glass field; while held, the bar keeps the look it has once
+// released instead (#1361). backdropScrollView: the list whose background
+// shows behind the search row once the bar is released. No-op off Liquid
+// Glass, or when the UIKit hooks it relies on didn't install. Defined in
+// ApolloScrollEdgeEffect.xm.
+void ApolloHeaderStyleRegisterScrollAwaySearchBar(UISearchBar *searchBar, UINavigationItem *item,
+                                                  UIScrollView *backdropScrollView);
 // Applies the selected style to every scroll view owned by an Apollo list
 // controller. Home, Profile, Comments, and similar screens all inherit Apollo's
 // ASTableViewController, which layers an intercepting UIScrollView over its
@@ -427,6 +443,7 @@ typedef NS_ENUM(NSInteger, ApolloAISummaryDetail) {
 extern NSInteger sAIPostWordThreshold;              // 50...300, step 50
 extern ApolloAISummaryDetail sAIPostSummaryDetail;  // post / link / both
 extern ApolloAISummaryDetail sAICommentSummaryDetail;
+extern NSString *sAISummaryLanguage;                // language code, nil = Device Default
 
 // Horizontal alignment for inline media containers narrower than the row width
 // (tall portrait images, height-capped images). Has no effect on full-width media.
@@ -611,6 +628,10 @@ static inline BOOL IsAppleTranslationSupported(void) {
 // authenticated with a WKWebView-harvested session cookie instead of a bearer
 // token. Dormant escape hatch for Reddit API-key revocation waves. Default NO.
 extern BOOL sWebJSONEnabled;
+// Reduce Rate Limiting (UDKeyReduceRateLimiting). Only takes effect while the
+// active account is API-key-free; read it through
+// ApolloReduceRateLimitingActive() (ApolloReduceRateLimiting.h). Default NO.
+extern BOOL sReduceRateLimiting;
 // Native Polls (ApolloPollVoting.xm / ApolloPollCompose.xm): master gate for
 // the experimental poll voting + creation feature. Default NO. Cached here (not
 // re-read from NSUserDefaults per call) because the poll node's layoutSubviews

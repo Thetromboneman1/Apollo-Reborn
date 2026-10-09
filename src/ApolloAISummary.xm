@@ -10,7 +10,7 @@
 //
 //  The Swift-only FoundationModels API is reached through the
 //  `ApolloFoundationModels` @objc bridge (ApolloFoundationModels.swift). We
-//  resolve it via NSClassFromString so there is no link-time dependency on the
+//  resolve it via objc_getClass so there is no link-time dependency on the
 //  Swift-generated interop header.
 //
 //  The summaries are inserted into CommentsHeaderCellNode's layout. The post
@@ -33,16 +33,18 @@
 #import "ApolloTextureDecls.h"
 #import "ApolloDevvitPosts.h"
 #import "Tweak.h"
+#import "ApolloClasses.h"
 
 #pragma mark - FoundationModels bridge (declared, resolved at runtime)
 
 // Mirrors the @objc surface of ApolloFoundationModels.swift. We never reference
-// the class symbol directly (only via NSClassFromString), so this is a pure
+// the class symbol directly (only via objc_getClass), so this is a pure
 // type declaration for clean message sends.
 @interface ApolloFoundationModels : NSObject
 + (instancetype)shared;
 - (NSInteger)availabilityStatus;
 - (BOOL)isModelAvailable;
+- (NSArray<NSString *> *)supportedLanguageCodes;
 - (void)prepareSession:(NSString *)identifier instructions:(NSString *)instructions;
 - (void)discardPreparedSession:(NSString *)identifier;
 - (void)cancelRequest:(NSString *)identifier;
@@ -61,7 +63,7 @@ static ApolloFoundationModels *ApolloAIBridge(void) {
     if (sAISummaryProvider.length > 0 && ![sAISummaryProvider isEqualToString:@"apple"]) {
         return (ApolloFoundationModels *)[ApolloAICloudBridge shared];
     }
-    Class cls = NSClassFromString(@"ApolloFoundationModels");
+    Class cls = ApolloClassApolloFoundationModels;
     if (!cls) return nil;
     return [cls shared];
 }
@@ -101,15 +103,111 @@ static NSUInteger ApolloAIMaxPostCharsForDetail(ApolloAISummaryDetail detail) {
     }
 }
 
+#pragma mark - Summary language
+
+// The model writes in the language of its input unless the instructions name
+// one (Apple's FoundationModels locale guide: "By default, the model responds
+// in the language or languages of its inputs"). So a Portuguese article came
+// back as a Portuguese "Link summary" under an English UI, right below a link
+// card the translation feature had already put into English. Every summary
+// prompt now names the reader's language: Apollo AI → Summaries → Language,
+// which defaults to the device language.
+
+// Base language codes the on-device model writes. Read once and kept: the set
+// only changes with an OS model update. An empty answer is not kept, so a model
+// that couldn't say yet is asked again next time. Main thread only, like every
+// caller (generation passes, header restores and the Apollo AI settings screen).
+static NSSet<NSString *> *ApolloAIOnDeviceLanguageCodes(void) {
+    static NSSet<NSString *> *sCodes;
+    if (sCodes.count > 0) return sCodes;
+    Class cls = NSClassFromString(@"ApolloFoundationModels");
+    ApolloFoundationModels *model = cls ? [cls shared] : nil;
+    if (![model respondsToSelector:@selector(supportedLanguageCodes)]) return nil;
+    NSArray<NSString *> *codes = [model supportedLanguageCodes];
+    if (codes.count == 0) return nil;
+    sCodes = [NSSet setWithArray:codes];
+    ApolloLog(@"[AISummary] on-device model writes: %@", [codes componentsJoinedByString:@","]);
+    return sCodes;
+}
+
+// A language code as the model lists it: lowercase, without region or script,
+// and Norwegian "no" (Translation's list, which the summary Language picker
+// shows) as Bokmål "nb".
+static NSString *ApolloAIModelLanguageCode(NSString *identifier) {
+    if (identifier.length == 0) return nil;
+    NSString *language = [[NSLocale componentsFromLocaleIdentifier:identifier][NSLocaleLanguageCode] lowercaseString];
+    return [language isEqualToString:@"no"] ? @"nb" : language;
+}
+
+BOOL ApolloAIOnDeviceCanWrite(NSString *identifier) {
+    NSString *language = ApolloAIModelLanguageCode(identifier);
+    NSSet<NSString *> *writable = ApolloAIOnDeviceLanguageCodes();
+    return language.length > 0 && (!writable || [writable containsObject:language]);
+}
+
+// The language summaries are written in: the one picked in Apollo AI →
+// Summaries → Language, else the device's preferred languages in order (Device
+// Default). A language the on-device model can't write is skipped for the next
+// one: asking for it throws unsupportedLanguageOrLocale. Cloud models write any
+// language. Returns language + script only ("en", "pt", "zh-Hant"): the script
+// separates Simplified from Traditional Chinese, and a region adds nothing a
+// summary needs. nil when no candidate fits; the prompts then name no language
+// and the model answers in the text's language, as before.
+NSString *ApolloAISummaryLanguage(BOOL *picked) {
+    BOOL cloud = sAISummaryProvider.length > 0 && ![sAISummaryProvider isEqualToString:@"apple"];
+    NSSet<NSString *> *writable = cloud ? nil : ApolloAIOnDeviceLanguageCodes();
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    // If the on-device model didn't say what it writes, skip the picked language
+    // (it could be one the model can't write) and use the device language: Apple
+    // Intelligence only runs when the device and Siri language are the same
+    // supported language.
+    BOOL choiceIsCandidate = sAISummaryLanguage.length > 0 && (cloud || writable);
+    if (choiceIsCandidate) [candidates addObject:sAISummaryLanguage];
+    [candidates addObjectsFromArray:[NSLocale preferredLanguages] ?: @[]];
+    NSString *summaryLanguage = nil;
+    if (picked) *picked = NO;
+    for (NSUInteger i = 0; i < candidates.count; i++) {
+        NSString *language = ApolloAIModelLanguageCode(candidates[i]);
+        if (language.length == 0 || (writable && ![writable containsObject:language])) continue;
+        NSString *script = [NSLocale componentsFromLocaleIdentifier:candidates[i]][NSLocaleScriptCode];
+        summaryLanguage = script.length > 0 ? [NSString stringWithFormat:@"%@-%@", language, script] : language;
+        if (picked) *picked = choiceIsCandidate && i == 0;
+        break;
+    }
+    // Logged when it changes (first use, a Language or provider switch),
+    // not per call: header restores ask again on every scroll-in.
+    static NSString *sLoggedLanguage;
+    NSString *logged = summaryLanguage ?: @"(none: the text's own language)";
+    if (![logged isEqualToString:sLoggedLanguage]) {
+        sLoggedLanguage = logged;
+        ApolloLog(@"[AISummary] summary language: %@", logged);
+    }
+    return summaryLanguage;
+}
+
+// `instructions` led by the summary language, worded as Apple's guide words it
+// ("You MUST respond in Italian"). It has to come FIRST: appended after the
+// summary rules, the on-device model still answered the Record (Portuguese)
+// article in Portuguese; leading, it answers in the reader's language for every
+// prompt and detail level here. Unchanged when there is no summary language.
+static NSString *ApolloAIInSummaryLanguage(NSString *instructions) {
+    NSString *language = ApolloAISummaryLanguage(NULL);
+    NSString *name = language.length > 0
+        ? [[NSLocale localeWithLocaleIdentifier:@"en_US"] localizedStringForLocaleIdentifier:language]
+        : nil;
+    if (name.length == 0) return instructions;
+    return [NSString stringWithFormat:@"You MUST respond in %@. %@", name, instructions];
+}
+
 static NSString *ApolloAIPostInstructionsForDetail(ApolloAISummaryDetail detail) {
     switch (ApolloAISanitizedDetail(detail)) {
         case ApolloAISummaryDetailBrief:
-            return @"Summarize this Reddit post in 1-2 concise plain sentences. Give only the essential point and what the poster asks, claims, or shares. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize this Reddit post in 1-2 concise plain sentences. Give only the essential point and what the poster asks, claims, or shares. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailInDepth:
-            return @"Summarize this Reddit post in 3-5 focused plain sentences. Explain the main point, the poster’s reasoning or context, and what they ask, claim, or share. Include useful supporting details, but stay clearly shorter than the post. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize this Reddit post in 3-5 focused plain sentences. Explain the main point, the poster’s reasoning or context, and what they ask, claim, or share. Include useful supporting details, but stay clearly shorter than the post. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailBalanced:
         default:
-            return @"Summarize this Reddit post in 2 short plain sentences. State the main point and what the poster asks, claims, or shares. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize this Reddit post in 2 short plain sentences. State the main point and what the poster asks, claims, or shares. No heading, Markdown, or added facts.");
     }
 }
 
@@ -125,12 +223,12 @@ static NSInteger ApolloAIPostResponseTokensForDetail(ApolloAISummaryDetail detai
 static NSString *ApolloAICommentInstructionsForDetail(ApolloAISummaryDetail detail) {
     switch (ApolloAISanitizedDetail(detail)) {
         case ApolloAISummaryDetailBrief:
-            return @"Summarize these Reddit comments in 1-2 concise plain sentences. Give the overall reaction and the most important takeaway. Summarize commenters, not the post. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize these Reddit comments in 1-2 concise plain sentences. Give the overall reaction and the most important takeaway. Summarize commenters, not the post. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailInDepth:
-            return @"Summarize these Reddit comments in 4-5 focused plain sentences. Explain the consensus, useful supporting details, notable alternatives, and an important disagreement when present. Summarize commenters, not the post, and stay clearly shorter than the discussion. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize these Reddit comments in 4-5 focused plain sentences. Explain the consensus, useful supporting details, notable alternatives, and an important disagreement when present. Summarize commenters, not the post, and stay clearly shorter than the discussion. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailBalanced:
         default:
-            return @"Summarize these Reddit comments in 2-3 short plain sentences. Cover the consensus, useful details, and one notable disagreement if present. Summarize commenters, not the post. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize these Reddit comments in 2-3 short plain sentences. Cover the consensus, useful details, and one notable disagreement if present. Summarize commenters, not the post. No heading, Markdown, or added facts.");
     }
 }
 
@@ -146,12 +244,12 @@ static NSInteger ApolloAICommentResponseTokensForDetail(ApolloAISummaryDetail de
 static NSString *ApolloAIArticleInstructionsForDetail(ApolloAISummaryDetail detail) {
     switch (ApolloAISanitizedDetail(detail)) {
         case ApolloAISummaryDetailBrief:
-            return @"Summarize this linked article in 1-2 concise plain sentences. Give the main topic and most important reported fact or conclusion. Summarize the article itself, not website navigation or ads. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize this linked article in 1-2 concise plain sentences. Give the main topic and most important reported fact or conclusion. Summarize the article itself, not website navigation or ads. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailInDepth:
-            return @"Summarize this linked article in 4-5 focused plain sentences. Explain the main topic, key facts, supporting context, and important conclusions or implications stated by the source. Stay clearly shorter than the article. Ignore website navigation and ads. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize this linked article in 4-5 focused plain sentences. Explain the main topic, key facts, supporting context, and important conclusions or implications stated by the source. Stay clearly shorter than the article. Ignore website navigation and ads. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailBalanced:
         default:
-            return @"Summarize this linked news article in 2-3 short plain sentences. State the main topic and the key facts or points it reports. Summarize the article itself, not website navigation or ads. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"Summarize this linked news article in 2-3 short plain sentences. State the main topic and the key facts or points it reports. Summarize the article itself, not website navigation or ads. No heading, Markdown, or added facts.");
     }
 }
 
@@ -167,12 +265,12 @@ static NSInteger ApolloAIArticleResponseTokensForDetail(ApolloAISummaryDetail de
 static NSString *ApolloAIBothInstructionsForDetail(ApolloAISummaryDetail detail) {
     switch (ApolloAISanitizedDetail(detail)) {
         case ApolloAISummaryDetailBrief:
-            return @"You are given a Reddit post and the article it links to. Summarize both together in 2 concise plain sentences: the post’s point and the article’s essential fact or conclusion. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"You are given a Reddit post and the article it links to. Summarize both together in 2 concise plain sentences: the post’s point and the article’s essential fact or conclusion. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailInDepth:
-            return @"You are given a Reddit post and the article it links to. Summarize both together in 4-6 focused plain sentences. Explain the post’s point, the article’s key facts and context, and how they relate, while staying clearly shorter than the sources. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"You are given a Reddit post and the article it links to. Summarize both together in 4-6 focused plain sentences. Explain the post’s point, the article’s key facts and context, and how they relate, while staying clearly shorter than the sources. No heading, Markdown, or added facts.");
         case ApolloAISummaryDetailBalanced:
         default:
-            return @"You are given a Reddit post and the article it links to. Summarize both together in 3-4 short plain sentences: the post’s point and the article’s key facts. No heading, Markdown, or added facts.";
+            return ApolloAIInSummaryLanguage(@"You are given a Reddit post and the article it links to. Summarize both together in 3-4 short plain sentences: the post’s point and the article’s key facts. No heading, Markdown, or added facts.");
     }
 }
 
@@ -215,24 +313,30 @@ static NSMutableDictionary<NSString *, NSString *> *sCommentSummaryCache;
 // fullName -> ApolloAISummaryDetail used to generate the cached text.
 static NSMutableDictionary<NSString *, NSNumber *> *sPostSummaryDetails;
 static NSMutableDictionary<NSString *, NSNumber *> *sCommentSummaryDetails;
-// fullName -> stable provider/model identity used to generate the cached text.
-// The raw defaults keys intentionally keep this PR compatible before and after
-// the separate cloud-provider PR lands; absent keys resolve to Apple on-device.
+// fullName -> stable provider/model/language identity used to generate the
+// cached text. The raw defaults keys intentionally keep this PR compatible
+// before and after the separate cloud-provider PR lands; absent keys resolve to
+// Apple on-device.
 static NSMutableDictionary<NSString *, NSString *> *sPostSummaryProfiles;
 static NSMutableDictionary<NSString *, NSString *> *sCommentSummaryProfiles;
 
 static NSString *ApolloAICurrentGenerationProfile(void) {
     NSString *provider = sAISummaryProvider;
+    // The summary language is part of what produced the text, so a summary in
+    // another language regenerates instead of being reused. That includes every
+    // summary cached before the prompts named a language ("apple" never equals
+    // "apple|en").
+    NSString *language = ApolloAISummaryLanguage(NULL) ?: @"";
     if (![provider isEqualToString:@"openrouter"] &&
         ![provider isEqualToString:@"gemini"] &&
         ![provider isEqualToString:@"custom"]) {
-        return @"apple";
+        return [@"apple|" stringByAppendingString:language];
     }
     // Same effective model the cloud bridge would actually send (stored value or
     // the provider default), so switching models invalidates cached summaries.
     NSString *model = ApolloAICloudEffectiveModel() ?: @"";
     NSString *endpoint = [provider isEqualToString:@"custom"] ? (sCustomAIBaseURL ?: @"") : @"";
-    return [NSString stringWithFormat:@"%@|%@|%@", provider, model, endpoint];
+    return [NSString stringWithFormat:@"%@|%@|%@|%@", provider, model, endpoint, language];
 }
 
 static BOOL ApolloAIPostCacheMatchesCurrentDetail(NSString *fullName) {
@@ -668,7 +772,7 @@ static void ApolloAIShowLoadingIfIdle(NSString *fullName, BOOL isPost);
 // Reddit fullName ("t3_xxxx") for the post; falls back to a stable key.
 static NSString *ApolloAILinkFullName(id link) {
     if (!link) return nil;
-    SEL sels[] = { @selector(fullName), NSSelectorFromString(@"name"), NSSelectorFromString(@"identifier") };
+    SEL sels[] = { @selector(fullName), @selector(name), @selector(identifier) };
     for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
         if ([link respondsToSelector:sels[i]]) {
             id v = ((id (*)(id, SEL))objc_msgSend)(link, sels[i]);
@@ -683,7 +787,7 @@ static NSString *ApolloAILinkFullName(id link) {
 // fixed name list misses.
 static id ApolloAIScanForLink(id obj) {
     if (!obj) return nil;
-    Class rdkLink = NSClassFromString(@"RDKLink");
+    Class rdkLink = ApolloClassRDKLink;
     if (!rdkLink) return nil;
 
     static const char *knownNames[] = {
@@ -722,7 +826,7 @@ static NSArray *ApolloAIAvailableNodes(UIViewController *vc) {
     // main thread (the old code's biggest stall) and defeats lazy loading.
     // Comment bodies are captured from the cell lifecycle hooks instead, so the
     // already-loaded nodes here are only a supplementary source.
-    SEL nodeForRowSelector = NSSelectorFromString(@"nodeForRowAtIndexPath:");
+    SEL nodeForRowSelector = @selector(nodeForRowAtIndexPath:);
     if (tableNode && tableView && [tableNode respondsToSelector:nodeForRowSelector]) {
         NSInteger sectionCount = [tableView numberOfSections];
         for (NSInteger section = 0; section < sectionCount; section++) {
@@ -739,7 +843,7 @@ static NSArray *ApolloAIAvailableNodes(UIViewController *vc) {
         }
     }
 
-    SEL visibleNodesSelector = NSSelectorFromString(@"visibleNodes");
+    SEL visibleNodesSelector = @selector(visibleNodes);
     if (tableNode && [tableNode respondsToSelector:visibleNodesSelector]) {
         id visibleNodes = ((id (*)(id, SEL))objc_msgSend)(tableNode, visibleNodesSelector);
         if ([visibleNodes isKindOfClass:[NSArray class]]) {
@@ -818,7 +922,7 @@ static UITableView *ApolloAICommentsTableView(UIViewController *vc) {
 static id ApolloAICommentFromCellNode(id cellNode) {
     if (!cellNode) return nil;
     id comment = ApolloObjectIvar(cellNode, "comment");
-    Class rdkComment = NSClassFromString(@"RDKComment");
+    Class rdkComment = ApolloClassRDKComment;
     if (!rdkComment || ![comment isMemberOfClass:rdkComment]) return nil;
     return comment;
 }
@@ -1099,12 +1203,14 @@ static NSString *ApolloAICleanInputText(NSString *text, NSUInteger maxLength) {
     }
 
     NSString *clean = [keptLines componentsJoinedByString:@" "];
-    NSError *regexError = nil;
-    NSRegularExpression *urlRegex =
-        [NSRegularExpression regularExpressionWithPattern:@"https?://\\S+"
-                                                  options:NSRegularExpressionCaseInsensitive
-                                                    error:&regexError];
-    if (!regexError) {
+    static NSRegularExpression *urlRegex;
+    static dispatch_once_t urlRegexOnce;
+    dispatch_once(&urlRegexOnce, ^{
+        urlRegex = [NSRegularExpression regularExpressionWithPattern:@"https?://\\S+"
+                                                             options:NSRegularExpressionCaseInsensitive
+                                                               error:NULL];
+    });
+    if (urlRegex) {
         clean = [urlRegex stringByReplacingMatchesInString:clean
                                                    options:0
                                                      range:NSMakeRange(0, clean.length)
@@ -1252,7 +1358,7 @@ static id ApolloAIRDKCommentFromObject(id obj, Class rdkComment) {
 static void ApolloAICollectCommentsFromDataModel(UIViewController *vc,
                                                  NSMutableArray *comments,
                                                  NSMutableSet<NSString *> *candidateKeys) {
-    Class rdkComment = NSClassFromString(@"RDKComment");
+    Class rdkComment = ApolloClassRDKComment;
     if (!rdkComment || !vc || !comments || !candidateKeys) return;
 
     NSArray *bestArray = nil;
@@ -1620,7 +1726,11 @@ static NSString *ApolloAIDecodeHTMLEntities(NSString *s) {
     };
     for (NSString *k in named) s = [s stringByReplacingOccurrencesOfString:k withString:named[k]];
     // Numeric decimal entities (&#160; etc.).
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"&#(\\d{2,7});" options:0 error:nil];
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"&#(\\d{2,7});" options:0 error:nil];
+    });
     NSArray<NSTextCheckingResult *> *matches = [re matchesInString:s options:0 range:NSMakeRange(0, s.length)];
     if (matches.count > 0) {
         NSMutableString *out = [s mutableCopy];
@@ -1989,7 +2099,7 @@ static UIColor *ApolloAISummaryThemeAccent(id headerNode) {
 }
 
 // The profile is captured when generation starts and persisted with the cached
-// summary (e.g. "gemini|gemini-3.6-flash|"). Derive attribution from that
+// summary (e.g. "gemini|gemini-3.6-flash||en"). Derive attribution from that
 // stored profile rather than today's global setting, so a completed/cached card
 // can never claim it came from a provider that did not generate it.
 static NSString *ApolloAISummaryProviderAttribution(NSString *generationProfile) {
@@ -2128,7 +2238,7 @@ static ASTextNode *ApolloAIEnsureSummaryNode(id headerNode, BOOL isPost) {
     ASTextNode *textNode = objc_getAssociatedObject(headerNode, key);
     if (textNode) return textNode;
 
-    Class textNodeClass = NSClassFromString(@"ASTextNode");
+    Class textNodeClass = ApolloClassASTextNode;
     if (!textNodeClass) return nil;
     textNode = [[textNodeClass alloc] init];
     textNode.maximumNumberOfLines = 0;
@@ -2143,8 +2253,8 @@ static ASTextNode *ApolloAIEnsureSummaryNode(id headerNode, BOOL isPost) {
         ASTextNode *strongTextNode = weakTextNode;
         id owner = weakHeaderNode;
         if (!owner || !strongTextNode.view) return;
-        SEL action = isPost ? NSSelectorFromString(@"apollo_togglePostSummary")
-                            : NSSelectorFromString(@"apollo_toggleDiscussionSummary");
+        SEL action = isPost ? @selector(apollo_togglePostSummary)
+                            : @selector(apollo_toggleDiscussionSummary);
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:owner action:action];
         [strongTextNode.view addGestureRecognizer:tap];
         strongTextNode.view.accessibilityTraits |= UIAccessibilityTraitButton;
@@ -2161,7 +2271,7 @@ static ASDisplayNode *ApolloAIEnsureBackgroundNode(id headerNode, BOOL isPost) {
     ASDisplayNode *background = objc_getAssociatedObject(headerNode, key);
     if (background) return background;
 
-    background = [[NSClassFromString(@"ASDisplayNode") alloc] init];
+    background = [[ApolloClassASDisplayNode alloc] init];
     UIColor *accent = ApolloAISummaryThemeAccent(headerNode);
     background.backgroundColor = [accent colorWithAlphaComponent:0.10];
     background.cornerRadius = 12.0;
@@ -2750,8 +2860,8 @@ static void ApolloAIRegisterHeaderNode(id headerNode) {
 }
 
 static id ApolloAISummaryLayoutSpec(id textNode, id backgroundNode) {
-    Class insetClass = NSClassFromString(@"ASInsetLayoutSpec");
-    Class backgroundClass = NSClassFromString(@"ASBackgroundLayoutSpec");
+    Class insetClass = ApolloClassASInsetLayoutSpec;
+    Class backgroundClass = ApolloClassASBackgroundLayoutSpec;
     if (!insetClass || !backgroundClass || !textNode || !backgroundNode) return nil;
     id inner = [insetClass insetLayoutSpecWithInsets:UIEdgeInsetsMake(12.0, 14.0, 12.0, 14.0)
                                                child:textNode];
@@ -2762,7 +2872,7 @@ static id ApolloAISummaryLayoutSpec(id textNode, id backgroundNode) {
 
 // Rebuild a stack spec with new children, preserving its layout attributes.
 static ASStackLayoutSpec *ApolloAIRebuildStack(ASStackLayoutSpec *stack, NSArray *children) {
-    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    Class stackClass = ApolloClassASStackLayoutSpec;
     ASStackLayoutSpec *s = [stackClass stackLayoutSpecWithDirection:stack.direction
                                                             spacing:stack.spacing
                                                      justifyContent:stack.justifyContent
@@ -2782,10 +2892,10 @@ static ASStackLayoutSpec *ApolloAIRebuildStack(ASStackLayoutSpec *stack, NSArray
 // descend to find the anchor rather than only scanning the top level. Returns a
 // rebuilt stack, or nil if no anchor was found anywhere.
 static ASStackLayoutSpec *ApolloAIInsertPostSummary(ASStackLayoutSpec *stack, id spec, NSUInteger depth) {
-    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    Class stackClass = ApolloClassASStackLayoutSpec;
     if (![stack isKindOfClass:stackClass] || depth > 4) return nil;
-    Class linkButtonClass = NSClassFromString(@"_TtC6Apollo14LinkButtonNode");
-    Class markdownClass = NSClassFromString(@"_TtC6Apollo12MarkdownNode");
+    Class linkButtonClass = ApolloClassLinkButtonNode;
+    Class markdownClass = ApolloClassMarkdownNode;
     NSArray *children = stack.children ?: @[];
 
     // 1) Directly below the inline link-preview card.
@@ -2860,14 +2970,14 @@ static id ApolloAIPlaceSummariesPreservingRoot(id rootSpec,
                                                id discussionSummarySpec) {
     if (!rootSpec || (!postSummarySpec && !discussionSummarySpec)) return nil;
 
-    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    Class stackClass = ApolloClassASStackLayoutSpec;
     if (stackClass && [rootSpec isKindOfClass:stackClass]) {
         return ApolloAICloneStackWithSummaries((ASStackLayoutSpec *)rootSpec,
                                                postSummarySpec,
                                                discussionSummarySpec);
     }
 
-    Class insetClass = NSClassFromString(@"ASInsetLayoutSpec");
+    Class insetClass = ApolloClassASInsetLayoutSpec;
     if (insetClass && [rootSpec isKindOfClass:insetClass]) {
         ASInsetLayoutSpec *originalInset = (ASInsetLayoutSpec *)rootSpec;
         id newChild = ApolloAIPlaceSummariesPreservingRoot(originalInset.child,
@@ -2893,12 +3003,12 @@ static void ApolloAILogLayoutChildrenOnce(id headerNode, id rootSpec) {
 
     id current = rootSpec;
     NSUInteger depth = 0;
-    Class insetClass = NSClassFromString(@"ASInsetLayoutSpec");
+    Class insetClass = ApolloClassASInsetLayoutSpec;
     while (insetClass && [current isKindOfClass:insetClass] && depth < 8) {
         current = ((ASInsetLayoutSpec *)current).child;
         depth++;
     }
-    Class stackClass = NSClassFromString(@"ASStackLayoutSpec");
+    Class stackClass = ApolloClassASStackLayoutSpec;
     if (![current isKindOfClass:stackClass]) {
         ApolloLog(@"[AISummary][layout] root=%@ unwrapped=%@",
                   NSStringFromClass([rootSpec class]), NSStringFromClass([current class]));
@@ -3032,7 +3142,7 @@ maximumResponseTokens:responseTokens
                     }
                     NSString *msg = error ? ApolloAIFriendlyError(error) : @"The model returned an empty summary.";
                     ApolloAIRecordFailure(fullName, YES, msg);
-                    ApolloLog(@"[AISummary] link summary error: %@", error ? error.localizedDescription : @"(empty)");
+                    ApolloLogError(@"[AISummary] link summary error: %@", error ? error.localizedDescription : @"(empty)");
                     ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateError, msg);
                     if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
                         ApolloAIForceHeaderRemeasure(fullName);
@@ -3163,7 +3273,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
     // Bind the controller's authoritative link identity to the actual Texture
     // header node. Swift Optional ivar encodings can make a later header-only
     // link lookup fail even though this controller lookup succeeded.
-    Class headerClass = NSClassFromString(@"_TtC6Apollo22CommentsHeaderCellNode");
+    Class headerClass = ApolloClassCommentsHeaderCellNode;
     for (id node in ApolloAIAvailableNodes(vc)) {
         if (headerClass && [node isMemberOfClass:headerClass]) {
             ApolloAIRegisterHeaderNodeForFullName(node, fullName);
@@ -3299,7 +3409,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                             }
                             NSString *msg = error ? ApolloAIFriendlyError(error) : @"The model returned an empty summary.";
                             ApolloAIRecordFailure(fullName, YES, msg);
-                            ApolloLog(@"[AISummary] post summary error: %@", error ? error.localizedDescription : @"(empty)");
+                            ApolloLogError(@"[AISummary] post summary error: %@", error ? error.localizedDescription : @"(empty)");
                             ApolloAISetBoxStateOnMatchingHeaders(fullName, YES, ApolloAIBoxStateError, msg);
                             if (ApolloAIAnyHeaderExpanded(fullName, YES)) {
                                 ApolloAIForceHeaderRemeasure(fullName);
@@ -3432,7 +3542,7 @@ static void ApolloAIGenerateForController(UIViewController *vc) {
                             }
                             NSString *msg = error ? ApolloAIFriendlyError(error) : @"The model returned an empty summary.";
                             ApolloAIRecordFailure(fullName, NO, msg);
-                            ApolloLog(@"[AISummary] comment summary error: %@", error ? error.localizedDescription : @"(empty)");
+                            ApolloLogError(@"[AISummary] comment summary error: %@", error ? error.localizedDescription : @"(empty)");
                             ApolloAISetBoxStateOnMatchingHeaders(fullName, NO, ApolloAIBoxStateError, msg);
                             if (ApolloAIAnyHeaderExpanded(fullName, NO)) {
                                 ApolloAIForceHeaderRemeasure(fullName);
@@ -3617,20 +3727,15 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
 
 %end
 
-%hook _TtC6Apollo15CommentCellNode
-
-- (void)didLoad {
-    %orig;
-    if (!sEnableAISummaries) return;
-    // Weak capture: comment cells die during collapse/scroll churn before the main
-    // queue drains (#630 round-5 crash mechanism).
-    __weak __typeof__(self) weakSelf = self;
+// Weak capture: comment cells die during collapse/scroll churn before the main
+// queue drains (#630 round-5 crash mechanism).
+static void ApolloAICaptureCommentCellNodeLater(id node) {
+    __weak id weakNode = node;
     dispatch_async(dispatch_get_main_queue(), ^{
-        // __strong is load-bearing: in a hook, __typeof__(self) is __unsafe_unretained (owns nothing).
-        __strong __typeof__(self) cellNode = weakSelf;
+        id cellNode = weakNode;
         if (!cellNode) return;
         UIViewController *vc = sVisibleCommentsController;
-        id comment = ApolloAICommentFromCellNode((id)cellNode);
+        id comment = ApolloAICommentFromCellNode(cellNode);
         if (!vc || !comment) return;
         if (ApolloAICaptureCommentForController(comment, vc)) {
             ApolloAIScheduleCommentGeneration(vc);
@@ -3638,20 +3743,18 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
     });
 }
 
+%hook _TtC6Apollo15CommentCellNode
+
+- (void)didLoad {
+    %orig;
+    if (!sEnableAISummaries) return;
+    ApolloAICaptureCommentCellNodeLater((id)self);
+}
+
 - (void)didEnterPreloadState {
     %orig;
     if (!sEnableAISummaries) return;
-    __weak __typeof__(self) weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        __strong __typeof__(self) cellNode = weakSelf;
-        if (!cellNode) return;
-        UIViewController *vc = sVisibleCommentsController;
-        id comment = ApolloAICommentFromCellNode((id)cellNode);
-        if (!vc || !comment) return;
-        if (ApolloAICaptureCommentForController(comment, vc)) {
-            ApolloAIScheduleCommentGeneration(vc);
-        }
-    });
+    ApolloAICaptureCommentCellNodeLater((id)self);
 }
 
 %end
@@ -3743,8 +3846,10 @@ static void ApolloAILogTableStructure(UIViewController *vc) {
     ApolloAIBoxState postState = sEnableAIPostSummaries ? ApolloAIGetBoxState((id)self, YES) : ApolloAIBoxStateNone;
     ApolloAIBoxState commentState = sEnableAICommentSummaries ? ApolloAIGetBoxState((id)self, NO) : ApolloAIBoxStateNone;
     if (postState == ApolloAIBoxStateNone && commentState == ApolloAIBoxStateNone) return originalSpec;
-    ApolloLog(@"[AISummary][UI] composing header layout postState=%ld commentState=%ld",
-              (long)postState, (long)commentState);
+    // Every layout pass of the comments header: debug level, logged directly
+    // so the pass never builds an NSString.
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [AISummary][UI] composing header layout postState=%ld commentState=%ld",
+                 (long)postState, (long)commentState);
 
     id postSummarySpec = nil;
     id discussionSummarySpec = nil;

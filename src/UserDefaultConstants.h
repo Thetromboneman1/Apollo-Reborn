@@ -124,6 +124,9 @@ static NSString *const ApolloFavoriteSubredditsUpdatedNotification = @"com.chris
 // (Reddit offers no way to leave or delete some dead subreddits). Array of
 // display names, compared case-insensitively.
 static NSString *const UDKeyHiddenModeratorSubreddits = @"HiddenModeratorSubreddits";
+// Apollo-native subreddit-list icon preference, relocated from Appearance.
+static NSString *const UDKeyShowSubredditIconsInSubredditList = @"ShowSubredditIconsInSubredditList";
+static NSString *const ApolloSubredditListIconsChangedNotification = @"com.christianselig.SubredditListShowSubredditIconsChanged";
 static NSString *const UDKeyModernSubredditDividers = @"ModernSubredditDividers";
 static NSString *const ApolloModernSubredditDividersChangedNotification = @"ApolloModernSubredditDividersChangedNotification";
 // Hides the description subtitles under the subreddit list's built-in feed rows
@@ -151,7 +154,7 @@ static NSString *const UDKeySubredditSectionOrder = @"SubredditSectionOrder";
 // append in their natural alphabetical order.
 static NSString *const UDKeyFollowedUsersOrder = @"FollowedUsersOrder";
 static NSString *const ApolloSubredditSectionsChangedNotification = @"ApolloSubredditSectionsChangedNotification";
-// Whether the Subreddit Sections screen keeps its live preview pinned above
+// Whether the Subreddit List screen keeps its live preview pinned above
 // the options (YES, default) or lets it scroll away with them. Absent == YES.
 static NSString *const UDKeySubredditSectionsPreviewPinned = @"SubredditSectionsPreviewPinned";
 // Color post (link) and user/author flairs with Reddit's assigned colors. Default NO.
@@ -371,6 +374,8 @@ static NSString *const ApolloIPadTabBarBottomChangedNotification = @"ApolloIPadT
 static NSString *const UDKeyIPadPaneLayout = @"IPadPaneLayout";
 // True Black Keyboard mode: 0 Off (default), 1 Dark Only, 2 Light Only, 3 Always.
 static NSString *const UDKeyTrueBlackKeyboardMode = @"TrueBlackKeyboardMode";
+// Settings icons: 0 = System, 1 = Light (default), 2 = Dark.
+static NSString *const UDKeySettingsIconAppearance = @"SettingsIconAppearance";
 // Liquid Glass only. When ON, tab-bar swipe navigates back/forward instead of
 // dragging to switch tabs (an either/or; needs a relaunch to apply). Opt-in;
 // default OFF via registerDefaults. See ApolloLiquidGlass.xm.
@@ -521,6 +526,10 @@ static NSString *const UDKeyEnableAICommentSummaries = @"EnableAICommentSummarie
 static NSString *const UDKeyAIPostWordThreshold = @"AIPostWordThreshold";
 static NSString *const UDKeyAIPostSummaryDetail = @"AIPostSummaryDetail";
 static NSString *const UDKeyAICommentSummaryDetail = @"AICommentSummaryDetail";
+// The language summaries are written in, whatever language the post, article or
+// comments are in: a language code from Translation's list ("ja", "pt", "zh"),
+// or "" for Device Default (the device's own language). Default "".
+static NSString *const UDKeyAISummaryLanguage = @"AISummaryLanguage";
 // When on, summaries are generated only when the user taps the card (rather than
 // automatically on open). Off by default. Cached summaries still show instantly.
 static NSString *const UDKeyEnableTapToSummarize = @"EnableTapToSummarize";
@@ -617,6 +626,18 @@ static NSString *const UDKeyPostFilterNameSubstrings = @"PostFilterNameSubstring
 // Web JSON spike (see ApolloWebJSON.m). Master switch for re-pointing
 // whitelisted listing reads at cookie-authenticated www.reddit.com JSON.
 static NSString *const UDKeyWebJSONEnabled = @"WebJSONEnabled";
+// Reduce Rate Limiting (ApolloReduceRateLimiting.m). Reddit gives an
+// API-key-free (web session) account a much smaller request budget than an API
+// key, so while one is active this trades a little polish for fewer requests:
+// avatars come only from batched lookups (no collectible frames), Community
+// Highlights refresh every 30 minutes instead of every 2, and the session check
+// runs every 10 minutes instead of every minute. No effect on API-key accounts.
+// Default NO; offered once at the first API-key-free sign-in.
+static NSString *const UDKeyReduceRateLimiting = @"ReduceRateLimiting";
+// Set once the Reduce Rate Limiting prompt has been shown (at the first
+// API-key-free sign-in, or at the first rate limit for accounts that signed in
+// before the prompt existed), so it never asks twice. Not user-facing.
+static NSString *const UDKeyReduceRateLimitingOffered = @"ReduceRateLimitingOffered";
 // Reddit's modern web Chat, for API-key and API-key-free accounts alike. Off
 // means Apollo's own Direct Chat, which needs Reddit API credentials.
 static NSString *const UDKeyUseModernRedditChat = @"UseModernRedditChat";
