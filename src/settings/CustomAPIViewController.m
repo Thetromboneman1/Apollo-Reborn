@@ -1064,7 +1064,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     [super viewDidLoad];
 
     self.title = [self apollo_screenTitle];
-    self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+
     if (![self apollo_isHub]) return;
     // What the first table load renders; viewWillAppear compares against it.
     self.setupFooterShowsKeyNudge = sRedditClientId.length == 0;
@@ -1996,8 +1996,8 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             NSString *readPostMaxStr = sReadPostMaxCount > 0 ? [NSString stringWithFormat:@"%ld", (long)sReadPostMaxCount] : @"";
             return [weakSelf textFieldCellWithIdentifier:@"Cell_Gen_ReadMax"
-                                                   label:@"History Limit"
-                                              placeholder:@"Unlimited"
+                                                   label:@"Recently Read Posts Limit"
+                                             placeholder:@"Unlimited"
                                                     text:readPostMaxStr
                                                      tag:TagReadPostMaxCount
                                                numerical:YES]
@@ -3738,17 +3738,31 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         textField.returnKeyType = UIReturnKeyDone;
         if (numerical) {
             textField.keyboardType = UIKeyboardTypeNumberPad;
+
+            if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone) {
+                UIToolbar *toolbar = [[UIToolbar alloc] init];
+                [toolbar sizeToFit];
+
+                UIBarButtonItem *flexibleSpace =
+                    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
+                                                                target:nil
+                                                                action:nil];
+
+                UIBarButtonItem *done =
+                    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                                target:textField
+                                                                action:@selector(resignFirstResponder)];
+
+                toolbar.items = @[flexibleSpace, done];
+                textField.inputAccessoryView = toolbar;
+            }
         }
 
-        CGFloat placeholderWidth = ceil([placeholder sizeWithAttributes:@{
-            NSFontAttributeName: textField.font
-        }].width);
-        CGFloat digitsWidth = ceil([@"99999" sizeWithAttributes:@{
-            NSFontAttributeName: textField.font
-        }].width);
-        CGFloat valueWidth = MAX(placeholderWidth, digitsWidth) + 24.0;
-
-        [textField.widthAnchor constraintEqualToConstant:valueWidth].active = YES;
+        NSLayoutConstraint *widthConstraint =
+            [textField.widthAnchor constraintEqualToConstant:0];
+        widthConstraint.active = YES;
+        objc_setAssociatedObject(textField, @selector(widthAnchor),
+                                 widthConstraint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         textField.translatesAutoresizingMaskIntoConstraints = NO;
         [cell.contentView addSubview:titleLabel];
@@ -3777,6 +3791,21 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     textField.text = text;
     textField.placeholder = placeholder;
     textField.accessibilityLabel = label;
+
+    UIFont *valueFont = ApolloSettingsFont(UIFontTextStyleCallout, self.traitCollection);
+    CGFloat placeholderWidth = ceil([placeholder sizeWithAttributes:@{
+        NSFontAttributeName: valueFont
+    }].width);
+    CGFloat digitsWidth = ceil([@"99999" sizeWithAttributes:@{
+        NSFontAttributeName: valueFont
+    }].width);
+    CGFloat valueWidth = MAX(placeholderWidth, digitsWidth) + 16.0;
+
+    NSLayoutConstraint *widthConstraint =
+        objc_getAssociatedObject(textField, @selector(widthAnchor));
+    NSCAssert(widthConstraint != nil, @"Missing numeric field width constraint");
+    widthConstraint.constant = valueWidth;
+
     [self apollo_applyPrimaryTextColorToCell:cell];
 
     return cell;
@@ -4635,7 +4664,10 @@ replacementString:(NSString *)string {
     if (textField.tag == TagReadPostMaxCount || textField.tag == TagTrendingLimit) {
         NSString *updated = [textField.text stringByReplacingCharactersInRange:range
                                                                     withString:string];
-        return updated.length <= 5;
+        NSCharacterSet *nonDigits =
+            [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+        return updated.length <= 5 &&
+               [updated rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
     }
 
     return YES;
