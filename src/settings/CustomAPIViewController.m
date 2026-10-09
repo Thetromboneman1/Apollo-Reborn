@@ -2555,7 +2555,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     };
 
     NSString *displayNavigationFooter =
-    @"User Profile Pictures adds avatars beside usernames in posts, comments, messages, inbox rows, and moderator lists. True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
+    @"True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
 
     if (IsLiquidGlass()) {
         displayNavigationFooter = [displayNavigationFooter stringByAppendingString:
@@ -2582,7 +2582,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
                                             footer:displayNavigationFooter
-                                              rows:@[ userAvatars, avatarShape, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, iPadPaneLayout, scrollEdgeEffect ]];
+                                              rows:@[ scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, iPadPaneLayout, scrollEdgeEffect ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
