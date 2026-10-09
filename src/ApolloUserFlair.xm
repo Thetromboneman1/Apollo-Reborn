@@ -108,7 +108,7 @@ extern void ApolloSwiftAssignOptionalString(void *storage, const char *utf8Value
 - (NSString *)templateID;
 - (NSString *)displayText;
 - (BOOL)isEditableWithKnown:(BOOL *)known;
-- (BOOL)setDisplayText:(NSString *)text;
+- (BOOL)apollo_applyDisplayText:(NSString *)text;
 @end
 
 @interface ApolloUserFlairSelectorAdapter : NSObject
@@ -441,7 +441,7 @@ static BOOL ApolloUserFlairSetOptionText(id option, NSString *text) {
     return ApolloUserFlairOptionIsEditable(self.option, known);
 }
 
-- (BOOL)setDisplayText:(NSString *)text {
+- (BOOL)apollo_applyDisplayText:(NSString *)text {
     return ApolloUserFlairSetOptionText(self.option, text);
 }
 
@@ -709,7 +709,7 @@ static BOOL ApolloUserFlairCommitEditedSession(ApolloUserFlairEditSession *sessi
     // Apollo only saves through the native Update path when its selector is dirty.
     // Text-only edits on the checked template do not flip that flag, so update the option text,
     // mark the selector dirty, then invoke Apollo's Update handler.
-    if (![session.optionAdapter setDisplayText:text]) return NO;
+    if (![session.optionAdapter apollo_applyDisplayText:text]) return NO;
     if (![session.selectorAdapter prepareForNativeUpdate]) return NO;
 
     ApolloLog(@"[UserFlair] committing through native update subreddit=%@ templateID=%@ textLen=%lu",
