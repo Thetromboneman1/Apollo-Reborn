@@ -174,6 +174,7 @@ NSArray<NSString *> *sTranslationSkipLanguages = nil;
 BOOL sAppleTranslateSheet = NO;
 
 BOOL sWebJSONEnabled = NO;
+BOOL sReduceRateLimiting = NO;
 BOOL sPollsFeatureEnabled = NO;
 NSInteger sPollOptionAlignment = ApolloPollOptionAlignmentCenter;
 NSString *sWebSessionCookieHeader = nil;
