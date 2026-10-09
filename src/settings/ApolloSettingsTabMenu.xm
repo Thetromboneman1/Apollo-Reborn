@@ -116,9 +116,9 @@ static UIView *ApolloFindSettingsItemView(UIView *view, UITabBarItem *settingsIt
                                          UIWindow *window, UITouch *touch, NSUInteger railIndex,
                                          NSUInteger itemCount) {
     if (view.hidden || view.alpha <= 0.01) return nil;
-    id item = ApolloSettingsObjectForSelector(view, @"item");
+    id item = ApolloSendObject(view, @selector(item));
     BOOL matches = item == settingsItem
-        || ApolloSettingsObjectForSelector(item, @"_linkedTabBarItem") == settingsItem;
+        || ApolloSendObject(item, @selector(_linkedTabBarItem)) == settingsItem;
     if (!matches && railIndex != NSNotFound) {
         matches = ApolloSettingsRailButtonAtIndex(view, railIndex, itemCount);
     }
@@ -146,7 +146,7 @@ static UIView *ApolloSettingsTabView(UITabBarController *controller, UITouch *to
         }
     }
     if (!settingsItem) return nil;
-    UIView *button = ApolloSettingsObjectForSelector(settingsItem, @"_tabBarButton");
+    UIView *button = ApolloSendObject(settingsItem, @selector(_tabBarButton));
     if (ApolloSettingsTabViewIsVisible(button, window, touch)
         && (rail || [button isDescendantOfView:controller.tabBar])) return button;
     Ivar viewIvar = class_getInstanceVariable(settingsItem.class, "_view");
