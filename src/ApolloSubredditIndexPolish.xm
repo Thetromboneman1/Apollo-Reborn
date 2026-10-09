@@ -814,7 +814,7 @@ static UIColor *ApolloSubredditIndexThemeListBackgroundColor(UITableView *tableV
 static BOOL ApolloSubredditIndexOwningTitleLooksLikeSubreddits(UITableView *tableView) {
     UIViewController *vc = ApolloSubredditIndexOwningViewController(tableView);
     NSString *title = vc.navigationItem.title ?: vc.title;
-    return [vc isKindOfClass:ApolloSubredditIndexRedditListViewControllerClass()] || [title isEqualToString:@"Subreddits"];
+    return [vc isKindOfClass:ApolloClassRedditListViewController] || [title isEqualToString:@"Subreddits"];
 }
 
 static BOOL ApolloSubredditIndexShouldInspectTable(UITableView *tableView) {
@@ -823,7 +823,7 @@ static BOOL ApolloSubredditIndexShouldInspectTable(UITableView *tableView) {
 
     id owner = (id)tableView.dataSource;
     if (!owner) owner = (id)tableView.delegate;
-    Class redditListClass = ApolloSubredditIndexRedditListViewControllerClass();
+    Class redditListClass = ApolloClassRedditListViewController;
     // The controller's title can disappear while UIKit reparents it into the
     // Duo sidebar. Its data source identity remains stable through that move.
     if (redditListClass && [owner isKindOfClass:redditListClass]) return YES;
@@ -1146,7 +1146,7 @@ static NSMutableDictionary *ApolloSubredditIndexCaptureCellNativeState(UITableVi
 }
 
 static CGFloat ApolloSubredditIndexContentRightMargin(UITableViewCell *cell, BOOL drawer) {
-    if (![cell isMemberOfClass:ApolloSubredditIndexRedditListTableViewCellClass()]) return drawer ? 16.0 : 0.0;
+    if (![cell isMemberOfClass:ApolloClassRedditListTableViewCell]) return drawer ? 16.0 : 0.0;
     UITableView *table = ApolloSubredditIndexTableForCell(cell);
     ApolloSubredditIndexOverlayView *index = objc_getAssociatedObject(table, &kApolloSubredditIndexOverlayKey);
     UIStackView *stack = ApolloSubredditIndexRedditListMainStackView(cell);
@@ -3027,7 +3027,7 @@ static CGFloat ApolloSubredditIndexHeightForFooterHook(id self, SEL _cmd, UITabl
 }
 
 static void ApolloSubredditIndexInstallPalHomeFooterHooks(void) {
-    Class cls = ApolloSubredditIndexRedditListViewControllerClass();
+    Class cls = ApolloClassRedditListViewController;
     if (!cls) {
         ApolloLog(@"[SubredditIndex] Pal Home footer hooks skipped: RedditListViewController missing");
         return;
@@ -3542,7 +3542,7 @@ static void ApolloSubredditIndexRefreshVisibleRowGeometry(UITableView *tableView
             objc_setAssociatedObject(cell, &kApolloSubredditRowPolishAppliedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         if (enhanced) ApolloSubredditIndexApplyCellMarginsOnce(cell);
-        if (enhanced && [cell isMemberOfClass:ApolloSubredditIndexRedditListTableViewCellClass()]) {
+        if (enhanced && [cell isMemberOfClass:ApolloClassRedditListTableViewCell]) {
             ApolloSubredditIndexApplyRedditListCellPolishOnce(cell,
                 ApolloSubredditIndexCellIsMultiredditChild(tableView, cell, [tableView indexPathForCell:cell]));
             ApolloSubredditIndexInstallStarProxyForCell(cell, tableView);
@@ -3817,7 +3817,7 @@ static void ApolloSubredditIndexRefreshHeadersForController(UIViewController *co
 %end
 
 static UIStackView *ApolloSubredditIndexRedditListMainStackView(UITableViewCell *cell) {
-    if (![cell isMemberOfClass:ApolloSubredditIndexRedditListTableViewCellClass()]) return nil;
+    if (![cell isMemberOfClass:ApolloClassRedditListTableViewCell]) return nil;
     static Ivar mainStackIvar = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
