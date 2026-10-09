@@ -332,7 +332,7 @@ static UIView *ApolloPFSectionFooterView(NSString *text) {
             }
 
             objc_setAssociatedObject(
-                weakSelf,
+                self,
                 kApolloPFKeywordsNativeCountKey,
                 @(n),
                 OBJC_ASSOCIATION_RETAIN_NONATOMIC
