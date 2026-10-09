@@ -681,7 +681,8 @@ static BOOL ApolloFollowingApplyRemovalAnimation(UITableView *table) {
             if (current) [animator startAnimation];
         });
     }
-    ApolloLogDebug(@"[ListEditing] animated confirmed row removal");
+    os_log_debug(ApolloFixLog(),
+        "[ApolloFix] [ListEditing] animated confirmed row removal");
     return YES;
 }
 
@@ -1392,7 +1393,8 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
 - (void)reloadData {
     // Defer additional reloads until the removal animation completes.
     if (objc_getAssociatedObject(self, &kApolloRemovalTransition)) {
-        ApolloLogDebug(@"[ListEditing] deferring reload until removal animation completes");
+        os_log_debug(ApolloFixLog(),
+            "[ApolloFix] [ListEditing] deferring reload until removal animation completes");
         return;
     }
     if (ApolloDeferMultiredditTableUpdate((UITableView *)self)) return;

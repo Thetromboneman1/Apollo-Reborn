@@ -662,7 +662,8 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
                 CGPoint current = [currentTouch locationInView:window];
                 if (hypot(current.x - sApolloAccountRailPressOrigin.x,
                           current.y - sApolloAccountRailPressOrigin.y) > 12.0) return;
-                ApolloLogDebug(@"[LiquidGlassTabBar] Profile touch hold opening account switcher");
+                os_log_debug(ApolloFixLog(),
+                    "[ApolloFix] [LiquidGlassTabBar] Profile touch hold opening account switcher");
                 OpenAccountManager(window);
             });
             break;
@@ -697,7 +698,8 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
     if (sApolloAccountRailSuppressesSelection && self == sApolloAccountRailTabController
         && self.viewControllers.count > 2 && selectedViewController == self.viewControllers[2]
         && selectedViewController != sApolloAccountRailPreviousTab) {
-        ApolloLogDebug(@"[LiquidGlassTabBar] Ignored Profile selection after account long press");
+        os_log_debug(ApolloFixLog(),
+            "[ApolloFix] [LiquidGlassTabBar] Ignored Profile selection after account long press");
         return;
     }
     %orig(selectedViewController);
@@ -708,7 +710,8 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
         ? self.viewControllers[selectedIndex] : nil;
     if (sApolloAccountRailSuppressesSelection && self == sApolloAccountRailTabController
         && selectedIndex == 2 && candidate != sApolloAccountRailPreviousTab) {
-        ApolloLogDebug(@"[LiquidGlassTabBar] Ignored Profile index after account long press");
+        os_log_debug(ApolloFixLog(),
+            "[ApolloFix] [LiquidGlassTabBar] Ignored Profile index after account long press");
         return;
     }
     %orig(selectedIndex);

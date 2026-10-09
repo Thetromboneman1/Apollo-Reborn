@@ -143,7 +143,9 @@ static void ApolloEditingAlignStar(UITableViewCell *cell, BOOL editing) {
 - (void)confirm {
     UITableView *table = self.table;
     NSIndexPath *path = [table indexPathForCell:self.cell];
-    ApolloLogDebug(@"[ListEditing] confirmation tapped editing=%d validRow=%d", table.editing, path != nil);
+    os_log_debug(ApolloFixLog(),
+        "[ApolloFix] [ListEditing] confirmation tapped editing=%{public}d validRow=%{public}d",
+        table.editing, path != nil);
     [self dismiss];
     // Resolve the current row before the remapping hooks translate its index.
     if (table.editing && path && [table.dataSource respondsToSelector:@selector(tableView:commitEditingStyle:forRowAtIndexPath:)]) {
@@ -215,7 +217,8 @@ static BOOL ApolloEditingShowConfirmation(UIControl *control) {
         [button.centerYAnchor constraintEqualToAnchor:surface.centerYAnchor],
         [button.heightAnchor constraintEqualToAnchor:surface.heightAnchor constant:-8.0]
     ]];
-    ApolloLogDebug(@"[ListEditing] showing confirmation %@", title);
+    os_log_debug(ApolloFixLog(),
+        "[ApolloFix] [ListEditing] showing confirmation %{public}@", title);
     state.cell = cell;
     objc_setAssociatedObject(cell, &kCellConfirmation, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     state.panel = panel;
