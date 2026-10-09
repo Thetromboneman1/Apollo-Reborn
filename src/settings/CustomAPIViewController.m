@@ -5100,7 +5100,6 @@ replacementString:(NSString *)string {
     // while this switch and its pending subtitle describe the saved choice.
     [self visibilityDidChange];
     [self reloadRowWithID:@"gen.iPadPaneLayout"];
-
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Restart to Apply"
                          message:on
