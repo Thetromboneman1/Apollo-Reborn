@@ -87,7 +87,7 @@ static BOOL ApolloTagFilterTagOn(NSString *subreddit, NSString *tagKey, BOOL glo
 // Per-subreddit overrides take precedence over global settings on a per-tag basis;
 // mode is also overridable per-sub.
 static NSString *ApolloTagFilterDecisionForLink(RDKLink *link) {
-    if (!sTagFilterEnabled || !link) return @"none";
+    if (!link) return @"none";
     if (![(id)link respondsToSelector:@selector(isNSFW)] && ![(id)link respondsToSelector:@selector(isSpoiler)]) return @"none";
 
     BOOL isNSFW = NO;
@@ -98,8 +98,10 @@ static NSString *ApolloTagFilterDecisionForLink(RDKLink *link) {
 
     NSString *sub = nil;
     @try { sub = link.subreddit; } @catch (__unused id e) {}
-    BOOL filterNSFW = ApolloTagFilterTagOn(sub, @"nsfw", sTagFilterNSFW);
-    BOOL filterSpoiler = ApolloTagFilterTagOn(sub, @"spoiler", sTagFilterSpoiler);
+    BOOL filterNSFW =
+        ApolloTagFilterTagOn(sub, @"nsfw", sTagFilterEnabled && sTagFilterNSFW);
+    BOOL filterSpoiler =
+        ApolloTagFilterTagOn(sub, @"spoiler", sTagFilterEnabled && sTagFilterSpoiler);
 
     BOOL match = (isNSFW && filterNSFW) || (isSpoiler && filterSpoiler);
     if (!match) return @"none";
@@ -246,7 +248,8 @@ BOOL ApolloShouldBlurNSFWMediaInSubreddit(NSString *subreddit) {
     // The tweak's own Tag Filters choice is independent of the Reddit account
     // pref: a user who opted into blurring NSFW (globally or for this
     // subreddit) keeps that cover even with Reddit's mature-media blur off.
-    if (sTagFilterEnabled && ApolloTagFilterTagOn(subreddit, @"nsfw", sTagFilterNSFW)) return YES;
+    if (ApolloTagFilterTagOn(subreddit, @"nsfw",
+                             sTagFilterEnabled && sTagFilterNSFW)) return YES;
     if (sTagEffectiveNoProfanity == 1) return YES;
     if (sTagEffectiveNoProfanity == 0) return NO;
     // Unknown: stay covered while the pref is still being resolved, just as
