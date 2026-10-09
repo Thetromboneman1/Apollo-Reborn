@@ -1541,7 +1541,6 @@ static void ApolloPollApplyOptionTextAlignment(id optionNode) {
     return [insetClass insetLayoutSpecWithInsets:UIEdgeInsetsMake(0, 8, 0, 0) child:row];
 }
 %end
-
 // PollNode is an ASControlNode: Apollo registers pollNodeTappedWithSender: for
 // its TouchUpInside event, and taps anywhere inside the poll — option rows
 // included, since plain option subnodes bubble touches up the responder chain —
@@ -1819,4 +1818,3 @@ static void ApolloPollApplyOptionTextAlignment(id optionNode) {
     }
 }
 %end
-
