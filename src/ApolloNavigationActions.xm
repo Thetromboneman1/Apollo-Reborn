@@ -1336,9 +1336,6 @@ static NSArray<UIBarButtonItem *> *ApolloActionsInboxItems(UINavigationItem *ite
     ApolloNavigationActionsControllerBox *controllerBox = objc_getAssociatedObject(self.item, &kActionsControllerKey);
     NSString *controllerClass = NSStringFromClass(controllerBox.controller.class);
     BOOL approvedSubmitters = [controllerClass isEqualToString:@"Apollo.ModeratorApprovedSubmittersViewController"];
-    BOOL blueDone = controllerBox.controller.isEditing &&
-        ([controllerClass isEqualToString:@"Apollo.RedditListViewController"] ||
-         [controllerClass isEqualToString:@"ApolloSettingsShortcutsViewController"]);
     for (UIBarButtonItem *item in items) {
         // Legacy Done buttons become filled/prominent on Liquid Glass.
         if (ApolloActionsUsesPlainSubmitStyle(item) && item.style != UIBarButtonItemStylePlain) {
