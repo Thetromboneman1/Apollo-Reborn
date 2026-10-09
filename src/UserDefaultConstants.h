@@ -742,14 +742,6 @@ static NSString *const UDKeyAutomaticUpdateChecks = @"AutomaticUpdateChecks";
 static NSString *const UDKeyUpdateLastCheck = @"UpdateLastCheck";           // NSDate of the last good fetch
 static NSString *const UDKeyUpdateSkippedVersion = @"UpdateSkippedVersion"; // "3.9.0" the user chose to skip
 
-// In-app update check (ApolloUpdateChecker.{h,m}). Once a day it reads
-// release-manifest.json from GitHub and offers to hand off to the user's
-// sideloader. Default ON; the Manual "Check for Updates" row works either way.
-static NSString *const UDKeyAutomaticUpdateChecks = @"AutomaticUpdateChecks";
-// Internal bookkeeping (not user-facing).
-static NSString *const UDKeyUpdateLastCheck = @"UpdateLastCheck";           // NSDate of the last good fetch
-static NSString *const UDKeyUpdateSkippedVersion = @"UpdateSkippedVersion"; // "3.9.0" the user chose to skip
-
 // Feed thumbnails for text posts with embedded images (off = native behavior).
 static NSString *const UDKeyFeedTextPostThumbnails = @"FeedTextPostThumbnails";
 // Replaces Apollo's fixed two/three-tile Reddit-gallery mosaic in large feed
