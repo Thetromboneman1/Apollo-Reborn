@@ -2068,6 +2068,8 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     // Refit even an empty squeezed title, or the old width cap can persist.
     CGRect contentFrame = [controller contentFrameInView:bar];
     CGRect titleBand = [titleControl convertRect:titleControl.bounds toView:bar];
+    CGRect columnBounds = ApolloDuoSplitContentFrame(topVC, bar);
+    CGRect titleBounds = CGRectIsNull(columnBounds) ? bar.bounds : columnBounds;
 
     // Walk the bar's view tree to find the nearest visible content edges on
     // either side. Liquid Glass pills are _UINavigationBarPlatterView instances
@@ -2165,8 +2167,6 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     CGFloat capsulePadding = !searching && (jumpBar || !ApolloPaneUsesUnifiedChrome(bar)) &&
         ApolloResolvedScrollEdgeEffectStyle() != ApolloScrollEdgeEffectStyleHard
         ? kApolloTitleCapsuleHorizontalPadding : 0.0;
-    CGRect columnBounds = ApolloDuoSplitContentFrame(topVC, bar);
-    CGRect titleBounds = CGRectIsNull(columnBounds) ? bar.bounds : columnBounds;
     // A pane's primary navigation bar can extend underneath UIKit's sidebar.
     // Its physical midpoint is then inside the occluded region. Fit and center
     // within the usable header unless Duo already supplied a narrower column.
