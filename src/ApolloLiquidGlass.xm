@@ -15,8 +15,9 @@
 #import "ApolloFindInCommentsGlass.h"
 #import "ApolloDuoRail.h"
 #import "ApolloClasses.h"
+#import "ApolloSubredditSwitcherSheet.h"
 
-/// Helpers for restoring long-press to activate account switcher w/ Liquid Glass
+/// Helpers for the Posts and account tab long-press shortcuts in Liquid Glass.
 static char kApolloTabButtonSetupKey;
 static char kApolloFloatingTabItemViewSetupKey;
 static char kApolloTabBarApplyingAdaptiveAppearanceKey;
@@ -251,53 +252,13 @@ static UITabBar *ApolloTabBarForTabObject(id tabObject) {
     return nil;
 }
 
-static BOOL ApolloIsProfileTabView(UIView *view) {
-    NSString *accessibilityName = [(view.accessibilityLabel.lowercaseString ?: @"")
-        stringByAppendingFormat:@" %@", view.accessibilityIdentifier.lowercaseString ?: @""];
-    if ([accessibilityName containsString:@"account"]
-        || [accessibilityName containsString:@"profile"]) {
-        return YES;
-    }
-
+static UITabBar *ApolloTabBarForTabView(UIView *view) {
     UITabBar *tabBar = FindAncestorTabBar(view);
-    UITabBarItem *item = ApolloTabBarItemForButtonInTabBar(view, tabBar);
-    if (!item) {
-        item = ApolloTabBarItemForTabView(view);
-    }
-
     if (!tabBar) {
         id tabObject = ApolloSendObjectReturningSelector(view, @selector(item));
         tabBar = ApolloTabBarForTabObject(tabObject);
     }
-
-    if (!tabBar || !item) {
-        // iOS 27's trailing floating rail owns two visual copies of each
-        // _UITabButton. Those copies are not always reachable through the
-        // UITabBarItem private view pointers, but each parent still contains
-        // the five buttons in vertical tab order. Keep this fallback scoped to
-        // that vertical geometry so ordinary iPhones retain the native path.
-        NSMutableArray<UIView *> *siblings = [NSMutableArray array];
-        for (UIView *candidate in view.superview.subviews) {
-            if ([candidate isKindOfClass:view.class] && !candidate.hidden
-                && CGRectGetHeight(candidate.bounds) > CGRectGetWidth(candidate.bounds)) {
-                [siblings addObject:candidate];
-            }
-        }
-        if (siblings.count >= 5) {
-            [siblings sortUsingComparator:^NSComparisonResult(UIView *left, UIView *right) {
-                CGFloat leftY = CGRectGetMidY(left.frame);
-                CGFloat rightY = CGRectGetMidY(right.frame);
-                if (leftY < rightY) return NSOrderedAscending;
-                if (leftY > rightY) return NSOrderedDescending;
-                return NSOrderedSame;
-            }];
-            return [siblings indexOfObjectIdenticalTo:view] == 2;
-        }
-        return NO;
-    }
-
-    NSArray<UITabBarItem *> *items = tabBar.items;
-    return items.count > 2 && items[2] == item;
+    return tabBar;
 }
 
 // Opens Apollo's account switcher by invoking ProfileViewController's bar button action.
@@ -393,8 +354,7 @@ static void OpenAccountManager(UIWindow *sourceWindow) {
 
 @implementation ApolloAccountTabGestureDelegate
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)recognizer {
-    return IsLiquidGlass() && !ApolloDuoRailHasVisibleSideBar()
-        && ApolloIsProfileTabView(recognizer.view);
+    return IsLiquidGlass() && !ApolloDuoRailHasVisibleSideBar();
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer
@@ -405,7 +365,7 @@ static void OpenAccountManager(UIWindow *sourceWindow) {
 }
 @end
 
-static void ApolloInstallAccountTabLongPress(UIView *view, const void *setupKey) {
+static void ApolloInstallTabShortcutLongPress(UIView *view, const void *setupKey) {
     if (!IsLiquidGlass() || !view.window) return;
     if (objc_getAssociatedObject(view, setupKey)) return;
     objc_setAssociatedObject(view, setupKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -467,7 +427,7 @@ static BOOL ApolloWindowPointTargetsProfile(UIWindow *window, CGPoint point) {
     return frames.count == 5 && CGRectContainsPoint(frames[2].CGRectValue, point);
 }
 
-static void ApolloHandleAccountTabLongPress(UIView *view, UILongPressGestureRecognizer *recognizer) {
+static void ApolloHandleTabShortcutLongPress(UIView *view, UILongPressGestureRecognizer *recognizer) {
     if (recognizer.state == UIGestureRecognizerStateEnded
         || recognizer.state == UIGestureRecognizerStateCancelled
         || recognizer.state == UIGestureRecognizerStateFailed) {
@@ -480,8 +440,18 @@ static void ApolloHandleAccountTabLongPress(UIView *view, UILongPressGestureReco
 
     // The vertical rail is handled by sendEvent: below, including finger-up.
     if (ApolloDuoRailHasVisibleSideBar()) return;
-    UITabBar *tabBar = FindAncestorTabBar(view);
-    if (ApolloIsProfileTabView(view)) {
+    UITabBar *tabBar = ApolloTabBarForTabView(view);
+    UITabBarItem *item = ApolloTabBarItemForButtonInTabBar(view, tabBar) ?: ApolloTabBarItemForTabView(view);
+    if (!tabBar || !item) return;
+
+    NSArray<UITabBarItem *> *items = tabBar.items;
+    if (item == items.firstObject) {
+        ApolloCancelLiquidLensGesture(tabBar);
+        if (ApolloPresentPostsTabSubredditSheet(view.window)) {
+            UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+            [feedback impactOccurred];
+        }
+    } else if (items.count > 2 && item == items[2]) {
         ApolloCancelLiquidLensGesture(tabBar);
         OpenAccountManager(view.window);
     }
@@ -758,7 +728,7 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
 - (void)didMoveToWindow {
     %orig;
 
-    ApolloInstallAccountTabLongPress(self, &kApolloTabButtonSetupKey);
+    ApolloInstallTabShortcutLongPress(self, &kApolloTabButtonSetupKey);
 
     // Toggle 'highlighted' to trigger Liquid Glass tab bar to re-layout labels correctly
     BOOL wasHighlighted = self.highlighted;
@@ -768,7 +738,7 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
 
 %new
 - (void)apollo_tabButtonLongPressed:(UILongPressGestureRecognizer *)recognizer {
-    ApolloHandleAccountTabLongPress(self, recognizer);
+    ApolloHandleTabShortcutLongPress(self, recognizer);
 }
 
 
@@ -778,12 +748,12 @@ static void ApolloInsetLiquidGlassTabBadges(UIView *tabButton) {
 
 - (void)didMoveToWindow {
     %orig;
-    ApolloInstallAccountTabLongPress(self, &kApolloFloatingTabItemViewSetupKey);
+    ApolloInstallTabShortcutLongPress(self, &kApolloFloatingTabItemViewSetupKey);
 }
 
 %new
 - (void)apollo_tabButtonLongPressed:(UILongPressGestureRecognizer *)recognizer {
-    ApolloHandleAccountTabLongPress(self, recognizer);
+    ApolloHandleTabShortcutLongPress(self, recognizer);
 }
 
 
@@ -1682,12 +1652,7 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
         return;
     }
     UIView *jumpBar = ApolloFindJumpBar(self.titleControl);
-    if (!jumpBar && ApolloPaneUsesUnifiedChrome(self.titleControl)) {
-        [self.glassView removeFromSuperview];
-        self.glassView = nil;
-        self.observationValid = NO;
-        return;
-    }
+    BOOL plainPaneTitle = !jumpBar && ApolloPaneUsesUnifiedChrome(self.titleControl);
     UIView *hostView = jumpBar ?: self.titleControl;
 
     if (ApolloNavigationTitleContainsNativeSearchSurface(self.titleControl)) {
@@ -1724,7 +1689,14 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
     // observations only after recentering succeeds, so skipped work retries.
     BOOL recenterSettled = ApolloRecenterTitleControl(self);
     if (recenterSettled && jumpBar) ApolloLayoutJumpBarSearchContent(jumpBar);
-    [self updateGlassForHostView:hostView candidateViews:[self titleContentViews]];
+    if (plainPaneTitle) {
+        // A plain pane title still needs safe-area fitting; suppress only its
+        // decorative capsule, not the geometry work that keeps it visible.
+        [self.glassView removeFromSuperview];
+        self.glassView = nil;
+    } else {
+        [self updateGlassForHostView:hostView candidateViews:[self titleContentViews]];
+    }
     if (animateSearch && oldGlass && self.glassView == oldGlass &&
         !CGRectEqualToRect(oldBounds, oldGlass.bounds)) {
         // The host already keeps the capsule centered. Animate only its size;
@@ -1786,10 +1758,6 @@ BOOL ApolloNavigationTitleContainsNativeSearchSurface(UIView *view) {
         return;
     }
     UIView *jumpBar = ApolloFindJumpBar(titleControl);
-    if (!jumpBar && ApolloPaneUsesUnifiedChrome(titleControl)) {
-        if (self.glassView) [self scheduleTargetRefresh];
-        return;
-    }
     BOOL unchanged = self.observationValid &&
         (!self.glassView || (self.glassHostView && self.glassView.superview == self.glassHostView)) &&
         self.preservesNativeSearchLayout == ApolloNavigationTitleContainsNativeSearchSurface(titleControl) &&
@@ -2053,6 +2021,8 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     // Refit even an empty squeezed title, or the old width cap can persist.
     CGRect contentFrame = [controller contentFrameInView:bar];
     CGRect titleBand = [titleControl convertRect:titleControl.bounds toView:bar];
+    CGRect columnBounds = ApolloDuoSplitContentFrame(topVC, bar);
+    CGRect titleBounds = CGRectIsNull(columnBounds) ? bar.bounds : columnBounds;
 
     // Walk the bar's view tree to find the nearest visible content edges on
     // either side. Liquid Glass pills are _UINavigationBarPlatterView instances
@@ -2093,7 +2063,7 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     }
     CGRect collapsedActions = ApolloNavigationActionsCollapsedFrame(bar);
     if (!searchActions && !CGRectIsNull(collapsedActions)) {
-        if (CGRectGetMidX(collapsedActions) >= CGRectGetMidX(bar.bounds)) {
+        if (CGRectGetMidX(collapsedActions) >= CGRectGetMidX(titleBounds)) {
             rightLimit = MIN(rightLimit, CGRectGetMinX(collapsedActions));
         } else {
             leftLimit = MAX(leftLimit, CGRectGetMaxX(collapsedActions));
@@ -2137,7 +2107,7 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
             if (CGRectGetMaxY(sibInBar) <= CGRectGetMinY(titleBand) ||
                 CGRectGetMinY(sibInBar) >= CGRectGetMaxY(titleBand) ||
                 CGRectGetWidth(sibInBar) >= CGRectGetWidth(bar.bounds) - 1.0) continue;
-            if (CGRectGetMidX(sibInBar) < CGRectGetMidX(bar.bounds)) {
+            if (CGRectGetMidX(sibInBar) < CGRectGetMidX(titleBounds)) {
                 leftLimit = MAX(leftLimit, CGRectGetMaxX(sibInBar));
             } else {
                 if (!searchActions) rightLimit = MIN(rightLimit, CGRectGetMinX(sibInBar));
@@ -2147,11 +2117,16 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
 
     const CGFloat kEdgePadding = kApolloTitleButtonSpacing;
 
-    CGFloat capsulePadding = !searching &&
+    CGFloat capsulePadding = !searching && (jumpBar || !ApolloPaneUsesUnifiedChrome(bar)) &&
         ApolloResolvedScrollEdgeEffectStyle() != ApolloScrollEdgeEffectStyleHard
         ? kApolloTitleCapsuleHorizontalPadding : 0.0;
-    CGRect columnBounds = ApolloDuoSplitContentFrame(topVC, bar);
-    CGRect titleBounds = CGRectIsNull(columnBounds) ? bar.bounds : columnBounds;
+    // A pane's primary navigation bar can extend underneath UIKit's sidebar.
+    // Its physical midpoint is then inside the occluded region. Fit and center
+    // within the usable header unless Duo already supplied a narrower column.
+    if (CGRectIsNull(columnBounds) && ApolloPaneUsesUnifiedChrome(bar)) {
+        titleBounds.origin.x = leftLimit;
+        titleBounds.size.width = MAX(0.0, rightLimit - leftLimit);
+    }
     CGRect floatingTabs = ApolloIPadFloatingTabsFrame(bar, topVC);
     BOOL lowerIPadTitle = CGRectIsNull(columnBounds) && !CGRectIsNull(floatingTabs);
     // Short bars (e.g. Settings) have no search/large-title space beneath the
@@ -2246,7 +2221,7 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
         CGRect centered = CGRectOffset(contentFrame,
             geometry.center - CGRectGetMidX(contentFrame), 0);
         centered = CGRectInset(centered, -capsulePadding, 0);
-        targetCenter += ApolloNavigationTitleExpandedActionsOffset(bar.bounds,
+        targetCenter += ApolloNavigationTitleExpandedActionsOffset(titleBounds,
             centered, leftLimit, CGRectGetMinX(expandedActions), kEdgePadding);
     }
     CGFloat delta = targetCenter - CGRectGetMidX(contentFrame);

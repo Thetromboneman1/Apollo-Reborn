@@ -3921,7 +3921,6 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeySubredditLayoutPreviewPinned: @YES,
                                     UDKeyCommunityHighlights: @NO,
                                     UDKeyCommunityHighlightsWeb: @NO,
-                                    UDKeyAutoHideTabBarShowOnIdle: @YES,
                                     UDKeyClassicTabBarScrollBehavior: @NO,
                                     UDKeyHideTopBarOnScroll: @NO,
                                     UDKeyTabBarCollapseSide: @0,
@@ -3931,6 +3930,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeySettingsIconAppearance: @(ApolloSettingsIconAppearanceLight),
                                     UDKeyTabBarSwipeNavigation: @NO,
                                     UDKeyDuoLandscapeFeedLayout: @0,
+                                    UDKeyLiquidGlassEnabled: @YES,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyInfoRowTapUpvote: @YES,
                                     UDKeyInfoRowTapComments: @YES,
@@ -4233,13 +4233,6 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     sCommunityHighlightsWeb = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb];
     sClassicTabBarScrollBehavior = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyClassicTabBarScrollBehavior];
     sHideTopBarOnScroll = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyHideTopBarOnScroll];
-    if (ApolloSupportsNativeTabBarScrollBehavior() &&
-        ![standardDefaults boolForKey:UDKeyAutoHideTabBarShowOnIdle]) {
-        // Idle re-expansion is now bundled into both selectable scroll modes.
-        // Normalize older/restored independent-switch state on supported OSes.
-        [standardDefaults setBool:YES forKey:UDKeyAutoHideTabBarShowOnIdle];
-        ApolloLog(@"[AutoHideTabBarFix] Migrated scroll behavior to include idle re-expansion");
-    }
     NSInteger storedTabBarHideStyle =
         [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyTabBarCollapseSide];
     if (storedTabBarHideStyle < ApolloTabBarHideStyleLeft ||
@@ -4255,6 +4248,8 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     NSInteger settingsIconAppearance = [standardDefaults integerForKey:UDKeySettingsIconAppearance];
     sSettingsIconAppearance = settingsIconAppearance >= ApolloSettingsIconAppearanceSystem && settingsIconAppearance <= ApolloSettingsIconAppearanceDark
         ? (ApolloSettingsIconAppearance)settingsIconAppearance : ApolloSettingsIconAppearanceLight;
+    // sLiquidGlassEnabled was already latched in ApolloCommon +load. Do not
+    // reload it here: UIKit and early hook constructors use that launch choice.
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
     sDuoLandscapeFeedLayout = [standardDefaults integerForKey:UDKeyDuoLandscapeFeedLayout];
     // Value 1 belonged to the removed side-by-side experiment. Keep Focused

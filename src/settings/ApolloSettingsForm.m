@@ -284,6 +284,14 @@ static const void *kApolloSFDisplayStyledKey = &kApolloSFDisplayStyledKey;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+
+    UITapGestureRecognizer *tapGesture =
+        [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                action:@selector(dismissKeyboard)];
+    tapGesture.cancelsTouchesInView = NO;
+    tapGesture.delegate = self;
+    [self.view addGestureRecognizer:tapGesture];
     // Let standard cells grow for Dynamic Type and long localized labels.
     // Returning UITableViewAutomaticDimension from the delegate below keeps
     // explicit row.height blocks authoritative while avoiding 44pt clipping.
@@ -302,6 +310,20 @@ static const void *kApolloSFDisplayStyledKey = &kApolloSFDisplayStyledKey;
     _sectionGeometryNeedsUpdate = _lastSectionGeometry != nil;
     _lastSectionGeometry = geometry;
     [self apollo_sf_scheduleFooterHeightCheck];
+}
+
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    // Finish editing when the user scrolls, including on iPad.
+    [scrollView endEditing:YES];
+}
+
+- (void)dismissKeyboard {
+    [self.view endEditing:YES];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+        shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    return YES;
 }
 
 - (void)refreshFormAfterRowMove {
@@ -703,10 +725,12 @@ static void ApolloSFAddPath(NSMutableDictionary<NSNumber *, NSMutableArray<NSInd
             // Shared pool: reset what a sibling's configure block may have added
             // (e.g. Translation's "Add Language…" disclosure chevron).
             cell.accessoryType = UITableViewCellAccessoryNone;
-            // Match switch/disclosure rows: unavailable actions must look
-            // disabled too. Reset both values for this shared reuse pool.
-            cell.selectionStyle = enabled ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
+            // Reset appearance for reused cells when the action is disabled.
+            cell.selectionStyle = enabled
+                ? UITableViewCellSelectionStyleDefault
+                : UITableViewCellSelectionStyleNone;
             cell.textLabel.enabled = enabled;
+
             if (enabled) {
                 [self apollo_applyAccentActionTextColorToCell:cell];
             } else {

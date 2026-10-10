@@ -18,6 +18,7 @@
 #import "ApolloAccountCredentials.h"
 #import "ApolloAsyncDisplayGuard.h"
 #import "ApolloAutoHideTabBar.h"
+#import "ApolloTiledText.h"
 #import "ApolloChatRoomDirectory.h"
 #import "ApolloCommentVoteInsights.h"
 #import <AVFoundation/AVFoundation.h>
@@ -41,7 +42,10 @@
 #import "UIWindow+Apollo.h"
 #import "ipad/ApolloPaneSplitViewController.h"
 #import "ipad/ApolloPaneLayout.h"
+#import "ipad/ApolloIPadLayoutWelcome.h"
 #import "ipad/ApolloPaneSidebar.h"
+#import "ipad/ApolloPaneMenus.h"
+#import "ipad/ApolloPaneFocus.h"
 #import <mach-o/dyld.h>
 
 void ApolloSubredditIndexDebugDescribeTables(void); // ApolloSubredditIndexPolish.xm (sim-only)
@@ -2185,9 +2189,14 @@ static void ApolloSimDebugBitmapAssert(void) {
 // "displayguard W H [capMP]" command: synchronously display a throwaway
 // ASTextNode with W x H pt bounds through the same
 // _displayBlockWithAsynchronous: path the display queue uses, optionally
-// lowering ApolloAsyncDisplayGuard's pixel budget to capMP megapixels first
-// (restored afterwards), and log whether the guard skipped the display, caught
-// UIKit's assert, or the node rendered.
+// setting ApolloAsyncDisplayGuard's pixel budget to capMP megapixels first
+// (restored afterwards), and log whether the node rendered, went to tiles
+// (ApolloTiledText takes text over the budget) or rendered nothing (skipped,
+// or its bitmap failed). A node that rendered nothing is displayed once more
+// a moment later, with the same budget: after a failed bitmap it comes back
+// in tiles.
+static ASTextNode *sApolloSimDebugDisplayGuardNode;
+
 static void ApolloSimDebugDisplayGuardTest(NSString *payload) {
     NSMutableArray<NSString *> *numbers = [NSMutableArray array];
     for (NSString *part in [payload componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
@@ -2208,11 +2217,30 @@ static void ApolloSimDebugDisplayGuardTest(NSString *payload) {
               width, height, ApolloAsyncDisplayGuardMaxPixels() / 1e6);
     @try {
         [node displayImmediately];
-        ApolloLog(@"[SimDebugTap] displayguard: returned, contents %@", layer.contents ? @"set" : @"nil");
+        ApolloLog(@"[SimDebugTap] displayguard: returned, contents %@, tiled %@",
+                  layer.contents ? @"set" : @"nil", ApolloTiledTextNodeIsTiled(node) ? @"YES" : @"no");
     } @catch (NSException *exception) {
         ApolloLog(@"[SimDebugTap] displayguard: exception ESCAPED the guard, %@: %@", exception.name, exception.reason);
     }
-    ApolloAsyncDisplayGuardSetMaxPixelsForTesting(0);
+    if (layer.contents || ApolloTiledTextNodeIsTiled(node)) {
+        ApolloAsyncDisplayGuardSetMaxPixelsForTesting(0);
+        return;
+    }
+    // Rendered nothing: if the bitmap failed, the guard has queued the switch
+    // to tiles on the main queue. Display again after it, under the same budget.
+    sApolloSimDebugDisplayGuardNode = node;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ASTextNode *retried = sApolloSimDebugDisplayGuardNode;
+        sApolloSimDebugDisplayGuardNode = nil;
+        @try {
+            [retried displayImmediately];
+            ApolloLog(@"[SimDebugTap] displayguard: second display, contents %@, tiled %@",
+                      [retried layer].contents ? @"set" : @"nil", ApolloTiledTextNodeIsTiled(retried) ? @"YES" : @"no");
+        } @catch (NSException *exception) {
+            ApolloLog(@"[SimDebugTap] displayguard: exception ESCAPED the guard on the second display, %@: %@", exception.name, exception.reason);
+        }
+        ApolloAsyncDisplayGuardSetMaxPixelsForTesting(0);
+    });
 }
 
 static BOOL ApolloSimDebugHandleIntegratedMainCommand(NSString *contents) {
@@ -2667,6 +2695,64 @@ static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *
             NSString *mode = [[contents substringFromIndex:8] stringByTrimmingCharactersInSet:
                 NSCharacterSet.whitespaceAndNewlineCharacterSet];
             ApolloSimDebugNavChurn(mode);
+            return;
+        }
+        // Validate and dispatch the real pane actions through the responder
+        // chain. This fixture does not synthesize hardware keyboard events.
+        if ([contents hasPrefix:@"panemenu "]) {
+            ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+            NSString *name = [[contents substringFromIndex:9] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([name isEqualToString:@"check"]) {
+                NSMutableArray *states = [NSMutableArray array];
+                for (UIKeyCommand *command in ApolloPaneMenuKeyCommands()) {
+                    [states addObject:[NSString stringWithFormat:@"%@=%d", NSStringFromSelector(command.action),
+                        ApolloPaneMenuCanPerform(pane, command.action)]];
+                }
+                ApolloLog(@"[PaneMenuTest] tab=%ld focused=%@ %@", (long)pane.apollo_tabIndex,
+                    NSStringFromClass(ApolloPaneFocusedController(pane).class), [states componentsJoinedByString:@","]);
+            } else {
+                SEL action = NSSelectorFromString([NSString stringWithFormat:@"apollo_menu%@:", name]);
+                BOOL allowed = ApolloPaneMenuOwnsAction(action) && ApolloPaneMenuCanPerform(pane, action);
+                if (allowed) {
+                    [pane becomeFirstResponder];
+                    [UIApplication.sharedApplication sendAction:action to:nil from:nil forEvent:nil];
+                }
+                ApolloLog(@"[PaneMenuTest] %@ allowed=%d", name, allowed);
+            }
+            return;
+        }
+        // Exercise the real native badge setter without creating messages or
+        // changing account state. Restore the original presentation afterwards.
+        if ([contents hasPrefix:@"panebadge "]) {
+            static __weak UITabBarItem *originalItem;
+            static NSString *originalBadge;
+            static BOOL captured;
+            UITabBarController *tabs = (id)ApolloMainTabBarController();
+            NSArray *roots = ApolloPaneSidebarRootControllers(tabs);
+            if (roots.count <= 1 || ![roots[1] isKindOfClass:ApolloPaneSplitViewController.class]) return;
+            ApolloPaneSplitViewController *pane = roots[1];
+            UITabBarItem *item = [pane apollo_navigationControllerForColumn:ApolloPaneColumnPrimary].tabBarItem;
+            NSString *value = [[contents substringFromIndex:10] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([value isEqualToString:@"restore"]) {
+                if (captured) originalItem.badgeValue = originalBadge;
+                captured = NO; originalItem = nil; originalBadge = nil;
+            } else {
+                if (!captured) { originalItem = item; originalBadge = item.badgeValue; captured = YES; }
+                item.badgeValue = [value isEqualToString:@"none"] ? nil : value;
+            }
+            return;
+        }
+        // Reset just the invitation marker for cold-launch QA. The tester
+        // controls the real layout switch separately; no preferences/account
+        // reset or fake launch-time layout state is involved.
+        if ([contents isEqualToString:@"ipadwelcomereset"]) {
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:UDKeyIPadLayoutWelcomeSeen];
+            ApolloLog(@"[iPadWelcome] reset invitation marker for simulator QA");
+            return;
+        }
+        // Replay only: never clears first-run history or toggles the layout.
+        if ([contents isEqualToString:@"ipadwelcome"]) {
+            ApolloIPadLayoutWelcomePresentForDebug(nil);
             return;
         }
         // "openurl <url>" command: route a reddit / apollo:// URL through

@@ -71,6 +71,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAutoHideMetaFeeds.xm \
     $(SRC_DIR)/ApolloDevvitPosts.xm \
     $(SRC_DIR)/ApolloWhatsNew.xm \
+    $(SRC_DIR)/ApolloWhatsNewHalloween.m \
     $(WHATS_NEW_GEN_M) \
     $(SRC_DIR)/Tweak.xm \
     $(SRC_DIR)/ApolloRecommendedSettingsMigration.m \
@@ -181,6 +182,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSafariDarkLoading.xm \
     $(SRC_DIR)/ApolloMedia.xm \
     $(SRC_DIR)/ApolloAsyncDisplayGuard.xm \
+    $(SRC_DIR)/ApolloTiledText.m \
     $(SRC_DIR)/ApolloFeedGalleryCarousel.xm \
     $(SRC_DIR)/ApolloSwipeUpComments.xm \
     $(SRC_DIR)/ApolloMediaMetadata.m \
@@ -210,6 +212,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloInterruptibleNavTransition.xm \
     $(SRC_DIR)/ApolloSystemBackSwipeGuard.xm \
     $(SRC_DIR)/ApolloLiquidGlassIconPicker.xm \
+    $(SRC_DIR)/ApolloLiquidGlassSpotlight.m \
     $(SRC_DIR)/ApolloModmailLayout.xm \
     $(SRC_DIR)/ApolloModmailSubjectCounter.xm \
     $(SRC_DIR)/ApolloCrosspostTitle.xm \
@@ -222,12 +225,14 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloTabBarHideStyle.xm \
     $(SRC_DIR)/ApolloIPadTabBarBottom.xm \
     $(SRC_DIR)/ipad/ApolloPaneLayout.m \
+    $(SRC_DIR)/ipad/ApolloIPadLayoutWelcome.m \
     $(SRC_DIR)/ipad/ApolloPaneDiagnostics.m \
     $(SRC_DIR)/ipad/ApolloPaneGeometry.m \
     $(SRC_DIR)/ipad/ApolloPaneTransitionObserver.m \
     $(SRC_DIR)/ipad/ApolloPaneChrome.m \
     $(SRC_DIR)/ipad/ApolloPaneSidebar.m \
     $(SRC_DIR)/ipad/ApolloPaneFocus.m \
+    $(SRC_DIR)/ipad/ApolloPaneMenus.xm \
     $(SRC_DIR)/ipad/ApolloPaneContent.xm \
     $(SRC_DIR)/ipad/ApolloPaneColumnHostViewController.m \
     $(SRC_DIR)/ipad/ApolloPaneRouting.m \
@@ -236,6 +241,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ipad/ApolloPaneInstall.xm \
     $(SRC_DIR)/ipad/ApolloPaneEntryPoints.xm \
     $(SRC_DIR)/ipad/ApolloPaneRouter.xm \
+    $(SRC_DIR)/ipad/ApolloPaneGallery.m \
     $(SRC_DIR)/ApolloScrollEdgeEffect.xm \
     $(SRC_DIR)/ApolloProgressiveBlur.xm \
     $(SRC_DIR)/settings/ApolloSettings.xm \

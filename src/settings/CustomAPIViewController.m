@@ -83,6 +83,7 @@
 #import "PictureInPictureViewController.h"
 #import "TagFiltersViewController.h"
 #import "ipad/ApolloPaneLayout.h"
+#import "ipad/ApolloIPadLayoutWelcome.h"
 
 // The six speeds the "Hold for Video Speed" picker offers, in display order. They
 // mirror the video player's own speed menu minus 1.0× (holding at normal speed
@@ -262,9 +263,9 @@ static NSString *ApolloIPadPaneLayoutSettingDetail(void) {
     if (desired != active) {
         return desired
             ? @"Will turn on after Apollo quits and reopens. The current single-column layout remains active until then."
-            : @"Will turn off after Apollo quits and reopens. The current multi-column layout remains active until then.";
+            : @"Will turn off after Apollo quits and reopens. The current iPad Layout remains active until then.";
     }
-    return @"Experimental on iPadOS 18+ and iOS 27. Opens detail beside the list when space allows, and returns to one column in narrow windows. Apollo restarts to apply changes.";
+    return @"Beta on iPadOS 18 or newer. Keep favourites in the sidebar and read posts and comments side by side. You can switch back anytime. Reopen Apollo to apply changes.";
 }
 
 @interface ApolloFeedShortcutsPreviewState : NSObject
@@ -1064,7 +1065,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     [super viewDidLoad];
 
     self.title = [self apollo_screenTitle];
-    self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+
     if (![self apollo_isHub]) return;
     // What the first table load renders; viewWillAppear compares against it.
     self.setupFooterShowsKeyNudge = sRedditClientId.length == 0;
@@ -1437,9 +1438,20 @@ typedef NS_ENUM(NSInteger, Tag) {
     loginPersistenceDebug.iconSystemName = @"wrench.and.screwdriver.fill"; loginPersistenceDebug.iconTileColor = [UIColor systemGrayColor];
     whatsNewDebug.iconSystemName = @"sparkles"; whatsNewDebug.iconTileColor = [UIColor systemGrayColor];
 
+    ApolloSettingsRow *iPadWelcomeDebug =
+        [ApolloSettingsRow buttonRowWithID:@"adv.iPadWelcomeDebug"
+                                     title:@"Preview iPad Layout Welcome"
+                                    action:^{ ApolloIPadLayoutWelcomePresentForDebug(weakSelf); }];
+    iPadWelcomeDebug.visible = ^BOOL {
+        return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad &&
+            ApolloPaneLayoutSupported() && [NSUserDefaults.standardUserDefaults boolForKey:UDKeyEnableFLEX];
+    };
+    iPadWelcomeDebug.iconSystemName = @"ipad.landscape";
+    iPadWelcomeDebug.iconTileColor = UIColor.systemGrayColor;
+
     return [ApolloSettingsSection sectionWithTitle:@"Advanced"
                                             footer:@"Notification backend, developer tools and diagnostics."
-                                              rows:@[ backend, flex, exportLogs, loginPersistenceDebug, whatsNewDebug ]];
+                                              rows:@[ backend, flex, exportLogs, loginPersistenceDebug, whatsNewDebug, iPadWelcomeDebug ]];
 }
 
 - (ApolloSettingsSection *)buildDataSection {
@@ -1996,8 +2008,8 @@ typedef NS_ENUM(NSInteger, Tag) {
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             NSString *readPostMaxStr = sReadPostMaxCount > 0 ? [NSString stringWithFormat:@"%ld", (long)sReadPostMaxCount] : @"";
             return [weakSelf textFieldCellWithIdentifier:@"Cell_Gen_ReadMax"
-                                                   label:@"History Limit"
-                                              placeholder:@"Unlimited"
+                                                   label:@"Recently Read Posts Limit"
+                                             placeholder:@"Unlimited"
                                                     text:readPostMaxStr
                                                      tag:TagReadPostMaxCount
                                                numerical:YES]
@@ -2198,8 +2210,27 @@ typedef NS_ENUM(NSInteger, Tag) {
                                               rows:@[ floatingTabs, magnet, preview ]];
 }
 
-// Interface group screen (ApolloInterfaceSettingsViewController) — compact
-// tab-bar controls followed by global display/navigation options.
+// Interface group screen (ApolloInterfaceSettingsViewController) — appearance,
+// tab-bar controls, and global display/navigation options.
+- (ApolloSettingsSection *)buildInterfaceLiquidGlassSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *liquidGlass =
+        [ApolloSettingsRow switchRowWithID:@"interface.liquidGlassEnabled"
+                                     title:@"Liquid Glass"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyLiquidGlassEnabled]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf liquidGlassSwitchToggled:sender]; }];
+
+    ApolloSettingsSection *section =
+        [ApolloSettingsSection sectionWithTitle:@"Appearance"
+                                         footer:@"Turn off for the classic appearance. Requires a restart."
+                                           rows:@[ liquidGlass ]];
+    // This is a build capability, not the active appearance: keep the switch
+    // available after a relaunch into classic mode so glass can be re-enabled.
+    section.visible = ^BOOL { return ApolloLiquidGlassCanToggle(); };
+    return section;
+}
+
 - (ApolloSettingsSection *)buildInterfaceTabBarSection {
     __weak typeof(self) weakSelf = self;
 
@@ -2313,8 +2344,7 @@ typedef NS_ENUM(NSInteger, Tag) {
              ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled());
     };
 
-    // Both behavior choices include idle re-expansion. A single picker keeps
-    // the gesture models mutually exclusive and explicit.
+    // A single picker keeps the gesture models mutually exclusive and explicit.
     ApolloSettingsRow *tabBarScrollBehavior =
         [ApolloSettingsRow customRowWithID:@"interface.tabBarScrollBehavior"
                                       cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
@@ -2401,7 +2431,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         }];
     return [ApolloSettingsSection
         sectionWithTitle:@"Menus"
-        footer:@"Reorder and hide actions in the ••• menus on feeds, posts and comments, and in the moderator menus. Touching and holding a post or comment opens the same menu."
+        footer:@"Reorder or hide items in feed, post, comment, and moderator menus."
         rows:@[ actionMenus ]];
 }
 
@@ -2478,11 +2508,15 @@ typedef NS_ENUM(NSInteger, Tag) {
         [ApolloSettingsRow customRowWithID:@"gen.iPadPaneLayout"
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             UITableViewCell *cell = [weakSelf switchCellWithIdentifier:@"Cell_Gen_IPadPaneLayout"
-                                                                 label:@"Multi-Column Layout (Experimental)"
+                                                                 label:@"iPad Layout"
                                                                 detail:ApolloIPadPaneLayoutSettingDetail()
                                                                     on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout]
                                                                enabled:YES
                                                                 action:@selector(iPadPaneLayoutSwitchToggled:)];
+            UILabel *title = [cell.contentView viewWithTag:7001];
+            title.attributedText = ApolloIPadLayoutBetaTitle(title.font, weakSelf.traitCollection);
+            title.accessibilityLabel = @"iPad Layout, Beta";
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
             return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
         }
                                   onSelect:nil];
@@ -3738,17 +3772,31 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         textField.returnKeyType = UIReturnKeyDone;
         if (numerical) {
             textField.keyboardType = UIKeyboardTypeNumberPad;
+
+            if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone) {
+                UIToolbar *toolbar = [[UIToolbar alloc] init];
+                [toolbar sizeToFit];
+
+                UIBarButtonItem *flexibleSpace =
+                    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
+                                                                target:nil
+                                                                action:nil];
+
+                UIBarButtonItem *done =
+                    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                                target:textField
+                                                                action:@selector(resignFirstResponder)];
+
+                toolbar.items = @[flexibleSpace, done];
+                textField.inputAccessoryView = toolbar;
+            }
         }
 
-        CGFloat placeholderWidth = ceil([placeholder sizeWithAttributes:@{
-            NSFontAttributeName: textField.font
-        }].width);
-        CGFloat digitsWidth = ceil([@"99999" sizeWithAttributes:@{
-            NSFontAttributeName: textField.font
-        }].width);
-        CGFloat valueWidth = MAX(placeholderWidth, digitsWidth) + 24.0;
-
-        [textField.widthAnchor constraintEqualToConstant:valueWidth].active = YES;
+        NSLayoutConstraint *widthConstraint =
+            [textField.widthAnchor constraintEqualToConstant:0];
+        widthConstraint.active = YES;
+        objc_setAssociatedObject(textField, @selector(widthAnchor),
+                                 widthConstraint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         textField.translatesAutoresizingMaskIntoConstraints = NO;
         [cell.contentView addSubview:titleLabel];
@@ -3777,6 +3825,21 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     textField.text = text;
     textField.placeholder = placeholder;
     textField.accessibilityLabel = label;
+
+    UIFont *valueFont = ApolloSettingsFont(UIFontTextStyleCallout, self.traitCollection);
+    CGFloat placeholderWidth = ceil([placeholder sizeWithAttributes:@{
+        NSFontAttributeName: valueFont
+    }].width);
+    CGFloat digitsWidth = ceil([@"99999" sizeWithAttributes:@{
+        NSFontAttributeName: valueFont
+    }].width);
+    CGFloat valueWidth = MAX(placeholderWidth, digitsWidth) + 16.0;
+
+    NSLayoutConstraint *widthConstraint =
+        objc_getAssociatedObject(textField, @selector(widthAnchor));
+    NSCAssert(widthConstraint != nil, @"Missing numeric field width constraint");
+    widthConstraint.constant = valueWidth;
+
     [self apollo_applyPrimaryTextColorToCell:cell];
 
     return cell;
@@ -4635,7 +4698,10 @@ replacementString:(NSString *)string {
     if (textField.tag == TagReadPostMaxCount || textField.tag == TagTrendingLimit) {
         NSString *updated = [textField.text stringByReplacingCharactersInRange:range
                                                                     withString:string];
-        return updated.length <= 5;
+        NSCharacterSet *nonDigits =
+            [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+        return updated.length <= 5 &&
+               [updated rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
     }
 
     return YES;
@@ -5013,14 +5079,9 @@ replacementString:(NSString *)string {
     if (!ApolloSupportsNativeTabBarScrollBehavior() ||
         ![self apollo_nativeHideBarsOnScrollEnabled]) return;
 
-    // Idle re-expansion is shared by both selectable modes. Keep the legacy
-    // boolean enabled for existing preferences/backups; the classic flag now
-    // selects the gesture model presented by the single row.
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    BOOL behaviorChanged = ![defaults boolForKey:UDKeyAutoHideTabBarShowOnIdle] ||
-        sClassicTabBarScrollBehavior != classic;
+    BOOL behaviorChanged = sClassicTabBarScrollBehavior != classic;
     sClassicTabBarScrollBehavior = classic;
-    [defaults setBool:YES forKey:UDKeyAutoHideTabBarShowOnIdle];
     [defaults setBool:classic forKey:UDKeyClassicTabBarScrollBehavior];
     if (behaviorChanged) {
         [[NSNotificationCenter defaultCenter] postNotificationName:ApolloTabBarScrollBehaviorChangedNotification object:nil];
@@ -5034,13 +5095,15 @@ replacementString:(NSString *)string {
 - (void)iPadPaneLayoutSwitchToggled:(UISwitch *)sender {
     BOOL on = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:UDKeyIPadPaneLayout];
+    [NSUserDefaults.standardUserDefaults setBool:YES forKey:UDKeyIPadLayoutWelcomeSeen];
+    // Dependent rows describe the hierarchy that is active in THIS process,
+    // while this switch and its pending subtitle describe the saved choice.
     [self visibilityDidChange];
     [self reloadRowWithID:@"gen.iPadPaneLayout"];
-
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Restart to Apply"
                          message:on
-            ? @"The multi-column layout is set up when Apollo launches, so it needs to quit and reopen to take effect."
+            ? @"iPad Layout is set up when Apollo launches, so it needs to quit and reopen to take effect."
             : @"Apollo needs to quit and reopen to return to the single-column layout."
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Quit Apollo"
@@ -5054,20 +5117,40 @@ replacementString:(NSString *)string {
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-// Takes effect on next relaunch — see ApolloLiquidGlass.xm.
-- (void)tabBarSwipeNavigationSwitchToggled:(UISwitch *)sender {
-    sTabBarSwipeNavigation = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sTabBarSwipeNavigation forKey:UDKeyTabBarSwipeNavigation];
-
+- (void)apollo_presentRestartRequiredAlertAllowingLater:(BOOL)allowLater {
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Restart Required"
                          message:@"Quit and reopen Apollo for this change to take effect."
                   preferredStyle:UIAlertControllerStyleAlert];
+    // A Liquid Glass change must be followed by a relaunch. With no cancel
+    // action, UIKit also keeps this alert up for outside taps or escape gestures.
+    alert.modalInPresentation = !allowLater;
     [alert addAction:[UIAlertAction actionWithTitle:@"Quit & Reopen"
                                               style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) { exit(0); }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+                                            handler:^(UIAlertAction *a) {
+        // exit(0) bypasses the normal lifecycle; flush the pending setting
+        // before quitting so the next launch reads the selected appearance.
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        exit(0);
+    }]];
+    if (allowLater) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+    }
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)liquidGlassSwitchToggled:(UISwitch *)sender {
+    // The current launch keeps its original appearance and hook selection.
+    // Only startup consumes this preference; do not refresh row visibility.
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyLiquidGlassEnabled];
+    [self apollo_presentRestartRequiredAlertAllowingLater:NO];
+}
+
+// Takes effect on next relaunch — see ApolloLiquidGlass.xm.
+- (void)tabBarSwipeNavigationSwitchToggled:(UISwitch *)sender {
+    sTabBarSwipeNavigation = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sTabBarSwipeNavigation forKey:UDKeyTabBarSwipeNavigation];
+    [self apollo_presentRestartRequiredAlertAllowingLater:YES];
 }
 
 - (void)proxyImgurDDGSwitchToggled:(UISwitch *)sender {
@@ -5914,6 +5997,7 @@ replacementString:(NSString *)string {
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildInterfaceTabBarSection],
               [self buildInterfaceDisplayNavigationSection],
+              [self buildInterfaceLiquidGlassSection],
               [self buildInterfaceMenusSection] ];
 }
 @end
