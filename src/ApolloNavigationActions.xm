@@ -1468,7 +1468,8 @@ static NSArray<UIBarButtonItem *> *ApolloActionsInboxItems(UINavigationItem *ite
         NSString *editingControllerClass = NSStringFromClass(controllerBox.controller.class);
         BOOL blueDone = duoSubredditsDone || (controllerBox.controller.isEditing &&
             ([editingControllerClass isEqualToString:@"Apollo.RedditListViewController"] ||
-             [editingControllerClass isEqualToString:@"ApolloSettingsShortcutsViewController"]));
+             [editingControllerClass isEqualToString:@"ApolloSettingsShortcutsViewController"] ||
+             [editingControllerClass isEqualToString:@"Apollo.SettingsFiltersViewController"]));
         objc_setAssociatedObject(item, &kActionsBlueDoneKey, @(blueDone), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         BOOL accentSubmit = ApolloActionsUsesAccentSubmitStyle(item);
         if (accentSubmit && !objc_getAssociatedObject(item, &kActionsAccentSubmitKey)) {
