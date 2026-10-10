@@ -19,6 +19,18 @@ static void Require(BOOL condition, NSString *message) {
 static NSArray<NSString *> *sIconIDs;
 static NSArray<NSNumber *> *sGroupIndexes;
 static NSDictionary<NSString *, NSNumber *> *sGroupForIconID;
+// Holiday-only (Standard-pack) icons -> their own pack index, as the picker
+// builds it: kLGIconGroupCount + LGStandardPack (originals 0, community 1,
+// ultra 2, sekrit 3).
+static NSDictionary<NSString *, NSNumber *> *sStandardGroups;
+
+static NSInteger StandardPackIndex(const char *name) {
+    if (strcmp(name, "originals") == 0) return 0;
+    if (strcmp(name, "community") == 0) return 1;
+    if (strcmp(name, "ultra") == 0) return 2;
+    if (strcmp(name, "sekrit") == 0) return 3;
+    return -1;
+}
 
 static void LoadRegistry(void) {
     NSMutableArray<NSString *> *iconIDs = [NSMutableArray array];
@@ -32,8 +44,19 @@ static void LoadRegistry(void) {
             groupForIconID[iconID] = @(gi);
         }
     }
+    NSMutableDictionary<NSString *, NSNumber *> *standardGroups = [NSMutableDictionary dictionary];
+    for (size_t i = 0; i < kLGNativeIconCount; i++) {
+        NSInteger pack = StandardPackIndex(kLGNativeIcons[i].standardPack);
+        Require(pack >= 0, @"native icons name a known Standard pack");
+        standardGroups[@(kLGNativeIcons[i].iconID)] = @((NSInteger)kLGIconGroupCount + pack);
+    }
+    for (size_t i = 0; i < kLGStandardPackEntries_ultraCount; i++) {
+        standardGroups[@(kLGStandardPackEntries_ultra[i].iconID)] = @((NSInteger)kLGIconGroupCount + 2);
+    }
     sIconIDs = iconIDs;
     sGroupIndexes = groupIndexes;
+    sStandardGroups = standardGroups;
+    [groupForIconID addEntriesFromDictionary:standardGroups];
     sGroupForIconID = groupForIconID;
 }
 
@@ -158,6 +181,18 @@ static const LGSeasonDef *SeasonForDate(TestDate date, NSInteger *daysUntilEnd) 
     return NULL;
 }
 
+// The made-for icons of every season except `season` (the picker's
+// everyday-pick exclusion while a holiday is on).
+static NSSet<NSString *> *OtherHolidayIcons(const LGSeasonDef *season) {
+    NSMutableSet<NSString *> *result = [NSMutableSet set];
+    if (!season) return result;
+    for (size_t i = 0; i < kLGSeasonCount; i++) {
+        if (&kLGSeasons[i] == season) continue;
+        [result addObjectsFromArray:Strings(kLGSeasons[i].iconIDs, kLGSeasons[i].iconIDCount)];
+    }
+    return result;
+}
+
 static NSArray<NSString *> *LineupForDate(TestDate date, NSArray<NSString *> *previous,
                                           NSString *activeIconID, const LGSeasonDef **outSeason,
                                           NSInteger *outSlots) {
@@ -167,12 +202,12 @@ static NSArray<NSString *> *LineupForDate(TestDate date, NSArray<NSString *> *pr
         ? @[ Strings(season->iconIDs, season->iconIDCount),
              Strings(season->colorMatchIconIDs, season->colorMatchIconIDCount) ]
         : @[];
-    NSInteger slots = ApolloLGSeasonalSlotCount(daysUntilEnd);
+    NSInteger slots = ApolloLGSeasonalSlotCount(daysUntilEnd, kLineupCount);
     if (outSeason) *outSeason = season;
     if (outSlots) *outSlots = slots;
     return ApolloLGSpotlightLineup(sIconIDs, sGroupIndexes, (NSInteger)kLGIconGroupCount,
                                    kLineupCount, DayIdentifier(date), previous, activeIconID,
-                                   tiers, slots);
+                                   tiers, sStandardGroups, OtherHolidayIcons(season), slots);
 }
 
 #pragma mark - Tests
@@ -187,14 +222,16 @@ static void TestWindowArithmetic(void) {
     Require(ApolloLGSeasonDaysUntilEnd(2028, 2, 28, 2, 20, 3, 10) == 11, @"counts Feb 29 in a leap year");
     Require(ApolloLGSeasonDaysUntilEnd(2027, 2, 28, 2, 20, 3, 10) == 10, @"no Feb 29 in a common year");
 
-    Require(ApolloLGSeasonalSlotCount(NSNotFound) == 0, @"no slots outside a window");
-    Require(ApolloLGSeasonalSlotCount(-1) == 0, @"no slots after the end");
-    Require(ApolloLGSeasonalSlotCount(30) == 1, @"one slot a month out");
-    Require(ApolloLGSeasonalSlotCount(14) == 1, @"one slot two weeks out");
-    Require(ApolloLGSeasonalSlotCount(13) == 2, @"two slots in the second-to-last week");
-    Require(ApolloLGSeasonalSlotCount(7) == 2, @"two slots a week out");
-    Require(ApolloLGSeasonalSlotCount(6) == 3, @"three slots in the final week");
-    Require(ApolloLGSeasonalSlotCount(0) == 3, @"three slots on the holiday");
+    Require(ApolloLGSeasonalSlotCount(NSNotFound, 5) == 0, @"no slots outside a window");
+    Require(ApolloLGSeasonalSlotCount(-1, 5) == 0, @"no slots after the end");
+    Require(ApolloLGSeasonalSlotCount(30, 5) == 2, @"two slots a month out");
+    Require(ApolloLGSeasonalSlotCount(14, 5) == 2, @"two slots two weeks out");
+    Require(ApolloLGSeasonalSlotCount(13, 5) == 3, @"three slots in the second-to-last week");
+    Require(ApolloLGSeasonalSlotCount(7, 5) == 3, @"three slots a week out");
+    Require(ApolloLGSeasonalSlotCount(6, 5) == 5, @"every slot in the final week");
+    Require(ApolloLGSeasonalSlotCount(0, 5) == 5, @"every slot on the holiday");
+    Require(ApolloLGSeasonalSlotCount(0, 2) == 2 && ApolloLGSeasonalSlotCount(30, 1) == 1,
+            @"never more slots than the lineup has");
 }
 
 // Off-season days must keep producing exactly the pre-seasons lineups.
@@ -207,10 +244,13 @@ static void TestMatchesLegacyWithoutSeason(void) {
         NSMutableSet<NSString *> *excluded = [NSMutableSet setWithArray:previous];
         if (active) [excluded addObject:active];
         NSArray<NSString *> *legacy = LegacyLineup(DayIdentifier(date), excluded);
+        // The holiday-only icons are passed too: without a season they must
+        // not change a thing.
         NSArray<NSString *> *current = ApolloLGSpotlightLineup(sIconIDs, sGroupIndexes,
                                                                (NSInteger)kLGIconGroupCount,
                                                                kLineupCount, DayIdentifier(date),
-                                                               previous, active, @[], 0);
+                                                               previous, active, @[], sStandardGroups,
+                                                               [NSSet set], 0);
         Require([legacy isEqualToArray:current],
                 [NSString stringWithFormat:@"%ld: %@ != legacy %@", (long)DayIdentifier(date),
                                            current, legacy]);
@@ -240,7 +280,6 @@ static void TestTwoYearsOfLineups(void) {
             Require(sGroupForIconID[iconID] != nil, [where stringByAppendingString:@" uses registered icons"]);
             [groups addIndex:sGroupForIconID[iconID].unsignedIntegerValue];
         }
-        Require(groups.count >= MIN(3, kLGIconGroupCount), [where stringByAppendingString:@" spans 3 packs"]);
 
         NSArray<NSString *> *made = season ? Strings(season->iconIDs, season->iconIDCount) : @[];
         NSArray<NSString *> *matches = season
@@ -265,6 +304,15 @@ static void TestTwoYearsOfLineups(void) {
             leading++;
         }
         Require(leading == expectedSeasonal, [where stringByAppendingString:@" fills its seasonal slots"]);
+        // Three packs when there is room: holiday picks count with their packs,
+        // and each everyday slot can add one more.
+        NSMutableIndexSet *holidayGroups = [NSMutableIndexSet indexSet];
+        for (NSString *iconID in [lineup subarrayWithRange:NSMakeRange(0, (NSUInteger)leading)]) {
+            [holidayGroups addIndex:sGroupForIconID[iconID].unsignedIntegerValue];
+        }
+        NSInteger roomForPacks = (NSInteger)holidayGroups.count + (kLineupCount - leading);
+        Require((NSInteger)groups.count >= MIN(MIN(3, (NSInteger)kLGIconGroupCount), roomForPacks),
+                [where stringByAppendingString:@" spans as many packs as it has room for, up to 3"]);
         NSInteger madeAvailable = 0;
         for (NSString *iconID in made) madeAvailable += [iconID isEqualToString:active] ? 0 : 1;
         NSInteger madeShown = 0;
@@ -274,10 +322,15 @@ static void TestTwoYearsOfLineups(void) {
         Require(madeShown == MIN(madeAvailable, expectedSeasonal),
                 [where stringByAppendingString:@" uses every made-for icon before color matches"]);
 
-        // Everything after the seasonal picks still rotates daily.
+        // Everything after the seasonal picks still rotates daily, and never
+        // includes a holiday-only (Standard-pack) icon.
         for (NSString *iconID in [lineup subarrayWithRange:NSMakeRange((NSUInteger)leading,
                                                                        lineup.count - (NSUInteger)leading)]) {
             Require(![previous containsObject:iconID], [where stringByAppendingString:@" rotates the rest"]);
+            Require(sStandardGroups[iconID] == nil,
+                    [where stringByAppendingString:@" keeps Standard-pack icons to holiday picks"]);
+            Require(![OtherHolidayIcons(season) containsObject:iconID],
+                    [where stringByAppendingString:@" keeps other holidays' icons out of the everyday picks"]);
         }
 
         Require([lineup isEqualToArray:LineupForDate(date, previous, active, NULL, NULL)],
@@ -287,48 +340,90 @@ static void TestTwoYearsOfLineups(void) {
     Require(seasonalDays > 0, @"the registry has at least one season");
 }
 
-// Halloween's final week shows both Halloween icons every day, plus one
-// orange/black color match.
+// Halloween's final week is all Halloween: five of its eight icons a day, the
+// ones not shown yesterday always among them.
 static void TestHalloweenFinalWeek(void) {
+    const LGSeasonDef *halloween = NULL;
+    for (size_t i = 0; i < kLGSeasonCount; i++) {
+        if (strcmp(kLGSeasons[i].seasonID, "halloween") == 0) halloween = &kLGSeasons[i];
+    }
+    Require(halloween != NULL, @"icons.json has a Halloween season");
+    NSArray<NSString *> *made = Strings(halloween->iconIDs, halloween->iconIDCount);
+    Require([made containsObject:@"witching-hour"] && [made containsObject:@"jackopollo"],
+            @"Halloween lists Liquid Glass and Apollo icons");
+
     NSArray<NSString *> *previous = @[];
     TestDate date = { 2026, 10, 25 };
     for (NSInteger i = 0; i < 7; i++, date = NextDay(date)) {
-        const LGSeasonDef *season = NULL;
-        NSArray<NSString *> *lineup = LineupForDate(date, previous, nil, &season, NULL);
-        Require(season && strcmp(season->seasonID, "halloween") == 0, @"late October is Halloween");
-        NSSet<NSString *> *lead = [NSSet setWithArray:[lineup subarrayWithRange:NSMakeRange(0, 2)]];
-        Require([lead isEqualToSet:[NSSet setWithArray:@[ @"witching-hour", @"helios-count" ]]],
-                [NSString stringWithFormat:@"Oct %ld leads with both Halloween icons: %@",
-                                           (long)date.day, lineup]);
-        Require([@[ @"LG-andru", @"LG-burnt-orange" ] containsObject:lineup[2]],
-                [NSString stringWithFormat:@"Oct %ld adds a color match: %@", (long)date.day, lineup]);
+        NSArray<NSString *> *lineup = LineupForDate(date, previous, nil, NULL, NULL);
+        for (NSString *iconID in lineup) {
+            Require([made containsObject:iconID],
+                    [NSString stringWithFormat:@"Oct %ld is all Halloween: %@", (long)date.day, lineup]);
+        }
+        // Fresh (not shown yesterday) icons go first: all of them when they
+        // fit, otherwise every card is a fresh one.
+        NSMutableArray<NSString *> *fresh = [NSMutableArray array];
+        for (NSString *iconID in made) if (![previous containsObject:iconID]) [fresh addObject:iconID];
+        for (NSString *iconID in fresh.count <= (NSUInteger)kLineupCount ? fresh : lineup) {
+            Require([lineup containsObject:iconID] && [fresh containsObject:iconID],
+                    [NSString stringWithFormat:@"Oct %ld puts fresh icons first (%@): %@", (long)date.day, iconID, lineup]);
+        }
         previous = lineup;
     }
 
-    // With Witching Hour already active, Count Helios and both color matches lead.
-    TestDate halloween = { 2026, 10, 31 };
-    NSArray<NSString *> *lineup = LineupForDate(halloween, @[], @"witching-hour", NULL, NULL);
-    Require([lineup[0] isEqualToString:@"helios-count"], @"remaining Halloween icon leads");
-    Require([[NSSet setWithArray:[lineup subarrayWithRange:NSMakeRange(1, 2)]]
-                isEqualToSet:[NSSet setWithArray:@[ @"LG-andru", @"LG-burnt-orange" ]]],
-            @"color matches fill the active icon's slot");
+    // The active icon is never featured, Standard-pack choices included.
+    TestDate day = { 2026, 10, 31 };
+    for (NSString *active in @[ @"witching-hour", @"jackopollo", @"poe-the-space-ghost" ]) {
+        NSArray<NSString *> *lineup = LineupForDate(day, @[], active, NULL, NULL);
+        Require(![lineup containsObject:active], [NSString stringWithFormat:@"skips active %@", active]);
+        for (NSString *iconID in lineup) {
+            Require([made containsObject:iconID], @"still all Halloween");
+        }
+    }
 }
 
-// With one slot, early October alternates between the two Halloween icons
-// instead of repeating yesterday's.
+// Christmas is all Ultra icons. The final week shows five of its seven each day,
+// even though that leaves the lineup in one pack.
+static void TestChristmasWeek(void) {
+    NSArray<NSString *> *previous = @[];
+    TestDate date = { 2026, 12, 19 };
+    for (NSInteger i = 0; i < 7; i++, date = NextDay(date)) {
+        const LGSeasonDef *season = NULL;
+        NSInteger slots = 0;
+        NSArray<NSString *> *lineup = LineupForDate(date, previous, nil, &season, &slots);
+        Require(season && strcmp(season->seasonID, "christmas") == 0 && slots == kLineupCount,
+                [NSString stringWithFormat:@"Dec %ld is Christmas week", (long)date.day]);
+        NSArray<NSString *> *made = Strings(season->iconIDs, season->iconIDCount);
+        Require(made.count == 7 && ![made containsObject:@"LG-calico"], @"Christmas is the seven Christmas icons");
+        Require(lineup.count == (NSUInteger)kLineupCount,
+                [NSString stringWithFormat:@"Dec %ld still has five cards: %@", (long)date.day, lineup]);
+        for (NSString *iconID in lineup) {
+            Require([made containsObject:iconID],
+                    [NSString stringWithFormat:@"Dec %ld is all Christmas: %@", (long)date.day, lineup]);
+        }
+        previous = lineup;
+    }
+}
+
+// Early in the window two cards are Halloween, and with eight icons to rotate
+// through they never repeat yesterday's.
 static void TestSingleSlotRotates(void) {
     NSArray<NSString *> *previous = @[];
-    NSString *yesterdayPick = nil;
+    NSArray<NSString *> *yesterdayPicks = @[];
     TestDate date = { 2026, 10, 1 };
     for (NSInteger i = 0; i < 17; i++, date = NextDay(date)) {
         NSInteger slots = 0;
-        NSArray<NSString *> *lineup = LineupForDate(date, previous, nil, NULL, &slots);
-        Require(slots == 1, [NSString stringWithFormat:@"Oct %ld has one seasonal slot", (long)date.day]);
-        Require([@[ @"witching-hour", @"helios-count" ] containsObject:lineup[0]],
-                [NSString stringWithFormat:@"Oct %ld leads with a Halloween icon: %@", (long)date.day, lineup]);
-        Require(![lineup[0] isEqualToString:yesterdayPick],
-                [NSString stringWithFormat:@"Oct %ld rotates its Halloween icon: %@", (long)date.day, lineup]);
-        yesterdayPick = lineup[0];
+        const LGSeasonDef *season = NULL;
+        NSArray<NSString *> *lineup = LineupForDate(date, previous, nil, &season, &slots);
+        Require(slots == 2, [NSString stringWithFormat:@"Oct %ld has two seasonal slots", (long)date.day]);
+        NSArray<NSString *> *picks = [lineup subarrayWithRange:NSMakeRange(0, 2)];
+        for (NSString *iconID in picks) {
+            Require([Strings(season->iconIDs, season->iconIDCount) containsObject:iconID],
+                    [NSString stringWithFormat:@"Oct %ld leads with Halloween icons: %@", (long)date.day, lineup]);
+            Require(![yesterdayPicks containsObject:iconID],
+                    [NSString stringWithFormat:@"Oct %ld rotates its Halloween icons: %@", (long)date.day, lineup]);
+        }
+        yesterdayPicks = picks;
         previous = lineup;
     }
 }
@@ -338,6 +433,7 @@ static void PrintCalendar(void) {
         { 2026, 9, 30 }, { 2026, 10, 1 }, { 2026, 10, 9 }, { 2026, 10, 20 }, { 2026, 10, 31 },
         { 2026, 11, 15 }, { 2026, 12, 1 }, { 2026, 12, 15 }, { 2026, 12, 24 },
         { 2027, 2, 10 }, { 2027, 3, 17 }, { 2027, 5, 4 }, { 2027, 6, 5 }, { 2027, 6, 28 }, { 2027, 7, 1 },
+        { 2027, 7, 4 },
     };
     for (size_t i = 0; i < sizeof(kDates) / sizeof(kDates[0]); i++) {
         const LGSeasonDef *season = NULL;
@@ -356,6 +452,7 @@ int main(int argc, const char *argv[]) {
         TestMatchesLegacyWithoutSeason();
         TestTwoYearsOfLineups();
         TestHalloweenFinalWeek();
+        TestChristmasWeek();
         TestSingleSlotRotates();
         if (argc > 1 && strcmp(argv[1], "--calendar") == 0) PrintCalendar();
         NSLog(@"liquid_glass_spotlight_tests passed");
