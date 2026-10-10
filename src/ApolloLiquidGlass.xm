@@ -252,53 +252,6 @@ static UITabBar *ApolloTabBarForTabObject(id tabObject) {
     return nil;
 }
 
-static BOOL ApolloIsProfileTabView(UIView *view) {
-    NSString *accessibilityName = [(view.accessibilityLabel.lowercaseString ?: @"")
-        stringByAppendingFormat:@" %@", view.accessibilityIdentifier.lowercaseString ?: @""];
-    if ([accessibilityName containsString:@"account"]
-        || [accessibilityName containsString:@"profile"]) {
-        return YES;
-    }
-
-    UITabBar *tabBar = FindAncestorTabBar(view);
-    UITabBarItem *item = ApolloTabBarItemForButtonInTabBar(view, tabBar);
-    if (!item) {
-        item = ApolloTabBarItemForTabView(view);
-    }
-    if (!tabBar) {
-        id tabObject = ApolloSendObjectReturningSelector(view, @selector(item));
-        tabBar = ApolloTabBarForTabObject(tabObject);
-    }
-    if (!tabBar || !item) {
-        // iOS 27's trailing floating rail owns two visual copies of each
-        // _UITabButton. Those copies are not always reachable through the
-        // UITabBarItem private view pointers, but each parent still contains
-        // the five buttons in vertical tab order. Keep this fallback scoped to
-        // that vertical geometry so ordinary iPhones retain the native path.
-        NSMutableArray<UIView *> *siblings = [NSMutableArray array];
-        for (UIView *candidate in view.superview.subviews) {
-            if ([candidate isKindOfClass:view.class] && !candidate.hidden
-                && CGRectGetHeight(candidate.bounds) > CGRectGetWidth(candidate.bounds)) {
-                [siblings addObject:candidate];
-            }
-        }
-        if (siblings.count >= 5) {
-            [siblings sortUsingComparator:^NSComparisonResult(UIView *left, UIView *right) {
-                CGFloat leftY = CGRectGetMidY(left.frame);
-                CGFloat rightY = CGRectGetMidY(right.frame);
-                if (leftY < rightY) return NSOrderedAscending;
-                if (leftY > rightY) return NSOrderedDescending;
-                return NSOrderedSame;
-            }];
-            return [siblings indexOfObjectIdenticalTo:view] == 2;
-        }
-        return NO;
-    }
-
-    NSArray<UITabBarItem *> *items = tabBar.items;
-    return items.count > 2 && items[2] == item;
-}
-
 static UITabBar *ApolloTabBarForTabView(UIView *view) {
     UITabBar *tabBar = FindAncestorTabBar(view);
     if (!tabBar) {
