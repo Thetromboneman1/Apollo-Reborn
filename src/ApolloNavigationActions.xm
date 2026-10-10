@@ -18,6 +18,17 @@ extern NSArray<UIBarButtonItem *> *ApolloDuoCommentsLayoutItems(UINavigationItem
 
 // Use the pill's spring for glyphs without changing button frames,
 // which translation measures when inserting its globe.
+// UIBarButtonItem.hidden is iOS 16 / macCatalyst 16 API. The explicit
+// macCatalyst clause keeps the Mac build (macCatalyst 15 floor) from sending
+// a selector macOS 12 does not implement; iOS 16+ behaviour is unchanged.
+static inline BOOL ApolloActionsBarItemHidden(UIBarButtonItem *item) {
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) return item.hidden;
+    return NO;
+}
+static inline void ApolloActionsSetBarItemHidden(UIBarButtonItem *item, BOOL hidden) {
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) item.hidden = hidden;
+}
+
 static const NSTimeInterval kActionsAnimationDuration = 0.36;
 static CASpringAnimation *ApolloActionsSpring(NSString *keyPath) {
     CASpringAnimation *spring = [CASpringAnimation animationWithKeyPath:keyPath];
@@ -63,12 +74,12 @@ static void ApolloActionsResetBeforeNavigation(UIViewController *controller);
 // The customization is glass-only, but public refresh helpers can still be
 // called on the iOS 14 deployment floor. Keep newer item state access guarded.
 static BOOL ApolloActionsItemHidden(UIBarButtonItem *item) {
-    if (@available(iOS 16.0, *)) return item.hidden;
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) return item.hidden;
     return NO;
 }
 
 static void ApolloActionsSetItemHidden(UIBarButtonItem *item, BOOL hidden) {
-    if (@available(iOS 16.0, *)) item.hidden = hidden;
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) item.hidden = hidden;
 }
 
 // The post composer's Post and Done buttons keep Done's prominent style, whose
