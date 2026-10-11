@@ -21,6 +21,7 @@ concurrency:
 env:
   UPSTREAM_REPOSITORY: Apollo-Reborn/Apollo-Reborn
   DOWNSTREAM_BRANCH: main
+  REPOSITORY_DEFAULT_BRANCH: main
 
 jobs:
   prepare:
@@ -30,6 +31,8 @@ jobs:
     timeout-minutes: 30
     outputs:
       branch: ${{ steps.result.outputs.branch }}
+      assembled_head: ${{ steps.result.outputs.assembled_head }}
+      trusted_sha: ${{ steps.tooling.outputs.sha }}
       changed: ${{ steps.result.outputs.changed }}
       complete: ${{ steps.result.outputs.complete }}
       fingerprint: ${{ steps.result.outputs.fingerprint }}
@@ -54,7 +57,10 @@ jobs:
           token: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
 
       - name: Freeze trusted batch tooling
-        run: cp scripts/upstream_pr_batch.py "$RUNNER_TEMP/upstream_pr_batch.py"
+        id: tooling
+        run: |
+          cp scripts/upstream_pr_batch.py "$RUNNER_TEMP/upstream_pr_batch.py"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Configure upstream and fetch main
         run: |
@@ -120,6 +126,7 @@ jobs:
           GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
         run: |
           set -euo pipefail
+          assembled_head=$(git rev-parse HEAD)
           branch=$(python3 -c 'import json; print(json.load(open("batch-manifest.json"))["branch"])')
           changed=$(python3 -c 'import json; print(str(json.load(open("batch-manifest.json"))["changed"]).lower())')
           complete=$(python3 -c 'import json; print(str(json.load(open("batch-manifest.json"))["complete"]).lower())')
@@ -129,6 +136,7 @@ jobs:
 
           {
             echo "branch=$branch"
+            echo "assembled_head=$assembled_head"
             echo "changed=$changed"
             echo "complete=$complete"
             echo "fingerprint=$fingerprint"
@@ -178,14 +186,14 @@ jobs:
       - name: Check out trusted validation tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.trusted_sha }}
           path: trusted
           persist-credentials: false
 
       - name: Check out candidate integration branch without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare.outputs.branch }}
+          ref: ${{ needs.prepare.outputs.assembled_head }}
           path: candidate
           fetch-depth: 0
           submodules: recursive
@@ -236,7 +244,7 @@ jobs:
       - name: Check out trusted publisher
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.trusted_sha }}
           path: trusted
           persist-credentials: false
 
@@ -250,7 +258,7 @@ jobs:
         if: needs.prepare.outputs.changed == 'true' && needs.validate.result == 'success'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare.outputs.branch }}
+          ref: ${{ needs.prepare.outputs.assembled_head }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -281,6 +289,8 @@ jobs:
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
+          # Only this trusted, allowlisted documentation result may be merged.
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Push documentation-only commit with short-lived credentials
         if: steps.docs.outputs.changed == 'true'
@@ -302,6 +312,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           MANIFEST_PATH: ${{ github.workspace }}/report/batch-manifest.json
           SUMMARY_PATH: ${{ github.workspace }}/report/batch-summary.md
+          VALIDATED_HEAD: ${{ steps.docs.outputs.head }}
           VALIDATION_RESULT: ${{ needs.prepare.outputs.changed == 'true' && needs.validate.result || 'success' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           AUTO_MERGE: ${{ github.event_name == 'schedule' || inputs.auto_merge }}
