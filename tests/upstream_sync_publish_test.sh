@@ -32,6 +32,8 @@ if [[ "$*" == *"--method GET"* && "$*" == *"/compare/"* ]]; then
   printf '%s\n' $'ahead\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 elif [[ "$*" == *"--method GET"* && "$*" == *"/pulls/22"* ]]; then
   printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+elif [[ "$*" == *"--method GET"* && ( "$*" == *"/pulls/41"* || "$*" == *"/pulls/42"* ) ]]; then
+  printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 elif [[ "$*" == *"--method GET"* && "$*" == *"head="* ]]; then
   printf '%s\n' "${FAKE_EXISTING:-}"
 elif [[ "$*" == *"--method GET"* ]]; then
@@ -75,6 +77,7 @@ run_publish() {
     GITHUB_REPOSITORY=Thetromboneman1/Apollo-Reborn \
     MANIFEST_PATH="$TEST_ROOT/manifest.json" \
     SUMMARY_PATH="$SUMMARY" \
+    VALIDATED_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
     VALIDATION_RESULT="${VALIDATION_RESULT:-success}" \
     RUN_URL=https://github.com/example/actions/runs/1 \
     AUTO_MERGE="${AUTO_MERGE:-false}" \
@@ -127,6 +130,7 @@ AUTO_MERGE=true \
 run_publish > "$TEST_ROOT/existing.out"
 grep -F ' <pr> <ready> <41>' "$FAKE_LOG" >/dev/null
 grep -F ' <pr> <merge> <41>' "$FAKE_LOG" >/dev/null
+grep -F '<--match-head-commit> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>' "$FAKE_LOG" >/dev/null
 grep -F 'Merged complete validated all-open PR snapshot' "$TEST_ROOT/existing.out" >/dev/null
 
 printf 'upstream sync publication tests passed\n'

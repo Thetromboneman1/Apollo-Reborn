@@ -72,10 +72,15 @@ state = json.loads(state_path.read_text())
 def save(): state_path.write_text(json.dumps(state))
 if args[:2] == ['pr', 'ready']:
     state[args[2]]['draft'] = '--undo' in args
+    if '--undo' not in args and os.environ.get('MOVE_ON_READY'):
+        state['live_head'] = os.environ['MOVE_ON_READY']
     save()
     sys.exit(0)
 if args[:2] == ['pr', 'merge']:
     if state[args[2]]['draft']: sys.exit(1)
+    live = state.get('live_head', os.environ.get('MOVED_CANDIDATE', os.environ['CANDIDATE']))
+    if '--match-head-commit' in args and args[args.index('--match-head-commit') + 1] != live:
+        sys.exit(1)
     state[args[2]]['merged'] = True
     save()
     sys.exit(0)
@@ -101,9 +106,15 @@ elif 'head=' in joined:
 elif '/pulls/60' in joined:
     print(os.environ.get('MOVED_OLD_HEAD', os.environ['OLD_HEAD']))
 elif '/pulls/62' in joined:
-    print(os.environ.get('MOVED_CANDIDATE', os.environ['CANDIDATE']))
+    if os.environ.get('HEAD_READ_ERROR') == 'true': sys.exit(1)
+    sequence = json.loads(os.environ.get('CANDIDATE_SEQUENCE', '[]'))
+    reads = state.get('candidate_reads', 0)
+    state['candidate_reads'] = reads + 1
+    save()
+    print(sequence[min(reads, len(sequence) - 1)] if sequence else os.environ.get('MOVED_CANDIDATE', os.environ['CANDIDATE']))
 else:
     if os.environ.get('LIST_ERROR') == 'true': sys.exit(1)
+    if os.environ.get('NO_PRIOR') == 'true': sys.exit(0)
     if os.environ.get('SECOND_PAGE') == 'true' and '--paginate' not in args: sys.exit(0)
     print('60\\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/60\\t' + os.environ['OLD_HEAD'])
 ''')
@@ -132,6 +143,7 @@ else:
         self.state.write_text(json.dumps({'60': {'draft': True, 'state': 'open'}}))
         env = dict(os.environ, STATE=str(self.state), PATH=f'{self.bin}:{os.environ["PATH"]}', CALLS=str(self.log),
                    HISTORY=str(self.repo), OLD_HEAD=self.old_head, CANDIDATE=self.candidate,
+                   VALIDATED_HEAD=self.candidate,
                    GH_TOKEN='fixture-only', BRANCH='Thetromboneman1/all-open-upstream-prs-new',
                    DOWNSTREAM_BRANCH='main', GITHUB_REPOSITORY='Thetromboneman1/Apollo-Reborn',
                    MANIFEST_PATH=str(manifest), SUMMARY_PATH=str(summary), VALIDATION_RESULT='success',
@@ -215,7 +227,8 @@ else:
         result, calls, _ = self.publish(True)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertTrue(any('state=closed' in call for call in calls), calls)
-        self.assertTrue(any(call[:2] == ['pr', 'merge'] for call in calls), calls)
+        merge = next(call for call in calls if call[:2] == ['pr', 'merge'])
+        self.assertEqual(self.candidate, merge[merge.index('--match-head-commit') + 1])
 
     def test_comparison_failure_preserves_prior_work(self) -> None:
         self.contain_prior_batch()
@@ -232,6 +245,65 @@ else:
     def test_failed_validation_preserves_even_contained_work(self) -> None:
         self.contain_prior_batch()
         self.assert_preserved(complete=True, VALIDATION_RESULT='failure')
+
+
+    def advance_candidate(self, path: str = 'unvalidated-code') -> str:
+        git(self.repo, 'switch', '--detach', self.candidate)
+        (self.repo / path).write_text('new commit after validation\n')
+        return self.commit('candidate advanced after validation')
+
+    def test_fast_forward_after_validation_preserves_prior_work(self) -> None:
+        self.contain_prior_batch()
+        moved = self.advance_candidate()
+        self.assert_preserved(complete=True, MOVED_CANDIDATE=moved)
+
+    def test_no_prior_prs_still_require_exact_validated_head(self) -> None:
+        moved = self.advance_candidate()
+        result, calls, _ = self.publish(True, NO_PRIOR='true', MOVED_CANDIDATE=moved)
+        self.assertNotEqual(0, result.returncode)
+        self.assertTrue(json.loads(self.state.read_text())['62']['draft'])
+        self.assertFalse(any(call[:2] == ['pr', 'merge'] for call in calls))
+
+    def test_missing_validated_head_cannot_be_inferred_from_live_branch(self) -> None:
+        self.assert_preserved(complete=True, VALIDATED_HEAD='')
+
+    def test_unreadable_live_head_keeps_candidate_draft(self) -> None:
+        self.contain_prior_batch()
+        self.assert_preserved(complete=True, HEAD_READ_ERROR='true')
+
+    def test_head_movement_during_inventory_preserves_prior_work(self) -> None:
+        self.contain_prior_batch()
+        moved = self.advance_candidate()
+        self.assert_preserved(complete=True, CANDIDATE_SEQUENCE=json.dumps([self.candidate, moved]))
+
+    def test_trusted_documentation_head_is_accepted_exactly(self) -> None:
+        self.contain_prior_batch()
+        documented = self.advance_candidate('README.md')
+        result, calls, _ = self.publish(True, VALIDATED_HEAD=documented, MOVED_CANDIDATE=documented)
+        self.assertEqual(0, result.returncode, result.stderr)
+        merge = next(call for call in calls if call[:2] == ['pr', 'merge'])
+        self.assertEqual(documented, merge[merge.index('--match-head-commit') + 1])
+
+    def test_push_after_last_read_is_rejected_by_atomic_merge_pin(self) -> None:
+        moved = self.advance_candidate()
+        result, calls, _ = self.publish(True, NO_PRIOR='true', MOVE_ON_READY=moved)
+        self.assertNotEqual(0, result.returncode)
+        state = json.loads(self.state.read_text())
+        self.assertFalse(state['62'].get('merged', False))
+        self.assertTrue(state['62']['draft'])
+        merge = next(call for call in calls if call[:2] == ['pr', 'merge'])
+        self.assertEqual(self.candidate, merge[merge.index('--match-head-commit') + 1])
+
+    def test_workflow_pins_validation_report_and_trusted_tooling(self) -> None:
+        workflow = (ROOT / '.github/workflows/boneman-upstream-sync.yml').read_text()
+        validate, report = workflow.split('  validate:', 1)[1].split('  report:', 1)
+        for job in [validate, report]:
+            self.assertIn('ref: ${{ needs.prepare.outputs.assembled_head }}', job)
+            self.assertNotIn('ref: ${{ needs.prepare.outputs.branch }}', job)
+            self.assertIn('ref: ${{ needs.prepare.outputs.trusted_sha }}', job)
+        self.assertIn('VALIDATED_HEAD: ${{ steps.docs.outputs.head }}', report)
+        self.assertIn('echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"', report)
+        self.assertIn('REPOSITORY_DEFAULT_BRANCH: main', workflow)
 
 
 if __name__ == '__main__':
