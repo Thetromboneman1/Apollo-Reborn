@@ -399,6 +399,37 @@ static void ApolloRecordRedditUploadedMediaInfo(NSURL *imageURL, NSString *asset
     }
 }
 
+// image_upload_s3.json returns only a staged S3 URL, not a Reddit asset_id.
+// Give that owned upload an opaque local member identifier so Apollo's later
+// createAlbum request can still be claimed and expanded back to the staged URL
+// for comment composition. This identifier must never be sent to Reddit as a
+// native gallery media_id (see ApolloRedditUploadAssetIDsContainCookieLease).
+static NSString *ApolloRecordRedditCookieLeaseMediaInfo(NSURL *imageURL, NSString *mimeType) {
+    NSString *urlString = imageURL.absoluteString;
+    if (urlString.length == 0) return nil;
+
+    NSString *uuid = [[NSUUID UUID].UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    NSString *memberID = [@"cookie-lease-" stringByAppendingString:uuid.lowercaseString];
+    NSString *resolvedMIMEType = ApolloMediaMIMETypeForFilename(nil, mimeType);
+    NSDictionary *info = @{
+        @"assetID": memberID,
+        @"mimeType": resolvedMIMEType ?: @"image/jpeg",
+        @"extension": ApolloRedditUploadExtensionForMIMEType(resolvedMIMEType) ?: @"jpeg",
+        @"mediaKind": @"image",
+        @"stagedURL": urlString,
+        @"cookieLease": @YES,
+    };
+
+    @synchronized(ApolloRedditUploadAssetMapLock()) {
+        if (!sRedditUploadAssetIDByURL) sRedditUploadAssetIDByURL = [NSMutableDictionary new];
+        if (!sRedditUploadInfoByAssetID) sRedditUploadInfoByAssetID = [NSMutableDictionary new];
+        sRedditUploadAssetIDByURL[urlString] = memberID;
+        if (imageURL.lastPathComponent.length > 0) sRedditUploadAssetIDByURL[imageURL.lastPathComponent] = memberID;
+        sRedditUploadInfoByAssetID[memberID] = info;
+    }
+    return memberID;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -441,6 +472,14 @@ static BOOL ApolloRedditUploadAssetIDIsVideo(NSString *assetID) {
 static BOOL ApolloRedditUploadAssetIDsContainVideo(NSArray<NSString *> *assetIDs) {
     for (NSString *assetID in assetIDs) {
         if (ApolloRedditUploadAssetIDIsVideo(assetID)) return YES;
+    }
+    return NO;
+}
+
+static BOOL ApolloRedditUploadAssetIDsContainCookieLease(NSArray<NSString *> *assetIDs) {
+    for (NSString *assetID in assetIDs) {
+        NSDictionary *info = ApolloRedditUploadInfoForAssetID(assetID);
+        if ([info[@"cookieLease"] boolValue]) return YES;
     }
     return NO;
 }
@@ -1421,6 +1460,13 @@ NSURLRequest *ApolloRedditMaybeRewriteSubmitRequest(NSURLRequest *request) {
         NSString *galleryAlbumID = nil;
         NSArray<NSString *> *galleryAssetIDs = ApolloRedditGalleryAssetIDsFromSubmitPairs(pairs, &galleryAlbumID);
         if (galleryAssetIDs.count >= 2) {
+            if (ApolloRedditUploadAssetIDsContainCookieLease(galleryAssetIDs)) {
+                // Cookie leases have no native media_id. Comment albums are
+                // expanded to staged URLs before submission; never put our
+                // opaque local member identifiers into a gallery payload.
+                ApolloLog(@"[RedditUpload] Refusing native gallery rewrite for cookie-lease album (albumID=%@, items=%lu)", galleryAlbumID ?: @"(missing)", (unsigned long)galleryAssetIDs.count);
+                return nil;
+            }
             if (ApolloRedditUploadAssetIDsContainVideo(galleryAssetIDs)) {
                 ApolloLog(@"[RedditUpload] Refusing unsupported mixed/video gallery submit (albumID=%@, items=%lu)", galleryAlbumID ?: @"(missing)", (unsigned long)galleryAssetIDs.count);
                 return nil;
@@ -3134,15 +3180,25 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
         }
 
         NSString *resolvedMIMEType = ApolloMediaMIMETypeForFilename(filename, mimeType);
-        ApolloRecordRedditUploadedMediaAssetID(mediaURL, assetID);
-        ApolloRecordRedditUploadedMediaInfo(mediaURL, assetID, resolvedMIMEType, webSocketURL);
+        NSString *recordedMemberID = assetID;
+        if (usedCookieLease) {
+            recordedMemberID = ApolloRecordRedditCookieLeaseMediaInfo(mediaURL, resolvedMIMEType);
+            if (recordedMemberID.length == 0) {
+                completionHandler(nil, nil, [NSError errorWithDomain:@"ApolloRedditMediaUpload" code:51
+                    userInfo:@{NSLocalizedDescriptionKey: @"Reddit cookie upload could not be recorded"}]);
+                return;
+            }
+        } else {
+            ApolloRecordRedditUploadedMediaAssetID(mediaURL, assetID);
+            ApolloRecordRedditUploadedMediaInfo(mediaURL, assetID, resolvedMIMEType, webSocketURL);
+        }
 
         BOOL isVideo = ApolloMediaMIMETypeIsVideo(resolvedMIMEType);
         void (^completeSyntheticUpload)(void) = ^{
             if (ApolloRedditNativeUploadAttemptIsCancelled(attempt, @"synthetic-upload-response")) return;
-            NSDictionary *info = ApolloRedditUploadInfoForAssetID(assetID);
+            NSDictionary *info = ApolloRedditUploadInfoForAssetID(recordedMemberID);
             NSString *posterURL = [info[@"posterURL"] isKindOfClass:[NSString class]] ? info[@"posterURL"] : nil;
-            ApolloLog(@"[RedditUpload] Completed Reddit native %@ upload (assetID=%@, websocket=%@, poster=%@)", isVideo ? @"video" : @"image", assetID, webSocketURL.length > 0 ? @"yes" : @"no", isVideo ? (posterURL.length > 0 ? @"yes" : @"no") : @"n/a");
+            ApolloLog(@"[RedditUpload] Completed Reddit native %@ upload (memberID=%@, websocket=%@, poster=%@)", isVideo ? @"video" : @"image", recordedMemberID, webSocketURL.length > 0 ? @"yes" : @"no", isVideo ? (posterURL.length > 0 ? @"yes" : @"no") : @"n/a");
             // Manage Uploads (issue #414): remember the upload so a delete of
             // this entry can be acknowledged (Reddit has no delete API) and
             // its list thumbnail can resolve to the real media URL.

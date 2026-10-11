@@ -30,6 +30,9 @@ int main(void) {
         Check([ApolloUploadAlbumResolveMembers(Tokens(@"deletehashes=one"), resolve) isEqual:@[@"asset1"]], @"claim a one-image Reddit album");
         Check([ApolloUploadAlbumResolveMembers(Tokens(@"deletehashes=two,one"), resolve) isEqual:@[@"asset2", @"asset1"]], @"retain picker order");
         Check([ApolloUploadAlbumResolveMembers(Tokens(@"deletehashes=one,one.jpg"), resolve) isEqual:@[@"asset1"]], @"duplicate aliases do not duplicate images");
+        NSDictionary *cookieOwned = @{@"cookie-one": @"cookie-lease-opaque1", @"cookie-two": @"cookie-lease-opaque2"};
+        NSString *(^resolveCookie)(NSString *) = ^NSString *(NSString *token) { return cookieOwned[token]; };
+        Check([ApolloUploadAlbumResolveMembers(Tokens(@"deletehashes=cookie-one,cookie-two"), resolveCookie) isEqual:@[@"cookie-lease-opaque1", @"cookie-lease-opaque2"]], @"cookie leases resolve through opaque owned members without asset IDs");
         Check(ApolloUploadAlbumResolveMembers(Tokens(@"deletehashes=one,foreign"), resolve) == nil, @"mixed host album cannot silently lose an image");
         Check(ApolloUploadAlbumResolveMembers(@[], resolve) == nil, @"never synthesize empty album");
 
