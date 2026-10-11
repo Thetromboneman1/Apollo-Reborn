@@ -291,6 +291,7 @@ static const void *kApolloSFDisplayStyledKey = &kApolloSFDisplayStyledKey;
         [[UITapGestureRecognizer alloc] initWithTarget:self
                                                 action:@selector(dismissKeyboard)];
     tapGesture.cancelsTouchesInView = NO;
+    tapGesture.name = @"ApolloSettingsKeyboardDismissTap";
     tapGesture.delegate = self;
     [self.view addGestureRecognizer:tapGesture];
     // Let standard cells grow for Dynamic Type and long localized labels.
@@ -324,7 +325,7 @@ static const void *kApolloSFDisplayStyledKey = &kApolloSFDisplayStyledKey;
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
         shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-    return YES;
+    return [gestureRecognizer.name isEqualToString:@"ApolloSettingsKeyboardDismissTap"];
 }
 
 - (void)refreshFormAfterRowMove {
