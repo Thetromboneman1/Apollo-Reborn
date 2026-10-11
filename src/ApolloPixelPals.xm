@@ -83,6 +83,7 @@
 #import <float.h>
 
 #import "ApolloCommon.h"
+#import "ApolloClasses.h"
 #import "ApolloDuoRail.h"
 #import "ApolloDuoCompatibility.h"
 #import "ApolloDuoSplitView.h"
@@ -96,7 +97,6 @@
 #import <SpriteKit/SpriteKit.h>
 
 extern "C" bool ApolloSwiftEnableHostingPreferredContentSize(const void *controller);
-#import "ApolloClasses.h"
 
 // Apollo's stock strip height (sub_10030c494) and y (sub_10030c880).
 static const CGFloat kApolloPalStripHeight = 14.0;
@@ -153,12 +153,7 @@ static char kApolloDuoPalToyStageInfoKey;
 static char kApolloDuoPalToyAnimatorKey;
 
 static Class ApolloDuoPalToyClass(void) {
-    static Class cls;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        cls = objc_getClass("_TtC6Apollo34PixelPalAddedSceneElementImageView");
-    });
-    return cls;
+    return ApolloClassPixelPalAddedSceneElementImageView;
 }
 
 static ApolloDuoPalToyStageInfo *ApolloDuoPalToyStageInfoForView(UIView *view) {

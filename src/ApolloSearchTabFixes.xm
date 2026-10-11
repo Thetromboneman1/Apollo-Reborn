@@ -178,8 +178,8 @@ static void ApolloSearchTabUpdateRefreshAvailability(UIViewController *vc) {
 
 static void *ApolloSearchTabTrendingStorage(UIViewController *vc) {
     if (!vc) return NULL;
-    Ivar ivar = class_getInstanceVariable(vc.class, "trendingSubreddits");
-    return ivar ? (uint8_t *)(__bridge void *)vc + ivar_getOffset(ivar) : NULL;
+    ptrdiff_t offset = ApolloIvarOffset(object_getClass(vc), "trendingSubreddits");
+    return offset >= 0 ? (uint8_t *)(__bridge void *)vc + offset : NULL;
 }
 
 static NSArray<NSString *> *ApolloSearchTabCopyTrending(UIViewController *vc) {

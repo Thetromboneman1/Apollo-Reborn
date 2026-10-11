@@ -2,7 +2,7 @@
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
 #define ApolloLog(...) do {} while (0)
-#define ApolloLogDebug(...) do {} while (0)
+#define os_log_debug(...) do {} while (0)
 
 typedef NSInteger UITableViewRowAnimation;
 

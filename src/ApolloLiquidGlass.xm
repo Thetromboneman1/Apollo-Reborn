@@ -261,6 +261,22 @@ static UITabBar *ApolloTabBarForTabView(UIView *view) {
     return tabBar;
 }
 
+// Native floating bars can expose a visual copy without an item pointer.
+// Retain Duo's accessible Account identity for those copies; vertical rail
+// hit testing remains owned by the window touch observer below.
+static NSInteger ApolloTabShortcutIndexForView(UIView *view) {
+    UITabBar *tabBar = ApolloTabBarForTabView(view);
+    UITabBarItem *item = ApolloTabBarItemForButtonInTabBar(view, tabBar)
+        ?: ApolloTabBarItemForTabView(view);
+    NSArray<UITabBarItem *> *items = tabBar.items;
+    if (item && item == items.firstObject) return 0;
+    if (item && items.count > 2 && item == items[2]) return 2;
+    NSString *accessibilityName = [(view.accessibilityLabel.lowercaseString ?: @"")
+        stringByAppendingFormat:@" %@", view.accessibilityIdentifier.lowercaseString ?: @""];
+    if ([accessibilityName containsString:@"account"] || [accessibilityName containsString:@"profile"]) return 2;
+    return NSNotFound;
+}
+
 // Opens Apollo's account switcher by invoking ProfileViewController's bar button action.
 // sourceWindow is the window of the long-pressed tab button (the scene the user is in);
 // the app-wide key window / first visible window is only a fallback.
@@ -286,7 +302,7 @@ static void OpenAccountManager(UIWindow *sourceWindow) {
         return;
     }
 
-    Class profileVCClass = objc_getClass("Apollo.ProfileViewController");
+    Class profileVCClass = ApolloClassProfileViewController;
     UIViewController *rootVC = lastKeyWindow.rootViewController;
 
     UITabBarController *tabBarController = nil;
@@ -346,15 +362,16 @@ static void OpenAccountManager(UIWindow *sourceWindow) {
     }
 }
 
-// A horizontal Account button owns a recognizer; the vertical rail uses the
+// Horizontal Posts/Account buttons own recognizers; the vertical rail uses the
 // touch observer below. Reject before recognition so the unused recognizer
 // cannot cancel the rail touch before its hold timer fires.
-@interface ApolloAccountTabGestureDelegate : NSObject <UIGestureRecognizerDelegate>
+@interface ApolloTabShortcutGestureDelegate : NSObject <UIGestureRecognizerDelegate>
 @end
 
-@implementation ApolloAccountTabGestureDelegate
+@implementation ApolloTabShortcutGestureDelegate
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)recognizer {
-    return IsLiquidGlass() && !ApolloDuoRailHasVisibleSideBar();
+    if (!IsLiquidGlass() || ApolloDuoRailHasVisibleSideBar()) return NO;
+    return ApolloTabShortcutIndexForView(recognizer.view) != NSNotFound;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer
@@ -373,9 +390,9 @@ static void ApolloInstallTabShortcutLongPress(UIView *view, const void *setupKey
     UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc]
         initWithTarget:view action:@selector(apollo_tabButtonLongPressed:)];
     longPress.minimumPressDuration = 0.5;
-    static ApolloAccountTabGestureDelegate *delegate;
+    static ApolloTabShortcutGestureDelegate *delegate;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ delegate = [ApolloAccountTabGestureDelegate new]; });
+    dispatch_once(&once, ^{ delegate = [ApolloTabShortcutGestureDelegate new]; });
     longPress.delegate = delegate;
     [view addGestureRecognizer:longPress];
 }
@@ -441,17 +458,14 @@ static void ApolloHandleTabShortcutLongPress(UIView *view, UILongPressGestureRec
     // The vertical rail is handled by sendEvent: below, including finger-up.
     if (ApolloDuoRailHasVisibleSideBar()) return;
     UITabBar *tabBar = ApolloTabBarForTabView(view);
-    UITabBarItem *item = ApolloTabBarItemForButtonInTabBar(view, tabBar) ?: ApolloTabBarItemForTabView(view);
-    if (!tabBar || !item) return;
-
-    NSArray<UITabBarItem *> *items = tabBar.items;
-    if (item == items.firstObject) {
+    NSInteger shortcutIndex = ApolloTabShortcutIndexForView(view);
+    if (shortcutIndex == 0) {
         ApolloCancelLiquidLensGesture(tabBar);
         if (ApolloPresentPostsTabSubredditSheet(view.window)) {
             UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
             [feedback impactOccurred];
         }
-    } else if (items.count > 2 && item == items[2]) {
+    } else if (shortcutIndex == 2) {
         ApolloCancelLiquidLensGesture(tabBar);
         OpenAccountManager(view.window);
     }

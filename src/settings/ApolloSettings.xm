@@ -3,8 +3,9 @@
 #import <objc/runtime.h>
 
 #import "ApolloCommon.h"
-#import "ApolloSwiftRuntime.h"
+#import "ApolloClasses.h"
 #import "ApolloDuoRail.h"
+#import "ApolloSwiftRuntime.h"
 #import "CustomAPIViewController.h"
 #import "ApolloBuyUsACoffeeViewController.h"
 #import "SavedCategoriesViewController.h"
@@ -709,7 +710,7 @@ static void ApolloPresentFeatureRequestsChooser(UIViewController *aboutVC,
         // About is always pushed from Settings, so it lives below us in the stack.
         UIViewController *aboutVC = (UIViewController *)self;
         UIViewController *settingsVC = nil;
-        Class settingsClass = objc_getClass("_TtC6Apollo22SettingsViewController");
+        Class settingsClass = ApolloClassSettingsViewController;
         // 1) Nav stack (when About is pushed).
         for (UIViewController *vc in [aboutVC.navigationController.viewControllers reverseObjectEnumerator]) {
             if ([vc isKindOfClass:settingsClass]) {
@@ -803,7 +804,7 @@ static void ApolloPresentFeatureRequestsChooser(UIViewController *aboutVC,
     if (tabBarController.selectedViewController == viewController &&
         [viewController isKindOfClass:UINavigationController.class]) {
         UIViewController *top = ((UINavigationController *)viewController).topViewController;
-        if ([top isKindOfClass:objc_getClass("_TtC6Apollo22SettingsViewController")]) settingsVC = top;
+        if ([top isKindOfClass:ApolloClassSettingsViewController]) settingsVC = top;
     }
 
     ApolloSettingsSearchPrepareForScrollToTop(settingsVC);
@@ -857,7 +858,7 @@ static void ApolloPresentFeatureRequestsChooser(UIViewController *aboutVC,
     if (@available(iOS 26.0, *)) {
         %init(ApolloSettingsGestureHeaders, ApolloSettingsGesturesViewController = objc_getClass("Apollo.SettingsGesturesViewController"));
     }
-    %init(SettingsViewController=objc_getClass("_TtC6Apollo22SettingsViewController"),
+    %init(SettingsViewController=ApolloClassSettingsViewController,
           SettingsAboutViewController=objc_getClass("_TtC6Apollo27SettingsAboutViewController"));
 
     if (objc_getClass("_TtC6Apollo26ApolloSafariViewController")) {

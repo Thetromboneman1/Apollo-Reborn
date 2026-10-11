@@ -393,7 +393,7 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
         self.accountHeaderClip.clipsToBounds = YES;
         [self.accountHeaderClip addSubview:self.accountHeader];
         [self.view addSubview:self.accountHeaderClip];
-        [self.view addSubview:self.accountsButton];
+        if (self.accountsButton) [self.view addSubview:self.accountsButton];
         [self.view addSubview:self.moreButton];
         [self.view addSubview:self.sidebarNavigationBar];
         if (self.profileBackButton) [self.view addSubview:self.profileBackButton];
@@ -2017,6 +2017,7 @@ static void ApolloDuoSearchUpdateBackItem(ApolloDuoSplitState *state) {
 
 static void ApolloDuoAccountPrepareHost(ApolloDuoSplitState *state, ApolloDuoSplitHost *host) {
     UIViewController *profile = state.root;
+    BOOL ownAccount = ApolloDuoSplitIsOwnAccountController(profile);
     host.accountHeader = ApolloDuoAccountProfileHeader(profile);
     UINavigationBar *sidebarBar = [[UINavigationBar alloc] init];
     UINavigationBarAppearance *sidebarAppearance = [UINavigationBarAppearance new];
@@ -2065,22 +2066,25 @@ static void ApolloDuoAccountPrepareHost(ApolloDuoSplitState *state, ApolloDuoSpl
         host.profileBackButton = back;
     }
     __weak ApolloDuoSplitState *weakState = state;
-    UIButton *accounts = [UIButton buttonWithType:UIButtonTypeSystem];
     UIButtonConfiguration *configuration;
-    if (@available(iOS 26.0, *)) configuration = [UIButtonConfiguration glassButtonConfiguration];
-    else configuration = [UIButtonConfiguration tintedButtonConfiguration];
-    configuration.baseForegroundColor = UIColor.labelColor;
-    configuration.image = [UIImage systemImageNamed:@"person.2" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightRegular]];
-    configuration.contentInsets = NSDirectionalEdgeInsetsZero;
-    accounts.accessibilityLabel = @"Accounts";
-    configuration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-    accounts.configuration = configuration;
-    [accounts addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
-        UIViewController *root = weakState.root;
-        SEL selector = NSSelectorFromString(@"accountsBarButtonItemTappedWithSender:");
-        if ([root respondsToSelector:selector]) ((void (*)(id, SEL, id))objc_msgSend)(root, selector, nil);
-    }] forControlEvents:UIControlEventTouchUpInside];
-    host.accountsButton = accounts;
+    if (ownAccount) {
+        UIButton *accounts = [UIButton buttonWithType:UIButtonTypeSystem];
+        if (@available(iOS 26.0, *)) configuration = [UIButtonConfiguration glassButtonConfiguration];
+        else configuration = [UIButtonConfiguration tintedButtonConfiguration];
+        configuration.baseForegroundColor = UIColor.labelColor;
+        configuration.image = [UIImage systemImageNamed:@"person.2" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightRegular]];
+        configuration.contentInsets = NSDirectionalEdgeInsetsZero;
+        accounts.accessibilityLabel = @"Accounts";
+        configuration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+        accounts.configuration = configuration;
+        [accounts addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+            UIViewController *root = weakState.root;
+            SEL selector = @selector(accountsBarButtonItemTappedWithSender:);
+            if ([root respondsToSelector:selector]) ((void (*)(id, SEL, id))objc_msgSend)(root, selector, nil);
+        }] forControlEvents:UIControlEventTouchUpInside];
+        accounts.tintColor = UIColor.labelColor;
+        host.accountsButton = accounts;
+    }
     UIButton *more = [UIButton buttonWithType:UIButtonTypeSystem];
     if (@available(iOS 26.0, *)) configuration = [UIButtonConfiguration glassButtonConfiguration];
     else configuration = [UIButtonConfiguration tintedButtonConfiguration];
@@ -2092,14 +2096,25 @@ static void ApolloDuoAccountPrepareHost(ApolloDuoSplitState *state, ApolloDuoSpl
     configuration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
     more.configuration = configuration;
     more.accessibilityLabel = @"More Options";
-    UIAction *trophies = [UIAction actionWithTitle:@"Trophies" image:[UIImage systemImageNamed:@"trophy"] identifier:nil handler:^(__unused UIAction *action) {
-        ApolloDuoAccountSelect(weakState, @"Trophies");
-    }];
-    UIMenu *nativeMenu = ApolloProfileMoreMenuForController(profile);
-    more.menu = [UIMenu menuWithTitle:@"" children:[(nativeMenu.children ?: @[]) arrayByAddingObject:trophies]];
-    more.showsMenuAsPrimaryAction = YES;
+    if (ownAccount) {
+        UIAction *trophies = [UIAction actionWithTitle:@"Trophies" image:[UIImage systemImageNamed:@"trophy"] identifier:nil handler:^(__unused UIAction *action) {
+            ApolloDuoAccountSelect(weakState, @"Trophies");
+        }];
+        UIMenu *nativeMenu = ApolloProfileMoreMenuForController(profile);
+        more.menu = [UIMenu menuWithTitle:@"" children:[(nativeMenu.children ?: @[]) arrayByAddingObject:trophies]];
+        more.showsMenuAsPrimaryAction = YES;
+    } else {
+        // Visited profiles use Apollo's own actions for that user. The native
+        // menu hook anchors its presentation to this button in the dashboard.
+        __weak UIButton *weakMore = more;
+        [more addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+            UIViewController *root = weakState.root;
+            SEL selector = @selector(moreOptionsBarButtonItemTappedWithSender:);
+            if ([root respondsToSelector:selector])
+                ((void (*)(id, SEL, id))objc_msgSend)(root, selector, weakMore);
+        }] forControlEvents:UIControlEventTouchUpInside];
+    }
     host.moreButton = more;
-    accounts.tintColor = UIColor.labelColor;
     more.tintColor = ApolloNavigationChromeColor();
 }
 
@@ -2165,9 +2180,13 @@ static void ApolloDuoSplitOpen(ApolloDuoSplitState *state) {
     [sDuoSplitDeferredPresentations removeObject:state];
     NSArray *stack = [outer.viewControllers copy];
     NSUInteger rootIndex = 0;
-    // The most recently opened profile owns the dashboard, regardless of tab.
-    for (NSUInteger index = 1; index < stack.count; index++) {
-        if ([ApolloDuoSplitKind(stack[index]) isEqualToString:@"account"]) rootIndex = index;
+    // Only landscape has a profile dashboard. Portrait keeps visited profiles
+    // on the Posts navigation stack; promoting one to Account here would make
+    // the next update collapse it, then reopen Posts and repeat indefinitely.
+    if (ApolloDuoSplitShouldOpen((id)outer.tabBarController)) {
+        for (NSUInteger index = 1; index < stack.count; index++) {
+            if ([ApolloDuoSplitKind(stack[index]) isEqualToString:@"account"]) rootIndex = index;
+        }
     }
     if (rootIndex) {
         state.tabRoot = state.root;
@@ -2439,12 +2458,17 @@ static void ApolloDuoSplitUpdate(void) {
         BOOL postsOpen = [state.kind isEqualToString:@"subreddits"] && ApolloDuoSplitIsUnfolded();
         if (!open && !postsOpen) ApolloDuoSplitClose(state, NO);
         else {
-            // Native Swift pushes can bypass the ObjC push hook. Normalize a
-            // newly visited profile before rebuilding its full-width header.
-            for (UIViewController *page in [state.secondary.viewControllers copy]) {
-                if (page != state.root && [ApolloDuoSplitKind(page) isEqualToString:@"account"]) {
-                    ApolloDuoSplitClose(state, YES);
-                    break;
+            // Native Swift pushes can bypass the ObjC push hook. On rotation
+            // into landscape, a profile may also still be on the portrait feed
+            // stack. Normalize either path before installing its dashboard.
+            if (open) {
+                NSArray *pages = [(state.feed.viewControllers ?: @[])
+                    arrayByAddingObjectsFromArray:state.secondary.viewControllers ?: @[]];
+                for (UIViewController *page in pages) {
+                    if (page != state.root && [ApolloDuoSplitKind(page) isEqualToString:@"account"]) {
+                        ApolloDuoSplitClose(state, YES);
+                        break;
+                    }
                 }
             }
             // Search stays full-width until a result is opened. Once it has
@@ -2535,8 +2559,17 @@ static BOOL ApolloDuoSplitRoutePush(UINavigationController *nav, UIViewControlle
         [page isKindOfClass:UISplitViewController.class]) return NO;
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, YES);
     if (state.split && !state.changing && [ApolloDuoSplitKind(page) isEqualToString:@"account"]) {
-        ApolloDuoSplitNavigateProfile(state, page, YES);
-        return YES;
+        if (ApolloDuoSplitShouldOpen((id)state.outer.tabBarController)) {
+            ApolloDuoSplitNavigateProfile(state, page, YES);
+            return YES;
+        }
+        // The portrait drawer is an overlay, not a profile sidebar. Push onto
+        // the retained feed so native Back returns to the previous page.
+        if (state.feed && (nav == state.primary || nav == state.outer)) {
+            [state.feed pushViewController:page animated:animated];
+            [state.host setListVisible:NO animated:animated];
+            return YES;
+        }
     }
     if (state.feed && !state.changing) {
         if (state.host.postsColumnsPaired && (nav == state.feed || nav == state.outer)) {

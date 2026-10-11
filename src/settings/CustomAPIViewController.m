@@ -2399,7 +2399,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     };
 
     NSString *footer = ApolloSupportsNativeTabBarScrollBehavior()
-        ? @"After the tab bar reappears, Two-Gesture hides it on the second downward gesture; Classic hides it on the first. Both re-expand after 30 seconds of inactivity."
+        ? @"After the tab bar reappears, Two-Gesture hides it on the second downward gesture; Classic hides it on the first."
         : @"Hide Bars on Scroll uses the classic on/off behavior on this version of iOS.";
     if (!ApolloInterfaceSupportsBarScrollSettings()) {
         footer = nil;

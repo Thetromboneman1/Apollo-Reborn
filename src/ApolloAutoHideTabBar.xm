@@ -483,6 +483,8 @@ static CGRect ApolloMinimizeCompactFrame(UITabBar *tabBar, ApolloCompactTabBarVi
 }
 
 static BOOL ApolloMinimizeCanPresent(UITabBarController *tbc, CGRect expanded) {
+    // Release Minimize when a fold moves the bottom bar into the side rail.
+    if (!ApolloDuoAllowsTabBarScrollHiding()) return NO;
     UITabBar *tabBar = tbc.tabBar;
     if (CGRectIsNull(expanded) || CGRectIsEmpty(expanded) || !tabBar.window || tabBar.hidden) return NO;
     if (@available(iOS 18.0, *)) {
@@ -1802,6 +1804,9 @@ void ApolloScheduleDuoBarPolicyUpdate(UITabBarController *tbc) {
         }
         ApolloReapplyNativeMinimizeBehavior(tabs, @"Duo bar placement changed");
         ApolloRefreshDuoHeaderPolicies(tabs);
+        // Folding can keep the content scroll views in the same window.
+        // Reconcile Minimize's bottom edge without waiting for reattachment.
+        ApolloApplyScrollEdgeEffectStyleToViewController(tabs);
         current.duoPolicyUpdateScheduled = NO;
         ApolloLog(@"[AutoHideTabBarFix] Duo bottom-scroll eligible=%d", bottomBar);
     });
