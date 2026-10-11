@@ -28,12 +28,16 @@ cat > "$FAKE_BIN/gh" <<'SH'
 printf 'gh' >> "$FAKE_LOG"
 printf ' <%s>' "$@" >> "$FAKE_LOG"
 printf '\n' >> "$FAKE_LOG"
-if [[ "$*" == *"--method GET"* && "$*" == *"head="* ]]; then
+if [[ "$*" == *"--method GET"* && "$*" == *"/compare/"* ]]; then
+  printf '%s\n' $'ahead\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+elif [[ "$*" == *"--method GET"* && "$*" == *"/pulls/22"* ]]; then
+  printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+elif [[ "$*" == *"--method GET"* && "$*" == *"head="* ]]; then
   printf '%s\n' "${FAKE_EXISTING:-}"
 elif [[ "$*" == *"--method GET"* ]]; then
   printf '%s\n' "${FAKE_SUPERSEDED:-}"
 elif [[ "$*" == *"--method POST"* ]]; then
-  printf '%s\n' $'42\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/42\t'"${FAKE_CREATED_DRAFT:-false}"
+  printf '%s\n' $'42\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/42\t'"${FAKE_CREATED_DRAFT:-true}"
 fi
 SH
 chmod +x "$FAKE_BIN/gh"
@@ -50,6 +54,8 @@ json.dump({
     "complete": sys.argv[2] == "true",
     "changed": sys.argv[3] == "true",
     "fingerprint": "0123456789abcdef",
+    "downstream_sha": "a" * 40,
+    "assembled_head": "b" * 40,
     "total": 18,
     "included_count": 18 if sys.argv[2] == "true" else 13,
 }, open(sys.argv[1], "w", encoding="utf-8"))
@@ -62,7 +68,7 @@ run_publish() {
     FAKE_LOG="$FAKE_LOG" \
     FAKE_EXISTING="${FAKE_EXISTING:-}" \
     FAKE_SUPERSEDED="${FAKE_SUPERSEDED:-}" \
-    FAKE_CREATED_DRAFT="${FAKE_CREATED_DRAFT:-false}" \
+    FAKE_CREATED_DRAFT="${FAKE_CREATED_DRAFT:-true}" \
     GH_TOKEN=test-token \
     BRANCH=Thetromboneman1/all-open-upstream-prs-0123456789ab \
     DOWNSTREAM_BRANCH=main \
@@ -80,14 +86,14 @@ run_publish() {
 write_manifest true false
 run_publish > "$TEST_ROOT/no-change.out"
 grep -F 'already present on main' "$TEST_ROOT/no-change.out" >/dev/null
-grep -F 'gh <api> <--method> <GET>' "$FAKE_LOG" >/dev/null
+grep -F 'gh <api> <--paginate> <--method> <GET>' "$FAKE_LOG" >/dev/null
 if grep -F '<state=closed>' "$FAKE_LOG" >/dev/null; then
   printf 'no-change publication unexpectedly closed a non-existent batch PR\n' >&2
   exit 1
 fi
 
 : > "$FAKE_LOG"
-FAKE_SUPERSEDED=$'22\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/22' \
+FAKE_SUPERSEDED=$'22\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/22\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
 run_publish > "$TEST_ROOT/no-change-superseded.out"
 grep -F '<PATCH> <repos/Thetromboneman1/Apollo-Reborn/pulls/22>' "$FAKE_LOG" >/dev/null
 grep -F '<state=closed>' "$FAKE_LOG" >/dev/null
@@ -108,7 +114,8 @@ grep -F 'batch remains review-required' "$TEST_ROOT/incomplete.out" >/dev/null
 write_manifest true true
 unset FAKE_CREATED_DRAFT
 AUTO_MERGE=false run_publish > "$TEST_ROOT/ready.out"
-grep -F '<draft=false>' "$FAKE_LOG" >/dev/null
+grep -F '<draft=true>' "$FAKE_LOG" >/dev/null
+grep -F ' <pr> <ready> <42>' "$FAKE_LOG" >/dev/null
 if grep -F ' <pr> <merge>' "$FAKE_LOG" >/dev/null; then
   printf 'auto-merge=false unexpectedly merged the PR\n' >&2
   exit 1
