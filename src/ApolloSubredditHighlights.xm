@@ -2114,7 +2114,7 @@ static void ApolloHLApplyHeaderChange(UITableView *tableView, UIView *previousCa
 static void ApolloHLInstall(UIViewController *vc); // defined with the PostsViewController hooks
 
 static void ApolloHLClearTableDeDupState(UIViewController *vc) {
-    id tableNode = ApolloHLTypedIvar(vc, @"tableNode", objc_getClass("ASTableNode"));
+    id tableNode = ApolloHLTypedIvar(vc, @"tableNode", ApolloClassASTableNode);
     if (!tableNode) return;
     @synchronized(tableNode) {
         [(NSMutableSet *)objc_getAssociatedObject(tableNode, &kApolloHLHiddenRowsKey) removeAllObjects];
@@ -2139,7 +2139,7 @@ static void ApolloHLPrepareDeDupForSubreddit(UIViewController *vc, NSString *sub
         ApolloHLClearTableDeDupState(vc);
     }
 
-    id tableNode = ApolloHLTypedIvar(vc, @"tableNode", objc_getClass("ASTableNode"));
+    id tableNode = ApolloHLTypedIvar(vc, @"tableNode", ApolloClassASTableNode);
     if (tableNode) {
         @synchronized(tableNode) {
             objc_setAssociatedObject(tableNode, &kApolloHLDeDupSubKey, sub,
@@ -3125,12 +3125,16 @@ static BOOL ApolloHLApplyStickyCountToTable(UIViewController *vc, NSString *subr
     // The mask travels with N: both describe the same sticky run, and a change to
     // either one changes which separators are orphaned.
     NSNumber *ownedMask = ApolloDevvitFeedOwnsInteractivePosts() ? (ApolloHLFeedOwnedMask()[subKey] ?: @0) : @0;
-    NSNumber *prev = objc_getAssociatedObject(tableNode, &kApolloHLStickyCountKey);
-    NSNumber *prevMask = objc_getAssociatedObject(tableNode, &kApolloHLFeedOwnedMaskKey);
-    BOOL maskChanged = ![(prevMask ?: @0) isEqualToNumber:ownedMask];
-    if ([prev isEqualToNumber:stickyN] && !maskChanged) return NO;
-    objc_setAssociatedObject(tableNode, &kApolloHLStickyCountKey, stickyN, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(tableNode, &kApolloHLFeedOwnedMaskKey, ownedMask, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSNumber *prev;
+    // Publish together for off-main layout; never reload while holding this lock.
+    @synchronized(tableNode) {
+        prev = objc_getAssociatedObject(tableNode, &kApolloHLStickyCountKey);
+        NSNumber *prevMask = objc_getAssociatedObject(tableNode, &kApolloHLFeedOwnedMaskKey);
+        BOOL maskChanged = ![(prevMask ?: @0) isEqualToNumber:ownedMask];
+        if ([prev isEqualToNumber:stickyN] && !maskChanged) return NO;
+        objc_setAssociatedObject(tableNode, &kApolloHLStickyCountKey, stickyN, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(tableNode, &kApolloHLFeedOwnedMaskKey, ownedMask, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
     // The cold-load fallback collapses exactly the first separator (row 1) — correct
     // only for the common 2-sticky feed. When N differs (a single sticky that lost its
     // breaker, or 3+ that kept an orphan), the already-measured separators are wrong and
@@ -3410,14 +3414,22 @@ static BOOL ApolloHLSeparatorRowShouldCollapse(NSInteger row, BOOL eligible,
     // common case, so collapse only the first orphan until the exact count lands.
     return row == 1;
 }
-
 static BOOL ApolloHLSeparatorShouldCollapse(id sepNode) {
     if (!sCommunityHighlights || ApolloHLHideSubsIsEmpty()) return NO;
     NSInteger r = ApolloHLNodeRow(sepNode);
     if (r < 1) return NO;
     id owning = ApolloHLOwningTableNode(sepNode);
     if (!owning) return NO;
-    NSString *subreddit = objc_getAssociatedObject(owning, &kApolloHLDeDupSubKey);
+    NSString *subreddit;
+    NSNumber *n;
+    NSUInteger mask;
+    // Read one consistent snapshot while main may switch or tear down the feed.
+    @synchronized(owning) {
+        subreddit = objc_getAssociatedObject(owning, &kApolloHLDeDupSubKey);
+        n = objc_getAssociatedObject(owning, &kApolloHLStickyCountKey);
+        mask = [objc_getAssociatedObject(owning, &kApolloHLFeedOwnedMaskKey) unsignedIntegerValue];
+    }
+    // Another tab's Highlights must not collapse Home/All separators (#830).
     BOOL eligible = subreddit.length > 0 && ApolloHLHideSubsContains(subreddit);
     if (!eligible) return NO;
     if ([objc_getAssociatedObject(sepNode, &kApolloHLSepCollapseKey) boolValue]) return YES; // reactive pass
@@ -3426,8 +3438,6 @@ static BOOL ApolloHLSeparatorShouldCollapse(id sepNode) {
     // breaker is the LAST one (row 2N-1). Collapse every separator before it. This is
     // correct for any N from the FIRST measure — including N==1 (2N-1==1, so r<1 is
     // false and the lone separator is kept as the breaker).
-    NSNumber *n = objc_getAssociatedObject(owning, &kApolloHLStickyCountKey);
-    NSUInteger mask = [objc_getAssociatedObject(owning, &kApolloHLFeedOwnedMaskKey) unsignedIntegerValue];
     return ApolloHLSeparatorRowShouldCollapse(r, eligible, n != nil, n.integerValue, mask);
 }
 

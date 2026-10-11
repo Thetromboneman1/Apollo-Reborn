@@ -21,6 +21,7 @@ static char kApolloHLHiddenRowsKey;
 static char kApolloHLDeDupSubKey;
 static char kApolloHLStickyCountKey;
 static char kApolloHLFeedOwnedMaskKey;
+static Class ApolloClassASTableNode;
 static id ApolloHLTypedIvar(id object, NSString *name, Class expectedClass);
 static void ApolloHLHideSubsAdd(NSString *sub);
 static void ApolloHLHideSubsRemove(NSString *sub);

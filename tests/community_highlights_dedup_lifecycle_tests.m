@@ -39,6 +39,7 @@ static void Require(BOOL condition, NSString *message) {
 
 int main(void) {
     @autoreleasepool {
+        ApolloClassASTableNode = NSObject.class;
         UIViewController *controller = [UIViewController new];
         NSObject *tableNode = [NSObject new];
         controller.testTableNode = tableNode;
