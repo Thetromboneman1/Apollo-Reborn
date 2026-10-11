@@ -21,7 +21,8 @@ done
 
 body_file=$(mktemp "${TMPDIR:-/tmp}/apollo-upstream-pr-body.XXXXXX")
 recovery_file=$(mktemp "${TMPDIR:-/tmp}/apollo-upstream-recovery.XXXXXX")
-trap 'rm -f "$body_file" "$recovery_file"' EXIT
+pending_file=$(mktemp "${TMPDIR:-/tmp}/apollo-upstream-predecessors.XXXXXX")
+trap 'rm -f "$body_file" "$recovery_file" "$pending_file"' EXIT
 
 retry() {
   local attempt=1
@@ -107,7 +108,7 @@ preserve_batch() {
   printf 'Preserved prior integration PR %s at %s: %s\n' "$url" "$old_head" "$reason"
 }
 
-close_superseded_batches() {
+inspect_superseded_batches() {
   local current_number=${1:-} replacement_head records
   local old_number old_url old_head live_old reason
   if [[ "$changed" == true ]]; then
@@ -144,11 +145,33 @@ close_superseded_batches() {
       preserve_batch "$old_number" "$old_url" "$old_head" "$replacement_head" "$reason"
       continue
     fi
+    # Inspection does not close anything. A rejected/queued merge must leave
+    # every predecessor open, even if all of these comparisons passed.
+    printf '%s\t%s\t%s\t%s\n' "$old_number" "$old_url" "$old_head" "$replacement_head" >> "$pending_file"
+  done <<< "$records"
+}
+
+close_landed_predecessors() {
+  local old_number old_url old_head replacement_head live_old live_downstream
+  while IFS=$'\t' read -r old_number old_url old_head replacement_head; do
+    [[ -n "$old_number" ]] || continue
+    live_downstream=$(retry gh api --method GET "repos/${GITHUB_REPOSITORY}/branches/${DOWNSTREAM_BRANCH}" --jq '.commit.sha') || live_downstream=""
+    if ! contains_commit "$replacement_head" "$live_downstream"; then
+      preserve_batch "$old_number" "$old_url" "$old_head" "$replacement_head" \
+        "Downstream no longer contains the inspected replacement or could not be verified."
+      continue
+    fi
+    live_old=$(retry gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls/${old_number}" --jq '.head.sha') || live_old=""
+    if [[ "$live_old" != "$old_head" ]]; then
+      preserve_batch "$old_number" "$old_url" "$old_head" "$replacement_head" \
+        "Prior branch moved before post-merge cleanup or could not be rechecked."
+      continue
+    fi
     retry gh api --method PATCH "repos/${GITHUB_REPOSITORY}/pulls/${old_number}" \
       -f state=closed \
       --silent
-    printf 'Closed superseded fork integration PR after exact-head containment: %s\n' "$old_url"
-  done <<< "$records"
+    printf 'Closed superseded fork integration PR after exact-head containment and landing: %s\n' "$old_url"
+  done < "$pending_file"
 }
 
 {
@@ -182,7 +205,8 @@ if [[ "$changed" != true ]]; then
     printf 'manifest is incomplete despite no repository change\n' >&2
     exit 1
   fi
-  close_superseded_batches
+  inspect_superseded_batches
+  close_landed_predecessors
   if [[ "$preserved_batches" == true ]]; then
     printf 'prior integration work requires manual review; no branches imported or deleted\n' >&2
     exit 1
@@ -236,7 +260,7 @@ fi
 if [[ "$ready" == true ]] && ! candidate_head_matches "$number"; then
   block_changed_candidate
 fi
-close_superseded_batches "$number"
+inspect_superseded_batches "$number"
 # Recheck after the inventory/containment calls and before promoting the PR.
 if [[ "$ready" == true ]] && ! candidate_head_matches "$number"; then
   block_changed_candidate
@@ -276,7 +300,17 @@ if [[ "$ready" == true && "${AUTO_MERGE:-true}" == true ]]; then
     printf 'Pinned merge rejected; candidate remains review-required.\n' >&2
     exit 1
   fi
+  # A successful CLI call can enqueue a PR instead of landing it. Confirm the
+  # pinned head actually merged before closing recovery PRs.
+  merged_state=$(retry gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls/${number}" \
+    --jq '[.merged, .head.sha, .base.ref] | @tsv')
+  IFS=$'\t' read -r is_merged merged_head merged_base <<< "$merged_state"
+  if [[ "$is_merged" != true || "$merged_head" != "$validated_head" || "$merged_base" != "$DOWNSTREAM_BRANCH" ]]; then
+    printf 'Pinned merge has not been confirmed; predecessor PRs remain open.\n' >&2
+    exit 1
+  fi
   printf 'Merged complete validated all-open PR snapshot: %s\n' "$url"
+  close_landed_predecessors
 fi
 
 if [[ "$complete" != true || "$VALIDATION_RESULT" != success || "$preserved_batches" == true || "$candidate_changed" == true ]]; then

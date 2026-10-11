@@ -30,10 +30,16 @@ printf ' <%s>' "$@" >> "$FAKE_LOG"
 printf '\n' >> "$FAKE_LOG"
 if [[ "$*" == *"--method GET"* && "$*" == *"/compare/"* ]]; then
   printf '%s\n' $'ahead\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+elif [[ "$*" == *"--method GET"* && "$*" == *"/branches/main"* ]]; then
+  printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 elif [[ "$*" == *"--method GET"* && "$*" == *"/pulls/22"* ]]; then
   printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 elif [[ "$*" == *"--method GET"* && ( "$*" == *"/pulls/41"* || "$*" == *"/pulls/42"* ) ]]; then
-  printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  if [[ "$*" == *".merged"* ]]; then
+    printf '%s\n' $'true\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tmain'
+  else
+    printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  fi
 elif [[ "$*" == *"--method GET"* && "$*" == *"head="* ]]; then
   printf '%s\n' "${FAKE_EXISTING:-}"
 elif [[ "$*" == *"--method GET"* ]]; then

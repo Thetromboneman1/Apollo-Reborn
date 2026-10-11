@@ -77,11 +77,13 @@ if args[:2] == ['pr', 'ready']:
     save()
     sys.exit(0)
 if args[:2] == ['pr', 'merge']:
-    if state[args[2]]['draft']: sys.exit(1)
+    if state[args[2]]['draft'] or os.environ.get('MERGE_ERROR') == 'true': sys.exit(1)
+    if os.environ.get('MERGE_QUEUED') == 'true': sys.exit(0)
     live = state.get('live_head', os.environ.get('MOVED_CANDIDATE', os.environ['CANDIDATE']))
     if '--match-head-commit' in args and args[args.index('--match-head-commit') + 1] != live:
         sys.exit(1)
     state[args[2]]['merged'] = True
+    if os.environ.get('MOVE_PRIOR_ON_MERGE'): state['live_old'] = os.environ['MOVE_PRIOR_ON_MERGE']
     save()
     sys.exit(0)
 if '/compare/' in joined:
@@ -103,9 +105,14 @@ elif 'head=' in joined:
         state['62'] = {'draft': False, 'state': 'open'}
         save()
         print('62\\thttps://github.com/Thetromboneman1/Apollo-Reborn/pull/62\\tfalse')
+elif '/branches/main' in joined:
+    print(os.environ.get('LIVE_MAIN', os.environ['CANDIDATE'] if state.get('62', {}).get('merged') else os.environ['MAIN_HEAD']))
 elif '/pulls/60' in joined:
-    print(os.environ.get('MOVED_OLD_HEAD', os.environ['OLD_HEAD']))
+    print(state.get('live_old', os.environ.get('MOVED_OLD_HEAD', os.environ['OLD_HEAD'])))
 elif '/pulls/62' in joined:
+    if '.merged' in joined:
+        print(('true' if state['62'].get('merged', False) else 'false') + '\\t' + os.environ.get('MOVED_CANDIDATE', os.environ['CANDIDATE']) + '\\t' + os.environ.get('MERGED_BASE', 'main'))
+        sys.exit(0)
     if os.environ.get('HEAD_READ_ERROR') == 'true': sys.exit(1)
     sequence = json.loads(os.environ.get('CANDIDATE_SEQUENCE', '[]'))
     reads = state.get('candidate_reads', 0)
@@ -143,7 +150,7 @@ else:
         self.state.write_text(json.dumps({'60': {'draft': True, 'state': 'open'}}))
         env = dict(os.environ, STATE=str(self.state), PATH=f'{self.bin}:{os.environ["PATH"]}', CALLS=str(self.log),
                    HISTORY=str(self.repo), OLD_HEAD=self.old_head, CANDIDATE=self.candidate,
-                   VALIDATED_HEAD=self.candidate,
+                   VALIDATED_HEAD=self.candidate, MAIN_HEAD=self.new_main,
                    GH_TOKEN='fixture-only', BRANCH='Thetromboneman1/all-open-upstream-prs-new',
                    DOWNSTREAM_BRANCH='main', GITHUB_REPOSITORY='Thetromboneman1/Apollo-Reborn',
                    MANIFEST_PATH=str(manifest), SUMMARY_PATH=str(summary), VALIDATION_RESULT='success',
@@ -229,6 +236,9 @@ else:
         self.assertTrue(any('state=closed' in call for call in calls), calls)
         merge = next(call for call in calls if call[:2] == ['pr', 'merge'])
         self.assertEqual(self.candidate, merge[merge.index('--match-head-commit') + 1])
+        close_index = next(i for i, call in enumerate(calls) if 'state=closed' in call)
+        self.assertLess(calls.index(merge), close_index)
+        self.assertTrue(json.loads(self.state.read_text())['62']['merged'])
 
     def test_comparison_failure_preserves_prior_work(self) -> None:
         self.contain_prior_batch()
@@ -293,6 +303,79 @@ else:
         self.assertTrue(state['62']['draft'])
         merge = next(call for call in calls if call[:2] == ['pr', 'merge'])
         self.assertEqual(self.candidate, merge[merge.index('--match-head-commit') + 1])
+
+
+    def test_late_race_keeps_contained_predecessor_open(self) -> None:
+        self.contain_prior_batch()
+        moved = self.advance_candidate()
+        result, calls, _ = self.publish(True, MOVE_ON_READY=moved)
+        self.assertNotEqual(0, result.returncode)
+        state = json.loads(self.state.read_text())
+        self.assertEqual('open', state['60']['state'])
+        self.assertTrue(state['62']['draft'])
+        self.assertFalse(state['62'].get('merged', False))
+        self.assertFalse(any('state=closed' in call for call in calls))
+
+    def test_merge_api_failure_keeps_contained_predecessor_open(self) -> None:
+        self.contain_prior_batch()
+        result, calls, _ = self.publish(True, MERGE_ERROR='true')
+        self.assertNotEqual(0, result.returncode)
+        state = json.loads(self.state.read_text())
+        self.assertEqual('open', state['60']['state'])
+        self.assertTrue(state['62']['draft'])
+        self.assertFalse(any('state=closed' in call for call in calls))
+
+    def test_queued_merge_is_not_treated_as_landed(self) -> None:
+        self.contain_prior_batch()
+        result, calls, _ = self.publish(True, MERGE_QUEUED='true')
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual('open', json.loads(self.state.read_text())['60']['state'])
+        self.assertFalse(any('state=closed' in call for call in calls))
+
+    def test_manual_review_candidate_keeps_predecessors_open(self) -> None:
+        self.contain_prior_batch()
+        result, calls, _ = self.publish(True, AUTO_MERGE='false')
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(any('state=closed' in call or call[:2] == ['pr', 'merge'] for call in calls))
+        self.assertEqual('open', json.loads(self.state.read_text())['60']['state'])
+
+    def test_prior_head_moved_after_merge_is_preserved(self) -> None:
+        self.contain_prior_batch()
+        result, calls, summary = self.publish(True, MOVE_PRIOR_ON_MERGE=self.new_head)
+        self.assertNotEqual(0, result.returncode)
+        state = json.loads(self.state.read_text())
+        self.assertTrue(state['62']['merged'])
+        self.assertEqual('open', state['60']['state'])
+        self.assertFalse(any('state=closed' in call for call in calls))
+        self.assertIn('post-merge cleanup', summary)
+
+
+    def test_merge_into_wrong_base_cannot_close_predecessors(self) -> None:
+        self.contain_prior_batch()
+        result, calls, _ = self.publish(True, MERGED_BASE='other-branch')
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(any('state=closed' in call for call in calls))
+
+    def test_no_change_rechecks_downstream_before_cleanup(self) -> None:
+        self.contain_prior_batch()
+        self.new_main = self.candidate
+        result, calls, _ = self.publish(True, changed=False, LIVE_MAIN=self.base)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(any('state=closed' in call for call in calls))
+        self.assertEqual('open', json.loads(self.state.read_text())['60']['state'])
+
+    def test_no_change_contained_work_can_be_cleaned_up(self) -> None:
+        self.contain_prior_batch()
+        self.new_main = self.candidate
+        result, calls, _ = self.publish(True, changed=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(any('state=closed' in call for call in calls))
+
+    def test_downstream_movement_after_merge_keeps_predecessors_open(self) -> None:
+        self.contain_prior_batch()
+        result, calls, _ = self.publish(True, LIVE_MAIN=self.new_main)
+        self.assertNotEqual(0, result.returncode)
+        self.assertFalse(any('state=closed' in call for call in calls))
 
     def test_workflow_pins_validation_report_and_trusted_tooling(self) -> None:
         workflow = (ROOT / '.github/workflows/boneman-upstream-sync.yml').read_text()
