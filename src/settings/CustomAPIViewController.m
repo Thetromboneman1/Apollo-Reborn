@@ -499,7 +499,9 @@ static CGFloat ApolloFeedShortcutsPreviewSideBySideCenterOffset(ApolloFeedShortc
     self.shortcutItemViewsByIndex = [itemViewsByIndex copy];
 
     if (usesShortcutLayout) {
-        UIColor *separatorColor = UIColor.separatorColor;
+        UIColor *separatorColor = ApolloThemeSeparatorColor()
+            ?: self.hostTableView.separatorColor
+            ?: UIColor.separatorColor;
         self.shortcutSeparators = ApolloFeedShortcutInstallLayout(self,
                                                                    shortcutItems,
                                                                    contentViews,
@@ -2394,7 +2396,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         footer = [footer stringByAppendingString:@"\n\nSwipe Tab Bar to Navigate disables the native drag-to-switch-tab gesture."];
     }
     if (ApolloDuoUsesAdaptiveBars()) {
-        footer = [footer stringByAppendingString:@"\n\nOn iPhone Duo, Hide Tab Bar on Scroll, Hide Style, Scroll Behavior, and Swipe Tab Bar to Navigate apply only while open in portrait. The side rail always stays visible. Hide Header on Scroll works independently in every pose."];
+        NSString *duoFooter = @"On iPhone Duo, Hide Tab Bar on Scroll, Hide Style, Scroll Behavior, and Swipe Tab Bar to Navigate apply only while open in portrait. The side rail always stays visible. Hide Header on Scroll works independently in every pose.";
+        footer = footer.length > 0
+            ? [footer stringByAppendingFormat:@"\n\n%@", duoFooter]
+            : duoFooter;
     }
     return [ApolloSettingsSection sectionWithTitle:@"Tab Bar"
                                             footer:footer
