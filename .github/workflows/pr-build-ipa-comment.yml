@@ -7,9 +7,9 @@ name: PR build IPA comment
 # write-scoped token even for fork-originated runs, and only ever handles DATA
 # (the prebuilt comment body) — it never checks out or runs the PR's code. The
 # target PR and its author are resolved from trusted inputs (event data + the
-# API), and the authoritative code-owner gate is enforced HERE, in this
+# API), and the authoritative maintainer gate is enforced HERE, in this
 # fork-uneditable workflow, before any comment is posted: the PR author must be
-# a code owner, or a code owner must have started the build run (approved an
+# the base repository owner or a code owner, or one must have started the run (approved an
 # outside contributor's held run, or re-ran it).
 #
 # Note: workflow_run only fires once this file exists on the default branch.
@@ -94,24 +94,29 @@ jobs:
           # PR is authorized once a code owner approves (or re-runs) its build.
           OWNERS=$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/CODEOWNERS" \
                     -H "Accept: application/vnd.github.raw" 2>/dev/null \
-                    | grep -E '^\*[[:space:]]' | sed 's/#.*//' \
-                    | grep -oE '@[A-Za-z0-9_-]+' | sed 's/@//')
-          is_code_owner() {
+                    | sed 's/#.*//' | awk '$1 == "*" {
+                      for (i = 2; i <= NF; i++)
+                        if ($i ~ /^@[A-Za-z0-9_-]+$/) print substr($i, 2)
+                    }')
+          is_maintainer() {
             local user
             user=$(echo "$1" | tr '[:upper:]' '[:lower:]')
             [ -n "$user" ] || return 1
+            # GitHub supplies the BASE repository owner. Do not use HEAD_OWNER
+            # here: any contributor owns the fork they used to open their PR.
+            [ "$user" = "$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')" ] && return 0
             while IFS= read -r owner; do
               [ -z "$owner" ] && continue
               [ "$(echo "$owner" | tr '[:upper:]' '[:lower:]')" = "$user" ] && return 0
             done <<< "$OWNERS"
             return 1
           }
-          if is_code_owner "$PR_AUTHOR"; then
-            echo "Authorized: PR author ${PR_AUTHOR} is a code owner."
-          elif is_code_owner "$RUN_TRIGGERING_ACTOR"; then
-            echo "Authorized: code owner ${RUN_TRIGGERING_ACTOR} approved or re-ran the build."
+          if is_maintainer "$PR_AUTHOR"; then
+            echo "Authorized: PR author ${PR_AUTHOR} is a repository owner or code owner."
+          elif is_maintainer "$RUN_TRIGGERING_ACTOR"; then
+            echo "Authorized: maintainer ${RUN_TRIGGERING_ACTOR} approved or re-ran the build."
           else
-            echo "Neither PR author ${PR_AUTHOR} nor run starter ${RUN_TRIGGERING_ACTOR} is a code owner; not commenting."
+            echo "Neither PR author ${PR_AUTHOR} nor run starter ${RUN_TRIGGERING_ACTOR} is a repository owner or code owner; not commenting."
             exit 0
           fi
 
