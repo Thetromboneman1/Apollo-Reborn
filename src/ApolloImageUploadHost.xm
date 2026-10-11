@@ -430,6 +430,21 @@ static NSString *ApolloRecordRedditCookieLeaseMediaInfo(NSURL *imageURL, NSStrin
     return memberID;
 }
 
+static NSData *ApolloSyntheticImgurUploadResponseDataForMember(NSURL *mediaURL, NSString *mimeType, NSString *memberID) {
+    NSData *defaultData = ApolloSyntheticImgurUploadResponseData(mediaURL, mimeType);
+    if (memberID.length == 0 || defaultData.length == 0) return defaultData;
+
+    NSMutableDictionary *root = [[NSJSONSerialization JSONObjectWithData:defaultData options:NSJSONReadingMutableContainers error:nil] mutableCopy];
+    NSMutableDictionary *data = [root[@"data"] isKindOfClass:NSDictionary.class] ? [root[@"data"] mutableCopy] : nil;
+    if (!data) return defaultData;
+    // Apollo feeds these fields back into createAlbum. An opaque per-upload ID
+    // avoids filename alias collisions when cookie uploads overlap or retry.
+    data[@"id"] = memberID;
+    data[@"deletehash"] = memberID;
+    root[@"data"] = data;
+    return [NSJSONSerialization dataWithJSONObject:root options:0 error:nil] ?: defaultData;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -3203,7 +3218,9 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
             // this entry can be acknowledged (Reddit has no delete API) and
             // its list thumbnail can resolve to the real media URL.
             ApolloUploadRegistryRecordRedditUpload(mediaURL);
-            NSData *jsonData = ApolloSyntheticImgurUploadResponseData(mediaURL, resolvedMIMEType);
+            NSData *jsonData = usedCookieLease
+                ? ApolloSyntheticImgurUploadResponseDataForMember(mediaURL, resolvedMIMEType, recordedMemberID)
+                : ApolloSyntheticImgurUploadResponseData(mediaURL, resolvedMIMEType);
             NSHTTPURLResponse *response = ApolloSyntheticImgurHTTPResponse(originalURL ?: mediaURL);
             completionHandler(jsonData, response, nil);
         };
