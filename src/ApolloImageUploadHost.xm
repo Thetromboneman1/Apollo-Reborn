@@ -15,6 +15,7 @@
 #import "ApolloImgChestUpload.h"
 #import "ApolloMarkdownToolbarGif.h"
 #import "ApolloMediaMetadata.h"
+#import "ApolloNewVideoPost.h"
 #import "ApolloState.h"
 
 // Defined (extern "C") in ApolloChatComposer.xm: YES while a chat photo upload is in flight, so we
@@ -2475,6 +2476,11 @@ void ApolloRedditTransformSubmitResponseAsync(NSData *originalData, NSURLRequest
         if (synth.length > 0) {
             ApolloLog(@"[RedditUpload] Normalized media submit success response (linkID=%@, url=%@)", directLinkID, commentsURL ?: @"(missing)");
             ApolloMediaComposerMarkBodyTextSubmitted();
+            if (ApolloRedditSubmitContextIsVideo(context)) {
+                // Holds Posted! until the post has its video (ApolloNewVideoPost.xm).
+                ApolloNewVideoPostDeliverWhenPlayable(directLinkID, ^{ completion(synth); });
+                return;
+            }
             completion(synth);
             return;
         }
@@ -2502,6 +2508,11 @@ void ApolloRedditTransformSubmitResponseAsync(NSData *originalData, NSURLRequest
         if (synth.length == 0) { completion(originalData); return; }
         ApolloLog(@"[RedditUpload] Delivering synthesized /api/submit success response (linkID=%@, %lu bytes)", linkID, (unsigned long)synth.length);
         ApolloMediaComposerMarkBodyTextSubmitted();
+        if (ApolloRedditSubmitContextIsVideo(resolutionContext)) {
+            // Holds Posted! until the post has its video (ApolloNewVideoPost.xm).
+            ApolloNewVideoPostDeliverWhenPlayable(linkID, ^{ completion(synth); });
+            return;
+        }
         completion(synth);
     });
 }
