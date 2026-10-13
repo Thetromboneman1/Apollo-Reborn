@@ -102,9 +102,8 @@ preserve_batch() {
     printf 'These branches are recovery candidates, not imported changes. Manual review is required before reuse, especially when upstream heads changed.\n\n' | tee -a "$recovery_file" >> "$SUMMARY_PATH"
   fi
   preserved_batches=true
-  printf -- '- [#%s](%s): preserved head `%s`; replacement assembled head `%s`. %s [Pinned comparison](https://github.com/%s/compare/%s...%s).\n' \
-    "$number" "$url" "$old_head" "$replacement_head" "$reason" \
-    "$GITHUB_REPOSITORY" "$old_head" "$replacement_head" | tee -a "$recovery_file" >> "$SUMMARY_PATH"
+  printf -- '- Fork integration PR %s: preserved head `%s`; replacement assembled head `%s`. %s\n' \
+    "$number" "$old_head" "$replacement_head" "$reason" | tee -a "$recovery_file" >> "$SUMMARY_PATH"
   printf 'Preserved prior integration PR %s at %s: %s\n' "$url" "$old_head" "$reason"
 }
 
@@ -189,10 +188,33 @@ close_landed_predecessors() {
 # machine-readable manifest as the run artifact and keep the PR readable.
 python3 - "$body_file" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 path = Path(sys.argv[1])
 body = path.read_text(encoding="utf-8")
+# Defense in depth: even if a future report accidentally copies an upstream
+# title, URL, or author mention, the published PR body must not notify them.
+# The JSON manifest remains the lossless machine-readable provenance record.
+body = re.sub(
+    r"https://github\.com/([^/\s)]+/[^/\s)]+)/(pull|issues)/(\d+)(?:[^\s)]*)?",
+    lambda match: (
+        f"{match.group(1)} "
+        f"{'pull request' if match.group(2) == 'pull' else 'issue'} {match.group(3)}"
+    ),
+    body,
+)
+body = re.sub(
+    r"(?<![\w/.-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)",
+    lambda match: f"{match.group(1)} pull request {match.group(2)}",
+    body,
+)
+body = re.sub(r"(?<![\w])#(\d+)", r"PR \1", body)
+body = re.sub(
+    r"(?<![\w])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))",
+    lambda match: f"GitHub user {match.group(1)}",
+    body,
+)
 limit = 64000
 if len(body) > limit:
     body = body[:limit] + "\n\n_Report truncated; download the run artifact for the full manifest._\n"
