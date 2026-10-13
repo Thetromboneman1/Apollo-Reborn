@@ -180,18 +180,6 @@ void ApolloSettingsPresentPicker(UIViewController *presenter,
                                  NSInteger currentIndex,
                                  void (^apply)(NSInteger pickedIndex));
 
-// Same picker and selection state, but native-menu choices apply immediately
-// from UIAction instead of waiting for the dismissal animation. Use only for
-// in-place changes (preferences, notifications, row updates); callbacks must
-// not push or present another controller. Classic action sheets keep their
-// normal UIAlertAction timing. Re-picking the current option still calls apply.
-void ApolloSettingsPresentLivePicker(UIViewController *presenter,
-                                     UIView *_Nullable sourceView,
-                                     NSString *_Nullable title,
-                                     NSArray<NSString *> *optionTitles,
-                                     NSInteger currentIndex,
-                                     void (^apply)(NSInteger pickedIndex));
-
 // Settings-app-style icon tile: a white SF symbol on a colored 29pt rounded
 // square (cached). Shared with settings search so result rows can render the
 // same native-style icons. Unknown symbol names fail soft to a plain tile.
