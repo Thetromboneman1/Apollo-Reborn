@@ -1885,7 +1885,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                                  onSelect:^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            ApolloSettingsPresentPicker(self, [self cellForRowID:@"interface.inboxBadgeColor"],
+            ApolloSettingsPresentLivePicker(self, [self cellForRowID:@"interface.inboxBadgeColor"],
                                         @"Unread Badge Color", @[@"Red", @"Theme Accent"],
                                         [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? 1 : 0,
                                         ^(NSInteger pickedIndex) {
