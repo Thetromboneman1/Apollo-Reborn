@@ -69,6 +69,64 @@
 #import "PictureInPictureViewController.h"
 #import "TagFiltersViewController.h"
 
+// Keep both choices on screen so selecting a badge color does not wait for an
+// action sheet's dismissal. A vertical layout leaves room for the title on
+// narrow screens and when the settings text size is increased.
+@interface ApolloInboxBadgeColorCell : UITableViewCell
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UISegmentedControl *colorControl;
+- (void)updateAppearance;
+@end
+
+@implementation ApolloInboxBadgeColorCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
+    self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
+    if (!self) return nil;
+
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+    self.isAccessibilityElement = NO;
+    self.titleLabel = [UILabel new];
+    self.titleLabel.text = @"Unread Badge Color";
+    self.titleLabel.numberOfLines = 0;
+    self.titleLabel.adjustsFontForContentSizeCategory = YES;
+    self.colorControl = [[UISegmentedControl alloc] initWithItems:@[@"Red", @"Theme Accent"]];
+    self.colorControl.accessibilityLabel = self.titleLabel.text;
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[self.titleLabel, self.colorControl]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 8.0;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.contentView addSubview:stack];
+    UILayoutGuide *margins = self.contentView.layoutMarginsGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.leadingAnchor constraintEqualToAnchor:margins.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:margins.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:margins.topAnchor constant:4.0],
+        [stack.bottomAnchor constraintEqualToAnchor:margins.bottomAnchor constant:-4.0],
+        [self.colorControl.heightAnchor constraintGreaterThanOrEqualToConstant:44.0],
+    ]];
+    [self updateAppearance];
+    return self;
+}
+
+- (void)updateAppearance {
+    self.titleLabel.font = ApolloSettingsFont(UIFontTextStyleBody, self.traitCollection);
+    self.titleLabel.textColor = ApolloSettingsPrimaryTextColor();
+}
+
+- (void)tintColorDidChange {
+    [super tintColorDidChange];
+    [self updateAppearance];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    [self updateAppearance];
+}
+
+@end
+
 // The six speeds the "Hold for Video Speed" picker offers, in display order. They
 // mirror the video player's own speed menu minus 1.0× (holding at normal speed
 // would be a no-op). ApolloSanitizedHoldSpeed() guards the stored value to this set.
@@ -1877,26 +1935,21 @@ typedef NS_ENUM(NSInteger, Tag) {
         }];
 
     ApolloSettingsRow *inboxBadgeColor =
-        [ApolloSettingsRow valueRowWithID:@"interface.inboxBadgeColor"
-                                    title:@"Unread Badge Color"
-                                   detail:^NSString * {
-            return [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? @"Theme Accent" : @"Red";
-        }
-                                 onSelect:^{
-            __strong typeof(weakSelf) self = weakSelf;
-            if (!self) return;
-            ApolloSettingsPresentPicker(self, [self cellForRowID:@"interface.inboxBadgeColor"],
-                                        @"Unread Badge Color", @[@"Red", @"Theme Accent"],
-                                        [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? 1 : 0,
-                                        ^(NSInteger pickedIndex) {
-                [NSUserDefaults.standardUserDefaults setBool:(pickedIndex == 1) forKey:UDKeyInboxBadgeUseThemeAccent];
-                [NSNotificationCenter.defaultCenter postNotificationName:ApolloInboxBadgeChangedNotification object:nil];
-                [weakSelf reloadRowWithID:@"interface.inboxBadgeColor"];
-            });
-        }];
-    inboxBadgeColor.configure = ^(UITableViewCell *cell) {
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    };
+        [ApolloSettingsRow customRowWithID:@"interface.inboxBadgeColor"
+                                     cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            static NSString *const reuseID = @"ApolloInboxBadgeColor";
+            ApolloInboxBadgeColorCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+            if (!cell) {
+                cell = [[ApolloInboxBadgeColorCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseID];
+                [cell.colorControl addTarget:weakSelf action:@selector(inboxBadgeColorChanged:)
+                    forControlEvents:UIControlEventValueChanged];
+            }
+            cell.colorControl.selectedSegmentIndex =
+                [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? 1 : 0;
+            [cell updateAppearance];
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        } onSelect:nil];
 
     // Icon-Only already hides every tab label. Hide the narrower profile-only
     // option while it is active, then reinsert it with its remembered value.
@@ -4618,6 +4671,13 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     sUseProfileAvatarTabIcon = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sUseProfileAvatarTabIcon forKey:UDKeyUseProfileAvatarTabIcon];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification" object:nil];
+}
+
+- (void)inboxBadgeColorChanged:(UISegmentedControl *)sender {
+    // The control already reflects the choice. Apply it directly without a
+    // sheet dismissal or a row reload interrupting its selection animation.
+    [NSUserDefaults.standardUserDefaults setBool:(sender.selectedSegmentIndex == 1) forKey:UDKeyInboxBadgeUseThemeAccent];
+    [NSNotificationCenter.defaultCenter postNotificationName:ApolloInboxBadgeChangedNotification object:nil];
 }
 
 - (void)iconOnlyTabBarSwitchToggled:(UISwitch *)sender {
