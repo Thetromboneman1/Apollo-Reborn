@@ -339,7 +339,7 @@ def source_integrated_upstream_commits(
                     "merge",
                     "--no-ff",
                     "-m",
-                    f"Merge exact source head for upstream main PR #{pr_number}",
+                    f"Merge exact source head for upstream main PR {pr_number}",
                     "-m",
                     f"Source head: {pr_head}\nUpstream squash commit: {commit_sha}",
                     pr_head,
@@ -369,6 +369,12 @@ def markdown_escape(value: str) -> str:
 
 
 def render_summary(manifest: dict[str, Any]) -> str:
+    """Render a human report without notification-producing GitHub references.
+
+    Pull-request URLs, titles, authors, and exact source metadata remain intact in
+    the JSON manifest. The Markdown report deliberately uses neutral labels and
+    omits contributor-controlled titles/errors.
+    """
     lines = [
         "# All-open upstream PR integration",
         "",
@@ -380,41 +386,41 @@ def render_summary(manifest: dict[str, Any]) -> str:
         f"- Exact heads present after assembly: **{manifest['included_count']}/{manifest['total']}**",
         f"- Complete: **{'yes' if manifest['complete'] else 'no'}**",
         "",
-        "| PR | State | Draft | Upstream state | Head | Title |",
-        "|---:|---|:---:|---|---|---|",
+        "| Upstream pull request | State | Draft | Upstream state | Head |",
+        "|---:|---|:---:|---|---|",
     ]
     for result in manifest["results"]:
         pr = result["pull_request"]
         upstream_state = f"{pr['merge_state']} / {pr['review_decision']} / {pr['checks']}"
         lines.append(
-            f"| [#{pr['number']}]({pr['url']}) | `{result['status']}` | "
+            f"| `upstream PR {pr['number']}` | `{result['status']}` | "
             f"{'yes' if pr['draft'] else 'no'} | {markdown_escape(upstream_state)} | "
-            f"`{pr['head_sha'][:12]}` | {markdown_escape(pr['title'])} |"
+            f"`{pr['head_sha'][:12]}` |"
         )
     lines.extend(["", "## Per-PR merge record", ""])
     for result in manifest["results"]:
         pr = result["pull_request"]
         lines.extend(
             [
-                f"### #{pr['number']}: {markdown_escape(pr['title'])}",
+                f"### Upstream PR {pr['number']}",
                 "",
                 f"- Result: `{result['status']}`",
-                f"- Source: `{pr['head_repository'] or 'deleted repository'}:{pr['head_ref']}`",
                 f"- Exact head: `{pr['head_sha']}`",
-                f"- Original base: `{pr['base_ref']}`",
-                f"- Author: `{pr['author']}`",
+                "- Source branch, base, title, author, and URL: retained in the machine-readable manifest",
                 f"- Draft/review/checks: `{pr['draft']}` / `{pr['review_decision']}` / `{pr['checks']}`",
                 f"- Upstream merge state: `{pr['mergeable']} / {pr['merge_state']}`",
                 f"- Size: `{pr['changed_files']} files, +{pr['additions']}/-{pr['deletions']}`",
-                f"- Dependencies in this snapshot: `{', '.join('#' + str(value) for value in result['dependencies']) or 'none'}`",
+                "- Dependencies in this snapshot: `"
+                + (", ".join(f"upstream PR {value}" for value in result["dependencies"]) or "none")
+                + "`",
             ]
         )
         if result.get("merge_commit"):
             lines.append(f"- Integration merge commit: `{result['merge_commit']}`")
         if result.get("conflict_files"):
-            lines.append(f"- Conflicts: `{', '.join(result['conflict_files'])}`")
+            lines.append("- Conflict paths: retained in the machine-readable manifest")
         if result.get("error"):
-            lines.append(f"- Error: `{markdown_escape(result['error'])}`")
+            lines.append("- Error details: retained in the machine-readable manifest")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -568,8 +574,7 @@ def command_assemble(args: argparse.Namespace) -> int:
             "dependencies": dependencies[pr.number],
             "status": "pending",
         }
-        print(f"::group::Upstream PR #{pr.number}: {pr.title}")
-        print(f"url={pr.url}")
+        print(f"::group::Upstream PR {pr.number}")
         print(f"head={pr.head_sha}")
         print(f"draft={pr.draft} merge_state={pr.merge_state} review={pr.review_decision} checks={pr.checks}")
         if is_ancestor(root, pr.head_sha, "HEAD"):
@@ -577,9 +582,10 @@ def command_assemble(args: argparse.Namespace) -> int:
             print(f"result={record['status']}")
         else:
             before = git(root, "rev-parse", "HEAD")
-            message = f"Merge upstream PR #{pr.number}: {pr.title}"
+            message = f"Merge upstream PR {pr.number} exact head"
             details = (
-                f"Source: {pr.url}\n"
+                f"Source repository: {pr.head_repository or 'deleted repository'}\n"
+                f"Source pull request: {pr.number}\n"
                 f"Head: {pr.head_sha}\n"
                 f"Author: {pr.author}\n"
                 f"Draft: {pr.draft}\n"

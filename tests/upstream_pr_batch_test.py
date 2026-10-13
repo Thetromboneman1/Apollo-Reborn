@@ -83,6 +83,63 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("cursor=page-2", mocked.call_args_list[1].args[0])
 
 
+class SummarySafetyTests(unittest.TestCase):
+    def test_human_summary_omits_notification_producing_upstream_metadata(self) -> None:
+        manifest = {
+            "fingerprint": "fingerprint",
+            "downstream_sha": "a" * 40,
+            "upstream_main_sha": "b" * 40,
+            "upstream_main_result": {"status": "already-present"},
+            "total": 1,
+            "included_count": 0,
+            "complete": False,
+            "results": [
+                {
+                    "status": "conflict",
+                    "dependencies": [123],
+                    "conflict_files": ["safe`@path-owner"],
+                    "error": "ping @maintainer about owner/repo#456 and #789",
+                    "pull_request": {
+                        "number": 7,
+                        "title": "Ping @maintainer about #789",
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "draft": False,
+                        "base_ref": "main`@base-owner",
+                        "head_ref": "feature`@branch-owner",
+                        "head_sha": "c" * 40,
+                        "head_repository": "owner/repo",
+                        "author": "maintainer",
+                        "mergeable": "CONFLICTING",
+                        "merge_state": "DIRTY",
+                        "review_decision": "NONE",
+                        "checks": "FAILURE",
+                        "additions": 1,
+                        "deletions": 1,
+                        "changed_files": 1,
+                    },
+                }
+            ],
+        }
+
+        summary = BATCH.render_summary(manifest)
+
+        self.assertIn("Upstream PR 7", summary)
+        self.assertIn("upstream PR 123", summary)
+        self.assertIn("Error details: retained in the machine-readable manifest", summary)
+        for notifying_text in (
+            "@maintainer",
+            "#789",
+            "owner/repo#456",
+            "https://github.com/owner/repo/pull/7",
+            "Ping @maintainer",
+            "@path-owner",
+            "@base-owner",
+            "@branch-owner",
+        ):
+            self.assertNotIn(notifying_text, summary)
+        self.assertIn("Conflict paths: retained in the machine-readable manifest", summary)
+
+
 class AssemblyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -240,8 +297,8 @@ class AssemblyTests(unittest.TestCase):
         prs = [
             BATCH.PullRequest(
                 number=number,
-                title=f"PR {number}",
-                url=f"https://example.test/pull/{number}",
+                title="Ping @maintainer about #123" if number == 1 else f"PR {number}",
+                url=f"https://github.com/owner/repo/pull/{number}",
                 draft=number == 2,
                 base_ref="main",
                 head_ref=f"feature/{number}",
@@ -268,6 +325,14 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual(2, manifest["included_count"])
         self.assertFalse(manifest["complete"])
         self.assertEqual(3, manifest["total"])
+        first_record = by_number[1]["pull_request"]
+        self.assertEqual("Ping @maintainer about #123", first_record["title"])
+        self.assertEqual("https://github.com/owner/repo/pull/1", first_record["url"])
+        merge_messages = command(self.root, "git", "log", "--format=%B", f"{downstream}..HEAD")
+        self.assertNotIn("@maintainer", merge_messages)
+        self.assertNotIn("#123", merge_messages)
+        self.assertNotIn("https://github.com/owner/repo/pull/1", merge_messages)
+        self.assertIn("Merge upstream PR 1 exact head", merge_messages)
 
 
 if __name__ == "__main__":

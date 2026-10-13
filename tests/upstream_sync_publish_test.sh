@@ -28,6 +28,11 @@ cat > "$FAKE_BIN/gh" <<'SH'
 printf 'gh' >> "$FAKE_LOG"
 printf ' <%s>' "$@" >> "$FAKE_LOG"
 printf '\n' >> "$FAKE_LOG"
+for arg in "$@"; do
+  if [[ "$arg" == body=@* ]]; then
+    cp "${arg#body=@}" "$FAKE_CAPTURED_BODY"
+  fi
+done
 if [[ "$*" == *"--method GET"* && "$*" == *"/compare/"* ]]; then
   printf '%s\n' $'ahead\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 elif [[ "$*" == *"--method GET"* && "$*" == *"/branches/main"* ]]; then
@@ -51,7 +56,8 @@ SH
 chmod +x "$FAKE_BIN/gh"
 
 SUMMARY="$TEST_ROOT/summary.md"
-printf '# Complete batch report\n' > "$SUMMARY"
+CAPTURED_BODY="$TEST_ROOT/captured-body.md"
+printf '# Complete batch report\n\nUnsafe fixture: @maintainer `@escaped owner/repo#77 #88 https://github.com/owner/repo/pull/99\n' > "$SUMMARY"
 
 write_manifest() {
   python3 - "$TEST_ROOT/manifest.json" "$1" "$2" <<'PY'
@@ -77,6 +83,7 @@ run_publish() {
     FAKE_EXISTING="${FAKE_EXISTING:-}" \
     FAKE_SUPERSEDED="${FAKE_SUPERSEDED:-}" \
     FAKE_CREATED_DRAFT="${FAKE_CREATED_DRAFT:-true}" \
+    FAKE_CAPTURED_BODY="$CAPTURED_BODY" \
     GH_TOKEN=test-token \
     BRANCH=Thetromboneman1/all-open-upstream-prs-0123456789ab \
     DOWNSTREAM_BRANCH=main \
@@ -118,6 +125,15 @@ if run_publish > "$TEST_ROOT/incomplete.out" 2>&1; then
 fi
 grep -F '<draft=true>' "$FAKE_LOG" >/dev/null
 grep -F 'batch remains review-required' "$TEST_ROOT/incomplete.out" >/dev/null
+if grep -E '(@maintainer|@escaped|owner/repo#77|#88|github\.com/owner/repo/pull/99)' "$CAPTURED_BODY" >/dev/null; then
+  printf 'publisher left a notification-producing reference in the PR body\n' >&2
+  exit 1
+fi
+grep -F 'GitHub user maintainer' "$CAPTURED_BODY" >/dev/null
+grep -F 'GitHub user escaped' "$CAPTURED_BODY" >/dev/null
+grep -F 'owner/repo pull request 77' "$CAPTURED_BODY" >/dev/null
+grep -F 'PR 88' "$CAPTURED_BODY" >/dev/null
+grep -F 'owner/repo pull request 99' "$CAPTURED_BODY" >/dev/null
 
 : > "$FAKE_LOG"
 write_manifest true true
