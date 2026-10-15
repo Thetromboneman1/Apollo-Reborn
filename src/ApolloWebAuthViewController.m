@@ -70,7 +70,7 @@
     [self.spinner startAnimating];
 
     if ([self _isModernRedditSupported]) {
-        ApolloLog(@"[WebAuth] Loading auth URL: %@", self.authURL);
+        ApolloLog(@"[WebAuth] Loading auth URL: %@", ApolloLogURL(self.authURL));
         [self.webView loadRequest:[NSURLRequest requestWithURL:self.authURL]];
     } else {
         // Reddit's current consent UI does not render reliably in pre-iOS-16
@@ -108,7 +108,7 @@
         initWithAuthURL:self.authURL
             redirectURI:self.redirectURIString
              onComplete:^(NSURL *callbackURL) {
-        ApolloLog(@"[WebAuth] manual sign-in produced callback: %@", callbackURL);
+        ApolloLog(@"[WebAuth] manual sign-in produced callback: %@", ApolloLogURL(callbackURL));
         [weakSelf _finishWithURL:callbackURL error:nil];
     }];
     [self.navigationController pushViewController:vc animated:YES];
@@ -272,7 +272,7 @@ decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
         // dispatch it (which would fail for unregistered schemes) or the request
         // actually goes out over the network (for http/https redirect URIs).
         decisionHandler(WKNavigationActionPolicyCancel);
-        ApolloLog(@"[WebAuth] Intercepted callback: %@", url);
+        ApolloLog(@"[WebAuth] Intercepted callback: %@", ApolloLogURL(url));
         [self _harvestFeatureSessionThenFinishWithURL:url];
         return;
     }
@@ -335,14 +335,15 @@ decisionHandler:(void (^)(WKNavigationResponsePolicy))decisionHandler {
     // fired when decidePolicyForNavigationAction cancels a navigation — expected.
     if (error.code == NSURLErrorCancelled) return;
     if ([error.domain isEqualToString:@"WebKitErrorDomain"] && error.code == 102) return;
-    ApolloLogError(@"[WebAuth] Provisional navigation failed: %@", error);
+    // Domain + code only: the error's userInfo carries the failing authorize URL.
+    ApolloLogError(@"[WebAuth] Provisional navigation failed: %@ %ld (%@)", error.domain, (long)error.code, error.localizedDescription);
     [self _finishWithURL:nil error:error];
 }
 
 - (void)webView:(WKWebView *)webView didFailNavigation:(WKNavigation *)navigation withError:(NSError *)error {
     [self.spinner stopAnimating];
     if (error.code == NSURLErrorCancelled) return;
-    ApolloLogError(@"[WebAuth] Navigation failed: %@", error);
+    ApolloLogError(@"[WebAuth] Navigation failed: %@ %ld (%@)", error.domain, (long)error.code, error.localizedDescription);
     [self _finishWithURL:nil error:error];
 }
 
