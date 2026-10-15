@@ -16,19 +16,6 @@
 
 extern NSArray<UIBarButtonItem *> *ApolloDuoCommentsLayoutItems(UINavigationItem *item, NSArray<UIBarButtonItem *> *items);
 
-// Use the pill's spring for glyphs without changing button frames,
-// which translation measures when inserting its globe.
-// UIBarButtonItem.hidden is iOS 16 / macCatalyst 16 API. The explicit
-// macCatalyst clause keeps the Mac build (macCatalyst 15 floor) from sending
-// a selector macOS 12 does not implement; iOS 16+ behaviour is unchanged.
-static inline BOOL ApolloActionsBarItemHidden(UIBarButtonItem *item) {
-    if (@available(iOS 16.0, macCatalyst 16.0, *)) return item.hidden;
-    return NO;
-}
-static inline void ApolloActionsSetBarItemHidden(UIBarButtonItem *item, BOOL hidden) {
-    if (@available(iOS 16.0, macCatalyst 16.0, *)) item.hidden = hidden;
-}
-
 static const NSTimeInterval kActionsAnimationDuration = 0.36;
 static CASpringAnimation *ApolloActionsSpring(NSString *keyPath) {
     CASpringAnimation *spring = [CASpringAnimation animationWithKeyPath:keyPath];
