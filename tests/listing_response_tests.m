@@ -36,6 +36,14 @@ static NSHTTPURLResponse *nextResponse;
     return @"task";
 }
 @end
+// Web-bearer minting is outside this response-shape test. Keep the production
+// hook's deferral branch compilable and deterministically disabled.
+static BOOL sWebJSONEnabled = NO;
+static __thread BOOL sApolloWebJSONResendingAfterWebBearerMint = NO;
+static BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path) { (void)path; return NO; }
+static NSString *ApolloWebJSONWebSessionUsernameForClient(RDKClient *client) { (void)client; return nil; }
+static BOOL ApolloWebJSONWebBearerNeedsMint(NSString *username) { (void)username; return NO; }
+static NSString *ApolloWebJSONKeylessOAuthBearer(NSString *username) { (void)username; return nil; }
 // These tests isolate response-shape handling. Session-state behavior is
 // covered separately in session_expiry_tests.m.
 static BOOL ApolloWebJSONShouldActForClient(RDKClient *client) { (void)client; return NO; }

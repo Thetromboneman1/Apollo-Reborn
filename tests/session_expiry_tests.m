@@ -24,6 +24,13 @@ static NSUInteger probes;
 static NSUInteger merges;
 static BOOL ApolloWebJSONURLIsProbe(NSURL *url) { (void)url; return NO; }
 static NSString *ApolloWebJSONAccountFromURL(NSURL *url) { (void)url; return @"alice"; }
+static BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path) { (void)path; return NO; }
+static void ApolloWebJSONNoteWebBearerResponse(NSURLRequest *request, NSHTTPURLResponse *response) {
+    (void)request; (void)response;
+}
+static void ApolloWebJSONRecordRateLimit(NSString *username, NSURLRequest *request, NSHTTPURLResponse *response) {
+    (void)username; (void)request; (void)response;
+}
 @interface TestTask : NSObject
 @property(copy) void (^completion)(NSData *, NSURLResponse *, NSError *);
 - (void)resume;
