@@ -384,7 +384,10 @@ else:
             self.assertIn('ref: ${{ needs.prepare.outputs.assembled_head }}', job)
             self.assertNotIn('ref: ${{ needs.prepare.outputs.branch }}', job)
             self.assertIn('ref: ${{ needs.prepare.outputs.trusted_sha }}', job)
-        self.assertIn('VALIDATED_HEAD: ${{ steps.docs.outputs.head }}', report)
+        self.assertIn(
+            'VALIDATED_HEAD: ${{ steps.publish-docs.outputs.head || steps.docs.outputs.head }}',
+            report,
+        )
         self.assertIn('echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"', report)
         self.assertIn('REPOSITORY_DEFAULT_BRANCH: main', workflow)
 
