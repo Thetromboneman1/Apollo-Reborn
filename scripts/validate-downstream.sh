@@ -22,11 +22,13 @@ bash -n \
   "$ROOT/build-ipa.sh" \
   "$ROOT/patch.sh" \
   "$ROOT/scripts/publish-upstream-pr-batch.sh" \
+  "$ROOT/scripts/push-validated-docs.sh" \
   "$ROOT/scripts/publish-upstream-sync-review.sh" \
   "$ROOT/scripts/build_release_variants.sh" \
   "$ROOT/scripts/validate_release_variants.sh"
 
 bash "$ROOT/tests/upstream_sync_publish_test.sh"
+bash "$ROOT/tests/push_validated_docs_test.sh"
 python3 "$ROOT/tests/upstream_pr_batch_test.py"
 python3 "$ROOT/tests/upstream_batch_preservation_test.py"
 python3 "$ROOT/tests/pr_ipa_authorization_test.py"

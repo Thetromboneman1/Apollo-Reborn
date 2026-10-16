@@ -13,6 +13,8 @@ grep -F 'Secretless documentation and package validation' "$WORKFLOW" >/dev/null
 grep -F 'batch-manifest.json' "$WORKFLOW" >/dev/null
 grep -F 'Imported whitespace findings' "$WORKFLOW" >/dev/null
 grep -F 'Regenerate allowlisted documentation with trusted tooling' "$WORKFLOW" >/dev/null
+grep -F 'scripts/push-validated-docs.sh' "$WORKFLOW" >/dev/null
+grep -F 'VALIDATED_HEAD: ${{ steps.publish-docs.outputs.head || steps.docs.outputs.head }}' "$WORKFLOW" >/dev/null
 grep -F 'persist-credentials: false' "$WORKFLOW" >/dev/null
 if grep -F 'secrets.GITHUB_TOKEN' "$WORKFLOW" >/dev/null; then
   printf 'all-open upstream workflow must not use the built-in token for publication\n' >&2

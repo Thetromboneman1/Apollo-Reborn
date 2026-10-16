@@ -293,6 +293,7 @@ jobs:
           echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Push documentation-only commit with short-lived credentials
+        id: publish-docs
         if: steps.docs.outputs.changed == 'true'
         working-directory: candidate
         env:
@@ -301,8 +302,10 @@ jobs:
         run: |
           set -euo pipefail
           authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${authorization}" \
-            push origin "HEAD:refs/heads/${BRANCH}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${authorization}"
+          ../trusted/scripts/push-validated-docs.sh
 
       - name: Publish complete PR-specific report and enforce the gate
         env:
@@ -312,7 +315,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           MANIFEST_PATH: ${{ github.workspace }}/report/batch-manifest.json
           SUMMARY_PATH: ${{ github.workspace }}/report/batch-summary.md
-          VALIDATED_HEAD: ${{ steps.docs.outputs.head }}
+          VALIDATED_HEAD: ${{ steps.publish-docs.outputs.head || steps.docs.outputs.head }}
           VALIDATION_RESULT: ${{ needs.prepare.outputs.changed == 'true' && needs.validate.result || 'success' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           AUTO_MERGE: ${{ github.event_name == 'schedule' || inputs.auto_merge }}
