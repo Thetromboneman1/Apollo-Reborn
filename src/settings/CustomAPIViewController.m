@@ -5619,6 +5619,10 @@ replacementString:(NSString *)string {
 - (NSString *)apollo_screenTitle { return @"Subreddits"; }
 - (void)viewDidLoad {
     [super viewDidLoad];
+    // Keep native handles available beside the three Search sections without
+    // making the rest of this settings page behave like an edit-only list.
+    self.tableView.allowsSelectionDuringEditing = YES;
+    [self setEditing:YES animated:NO];
     // Own the gap above this untitled first section. UIKit's implicit grouped
     // top spacing depends on the navigation bar's scroll observation and can
     // collapse after a child page is popped, visibly moving the whole form.
