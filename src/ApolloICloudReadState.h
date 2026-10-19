@@ -27,6 +27,13 @@ FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateMergeJournalAtSe
     NSURL *selectedFolderURL, NSDictionary *localJournal, NSError **error);
 // Consent is stored outside exported preferences and is valid only for the
 // exact selected-folder identity recorded when the user opted in.
+typedef NS_ENUM(NSInteger, ApolloICloudReadStateConsentStatus) {
+    ApolloICloudReadStateConsentStatusUnavailable = 0,
+    ApolloICloudReadStateConsentStatusMatches,
+    ApolloICloudReadStateConsentStatusConfirmedMismatch,
+};
+FOUNDATION_EXPORT ApolloICloudReadStateConsentStatus
+ApolloICloudReadStateConsentStatusAtURL(NSURL *consentURL, NSString *folderIdentifier);
 FOUNDATION_EXPORT BOOL ApolloICloudReadStateConsentAtURLMatchesFolder(
     NSURL *consentURL, NSString *folderIdentifier);
 FOUNDATION_EXPORT BOOL ApolloICloudReadStateOperationConsentIsCurrent(

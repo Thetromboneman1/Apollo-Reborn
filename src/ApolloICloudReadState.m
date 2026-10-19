@@ -13,16 +13,36 @@
 
 static NSNumber *const kConsentVersion = @1;
 
-BOOL ApolloICloudReadStateConsentAtURLMatchesFolder(NSURL *consentURL, NSString *folderIdentifier) {
-    if (!consentURL.isFileURL || folderIdentifier.length == 0 || folderIdentifier.length > 128) return NO;
-    NSData *data = [NSData dataWithContentsOfURL:consentURL options:NSDataReadingMappedIfSafe error:nil];
-    if (data.length == 0 || data.length > 4096) return NO;
+ApolloICloudReadStateConsentStatus ApolloICloudReadStateConsentStatusAtURL(
+    NSURL *consentURL, NSString *folderIdentifier) {
+    if (!consentURL.isFileURL || folderIdentifier.length == 0 || folderIdentifier.length > 128) {
+        return ApolloICloudReadStateConsentStatusUnavailable;
+    }
+    NSError *readError = nil;
+    NSData *data = [NSData dataWithContentsOfURL:consentURL
+        options:NSDataReadingMappedIfSafe error:&readError];
+    if (readError || data.length == 0 || data.length > 4096) {
+        return ApolloICloudReadStateConsentStatusUnavailable;
+    }
     id value = [NSPropertyListSerialization propertyListWithData:data options:0 format:nil error:nil];
-    if (![value isKindOfClass:NSDictionary.class]) return NO;
+    if (![value isKindOfClass:NSDictionary.class]) {
+        return ApolloICloudReadStateConsentStatusUnavailable;
+    }
     NSDictionary *consent = value;
-    return [consent[@"v"] isEqual:kConsentVersion] && [consent[@"enabled"] isEqual:@YES] &&
-        [consent[@"folder"] isKindOfClass:NSString.class] &&
-        [consent[@"folder"] isEqualToString:folderIdentifier];
+    if (![consent[@"v"] isEqual:kConsentVersion] ||
+        (![consent[@"enabled"] isEqual:@YES] && ![consent[@"enabled"] isEqual:@NO]) ||
+        ![consent[@"folder"] isKindOfClass:NSString.class]) {
+        return ApolloICloudReadStateConsentStatusUnavailable;
+    }
+    return [consent[@"enabled"] isEqual:@YES] &&
+        [consent[@"folder"] isEqualToString:folderIdentifier]
+        ? ApolloICloudReadStateConsentStatusMatches
+        : ApolloICloudReadStateConsentStatusConfirmedMismatch;
+}
+
+BOOL ApolloICloudReadStateConsentAtURLMatchesFolder(NSURL *consentURL, NSString *folderIdentifier) {
+    return ApolloICloudReadStateConsentStatusAtURL(consentURL, folderIdentifier) ==
+        ApolloICloudReadStateConsentStatusMatches;
 }
 
 BOOL ApolloICloudReadStateOperationConsentIsCurrent(NSURL *consentURL,
@@ -639,12 +659,21 @@ BOOL ApolloICloudReadStateShouldRecheckConsent(BOOL enabled, BOOL protectedDataA
         dispatch_async(dispatch_get_main_queue(), ^{ [self selectedFolderDidChange:nil]; });
         return;
     }
-    if (self.enabled && !ApolloICloudReadStateInstallationConsentEnabled()) {
+    NSString *folderIdentifier = ApolloICloudBackupStore.sharedStore.selectedFolderConsentIdentifier;
+    ApolloICloudReadStateConsentStatus consentStatus =
+        ApolloICloudReadStateConsentStatusAtURL(ApolloICloudReadStateConsentURL(), folderIdentifier);
+    if (self.enabled && consentStatus == ApolloICloudReadStateConsentStatusConfirmedMismatch) {
         NSError *error = nil;
         [self setEnabled:NO error:&error];
         self.availabilityMessage = @"Off — confirm sync for the newly selected folder.";
         [NSNotificationCenter.defaultCenter postNotificationName:
             ApolloICloudReadStateDidChangeNotification object:self];
+    } else if (self.enabled && consentStatus == ApolloICloudReadStateConsentStatusUnavailable) {
+        // Complete file protection can make both the selected-folder marker and
+        // local consent temporarily unreadable while locked. Keep the active
+        // manager and its protected-data observer alive so unlock can retry.
+        self.available = NO;
+        self.availabilityMessage = @"Selected Folder access is temporarily unavailable.";
     }
 }
 

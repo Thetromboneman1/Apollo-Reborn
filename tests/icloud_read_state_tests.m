@@ -200,8 +200,14 @@ int main(void) {
         Check(consentWritten &&
               consentError == nil && ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
               @"installation-local consent matches the exact selected folder");
+        Check(ApolloICloudReadStateConsentStatusAtURL(consentURL, @"folder-a") ==
+                  ApolloICloudReadStateConsentStatusMatches,
+              @"readable matching consent is distinguished from transient unavailability");
         Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-b"),
               @"changing selected folders requires fresh consent");
+        Check(ApolloICloudReadStateConsentStatusAtURL(consentURL, @"folder-b") ==
+                  ApolloICloudReadStateConsentStatusConfirmedMismatch,
+              @"a readable different folder is a confirmed consent mismatch");
         Check(ApolloICloudReadStateOperationConsentIsCurrent(
                   consentURL, @"folder-a", @"folder-a") &&
               !ApolloICloudReadStateOperationConsentIsCurrent(
@@ -210,6 +216,9 @@ int main(void) {
         Check(ApolloICloudReadStateWriteConsentAtURL(consentURL, NO, nil, &consentError) &&
               !ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
               @"disabling persists a fail-closed installation-local tombstone");
+        Check(ApolloICloudReadStateConsentStatusAtURL(consentURL, @"folder-a") ==
+                  ApolloICloudReadStateConsentStatusConfirmedMismatch,
+              @"a readable opt-out tombstone is a confirmed mismatch");
         Check(!ApolloICloudReadStateOperationConsentIsCurrent(
                   consentURL, @"folder-a", @"folder-a"),
               @"queued work is rejected after opt-out");
@@ -217,6 +226,13 @@ int main(void) {
         [[@"malformed" dataUsingEncoding:NSUTF8StringEncoding] writeToURL:consentURL atomically:YES];
         Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
               @"malformed installation-local consent fails closed");
+        Check(ApolloICloudReadStateConsentStatusAtURL(consentURL, @"folder-a") ==
+                  ApolloICloudReadStateConsentStatusUnavailable,
+              @"unreadable consent is not mistaken for an explicit opt-out");
+        [fm removeItemAtURL:consentURL error:nil];
+        Check(ApolloICloudReadStateConsentStatusAtURL(consentURL, @"folder-a") ==
+                  ApolloICloudReadStateConsentStatusUnavailable,
+              @"temporarily missing protected consent remains recoverable");
         [fm removeItemAtURL:consentDirectory error:nil];
 
         NSMutableDictionary *restored = [NSMutableDictionary dictionary];
