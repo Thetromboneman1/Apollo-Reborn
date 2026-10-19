@@ -574,6 +574,11 @@ ApolloReborn_CFLAGS += -Wno-deprecated-declarations
 # screenshots. Only ever compiled into the simulator build, never the device/
 # release build (this branch is under the APOLLO_SIM_BUILD ifeq).
 ApolloReborn_FILES += $(SRC_DIR)/ApolloSimOpenRoute.m
+# ApolloPostedCommentInsert.xm owns the device implementation of the shared
+# comments-batch wrapper, but the internal Logos generator cannot compile that
+# hook and filters it out above. Keep simulator callers linkable and preserve
+# their underlying insert behavior with a no-animation passthrough.
+ApolloReborn_FILES += $(SRC_DIR)/ApolloCommentsBatchAnimationSim.m
 # Sim-only: runs +[ASDisplayNode initialize] from +load, ahead of every Logos
 # %init, so the internal generator can find the Texture lifecycle callbacks a
 # node class inherits (didEnterVisibleState etc.) and those %hooks install.
