@@ -229,10 +229,7 @@ NSDictionary *ApolloICloudReadStateMergeFolderAndLiveJournals(
         validFolder, activeGeneration);
     NSDictionary *activeLocal = ApolloICloudReadStateJournalByAdoptingGeneration(
         validLocal, activeGeneration);
-    NSMutableDictionary *combined = [ApolloICloudReadStateMergeJournals(
-        @[activeFolder, activeLocal]) mutableCopy];
-    combined[kJournalWriter] = validLocal[kJournalWriter];
-    return combined;
+    return ApolloICloudReadStateMergeJournals(@[activeFolder, activeLocal]);
 }
 
 NSArray<NSString *> *ApolloICloudReadStateProjectedReadIDs(NSDictionary *merged, NSUInteger limit) {
@@ -796,7 +793,9 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
             // the returned file does not yet include those events.
             NSDictionary *combined = ApolloICloudReadStateMergeFolderAndLiveJournals(
                 folderJournal, strongSelf.journal);
-            strongSelf.journal = [combined mutableCopy];
+            NSMutableDictionary *localWriter = [combined mutableCopy];
+            localWriter[kJournalWriter] = strongSelf.journal[kJournalWriter];
+            strongSelf.journal = localWriter;
             if (applyRemote) [strongSelf applyMergedJournal:combined];
             else [strongSelf saveJournal];
             strongSelf.available = YES;

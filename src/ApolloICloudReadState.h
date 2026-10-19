@@ -6,7 +6,8 @@ NS_ASSUME_NONNULL_BEGIN
 FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateValidatedJournal(id value);
 FOUNDATION_EXPORT NSDictionary *ApolloICloudReadStateMergeJournals(NSArray<NSDictionary *> *journals);
 // Reconciles the state returned by a provider operation with reads captured
-// while that operation was in flight, preserving the local writer identity.
+// while that operation was in flight. The returned provider representation
+// keeps the canonical top-level writer so equality checks ignore local identity.
 FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateMergeFolderAndLiveJournals(
     NSDictionary *folderJournal, NSDictionary *liveLocalJournal);
 FOUNDATION_EXPORT NSArray<NSString *> *ApolloICloudReadStateProjectedReadIDs(NSDictionary *merged,

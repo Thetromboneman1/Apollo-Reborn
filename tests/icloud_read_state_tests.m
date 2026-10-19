@@ -139,8 +139,15 @@ int main(void) {
         NSDictionary *withLateLocal = ApolloICloudReadStateMergeFolderAndLiveJournals(
             fileSecond, lateLocal);
         Check(withLateLocal[@"records"][@"read-during-provider-io"] != nil &&
-              [withLateLocal[@"w"] isEqual:@"late-reader"],
+              [withLateLocal[@"w"] isEqual:@"merged"],
               @"provider completion preserves a read captured while IO was in flight");
+        NSMutableDictionary *sameContentLocalWriter = [fileSecond mutableCopy];
+        sameContentLocalWriter[@"w"] = @"late-reader";
+        Check([[ApolloICloudReadStateMergeFolderAndLiveJournals(
+                  fileSecond, sameContentLocalWriter) objectForKey:@"w"] isEqual:@"merged"] &&
+              [ApolloICloudReadStateMergeFolderAndLiveJournals(
+                  fileSecond, sameContentLocalWriter) isEqual:fileSecond],
+              @"local writer identity does not requeue an otherwise converged sync");
         NSMutableDictionary *higherJoining = [Journal(@"higher-joining", 0,
             @{@"higher-local": Record(@40, nil, nil, nil, @"higher-joining")}) mutableCopy];
         higherJoining[@"g"] = @2;
