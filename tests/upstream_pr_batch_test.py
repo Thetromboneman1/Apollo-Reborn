@@ -82,6 +82,96 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(101, len(prs))
         self.assertIn("cursor=page-2", mocked.call_args_list[1].args[0])
 
+    def test_snapshot_excludes_configured_pull_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exclusions = root / "exclusions.json"
+            output = root / "snapshot.json"
+            exclusions.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "upstream_repository": "owner/repo",
+                        "pull_requests": [
+                            {"number": 1383, "reason": "excluded settings work"},
+                            {"number": 1401, "reason": "excluded setup work"},
+                            {"number": 1413, "reason": "excluded video work"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {
+                    "upstream_repository": "owner/repo",
+                    "downstream_sha": "a" * 40,
+                    "upstream_main_sha": "b" * 40,
+                    "exclusions": exclusions,
+                    "output": output,
+                },
+            )()
+            prs = [BATCH.PullRequest.from_dict(graph_node(number)) for number in (1383, 1401, 1413, 1500)]
+            statuses = {
+                number: {
+                    "number": number,
+                    "state": "open",
+                    "merged_at": None,
+                    "head_sha": f"{number:040x}",
+                }
+                for number in (1383, 1401, 1413)
+            }
+            with mock.patch.object(BATCH, "fetch_open_prs", return_value=prs), mock.patch.object(
+                BATCH,
+                "fetch_pull_request_status",
+                side_effect=lambda owner, name, number: statuses[number],
+            ):
+                self.assertEqual(0, BATCH.command_snapshot(args))
+            snapshot = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([1500], [record["number"] for record in snapshot["pull_requests"]])
+            self.assertEqual(
+                [1383, 1401, 1413],
+                [record["number"] for record in snapshot["excluded_pull_requests"]],
+            )
+
+    def test_snapshot_stops_when_excluded_pull_request_is_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exclusions = root / "exclusions.json"
+            exclusions.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "upstream_repository": "owner/repo",
+                        "pull_requests": [{"number": 1383, "reason": "excluded settings work"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {
+                    "upstream_repository": "owner/repo",
+                    "downstream_sha": "a" * 40,
+                    "upstream_main_sha": "b" * 40,
+                    "exclusions": exclusions,
+                    "output": root / "snapshot.json",
+                },
+            )()
+            merged = {
+                "number": 1383,
+                "state": "closed",
+                "merged_at": "2026-10-20T00:00:00Z",
+                "head_sha": "c" * 40,
+            }
+            with mock.patch.object(BATCH, "fetch_open_prs", return_value=[]), mock.patch.object(
+                BATCH, "fetch_pull_request_status", return_value=merged
+            ):
+                with self.assertRaisesRegex(RuntimeError, "manual upstream-main review is required"):
+                    BATCH.command_snapshot(args)
+
 
 class SummarySafetyTests(unittest.TestCase):
     def test_human_summary_omits_notification_producing_upstream_metadata(self) -> None:
@@ -282,6 +372,55 @@ class AssemblyTests(unittest.TestCase):
         self.assertFalse(manifest["complete"])
         self.assertFalse(manifest["upstream_main_included"])
         self.assertEqual("conflict", manifest["upstream_main_result"]["status"])
+
+    def test_assembly_stops_before_importing_excluded_upstream_commit(self) -> None:
+        command(self.root, "git", "switch", "--detach", self.base)
+        (self.root / "excluded.txt").write_text("excluded feature\n", encoding="utf-8")
+        command(self.root, "git", "add", "excluded.txt")
+        command(self.root, "git", "commit", "-m", "Excluded feature (#1383)")
+        upstream_main = command(self.root, "git", "rev-parse", "HEAD")
+        command(self.root, "git", "switch", "--force-create", "main", self.base)
+        snapshot = {
+            "schema_version": 2,
+            "generated_at": "test",
+            "upstream_repository": "owner/repo",
+            "downstream_sha": self.base,
+            "upstream_main_sha": upstream_main,
+            "fingerprint": "blocked",
+            "pull_requests": [],
+            "excluded_pull_requests": [
+                {
+                    "number": 1383,
+                    "reason": "excluded settings work",
+                    "state": "open",
+                    "merged_at": None,
+                    "head_sha": "c" * 40,
+                }
+            ],
+        }
+        snapshot_path = self.root / "snapshot.json"
+        snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        result = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts/upstream_pr_batch.py"),
+                "assemble",
+                "--repository",
+                str(self.root),
+                "--snapshot",
+                str(snapshot_path),
+                "--manifest",
+                str(self.root / "manifest.json"),
+                "--summary",
+                str(self.root / "summary.md"),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(1, result.returncode)
+        self.assertIn("upstream main contains excluded pull-request commits", result.stderr)
+        self.assertEqual(self.base, command(self.root, "git", "rev-parse", "HEAD"))
 
     def test_stacked_heads_are_ordered_and_conflict_is_reported(self) -> None:
         first = self.make_pr(1, self.base, "first.txt", "first\n")

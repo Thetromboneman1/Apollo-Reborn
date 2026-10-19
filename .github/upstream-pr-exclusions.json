@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "upstream_repository": "Apollo-Reborn/Apollo-Reborn",
+  "pull_requests": [
+    {
+      "number": 1383,
+      "reason": "Downstream feature exclusion: settings keyboard dismissal and numeric-field layout"
+    },
+    {
+      "number": 1401,
+      "reason": "Downstream feature exclusion: visual first-run setup assistant"
+    },
+    {
+      "number": 1413,
+      "reason": "Downstream feature exclusion: posted-video playback from the completion banner"
+    }
+  ]
+}

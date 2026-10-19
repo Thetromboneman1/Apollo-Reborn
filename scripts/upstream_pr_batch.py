@@ -167,11 +167,20 @@ def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     return run(["git", "merge-base", "--is-ancestor", ancestor, descendant], cwd=root, check=False).returncode == 0
 
 
-def snapshot_fingerprint(downstream_sha: str, upstream_main_sha: str, prs: list[PullRequest]) -> str:
+def snapshot_fingerprint(
+    downstream_sha: str,
+    upstream_main_sha: str,
+    prs: list[PullRequest],
+    excluded_prs: list[dict[str, Any]] | None = None,
+) -> str:
     payload = {
         "downstream_sha": downstream_sha,
         "upstream_main_sha": upstream_main_sha,
         "pull_requests": [[pr.number, pr.head_sha] for pr in sorted(prs, key=lambda item: item.number)],
+        "excluded_pull_requests": [
+            [record["number"], record["state"], record.get("head_sha", "")]
+            for record in sorted(excluded_prs or [], key=lambda item: int(item["number"]))
+        ],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -207,6 +216,37 @@ def fetch_open_prs(owner: str, name: str) -> list[PullRequest]:
     return prs
 
 
+def load_exclusions(path: Path | None, upstream_repository: str) -> dict[int, str]:
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise RuntimeError(f"unsupported upstream PR exclusion schema in {path}")
+    if payload.get("upstream_repository") != upstream_repository:
+        raise RuntimeError(f"upstream PR exclusions in {path} target a different repository")
+    exclusions: dict[int, str] = {}
+    for record in payload.get("pull_requests", []):
+        number = int(record["number"])
+        reason = str(record.get("reason") or "").strip()
+        if number <= 0 or not reason:
+            raise RuntimeError(f"invalid upstream PR exclusion in {path}: {record!r}")
+        if number in exclusions:
+            raise RuntimeError(f"duplicate upstream PR exclusion {number} in {path}")
+        exclusions[number] = reason
+    return exclusions
+
+
+def fetch_pull_request_status(owner: str, name: str, number: int) -> dict[str, Any]:
+    result = run(["gh", "api", f"repos/{owner}/{name}/pulls/{number}"])
+    payload = json.loads(result.stdout)
+    return {
+        "number": number,
+        "state": str(payload.get("state") or "unknown").lower(),
+        "merged_at": payload.get("merged_at"),
+        "head_sha": str((payload.get("head") or {}).get("sha") or ""),
+    }
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -214,19 +254,34 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def command_snapshot(args: argparse.Namespace) -> int:
     owner, name = args.upstream_repository.split("/", 1)
-    prs = fetch_open_prs(owner, name)
-    fingerprint = snapshot_fingerprint(args.downstream_sha, args.upstream_main_sha, prs)
+    exclusions = load_exclusions(args.exclusions, args.upstream_repository)
+    all_open_prs = fetch_open_prs(owner, name)
+    prs = [pr for pr in all_open_prs if pr.number not in exclusions]
+    excluded_prs: list[dict[str, Any]] = []
+    for number, reason in sorted(exclusions.items()):
+        status = fetch_pull_request_status(owner, name, number)
+        status["reason"] = reason
+        if status["merged_at"]:
+            raise RuntimeError(
+                f"excluded upstream PR {number} was merged; manual upstream-main review is required"
+            )
+        excluded_prs.append(status)
+    fingerprint = snapshot_fingerprint(args.downstream_sha, args.upstream_main_sha, prs, excluded_prs)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "upstream_repository": args.upstream_repository,
         "downstream_sha": args.downstream_sha,
         "upstream_main_sha": args.upstream_main_sha,
         "fingerprint": fingerprint,
         "pull_requests": [pr.as_dict() for pr in prs],
+        "excluded_pull_requests": excluded_prs,
     }
     write_json(args.output, payload)
-    print(f"snapshotted {len(prs)} open upstream pull requests ({fingerprint[:12]})")
+    print(
+        f"snapshotted {len(prs)} selected open upstream pull requests; "
+        f"excluded {len(excluded_prs)} by policy ({fingerprint[:12]})"
+    )
     return 0
 
 
@@ -290,6 +345,22 @@ def upstream_commit_source_pr(root: Path, commit_sha: str) -> int | None:
     subject = git(root, "show", "-s", "--format=%s", commit_sha)
     match = re.search(r"\(#(\d+)\)\s*$", subject)
     return int(match.group(1)) if match else None
+
+
+def excluded_upstream_commits(
+    root: Path,
+    downstream_sha: str,
+    upstream_main_sha: str,
+    excluded_numbers: set[int],
+) -> list[dict[str, Any]]:
+    blocked: list[dict[str, Any]] = []
+    for commit_sha in git(root, "rev-list", "--reverse", f"{downstream_sha}..{upstream_main_sha}").splitlines():
+        if not commit_sha:
+            continue
+        pr_number = upstream_commit_source_pr(root, commit_sha)
+        if pr_number in excluded_numbers:
+            blocked.append({"commit": commit_sha, "pull_request": pr_number})
+    return blocked
 
 
 def source_integrated_upstream_commits(
@@ -383,6 +454,7 @@ def render_summary(manifest: dict[str, Any]) -> str:
         f"- Upstream main: `{manifest['upstream_main_sha']}`",
         f"- Upstream main result: **{manifest['upstream_main_result']['status']}**",
         f"- Open PRs inventoried: **{manifest['total']}**",
+        f"- PRs excluded by fork policy: **{len(manifest.get('excluded_pull_requests', []))}**",
         f"- Exact heads present after assembly: **{manifest['included_count']}/{manifest['total']}**",
         f"- Complete: **{'yes' if manifest['complete'] else 'no'}**",
         "",
@@ -396,6 +468,18 @@ def render_summary(manifest: dict[str, Any]) -> str:
             f"| `upstream PR {pr['number']}` | `{result['status']}` | "
             f"{'yes' if pr['draft'] else 'no'} | {markdown_escape(upstream_state)} | "
             f"`{pr['head_sha'][:12]}` |"
+        )
+    if manifest.get("excluded_pull_requests"):
+        lines.extend(
+            [
+                "",
+                "Excluded upstream pull requests are omitted from assembly:",
+                "",
+                *[
+                    f"- `upstream PR {record['number']}`: {markdown_escape(record['reason'])}"
+                    for record in manifest["excluded_pull_requests"]
+                ],
+            ]
         )
     lines.extend(["", "## Per-PR merge record", ""])
     for result in manifest["results"]:
@@ -429,6 +513,21 @@ def command_assemble(args: argparse.Namespace) -> int:
     root = args.repository.resolve()
     snapshot, prs = load_snapshot(args.snapshot)
     downstream = snapshot["downstream_sha"]
+    excluded_records = snapshot.get("excluded_pull_requests", [])
+    excluded_numbers = {int(record["number"]) for record in excluded_records}
+    selected_exclusions = sorted(pr.number for pr in prs if pr.number in excluded_numbers)
+    if selected_exclusions:
+        raise RuntimeError(f"snapshot selected excluded upstream PRs: {selected_exclusions}")
+    blocked_upstream = excluded_upstream_commits(
+        root, downstream, snapshot["upstream_main_sha"], excluded_numbers
+    )
+    if blocked_upstream:
+        details = ", ".join(
+            f"PR {record['pull_request']} at {record['commit']}" for record in blocked_upstream
+        )
+        raise RuntimeError(
+            "upstream main contains excluded pull-request commits; manual review is required: " + details
+        )
     branch = args.branch or f"Thetromboneman1/all-open-upstream-prs-{snapshot['fingerprint'][:12]}"
     remote_tracking = f"refs/remotes/{args.origin_remote}/{branch}"
 
@@ -656,6 +755,7 @@ def command_assemble(args: argparse.Namespace) -> int:
         "complete": complete,
         "changed": changed,
         "results": results,
+        "excluded_pull_requests": excluded_records,
     }
     write_json(args.manifest, manifest)
     args.summary.parent.mkdir(parents=True, exist_ok=True)
@@ -693,6 +793,7 @@ def parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--upstream-repository", required=True)
     snapshot.add_argument("--downstream-sha", required=True)
     snapshot.add_argument("--upstream-main-sha", required=True)
+    snapshot.add_argument("--exclusions", type=Path)
     snapshot.add_argument("--output", type=Path, required=True)
     snapshot.set_defaults(func=command_snapshot)
 

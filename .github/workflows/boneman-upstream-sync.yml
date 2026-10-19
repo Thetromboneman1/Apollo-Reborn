@@ -93,6 +93,7 @@ jobs:
               --upstream-repository "$UPSTREAM_REPOSITORY" \
               --downstream-sha "$downstream_sha" \
               --upstream-main-sha "$upstream_main_sha" \
+              --exclusions .github/upstream-pr-exclusions.json \
               --output snapshot.json
             python3 "$RUNNER_TEMP/upstream_pr_batch.py" assemble \
               --repository . \
@@ -103,6 +104,7 @@ jobs:
               --upstream-repository "$UPSTREAM_REPOSITORY" \
               --downstream-sha "$downstream_sha" \
               --upstream-main-sha "$upstream_main_sha" \
+              --exclusions .github/upstream-pr-exclusions.json \
               --output snapshot-after.json
             if python3 "$RUNNER_TEMP/upstream_pr_batch.py" compare \
               --before snapshot.json \
