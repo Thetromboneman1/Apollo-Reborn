@@ -5,9 +5,9 @@ Updated: 2026-10-19
 This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
-- Repository: `Thetromboneman1/Apollo-Reborn`
+- Repository: `apollo-icloud-sync`
 - Default branch: `main`
-- Implementation fingerprint: `7f7c37b8725991b8`
+- Implementation fingerprint: `3bb33c6b386b8dd1`
 - Maintained documents: 55
 - Architecture assets: 5
 

@@ -393,10 +393,10 @@ See [repository maintenance](docs/repository-maintenance.md) before syncing.
 
 ## Current repository state
 
-![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
+![apollo-icloud-sync system architecture](docs/architecture/apollo-reborn-system-architecture.png)
 
 - **Default branch:** `main`
-- **Implementation fingerprint:** `7f7c37b8725991b8`
+- **Implementation fingerprint:** `3bb33c6b386b8dd1`
 - **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.
