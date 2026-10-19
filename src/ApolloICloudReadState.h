@@ -14,6 +14,10 @@ FOUNDATION_EXPORT NSArray<NSString *> *ApolloICloudReadStateProjectedReadIDs(NSD
                                                                              NSUInteger limit);
 FOUNDATION_EXPORT NSData * _Nullable ApolloICloudReadStateProjectedCommentData(NSDictionary *merged,
                                                                                 NSUInteger limit);
+FOUNDATION_EXPORT BOOL ApolloICloudReadStateProjectionMatchesSnapshots(
+    NSDictionary *merged, NSArray<NSString *> *currentReadIDs,
+    NSDictionary<NSString *, NSDictionary *> *currentComments,
+    NSUInteger readLimit, NSUInteger commentLimit);
 FOUNDATION_EXPORT NSDictionary *ApolloICloudReadStateJournalByCapturing(
     NSDictionary *journal, NSArray<NSString *> *readIDs, NSDictionary<NSString *, NSDictionary *> *comments,
     NSArray<NSString *> * _Nullable previousReadIDs, NSTimeInterval now, BOOL historicalSeed);

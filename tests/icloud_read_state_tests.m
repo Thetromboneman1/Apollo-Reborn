@@ -85,6 +85,15 @@ int main(void) {
         NSArray *native = [NSJSONSerialization JSONObjectWithData:comments options:0 error:nil];
         Check(native.count == 2 && [native[0] isEqual:@"abc"] && [native[1][@"timestamp"] isEqual:@22] &&
               [native[1][@"totalComments"] isEqual:@7], @"latest view timestamp and baseline are projected");
+        NSDictionary *projectedCommentSnapshots = @{
+            @"abc": @{@"timestamp": @22, @"totalComments": @7},
+        };
+        Check(ApolloICloudReadStateProjectionMatchesSnapshots(
+                  mergedAB, @[@"t3_abc", @"fresh"], projectedCommentSnapshots, 5000, 1000),
+              @"an unchanged native projection is recognized after ID normalization");
+        Check(!ApolloICloudReadStateProjectionMatchesSnapshots(
+                  mergedAB, @[@"abc"], projectedCommentSnapshots, 5000, 1000),
+              @"a changed native projection still requires application");
 
         NSDictionary *tie = ApolloICloudReadStateMergeJournals(@[
             Journal(@"a", 0, @{@"same": Record(nil, nil, @50, @8, @"a")}),

@@ -274,6 +274,28 @@ NSData *ApolloICloudReadStateProjectedCommentData(NSDictionary *merged, NSUInteg
     return [NSJSONSerialization dataWithJSONObject:native options:0 error:nil];
 }
 
+BOOL ApolloICloudReadStateProjectionMatchesSnapshots(
+    NSDictionary *merged, NSArray<NSString *> *currentReadIDs,
+    NSDictionary<NSString *, NSDictionary *> *currentComments,
+    NSUInteger readLimit, NSUInteger commentLimit) {
+    if (!ApolloICloudReadStateValidatedJournal(merged)) return NO;
+    NSMutableOrderedSet<NSString *> *normalizedReadIDs = [NSMutableOrderedSet orderedSet];
+    for (id rawID in currentReadIDs) {
+        NSString *postID = [rawID isKindOfClass:NSString.class] ? ApolloICloudBarePostID(rawID) : nil;
+        if (postID) [normalizedReadIDs addObject:postID];
+    }
+    if (![ApolloICloudReadStateProjectedReadIDs(merged, readLimit)
+            isEqual:normalizedReadIDs.array]) return NO;
+
+    NSData *commentData = ApolloICloudReadStateProjectedCommentData(merged, commentLimit);
+    NSArray *native = [NSJSONSerialization JSONObjectWithData:commentData options:0 error:nil];
+    NSMutableDictionary *projectedComments = [NSMutableDictionary dictionary];
+    for (NSUInteger index = 0; index + 1 < native.count; index += 2) {
+        projectedComments[native[index]] = native[index + 1];
+    }
+    return [projectedComments isEqual:currentComments ?: @{}];
+}
+
 NSDictionary *ApolloICloudReadStateJournalByCapturing(NSDictionary *rawJournal,
     NSArray<NSString *> *readIDs, NSDictionary<NSString *, NSDictionary *> *comments,
     NSArray<NSString *> *previousReadIDs, NSTimeInterval now, BOOL historicalSeed) {
@@ -708,6 +730,12 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
     NSUInteger configured = sReadPostMaxCount > 0 ? MIN((NSUInteger)sReadPostMaxCount, 5000u) : 5000u;
     NSArray *readIDs = ApolloICloudReadStateProjectedReadIDs(merged, configured);
     NSData *comments = ApolloICloudReadStateProjectedCommentData(merged, 1000);
+    NSArray *currentReadIDs = ApolloReadPostIDsSnapshot();
+    if (!currentReadIDs) {
+        currentReadIDs = [NSUserDefaults.standardUserDefaults stringArrayForKey:@"ReadPostIDs"] ?: @[];
+    }
+    BOOL projectionChanged = !ApolloICloudReadStateProjectionMatchesSnapshots(
+        merged, currentReadIDs, ApolloRawPostCommentSnapshots(), configured, 1000);
     // Adopt the converged values before posting the projection notification.
     // The delayed observer then sees existing timestamps instead of turning
     // remote reads into newly-viewed local reads.
@@ -715,9 +743,11 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
     convergedLocal[kJournalWriter] = self.journal[kJournalWriter];
     self.journal = convergedLocal;
     [self saveJournal];
-    self.applyingProjection = YES;
-    ApolloApplySyncedPostReadState(readIDs, comments);
-    self.applyingProjection = NO;
+    if (projectionChanged) {
+        self.applyingProjection = YES;
+        ApolloApplySyncedPostReadState(readIDs, comments);
+        self.applyingProjection = NO;
+    }
     self.lastObservedReadIDs = readIDs;
     self.hasObservedReadIDs = YES;
 }
