@@ -34,6 +34,10 @@ FOUNDATION_EXPORT BOOL ApolloICloudReadStateOperationConsentIsCurrent(
     NSString *currentFolderIdentifier);
 FOUNDATION_EXPORT BOOL ApolloICloudReadStateWriteConsentAtURL(
     NSURL *consentURL, BOOL enabled, NSString * _Nullable folderIdentifier, NSError **error);
+// A locked launch can make the protected consent file temporarily unreadable.
+// Recheck only after protected data is available, and never churn an active manager.
+FOUNDATION_EXPORT BOOL ApolloICloudReadStateShouldRecheckConsent(
+    BOOL enabled, BOOL protectedDataAvailable);
 #if !defined(APOLLO_ICLOUD_READ_STATE_TESTS)
 FOUNDATION_EXPORT BOOL ApolloICloudReadStateInstallationConsentEnabled(void);
 #endif

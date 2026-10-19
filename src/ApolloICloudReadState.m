@@ -496,8 +496,17 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         ApolloICloudReadStateConsentURL(), folderIdentifier);
 }
 
+#endif
+
+BOOL ApolloICloudReadStateShouldRecheckConsent(BOOL enabled, BOOL protectedDataAvailable) {
+    return !enabled && protectedDataAvailable;
+}
+
+#if !defined(APOLLO_ICLOUD_READ_STATE_TESTS)
+
 @interface ApolloICloudReadState ()
 @property (nonatomic) BOOL started;
+@property (nonatomic) BOOL observingConsentAvailability;
 @property (nonatomic) BOOL available;
 @property (nonatomic, copy) NSString *availabilityMessage;
 @property (nonatomic, strong) NSMutableDictionary *journal;
@@ -548,17 +557,27 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
 
 - (void)start {
     if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ [self start]; }); return; }
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    if (!self.observingConsentAvailability) {
+        self.observingConsentAvailability = YES;
+        [nc addObserver:self selector:@selector(refreshForLifecycle:)
+            name:UIApplicationDidBecomeActiveNotification object:nil];
+        [nc addObserver:self selector:@selector(refreshForLifecycle:)
+            name:UIApplicationProtectedDataDidBecomeAvailable object:nil];
+    }
     if (self.started) return;
-    self.started = YES;
+    if (ApolloICloudReadStateShouldRecheckConsent(
+            self.enabled, UIApplication.sharedApplication.isProtectedDataAvailable) &&
+        ApolloICloudReadStateInstallationConsentEnabled()) {
+        sICloudReadStateSyncEnabled = YES;
+    }
     if (!self.enabled) return;
+    self.started = YES;
     self.journal = [[self loadOrCreateJournal] mutableCopy];
     self.available = NO;
     self.availabilityMessage = @"Connecting to Selected Folder…";
-    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     [nc addObserver:self selector:@selector(localDidChange:)
         name:ApolloPostReadStateDidChangeNotification object:nil];
-    [nc addObserver:self selector:@selector(refreshForLifecycle:)
-        name:UIApplicationDidBecomeActiveNotification object:nil];
     [nc addObserver:self selector:@selector(flushForLifecycle:)
         name:UIApplicationWillResignActiveNotification object:nil];
     [nc addObserver:self selector:@selector(selectedFolderDidChange:)
@@ -599,6 +618,7 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         self.pollTimer = nil;
         [NSNotificationCenter.defaultCenter removeObserver:self];
         self.started = NO;
+        self.observingConsentAvailability = NO;
         self.syncPending = NO;
         self.availabilityMessage = @"Off";
         [NSNotificationCenter.defaultCenter postNotificationName:
@@ -629,7 +649,19 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
 }
 
 - (void)refreshForLifecycle:(__unused NSNotification *)note {
-    if (!self.enabled) return;
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self refreshForLifecycle:nil]; });
+        return;
+    }
+    if (ApolloICloudReadStateShouldRecheckConsent(
+            self.enabled, UIApplication.sharedApplication.isProtectedDataAvailable)) {
+        if (ApolloICloudReadStateInstallationConsentEnabled()) {
+            sICloudReadStateSyncEnabled = YES;
+            [self start];
+        }
+        return;
+    }
+    if (!self.enabled || !self.started) return;
     [self syncWithSelectedFolderApplyingRemote:YES];
 }
 - (void)flushForLifecycle:(__unused NSNotification *)note {

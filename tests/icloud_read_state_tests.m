@@ -23,6 +23,13 @@ static NSDictionary *Record(NSNumber *readAt, NSNumber *unreadAt, NSNumber *comm
 
 int main(void) {
     @autoreleasepool {
+        Check(!ApolloICloudReadStateShouldRecheckConsent(NO, NO),
+              @"locked launch waits for protected data before rereading consent");
+        Check(ApolloICloudReadStateShouldRecheckConsent(NO, YES),
+              @"disabled startup rechecks consent after protected data becomes available");
+        Check(!ApolloICloudReadStateShouldRecheckConsent(YES, YES),
+              @"active sync does not repeatedly reread installation consent");
+
         NSDictionary *first = Journal(@"writer-a", 0, @{
             @"abc": Record(@10, nil, @20, @4, @"writer-a"),
             @"gone": Record(@5, @12, nil, nil, @"writer-a"),
