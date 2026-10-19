@@ -205,7 +205,7 @@ public func ApolloSwiftExchangePaneTabs(_ storage: UnsafeMutableRawPointer?, _ o
     return previous.map { Unmanaged.passRetained($0).toOpaque() }
 }
 
-// Balanced Search reads Apollo's live trending model without treating a Swift
+// The Search landing reads Apollo's live trending model without treating a Swift
 // Array as an Objective-C ivar. The caller consumes this retained NSArray.
 @_cdecl("ApolloSwiftCopyOptionalStringArray")
 public func ApolloSwiftCopyOptionalStringArray(_ storage: UnsafeRawPointer?) -> UnsafeMutableRawPointer? {
@@ -240,4 +240,16 @@ public func ApolloSwiftEnableHostingPreferredContentSize(_ controller: UnsafeRaw
     guard let hosting = object as? any ApolloHostingPreferredSizeReporting else { return false }
     hosting.apolloEnablePreferredSizeReporting()
     return true
+}
+
+// PostsViewController.links is a non-optional Array<RDKLink>. Arrays of class
+// references share Array<AnyObject>'s element representation; Swift handles its
+// native/bridged storage and empty-array sentinel. Reading .first is O(1) and
+// never bridges/copies the entire feed. The caller consumes the retained object
+// and validates its RDKLink class before reading subreddit.
+@_cdecl("ApolloSwiftCopyFirstObjectArrayElement")
+public func ApolloSwiftCopyFirstObjectArrayElement(_ storage: UnsafeRawPointer?) -> UnsafeMutableRawPointer? {
+    guard Thread.isMainThread, let storage,
+          let first = storage.assumingMemoryBound(to: Array<AnyObject>.self).pointee.first else { return nil }
+    return Unmanaged.passRetained(first).toOpaque()
 }

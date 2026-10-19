@@ -79,6 +79,10 @@ static NSString *const UDKeyRandomSubredditsSource = @"RandomSubredditsSource";
 static NSString *const UDKeyRandNsfwSubredditsSource = @"RandNsfwSubredditsSource";
 static NSString *const UDKeyTrendingSubredditsSource = @"TrendingSubredditsSource";
 static NSString *const UDKeyTrendingSubredditsLimit = @"TrendingSubredditsLimit";
+// Search landing history display count. Default 5; empty means unlimited, 0 hides.
+static NSString *const UDKeyRecentlyVisitedSubredditsLimit = @"RecentlyVisitedSubredditsLimit";
+// Search landing sections, ordered by stable identifiers. Default trending/random/recent.
+static NSString *const UDKeySearchTabSectionOrder = @"SearchTabSectionOrder";
 // Master toggle for subreddit list polish/enhancements. Default YES. Feed
 // Shortcuts is independent; Modern Subreddit Dividers remains a sub-option.
 static NSString *const UDKeySubredditListEnhancements = @"SubredditListEnhancements";
@@ -309,6 +313,8 @@ static NSString *const UDKeyShowSubredditHeaders = @"ShowSubredditHeaders";
 // flat) — mirrors UDKeyProfileHeaderImmersive's semantics for subreddits.
 static NSString *const UDKeySubredditHeaderImmersive = @"SubredditHeaderImmersive";
 static NSString *const UDKeySubredditShowBanner = @"SubredditShowBanner";
+// Show the community icon in Compact and Immersive headers (default YES).
+static NSString *const UDKeySubredditShowIcon = @"SubredditShowIcon";
 static NSString *const UDKeySubredditShowJoinButton = @"SubredditShowJoinButton";
 // Show direct actions beside Join in Apollo Reborn's subreddit header.
 // Both default to NO; User Flair is also hidden when the subreddit disallows it.
@@ -418,6 +424,7 @@ static NSString *const UDKeyInfoRowTapComments = @"InfoRowTapComments";
 static NSString *const UDKeyInfoRowPopupMode = @"InfoRowPopupMode";       // %/time/edited → popup alert
 static NSString *const UDKeyInfoRowOverlayMode = @"InfoRowOverlayMode";   // %/time/edited → transient overlay
 static NSString *const UDKeyInfoRowTapTranslation = @"InfoRowTapTranslation";
+static NSString *const UDKeyThreeStateVoting = @"ThreeStateVoting";
 static NSString *const UDKeyLiveCommentsFollow = @"LiveCommentsFollow";
 // Per-POST comment sort memory (issue #555). When ON, changing a post's comment sort
 // is remembered for that post (capped LRU mapping below) and restored when its
