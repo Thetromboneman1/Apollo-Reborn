@@ -24,7 +24,7 @@ static NSError *ApolloICloudBackupError(NSString *message) {
         userInfo:@{NSLocalizedDescriptionKey: message ?: @"iCloud Drive is unavailable."}];
 }
 
-static void ApolloICloudBackupCancelCoordinatorAfterTimeout(NSFileCoordinator *coordinator) {
+void ApolloICloudBackupCancelCoordinatorAfterTimeout(NSFileCoordinator *coordinator) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kApolloICloudDownloadTimeout * NSEC_PER_SEC)),
         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ [coordinator cancel]; });
 }

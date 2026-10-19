@@ -11,6 +11,9 @@ typedef NS_ENUM(NSInteger, ApolloICloudBackupAvailability) {
 
 __BEGIN_DECLS
 extern NSNotificationName const ApolloICloudBackupStoreDidChangeNotification;
+// File-provider coordination is bounded everywhere this store is reused so a
+// stalled provider cannot permanently block its serialized work queue.
+extern void ApolloICloudBackupCancelCoordinatorAfterTimeout(NSFileCoordinator *coordinator);
 __END_DECLS
 
 typedef id _Nullable (^ApolloICloudSelectedFolderOperation)(NSURL *folderURL,

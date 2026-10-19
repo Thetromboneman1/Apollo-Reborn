@@ -15,6 +15,10 @@ real backup folder containing credentials for development evidence.
   byte-for-byte unchanged.
 - Make the selected folder temporarily unavailable. Confirm local read tracking
   continues, the status explains the failure, and sync retries after foregrounding.
+- Stall or disconnect the selected folder's file provider during a read-state
+  update. Confirm the operation stops waiting after the shared 45-second
+  coordinator timeout, backup operations resume, and sync reports a retryable
+  error instead of blocking the store queue indefinitely.
 - Revoke or stale the saved bookmark. Confirm the UI asks the user to reconnect
   the folder through Backup Settings instead of choosing a fallback container.
 - Restore a settings backup that was created while read-state sync was enabled.

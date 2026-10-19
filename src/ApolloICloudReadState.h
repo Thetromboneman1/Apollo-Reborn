@@ -5,6 +5,10 @@ NS_ASSUME_NONNULL_BEGIN
 // Deterministic, Foundation-only helpers used by the runtime and host tests.
 FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateValidatedJournal(id value);
 FOUNDATION_EXPORT NSDictionary *ApolloICloudReadStateMergeJournals(NSArray<NSDictionary *> *journals);
+// Reconciles the state returned by a provider operation with reads captured
+// while that operation was in flight, preserving the local writer identity.
+FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateMergeFolderAndLiveJournals(
+    NSDictionary *folderJournal, NSDictionary *liveLocalJournal);
 FOUNDATION_EXPORT NSArray<NSString *> *ApolloICloudReadStateProjectedReadIDs(NSDictionary *merged,
                                                                              NSUInteger limit);
 FOUNDATION_EXPORT NSData * _Nullable ApolloICloudReadStateProjectedCommentData(NSDictionary *merged,

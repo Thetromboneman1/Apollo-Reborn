@@ -218,6 +218,23 @@ NSDictionary *ApolloICloudReadStateMergeJournals(NSArray<NSDictionary *> *journa
              kJournalRecords: merged};
 }
 
+NSDictionary *ApolloICloudReadStateMergeFolderAndLiveJournals(
+    NSDictionary *folderJournal, NSDictionary *liveLocalJournal) {
+    NSDictionary *validFolder = ApolloICloudReadStateValidatedJournal(folderJournal);
+    NSDictionary *validLocal = ApolloICloudReadStateValidatedJournal(liveLocalJournal);
+    if (!validFolder || !validLocal) return nil;
+    long long activeGeneration = MAX([validFolder[kJournalGeneration] longLongValue],
+                                     [validLocal[kJournalGeneration] longLongValue]);
+    NSDictionary *activeFolder = ApolloICloudReadStateJournalByAdoptingGeneration(
+        validFolder, activeGeneration);
+    NSDictionary *activeLocal = ApolloICloudReadStateJournalByAdoptingGeneration(
+        validLocal, activeGeneration);
+    NSMutableDictionary *combined = [ApolloICloudReadStateMergeJournals(
+        @[activeFolder, activeLocal]) mutableCopy];
+    combined[kJournalWriter] = validLocal[kJournalWriter];
+    return combined;
+}
+
 NSArray<NSString *> *ApolloICloudReadStateProjectedReadIDs(NSDictionary *merged, NSUInteger limit) {
     NSDictionary *journal = ApolloICloudReadStateValidatedJournal(merged);
     if (!journal || limit == 0) return @[];
@@ -432,6 +449,7 @@ NSDictionary *ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
     mergeAccessor(stateURL);
 #else
     NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+    ApolloICloudBackupCancelCoordinatorAfterTimeout(coordinator);
     [coordinator coordinateWritingItemAtURL:stateURL options:NSFileCoordinatorWritingForReplacing
         error:&coordinationError byAccessor:mergeAccessor];
 #endif
@@ -526,7 +544,6 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         name:UIApplicationWillResignActiveNotification object:nil];
     [nc addObserver:self selector:@selector(selectedFolderDidChange:)
         name:ApolloICloudBackupStoreDidChangeNotification object:nil];
-    [self captureLocalStateUsingHistoricalSeed:YES];
     [self syncWithSelectedFolderApplyingRemote:YES];
     self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 target:self
         selector:@selector(pollSelectedFolder:) userInfo:nil repeats:YES];
@@ -594,7 +611,6 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
 
 - (void)refreshForLifecycle:(__unused NSNotification *)note {
     if (!self.enabled) return;
-    [self captureLocalStateUsingHistoricalSeed:!self.hasObservedReadIDs];
     [self syncWithSelectedFolderApplyingRemote:YES];
 }
 - (void)flushForLifecycle:(__unused NSNotification *)note {
@@ -648,7 +664,6 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
 }
 
 - (void)captureLocalStateAndUpload {
-    [self captureLocalStateUsingHistoricalSeed:NO];
     [self syncWithSelectedFolderApplyingRemote:YES];
 }
 
@@ -717,6 +732,12 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         self.syncPending = YES;
         return;
     }
+    // Native read notifications are debounced. Capture the tracker at the
+    // synchronization boundary so a poll cannot snapshot an older journal
+    // and project it over a read that has not reached the timer yet.
+    [self.uploadTimer invalidate];
+    self.uploadTimer = nil;
+    [self captureLocalStateUsingHistoricalSeed:!self.hasObservedReadIDs];
     self.syncInFlight = YES;
     self.syncPending = NO;
     NSDictionary *snapshot = [self.journal copy];
@@ -752,6 +773,12 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
                 [strongSelf selectedFolderDidChange:nil];
                 return;
             }
+            // Capture once more after provider I/O. This preserves native
+            // reads made near the end of the operation before remote state is
+            // projected into Apollo's tracker.
+            [strongSelf.uploadTimer invalidate];
+            strongSelf.uploadTimer = nil;
+            [strongSelf captureLocalStateUsingHistoricalSeed:!strongSelf.hasObservedReadIDs];
             NSDictionary *folderJournal = ApolloICloudReadStateValidatedJournal(result);
             if (!folderJournal || operationError) {
                 strongSelf.available = NO;
@@ -767,16 +794,9 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
             // Local events may have landed while coordinated I/O was running.
             // Merge again before projection, then schedule one more write when
             // the returned file does not yet include those events.
-            long long activeGeneration = MAX([folderJournal[kJournalGeneration] longLongValue],
-                [strongSelf.journal[kJournalGeneration] longLongValue]);
-            NSDictionary *activeFolder = ApolloICloudReadStateJournalByAdoptingGeneration(
-                folderJournal, activeGeneration);
-            NSDictionary *activeLocal = ApolloICloudReadStateJournalByAdoptingGeneration(
-                strongSelf.journal, activeGeneration);
-            NSDictionary *combined = ApolloICloudReadStateMergeJournals(@[activeFolder, activeLocal]);
-            NSMutableDictionary *localWriter = [combined mutableCopy];
-            localWriter[kJournalWriter] = strongSelf.journal[kJournalWriter];
-            strongSelf.journal = localWriter;
+            NSDictionary *combined = ApolloICloudReadStateMergeFolderAndLiveJournals(
+                folderJournal, strongSelf.journal);
+            strongSelf.journal = [combined mutableCopy];
             if (applyRemote) [strongSelf applyMergedJournal:combined];
             else [strongSelf saveJournal];
             strongSelf.available = YES;

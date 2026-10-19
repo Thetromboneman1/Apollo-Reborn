@@ -134,6 +134,13 @@ int main(void) {
             objectForKey:NSFileSystemFileNumber];
         Check([fileNoOp isEqual:fileSecond] && [inodeAfter isEqual:inodeBefore],
               @"converged poll returns without replacing the shared file");
+        NSDictionary *lateLocal = Journal(@"late-reader", 0,
+            @{@"read-during-provider-io": Record(@35, nil, nil, nil, @"late-reader")});
+        NSDictionary *withLateLocal = ApolloICloudReadStateMergeFolderAndLiveJournals(
+            fileSecond, lateLocal);
+        Check(withLateLocal[@"records"][@"read-during-provider-io"] != nil &&
+              [withLateLocal[@"w"] isEqual:@"late-reader"],
+              @"provider completion preserves a read captured while IO was in flight");
         NSMutableDictionary *higherJoining = [Journal(@"higher-joining", 0,
             @{@"higher-local": Record(@40, nil, nil, nil, @"higher-joining")}) mutableCopy];
         higherJoining[@"g"] = @2;
