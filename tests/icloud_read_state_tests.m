@@ -126,6 +126,23 @@ int main(void) {
             fixture, second, &folderError);
         Check([ApolloICloudReadStateProjectedReadIDs(fileSecond, 5000) isEqual:expected],
               @"sequential device fixtures converge through coordinated file IO");
+        NSMutableDictionary *higherJoining = [Journal(@"higher-joining", 0,
+            @{@"higher-local": Record(@40, nil, nil, nil, @"higher-joining")}) mutableCopy];
+        higherJoining[@"g"] = @2;
+        NSDictionary *fileHigherJoining = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, higherJoining, &folderError);
+        Check([fileHigherJoining[@"g"] isEqual:@2] &&
+              fileHigherJoining[@"records"][@"higher-local"] != nil &&
+              fileHigherJoining[@"records"][@"fresh"] != nil,
+              @"higher-generation joining device preserves current folder records");
+        NSDictionary *lowerJoining = Journal(@"lower-joining", 0,
+            @{@"lower-local": Record(@50, nil, nil, nil, @"lower-joining")});
+        NSDictionary *fileLowerJoining = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, lowerJoining, &folderError);
+        Check([fileLowerJoining[@"g"] isEqual:@2] &&
+              fileLowerJoining[@"records"][@"lower-local"] != nil &&
+              fileLowerJoining[@"records"][@"higher-local"] != nil,
+              @"lower-generation joining device adopts folder generation without local data loss");
         Check([[NSData dataWithContentsOfURL:backup] isEqual:backupBytes],
               @"read-state sync leaves credential-bearing backup archives untouched");
 

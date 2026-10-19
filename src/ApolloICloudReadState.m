@@ -94,6 +94,17 @@ static BOOL ApolloICloudRecordWins(NSDictionary *candidate, NSDictionary *curren
     return NO;
 }
 
+static NSDictionary *ApolloICloudReadStateJournalByAdoptingGeneration(
+    NSDictionary *rawJournal, long long generation) {
+    NSDictionary *journal = ApolloICloudReadStateValidatedJournal(rawJournal);
+    if (!journal) return nil;
+    long long adopted = MAX([journal[kJournalGeneration] longLongValue], generation);
+    if (adopted == [journal[kJournalGeneration] longLongValue]) return journal;
+    NSMutableDictionary *rebased = [journal mutableCopy];
+    rebased[kJournalGeneration] = @(adopted);
+    return rebased;
+}
+
 NSDictionary *ApolloICloudReadStateMergeJournals(NSArray<NSDictionary *> *journals) {
     NSMutableDictionary *merged = [NSMutableDictionary dictionary];
     double clearAt = 0;
@@ -317,17 +328,26 @@ NSDictionary *ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
                 merged = validLocal;
                 return;
             }
-            NSMutableArray<NSDictionary *> *journals = [NSMutableArray arrayWithObject:validLocal];
             NSDictionary *current = ApolloICloudReadStateJournalAtURL(coordinatedURL, &workError);
             if (!current) return;
-            [journals addObject:current];
-
+            NSMutableArray<NSDictionary *> *conflictJournals = [NSMutableArray array];
+            long long activeGeneration = MAX([validLocal[kJournalGeneration] longLongValue],
+                                             [current[kJournalGeneration] longLongValue]);
             NSArray<NSFileVersion *> *conflicts = [NSFileVersion unresolvedConflictVersionsOfItemAtURL:coordinatedURL] ?: @[];
             for (NSFileVersion *version in conflicts) {
                 NSDictionary *conflict = ApolloICloudReadStateJournalAtURL(version.URL, &workError);
                 if (!conflict) return;
-                [journals addObject:conflict];
+                activeGeneration = MAX(activeGeneration, [conflict[kJournalGeneration] longLongValue]);
+                [conflictJournals addObject:conflict];
             }
+            // The joining device and the provider's current file are both live
+            // sources. Adopt the highest observed reset generation before the
+            // merge so neither is mistaken for a stale conflict version. Only
+            // historical NSFileVersion conflicts retain their old generation.
+            NSMutableArray<NSDictionary *> *journals = [NSMutableArray arrayWithObjects:
+                ApolloICloudReadStateJournalByAdoptingGeneration(validLocal, activeGeneration),
+                ApolloICloudReadStateJournalByAdoptingGeneration(current, activeGeneration), nil];
+            [journals addObjectsFromArray:conflictJournals];
             merged = ApolloICloudReadStateMergeJournals(journals);
             NSData *data = [NSPropertyListSerialization dataWithPropertyList:merged
                 format:NSPropertyListBinaryFormat_v1_0 options:0 error:&workError];
@@ -622,8 +642,13 @@ static NSURL *ApolloICloudReadStateURL(void) {
             // Local events may have landed while coordinated I/O was running.
             // Merge again before projection, then schedule one more write when
             // the returned file does not yet include those events.
-            NSDictionary *combined = ApolloICloudReadStateMergeJournals(
-                @[folderJournal, strongSelf.journal]);
+            long long activeGeneration = MAX([folderJournal[kJournalGeneration] longLongValue],
+                [strongSelf.journal[kJournalGeneration] longLongValue]);
+            NSDictionary *activeFolder = ApolloICloudReadStateJournalByAdoptingGeneration(
+                folderJournal, activeGeneration);
+            NSDictionary *activeLocal = ApolloICloudReadStateJournalByAdoptingGeneration(
+                strongSelf.journal, activeGeneration);
+            NSDictionary *combined = ApolloICloudReadStateMergeJournals(@[activeFolder, activeLocal]);
             NSMutableDictionary *localWriter = [combined mutableCopy];
             localWriter[kJournalWriter] = strongSelf.journal[kJournalWriter];
             strongSelf.journal = localWriter;
