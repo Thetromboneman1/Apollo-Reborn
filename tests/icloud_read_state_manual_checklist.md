@@ -21,6 +21,8 @@ real backup folder containing credentials for development evidence.
   Confirm this installation remains opted out until the disclosure is accepted.
 - While sync is active, select a different folder. Confirm sync turns off and
   requires the disclosure to be accepted again for that exact folder.
+- Make the local consent marker temporarily undeletable, then turn sync off.
+  Confirm polling and uploads stop immediately even though cleanup reports an error.
 
 ## Real-device acceptance
 

@@ -396,6 +396,10 @@ NSDictionary *ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
                 ApolloICloudReadStateJournalByAdoptingGeneration(current, activeGeneration), nil];
             [journals addObjectsFromArray:conflictJournals];
             merged = ApolloICloudReadStateMergeJournals(journals);
+            // Polling a converged folder must not create a new provider upload
+            // or conflict version. Conflicts still take the replacement path
+            // so their versions can be marked resolved below.
+            if (conflicts.count == 0 && [merged isEqual:current]) return;
             NSData *data = [NSPropertyListSerialization dataWithPropertyList:merged
                 format:NSPropertyListBinaryFormat_v1_0 options:0 error:&workError];
             if (!data || data.length > kMaximumJournalBytes) {
@@ -529,19 +533,22 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         if (error) *error = ApolloICloudReadStateError(self.availabilityMessage);
         return NO;
     }
-    NSError *consentError = nil;
-    if (!ApolloICloudReadStateWriteConsentAtURL(ApolloICloudReadStateConsentURL(), enabled,
-                                                 folderIdentifier, &consentError)) {
-        if (error) *error = consentError ?: ApolloICloudReadStateError(
-            @"Could not save this installation's read-state sync consent.");
-        return NO;
-    }
-    if (enabled && !self.journal) self.journal = [[self loadOrCreateJournal] mutableCopy];
-    sICloudReadStateSyncEnabled = enabled;
     if (enabled) {
+        NSError *consentError = nil;
+        if (!ApolloICloudReadStateWriteConsentAtURL(ApolloICloudReadStateConsentURL(), YES,
+                                                     folderIdentifier, &consentError)) {
+            if (error) *error = consentError ?: ApolloICloudReadStateError(
+                @"Could not save this installation's read-state sync consent.");
+            return NO;
+        }
+        if (!self.journal) self.journal = [[self loadOrCreateJournal] mutableCopy];
+        sICloudReadStateSyncEnabled = YES;
         self.started = NO;
         [self start];
     } else {
+        // Explicit opt-out is fail-closed in memory. Marker cleanup can report
+        // a persistence error, but it must never leave uploads or polls alive.
+        sICloudReadStateSyncEnabled = NO;
         [self.uploadTimer invalidate];
         self.uploadTimer = nil;
         [self.pollTimer invalidate];
@@ -552,6 +559,13 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         self.availabilityMessage = @"Off";
         [NSNotificationCenter.defaultCenter postNotificationName:
             ApolloICloudReadStateDidChangeNotification object:self];
+        NSError *consentError = nil;
+        if (!ApolloICloudReadStateWriteConsentAtURL(ApolloICloudReadStateConsentURL(), NO,
+                                                     folderIdentifier, &consentError)) {
+            if (error) *error = consentError ?: ApolloICloudReadStateError(
+                @"Sync is off, but its local consent marker could not be removed.");
+            return NO;
+        }
     }
     return YES;
 }
@@ -563,19 +577,10 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
     }
     if (self.enabled && !ApolloICloudReadStateInstallationConsentEnabled()) {
         NSError *error = nil;
-        if (![self setEnabled:NO error:&error]) {
-            // Fail closed in memory even if the installation-local marker
-            // cannot be removed; startup validation will reject a mismatch.
-            sICloudReadStateSyncEnabled = NO;
-            [self.uploadTimer invalidate];
-            [self.pollTimer invalidate];
-            [NSNotificationCenter.defaultCenter removeObserver:self];
-            self.started = NO;
-            self.syncPending = NO;
-            self.availabilityMessage = @"Off — confirm sync for the newly selected folder.";
-            [NSNotificationCenter.defaultCenter postNotificationName:
-                ApolloICloudReadStateDidChangeNotification object:self];
-        }
+        [self setEnabled:NO error:&error];
+        self.availabilityMessage = @"Off — confirm sync for the newly selected folder.";
+        [NSNotificationCenter.defaultCenter postNotificationName:
+            ApolloICloudReadStateDidChangeNotification object:self];
     }
 }
 

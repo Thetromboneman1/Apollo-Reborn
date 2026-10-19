@@ -126,6 +126,14 @@ int main(void) {
             fixture, second, &folderError);
         Check([ApolloICloudReadStateProjectedReadIDs(fileSecond, 5000) isEqual:expected],
               @"sequential device fixtures converge through coordinated file IO");
+        NSNumber *inodeBefore = [[fm attributesOfItemAtPath:syncFile.path error:nil]
+            objectForKey:NSFileSystemFileNumber];
+        NSDictionary *fileNoOp = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, fileSecond, &folderError);
+        NSNumber *inodeAfter = [[fm attributesOfItemAtPath:syncFile.path error:nil]
+            objectForKey:NSFileSystemFileNumber];
+        Check([fileNoOp isEqual:fileSecond] && [inodeAfter isEqual:inodeBefore],
+              @"converged poll returns without replacing the shared file");
         NSMutableDictionary *higherJoining = [Journal(@"higher-joining", 0,
             @{@"higher-local": Record(@40, nil, nil, nil, @"higher-joining")}) mutableCopy];
         higherJoining[@"g"] = @2;
