@@ -23,6 +23,13 @@ static NSDictionary *Record(NSNumber *readAt, NSNumber *unreadAt, NSNumber *comm
 
 int main(void) {
     @autoreleasepool {
+        Check(!ApolloICloudReadStateShouldRecheckConsent(NO, NO),
+              @"locked launch waits for protected data before rereading consent");
+        Check(ApolloICloudReadStateShouldRecheckConsent(NO, YES),
+              @"disabled startup rechecks consent after protected data becomes available");
+        Check(!ApolloICloudReadStateShouldRecheckConsent(YES, YES),
+              @"active sync does not repeatedly reread installation consent");
+
         NSDictionary *first = Journal(@"writer-a", 0, @{
             @"abc": Record(@10, nil, @20, @4, @"writer-a"),
             @"gone": Record(@5, @12, nil, nil, @"writer-a"),
@@ -53,7 +60,7 @@ int main(void) {
             isEqual:[ApolloICloudReadStateMergeJournals(@[first]) objectForKey:@"records"]], @"merge is idempotent");
         NSDictionary *emptyDevice = Journal(@"new-device", 0, @{});
         Check([ApolloICloudReadStateMergeJournals(@[mergedAB, emptyDevice]) isEqual:mergedAB],
-              @"receiving converged cloud state reaches a no-write fixed point");
+              @"receiving converged shared state reaches a no-write fixed point");
         NSMutableDictionary *adopted = [mergedAB mutableCopy];
         adopted[@"w"] = @"device-b";
         NSDictionary *capturedAgain = ApolloICloudReadStateJournalByCapturing(adopted, expected,
@@ -85,6 +92,15 @@ int main(void) {
         NSArray *native = [NSJSONSerialization JSONObjectWithData:comments options:0 error:nil];
         Check(native.count == 2 && [native[0] isEqual:@"abc"] && [native[1][@"timestamp"] isEqual:@22] &&
               [native[1][@"totalComments"] isEqual:@7], @"latest view timestamp and baseline are projected");
+        NSDictionary *projectedCommentSnapshots = @{
+            @"abc": @{@"timestamp": @22, @"totalComments": @7},
+        };
+        Check(ApolloICloudReadStateProjectionMatchesSnapshots(
+                  mergedAB, @[@"t3_abc", @"fresh"], projectedCommentSnapshots, 5000, 1000),
+              @"an unchanged native projection is recognized after ID normalization");
+        Check(!ApolloICloudReadStateProjectionMatchesSnapshots(
+                  mergedAB, @[@"abc"], projectedCommentSnapshots, 5000, 1000),
+              @"a changed native projection still requires application");
 
         NSDictionary *tie = ApolloICloudReadStateMergeJournals(@[
             Journal(@"a", 0, @{@"same": Record(nil, nil, @50, @8, @"a")}),
@@ -108,16 +124,100 @@ int main(void) {
         Check(commentCap.count == 6 && [commentCap[0] isEqual:@"p09"] && [commentCap[4] isEqual:@"p11"],
               @"comment projection keeps newest baselines at cap");
 
-        NSMutableData *key = [NSMutableData dataWithLength:32];
-        memset(key.mutableBytes, 0x5a, key.length);
-        NSData *plain = [@"private post history" dataUsingEncoding:NSUTF8StringEncoding];
-        NSData *encrypted = ApolloICloudReadStateEncrypt(plain, key, nil);
-        Check(encrypted.length > plain.length && [encrypted rangeOfData:plain options:0
-            range:NSMakeRange(0, encrypted.length)].location == NSNotFound, @"cloud envelope does not expose plaintext");
-        Check([ApolloICloudReadStateDecrypt(encrypted, key, nil) isEqual:plain], @"encrypted journal round trips");
-        NSMutableData *tampered = [encrypted mutableCopy];
-        ((uint8_t *)tampered.mutableBytes)[20] ^= 1;
-        Check(ApolloICloudReadStateDecrypt(tampered, key, nil) == nil, @"tampered journal is rejected");
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSURL *fixture = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+            URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+        [fm createDirectoryAtURL:fixture withIntermediateDirectories:YES attributes:nil error:nil];
+        NSURL *backup = [fixture URLByAppendingPathComponent:@"Keep.apollobackup"];
+        NSData *backupBytes = [@"credential-bearing fixture" dataUsingEncoding:NSUTF8StringEncoding];
+        [backupBytes writeToURL:backup atomically:YES];
+        NSError *folderError = nil;
+        NSDictionary *fileFirst = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, first, &folderError);
+        NSURL *syncFile = [[fixture URLByAppendingPathComponent:@"Apollo Reborn Sync" isDirectory:YES]
+            URLByAppendingPathComponent:@"Read State.plist"];
+        Check(fileFirst != nil && folderError == nil && [fm fileExistsAtPath:syncFile.path],
+              @"selected-folder merge creates only the namespaced read-state file");
+        NSDictionary *fileSecond = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, second, &folderError);
+        Check([ApolloICloudReadStateProjectedReadIDs(fileSecond, 5000) isEqual:expected],
+              @"sequential device fixtures converge through coordinated file IO");
+        NSNumber *inodeBefore = [[fm attributesOfItemAtPath:syncFile.path error:nil]
+            objectForKey:NSFileSystemFileNumber];
+        NSDictionary *fileNoOp = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, fileSecond, &folderError);
+        NSNumber *inodeAfter = [[fm attributesOfItemAtPath:syncFile.path error:nil]
+            objectForKey:NSFileSystemFileNumber];
+        Check([fileNoOp isEqual:fileSecond] && [inodeAfter isEqual:inodeBefore],
+              @"converged poll returns without replacing the shared file");
+        NSDictionary *lateLocal = Journal(@"late-reader", 0,
+            @{@"read-during-provider-io": Record(@35, nil, nil, nil, @"late-reader")});
+        NSDictionary *withLateLocal = ApolloICloudReadStateMergeFolderAndLiveJournals(
+            fileSecond, lateLocal);
+        Check(withLateLocal[@"records"][@"read-during-provider-io"] != nil &&
+              [withLateLocal[@"w"] isEqual:@"merged"],
+              @"provider completion preserves a read captured while IO was in flight");
+        NSMutableDictionary *sameContentLocalWriter = [fileSecond mutableCopy];
+        sameContentLocalWriter[@"w"] = @"late-reader";
+        Check([[ApolloICloudReadStateMergeFolderAndLiveJournals(
+                  fileSecond, sameContentLocalWriter) objectForKey:@"w"] isEqual:@"merged"] &&
+              [ApolloICloudReadStateMergeFolderAndLiveJournals(
+                  fileSecond, sameContentLocalWriter) isEqual:fileSecond],
+              @"local writer identity does not requeue an otherwise converged sync");
+        NSMutableDictionary *higherJoining = [Journal(@"higher-joining", 0,
+            @{@"higher-local": Record(@40, nil, nil, nil, @"higher-joining")}) mutableCopy];
+        higherJoining[@"g"] = @2;
+        NSDictionary *fileHigherJoining = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, higherJoining, &folderError);
+        Check([fileHigherJoining[@"g"] isEqual:@2] &&
+              fileHigherJoining[@"records"][@"higher-local"] != nil &&
+              fileHigherJoining[@"records"][@"fresh"] != nil,
+              @"higher-generation joining device preserves current folder records");
+        NSDictionary *lowerJoining = Journal(@"lower-joining", 0,
+            @{@"lower-local": Record(@50, nil, nil, nil, @"lower-joining")});
+        NSDictionary *fileLowerJoining = ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+            fixture, lowerJoining, &folderError);
+        Check([fileLowerJoining[@"g"] isEqual:@2] &&
+              fileLowerJoining[@"records"][@"lower-local"] != nil &&
+              fileLowerJoining[@"records"][@"higher-local"] != nil,
+              @"lower-generation joining device adopts folder generation without local data loss");
+        Check([[NSData dataWithContentsOfURL:backup] isEqual:backupBytes],
+              @"read-state sync leaves credential-bearing backup archives untouched");
+
+        NSData *corrupt = [@"not a journal" dataUsingEncoding:NSUTF8StringEncoding];
+        [corrupt writeToURL:syncFile atomically:YES];
+        folderError = nil;
+        Check(ApolloICloudReadStateMergeJournalAtSelectedFolderURL(fixture, first, &folderError) == nil &&
+              folderError != nil && [[NSData dataWithContentsOfURL:syncFile] isEqual:corrupt],
+              @"invalid remote state fails closed without overwrite");
+        [fm removeItemAtURL:fixture error:nil];
+
+        NSURL *consentDirectory = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+            URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+        NSURL *consentURL = [consentDirectory URLByAppendingPathComponent:@"consent.plist"];
+        NSError *consentError = nil;
+        BOOL consentWritten = ApolloICloudReadStateWriteConsentAtURL(consentURL, YES, @"folder-a", &consentError);
+        Check(consentWritten &&
+              consentError == nil && ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
+              @"installation-local consent matches the exact selected folder");
+        Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-b"),
+              @"changing selected folders requires fresh consent");
+        Check(ApolloICloudReadStateOperationConsentIsCurrent(
+                  consentURL, @"folder-a", @"folder-a") &&
+              !ApolloICloudReadStateOperationConsentIsCurrent(
+                  consentURL, @"folder-a", @"folder-b"),
+              @"queued work is bound to the folder that received consent");
+        Check(ApolloICloudReadStateWriteConsentAtURL(consentURL, NO, nil, &consentError) &&
+              !ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
+              @"disabling persists a fail-closed installation-local tombstone");
+        Check(!ApolloICloudReadStateOperationConsentIsCurrent(
+                  consentURL, @"folder-a", @"folder-a"),
+              @"queued work is rejected after opt-out");
+        [fm createDirectoryAtURL:consentDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+        [[@"malformed" dataUsingEncoding:NSUTF8StringEncoding] writeToURL:consentURL atomically:YES];
+        Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
+              @"malformed installation-local consent fails closed");
+        [fm removeItemAtURL:consentDirectory error:nil];
 
         NSMutableDictionary *restored = [NSMutableDictionary dictionary];
         for (NSUInteger i = 0; i < 5000; i++) {
@@ -130,7 +230,7 @@ int main(void) {
               @"remote clear beats timestamp-less restored history");
         NSData *largePlain = [NSPropertyListSerialization dataWithPropertyList:restoredJournal
             format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
-        Check(largePlain.length < 900 * 1024, @"single bounded 5,000-record journal fits KVS quota budget");
+        Check(largePlain.length < 900 * 1024, @"single bounded 5,000-record journal fits the file safety cap");
 
         NSMutableDictionary *overflowA = [NSMutableDictionary dictionary];
         NSMutableDictionary *overflowB = [NSMutableDictionary dictionary];
@@ -144,14 +244,12 @@ int main(void) {
               @"concurrent histories compact to one bounded journal with an anti-resurrection floor");
         NSMutableDictionary *generationOne = [first mutableCopy]; generationOne[@"g"] = @1;
         NSMutableDictionary *generationTwo = [second mutableCopy]; generationTwo[@"g"] = @2;
-        Check([[ApolloICloudReadStateMergeJournals(@[generationOne, generationTwo]) objectForKey:@"g"] isEqual:@2],
-              @"newer reset generation propagates across clients");
-        long long parsedGeneration = 0;
-        NSData *resetMarker = ApolloICloudReadStateResetMarker(3);
-        Check(ApolloICloudReadStateParseResetMarker(resetMarker, &parsedGeneration) && parsedGeneration == 3,
-              @"atomic reset marker carries the generation in the state key");
-        Check(ApolloICloudReadStateDecrypt(resetMarker, key, nil) == nil,
-              @"reset marker cannot be mistaken for an encrypted journal");
+        NSDictionary *newGeneration = ApolloICloudReadStateMergeJournals(@[generationOne, generationTwo]);
+        Check([newGeneration[@"g"] isEqual:@2] &&
+              [newGeneration[@"records"] objectForKey:@"fresh"] != nil &&
+              [newGeneration[@"records"] objectForKey:@"abc"] != nil &&
+              [newGeneration[@"records"] objectForKey:@"gone"] == nil,
+              @"newer generation tombstones all records from stale conflict versions");
 
         printf("%lu failure(s)\n", (unsigned long)failures);
         return failures == 0 ? 0 : 1;
