@@ -33,6 +33,15 @@ static NSString *ApolloWebJSONClientUsername(RDKClient *client) { (void)client; 
 static void ApolloWebJSONNoteMalformedAccountResponse(NSString *username, NSString *path) { (void)username; (void)path; }
 static void ApolloWebJSONCheckAccountSession(NSString *username) { (void)username; }
 static NSError *ApolloWebJSONAccountSessionError(NSString *username) { (void)username; return nil; }
+// The production RDKClient hook now performs a keyless-OAuth preflight before
+// the response-shape guard. This harness keeps WebJSON disabled and supplies
+// inert declarations so it can continue isolating response handling.
+static BOOL sWebJSONEnabled = NO;
+static __thread BOOL sApolloWebJSONResendingAfterWebBearerMint = NO;
+static BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path) { (void)path; return NO; }
+static NSString *ApolloWebJSONWebSessionUsernameForClient(RDKClient *client) { (void)client; return nil; }
+static BOOL ApolloWebJSONWebBearerNeedsMint(NSString *username) { (void)username; return NO; }
+static NSString *ApolloWebJSONKeylessOAuthBearer(NSString *username) { (void)username; return nil; }
 // PRODUCTION_HOOK
 
 static void Check(BOOL condition, NSString *message) {
