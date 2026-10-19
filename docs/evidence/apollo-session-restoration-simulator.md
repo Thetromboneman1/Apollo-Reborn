@@ -1,5 +1,16 @@
 # Session restoration simulator evidence
 
+![Integrated main cold-launch restoration on an anonymous iOS 27 simulator](apollo-main-integration-restoration.gif)
+
+The first capture is a fresh validation of the combined main integration on an
+anonymous iOS 27 simulator. It records a process termination and cold launch,
+then shows Apollo returning to the saved full 46-comment post. The capture is
+cropped above the account tab and before author rows so it publishes neither
+the test account nor public author labels. The accompanying runtime trace
+recorded the bounded saved-anchor expansion and successful post-anchor restore;
+when the stale feed anchor was unavailable, restoration used the bounded pixel
+fallback without replacing the full thread with a single-comment route.
+
 ![Apollo comments before termination, during cold launch, and after restoration](apollo-session-restoration-simulator.gif)
 
 ![Build 354 full-thread regression fix cold launch](apollo-session-full-thread-restoration.gif)
