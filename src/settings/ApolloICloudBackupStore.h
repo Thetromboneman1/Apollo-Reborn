@@ -13,6 +13,9 @@ __BEGIN_DECLS
 extern NSNotificationName const ApolloICloudBackupStoreDidChangeNotification;
 __END_DECLS
 
+typedef id _Nullable (^ApolloICloudSelectedFolderOperation)(NSURL *folderURL,
+                                                             NSError **error);
+
 // Owns the iCloud Drive seam. Every public completion returns on main. The
 // backup engine remains unaware of iCloud and continues to create/restore the
 // same .apollobackup archives.
@@ -24,9 +27,17 @@ __END_DECLS
 @property (nonatomic, readonly, getter=isWorking) BOOL working;
 @property (atomic, readonly, copy, nullable) NSString *scopeIdentifier;
 @property (atomic, readonly, copy, nullable) NSString *selectedFolderName;
+@property (nonatomic, readonly) BOOL hasSelectedFolder;
 
 - (void)refreshAvailabilityWithCompletion:(nullable void (^)(void))completion;
 - (void)selectFolderURL:(NSURL *)folderURL completion:(void (^)(NSError *_Nullable error))completion;
+// Runs on the store's serialized file-provider queue while the existing
+// selected-folder bookmark is resolved, identity-checked, and security-scoped.
+// It never falls back to a signed ubiquity container: callers using this seam
+// require the folder the user explicitly chose in Files.
+- (void)performSelectedFolderOperation:(ApolloICloudSelectedFolderOperation)operation
+                            completion:(void (^)(id _Nullable result,
+                                                 NSError *_Nullable error))completion;
 - (void)uploadLocalBackupURL:(NSURL *)localURL
                expectedScope:(nullable NSString *)expectedScope
                identityToken:(NSString *)identityToken

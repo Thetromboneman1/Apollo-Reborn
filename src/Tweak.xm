@@ -3834,7 +3834,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyAutomaticBackupsEnabled: @NO,
                                     UDKeyAutomaticBackupIntervalDays: @3,
                                     UDKeyAutomaticBackupDestination: @0,
-                                    UDKeyICloudReadStateSyncEnabled: @NO,
+                                    UDKeyICloudFolderReadStateSyncEnabled: @NO,
                                     UDKeyCrashCaptureEnabled: @YES,
                                     UDKeyTrendingSubredditsLimit: @"5",
                                     UDKeyShowRandNsfw: @NO,
@@ -4003,7 +4003,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
         [standardDefaults setInteger:3 forKey:UDKeyAutomaticBackupIntervalDays];
     }
     sAutomaticBackupDestination = [standardDefaults integerForKey:UDKeyAutomaticBackupDestination] == 1 ? 1 : 0;
-    sICloudReadStateSyncEnabled = [standardDefaults boolForKey:UDKeyICloudReadStateSyncEnabled];
+    sICloudReadStateSyncEnabled = [standardDefaults boolForKey:UDKeyICloudFolderReadStateSyncEnabled];
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     NSDictionary *persistentDomain = bundleID.length > 0 ? [standardDefaults persistentDomainForName:bundleID] : nil;
 

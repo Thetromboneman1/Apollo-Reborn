@@ -1065,10 +1065,18 @@ typedef NS_ENUM(NSInteger, Tag) {
     [super viewDidLoad];
 
     self.title = [self apollo_screenTitle];
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(apollo_iCloudReadStateDidChange:)
+        name:ApolloICloudReadStateDidChangeNotification object:nil];
 
     if (![self apollo_isHub]) return;
     // What the first table load renders; viewWillAppear compares against it.
     self.setupFooterShowsKeyNudge = sRedditClientId.length == 0;
+}
+
+- (void)apollo_iCloudReadStateDidChange:(__unused NSNotification *)notification {
+    [self reloadRowWithID:@"gen.iCloudReadState"];
+    [self reloadRowWithID:@"gen.iCloudReadStateStatus"];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -2031,7 +2039,7 @@ typedef NS_ENUM(NSInteger, Tag) {
         if (sender.isOn) {
             [sender setOn:NO animated:YES];
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sync Read History with iCloud?"
-                message:@"Apollo will sync read post IDs, view times, and new-comment baselines. The cloud payload is encrypted with a key stored in iCloud Keychain. Sync only works across devices using the same iCloud account and compatible signing identity. Changing iCloud accounts turns sync off without changing local history."
+                message:@"Apollo will store read post IDs, view times, and new-comment baselines in a separate Apollo Reborn Sync file inside the iCloud Drive folder already selected in Backup Settings. It never reads or uploads your credential-bearing backups. The read-state file is protected by that folder's access controls, not by a separate Apollo encryption key. Select the same folder on each device."
                 preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
             [alert addAction:[UIAlertAction actionWithTitle:@"Enable Sync" style:UIAlertActionStyleDefault
@@ -2063,30 +2071,12 @@ typedef NS_ENUM(NSInteger, Tag) {
                                    detail:^NSString * {
         ApolloICloudReadState *manager = ApolloICloudReadState.sharedManager;
         if (!manager.enabled) return manager.availabilityMessage ?: @"Off";
-        return manager.available ? @"Encrypted · Active" : (manager.availabilityMessage ?: @"Unavailable");
-    } onSelect:^{
-        UIAlertController *reset = [UIAlertController alertControllerWithTitle:@"Reset Encrypted Cloud State?"
-            message:@"Use this only when devices created conflicting encryption keys. It deletes Apollo's encrypted read-state value and synchronized key from iCloud, but does not change local read history. After resetting, enable sync on one device first, then the others."
-            preferredStyle:UIAlertControllerStyleAlert];
-        [reset addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [reset addAction:[UIAlertAction actionWithTitle:@"Reset Cloud Sync" style:UIAlertActionStyleDestructive
-            handler:^(__unused UIAlertAction *action) {
-                NSError *resetError = nil;
-                if (![ApolloICloudReadState.sharedManager resetEncryptedCloudState:&resetError]) {
-                    [weakSelf showAlertWithTitle:@"Reset Failed" message:resetError.localizedDescription];
-                }
-                [weakSelf reloadRowWithID:@"gen.iCloudReadState"];
-                [weakSelf reloadRowWithID:@"gen.iCloudReadStateStatus"];
-            }]];
-        [weakSelf presentViewController:reset animated:YES completion:nil];
-    }];
-    iCloudReadStateStatus.enabled = ^BOOL {
-        ApolloICloudReadState *manager = ApolloICloudReadState.sharedManager;
-        return manager.enabled || manager.recoveryNeeded;
-    };
+        return manager.availabilityMessage ?: (manager.available ? @"Active" : @"Unavailable");
+    } onSelect:nil];
+    iCloudReadStateStatus.enabled = ^BOOL { return NO; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Recently Read"
-                                             footer:@"Show thumbnails on posts you've already read, and cap how many Apollo remembers. iCloud sync is optional and requires usable iCloud key-value-store and iCloud Keychain access. Read state updates live; native comment highlighting uses received baselines after the next cold start."
+                                             footer:@"Show thumbnails on posts you've already read, and cap how many Apollo remembers. Folder sync is optional and reuses the iCloud Drive folder selected in Backup Settings; stale or revoked access requires reconnecting that folder. Read state retries after offline periods; native comment highlighting uses received baselines after the next cold start."
                                                rows:@[ readThumbnails, readPostMax, filterNSFWRR, iCloudReadState, iCloudReadStateStatus ]];
 }
 

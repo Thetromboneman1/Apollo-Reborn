@@ -9,33 +9,30 @@ FOUNDATION_EXPORT NSArray<NSString *> *ApolloICloudReadStateProjectedReadIDs(NSD
                                                                              NSUInteger limit);
 FOUNDATION_EXPORT NSData * _Nullable ApolloICloudReadStateProjectedCommentData(NSDictionary *merged,
                                                                                 NSUInteger limit);
-FOUNDATION_EXPORT NSData * _Nullable ApolloICloudReadStateEncrypt(NSData *plaintext, NSData *key,
-                                                                   NSError **error);
-FOUNDATION_EXPORT NSData * _Nullable ApolloICloudReadStateDecrypt(NSData *envelope, NSData *key,
-                                                                   NSError **error);
 FOUNDATION_EXPORT NSDictionary *ApolloICloudReadStateJournalByCapturing(
     NSDictionary *journal, NSArray<NSString *> *readIDs, NSDictionary<NSString *, NSDictionary *> *comments,
     NSArray<NSString *> * _Nullable previousReadIDs, NSTimeInterval now, BOOL historicalSeed);
-FOUNDATION_EXPORT NSData *ApolloICloudReadStateResetMarker(long long generation);
-FOUNDATION_EXPORT BOOL ApolloICloudReadStateParseResetMarker(NSData *data, long long * _Nullable generation);
+// The caller must hold access to selectedFolderURL for the duration of this
+// coordinated merge. Only the dedicated Apollo Reborn Sync namespace is used.
+FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
+    NSURL *selectedFolderURL, NSDictionary *localJournal, NSError **error);
+
+__BEGIN_DECLS
+extern NSNotificationName const ApolloICloudReadStateDidChangeNotification;
+__END_DECLS
 
 @interface ApolloICloudReadState : NSObject
 + (instancetype)sharedManager;
 
 @property (nonatomic, readonly, getter=isEnabled) BOOL enabled;
 @property (nonatomic, readonly, getter=isAvailable) BOOL available;
-@property (nonatomic, readonly, getter=isRecoveryNeeded) BOOL recoveryNeeded;
 @property (nonatomic, readonly, nullable) NSString *availabilityMessage;
 
 // Called after defaults are registered. The manager is completely dormant while
-// the opt-in is off. Returns NO without changing the setting when iCloud KVS is
-// unavailable for the current signing identity.
+// the opt-in is off. Returns NO without changing the setting when no
+// user-selected backup folder has been saved.
 - (void)start;
 - (BOOL)setEnabled:(BOOL)enabled error:(NSError **)error;
-// Explicit recovery for a mismatched first-time encryption-key race. Deletes
-// only this feature's encrypted cloud value and synchronizable key, then turns
-// sync off; local Apollo history is never changed.
-- (BOOL)resetEncryptedCloudState:(NSError **)error;
 
 // Explicit user intent. Ordinary native history eviction must not become a
 // cross-device unread event.

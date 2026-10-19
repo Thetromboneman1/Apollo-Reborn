@@ -147,6 +147,10 @@ static NSURL *ApolloICloudBackupSelectionURL(void) {
     return [value isKindOfClass:NSDictionary.class] && [value[@"bookmark"] isKindOfClass:NSData.class] ? value : nil;
 }
 
+- (BOOL)hasSelectedFolder {
+    return [self selectedFolderState] != nil;
+}
+
 - (BOOL)writeSelectedFolderState:(NSDictionary *)state error:(NSError **)error {
     NSURL *stateURL = ApolloICloudBackupSelectionURL();
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -451,6 +455,39 @@ static NSURL *ApolloICloudBackupSelectionURL(void) {
         if (scoped) [self endAccessingSelectedFolderURL:root];
         if (directory) [self publishState:ApolloICloudBackupAvailabilityAvailable description:@"Available" working:NO];
         dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(); });
+    });
+}
+
+- (void)performSelectedFolderOperation:(ApolloICloudSelectedFolderOperation)operation
+                            completion:(void (^)(id, NSError *))completion {
+    if (!operation) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(nil, ApolloICloudBackupError(@"No selected-folder operation was provided."));
+        });
+        return;
+    }
+    dispatch_async(self.workQueue, ^{
+        NSError *error = nil;
+        id result = nil;
+        NSURL *root = nil;
+        BOOL scoped = NO;
+        NSURL *directory = nil;
+        if (![self selectedFolderState]) {
+            error = ApolloICloudBackupError(
+                @"Choose an iCloud Drive folder in Backup Settings before enabling read-state sync.");
+        } else {
+            directory = [self resolveDirectoryWithError:&error accessRoot:&root scoped:&scoped];
+        }
+        // resolveDirectoryWithError validates the saved bookmark, refreshes it
+        // when stale, and checks the folder identity. Read-state callers need
+        // that exact user-selected root rather than the Apollo Backups child
+        // used for credential-bearing archives.
+        NSURL *selectedRoot = root ?: directory;
+        if (selectedRoot && !error) result = operation(selectedRoot, &error);
+        if (scoped) [self endAccessingSelectedFolderURL:root];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(result, error);
+        });
     });
 }
 
