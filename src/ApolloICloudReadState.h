@@ -20,6 +20,9 @@ FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateMergeJournalAtSe
 // exact selected-folder identity recorded when the user opted in.
 FOUNDATION_EXPORT BOOL ApolloICloudReadStateConsentAtURLMatchesFolder(
     NSURL *consentURL, NSString *folderIdentifier);
+FOUNDATION_EXPORT BOOL ApolloICloudReadStateOperationConsentIsCurrent(
+    NSURL *consentURL, NSString *capturedFolderIdentifier,
+    NSString *currentFolderIdentifier);
 FOUNDATION_EXPORT BOOL ApolloICloudReadStateWriteConsentAtURL(
     NSURL *consentURL, BOOL enabled, NSString * _Nullable folderIdentifier, NSError **error);
 #if !defined(APOLLO_ICLOUD_READ_STATE_TESTS)

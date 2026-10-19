@@ -172,9 +172,17 @@ int main(void) {
               @"installation-local consent matches the exact selected folder");
         Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-b"),
               @"changing selected folders requires fresh consent");
+        Check(ApolloICloudReadStateOperationConsentIsCurrent(
+                  consentURL, @"folder-a", @"folder-a") &&
+              !ApolloICloudReadStateOperationConsentIsCurrent(
+                  consentURL, @"folder-a", @"folder-b"),
+              @"queued work is bound to the folder that received consent");
         Check(ApolloICloudReadStateWriteConsentAtURL(consentURL, NO, nil, &consentError) &&
               !ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
-              @"disabling removes installation-local consent");
+              @"disabling persists a fail-closed installation-local tombstone");
+        Check(!ApolloICloudReadStateOperationConsentIsCurrent(
+                  consentURL, @"folder-a", @"folder-a"),
+              @"queued work is rejected after opt-out");
         [fm createDirectoryAtURL:consentDirectory withIntermediateDirectories:YES attributes:nil error:nil];
         [[@"malformed" dataUsingEncoding:NSUTF8StringEncoding] writeToURL:consentURL atomically:YES];
         Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),

@@ -153,6 +153,9 @@ static NSURL *ApolloICloudBackupSelectionURL(void) {
 
 - (NSString *)selectedFolderConsentIdentifier {
     NSDictionary *selection = [self selectedFolderState];
+    NSString *consentIdentifier = [selection[@"consentIdentifier"] isKindOfClass:NSString.class]
+        ? selection[@"consentIdentifier"] : nil;
+    if (consentIdentifier.length > 0 && consentIdentifier.length <= 128) return consentIdentifier;
     NSString *identifier = ApolloICloudBackupValidatedFolderIdentifier(selection[@"folderIdentifier"]);
     if (identifier.length > 0) return identifier;
     NSString *scope = [selection[@"scope"] isKindOfClass:NSString.class] ? selection[@"scope"] : nil;
@@ -244,6 +247,7 @@ static NSURL *ApolloICloudBackupSelectionURL(void) {
                 @"name": folderName ?: kApolloICloudBackupDirectoryName,
                 @"isBackupDirectory": @YES,
                 @"folderIdentifier": folderIdentifier ?: @"",
+                @"consentIdentifier": folderIdentifier ?: @"",
                 @"scope": scope ?: @"",
             } mutableCopy];
             if (!resultError && ![self writeSelectedFolderState:state error:&resultError]) state = nil;
@@ -391,6 +395,20 @@ static NSURL *ApolloICloudBackupSelectionURL(void) {
         NSMutableDictionary *updated = [selection mutableCopy];
         BOOL selectionChanged = NO;
         BOOL bookmarkRefreshFailed = NO;
+        NSString *stableConsentIdentifier = [selection[@"consentIdentifier"] isKindOfClass:NSString.class]
+            ? selection[@"consentIdentifier"] : nil;
+        if (stableConsentIdentifier.length == 0 || stableConsentIdentifier.length > 128) {
+            stableConsentIdentifier = ApolloICloudBackupValidatedFolderIdentifier(selection[@"folderIdentifier"]);
+            if (stableConsentIdentifier.length == 0) {
+                NSString *legacyScope = [selection[@"scope"] isKindOfClass:NSString.class]
+                    ? selection[@"scope"] : nil;
+                stableConsentIdentifier = legacyScope.length <= 128 ? legacyScope : nil;
+            }
+            if (stableConsentIdentifier.length > 0) {
+                updated[@"consentIdentifier"] = stableConsentIdentifier;
+                selectionChanged = YES;
+            }
+        }
         if (!ApolloICloudBackupValidatedFolderIdentifier(selection[@"folderIdentifier"]) && actualIdentifier) {
             updated[@"folderIdentifier"] = actualIdentifier;
             [updated removeObjectForKey:@"resourceIdentifier"];

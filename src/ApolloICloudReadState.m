@@ -25,6 +25,14 @@ BOOL ApolloICloudReadStateConsentAtURLMatchesFolder(NSURL *consentURL, NSString 
         [consent[@"folder"] isEqualToString:folderIdentifier];
 }
 
+BOOL ApolloICloudReadStateOperationConsentIsCurrent(NSURL *consentURL,
+                                                      NSString *capturedFolderIdentifier,
+                                                      NSString *currentFolderIdentifier) {
+    return capturedFolderIdentifier.length > 0 &&
+        [capturedFolderIdentifier isEqualToString:currentFolderIdentifier] &&
+        ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, capturedFolderIdentifier);
+}
+
 BOOL ApolloICloudReadStateWriteConsentAtURL(NSURL *consentURL, BOOL enabled,
                                              NSString *folderIdentifier, NSError **error) {
     if (!consentURL.isFileURL) {
@@ -33,11 +41,7 @@ BOOL ApolloICloudReadStateWriteConsentAtURL(NSURL *consentURL, BOOL enabled,
         return NO;
     }
     NSFileManager *fm = NSFileManager.defaultManager;
-    if (!enabled) {
-        if (![fm fileExistsAtPath:consentURL.path]) return YES;
-        return [fm removeItemAtURL:consentURL error:error];
-    }
-    if (folderIdentifier.length == 0 || folderIdentifier.length > 128) {
+    if (enabled && (folderIdentifier.length == 0 || folderIdentifier.length > 128)) {
         if (error) *error = [NSError errorWithDomain:@"ApolloICloudReadState" code:2
             userInfo:@{NSLocalizedDescriptionKey: @"Choose the iCloud Drive folder again before enabling sync."}];
         return NO;
@@ -52,8 +56,12 @@ BOOL ApolloICloudReadStateWriteConsentAtURL(NSURL *consentURL, BOOL enabled,
     if (![fm createDirectoryAtURL:directory withIntermediateDirectories:YES
         attributes:directoryAttributes error:error]) return NO;
     [directory setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
+    // Opt-out is persisted as a tombstone instead of deleting the marker.
+    // An interrupted or denied cleanup can therefore never reveal an older
+    // enabled marker and silently restart uploads on the next launch.
     NSData *data = [NSPropertyListSerialization dataWithPropertyList:@{
-        @"v": kConsentVersion, @"enabled": @YES, @"folder": folderIdentifier,
+        @"v": kConsentVersion, @"enabled": @(enabled),
+        @"folder": enabled ? folderIdentifier : (folderIdentifier ?: @""),
     } format:NSPropertyListBinaryFormat_v1_0 options:0 error:error];
     return data && [data writeToURL:consentURL options:writingOptions error:error];
 }
@@ -546,8 +554,8 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         self.started = NO;
         [self start];
     } else {
-        // Explicit opt-out is fail-closed in memory. Marker cleanup can report
-        // a persistence error, but it must never leave uploads or polls alive.
+        // Explicit opt-out is fail-closed in memory first, then atomically
+        // persists a disabled tombstone so relaunch cannot revive old consent.
         sICloudReadStateSyncEnabled = NO;
         [self.uploadTimer invalidate];
         self.uploadTimer = nil;
@@ -563,7 +571,7 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
         if (!ApolloICloudReadStateWriteConsentAtURL(ApolloICloudReadStateConsentURL(), NO,
                                                      folderIdentifier, &consentError)) {
             if (error) *error = consentError ?: ApolloICloudReadStateError(
-                @"Sync is off, but its local consent marker could not be removed.");
+                @"Sync is off for this process, but the local opt-out could not be saved.");
             return NO;
         }
     }
@@ -712,9 +720,25 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
     self.syncInFlight = YES;
     self.syncPending = NO;
     NSDictionary *snapshot = [self.journal copy];
+    ApolloICloudBackupStore *backupStore = ApolloICloudBackupStore.sharedStore;
+    NSString *consentedFolderIdentifier = backupStore.selectedFolderConsentIdentifier;
+    NSURL *consentURL = ApolloICloudReadStateConsentURL();
+    if (!ApolloICloudReadStateOperationConsentIsCurrent(consentURL,
+            consentedFolderIdentifier, consentedFolderIdentifier)) {
+        self.syncInFlight = NO;
+        [self selectedFolderDidChange:nil];
+        return;
+    }
     __weak typeof(self) weakSelf = self;
-    [ApolloICloudBackupStore.sharedStore performSelectedFolderOperation:
+    [backupStore performSelectedFolderOperation:
         ^id(NSURL *folderURL, NSError **operationError) {
+            NSString *currentFolderIdentifier = backupStore.selectedFolderConsentIdentifier;
+            if (!ApolloICloudReadStateOperationConsentIsCurrent(consentURL,
+                    consentedFolderIdentifier, currentFolderIdentifier)) {
+                if (operationError) *operationError = ApolloICloudReadStateError(
+                    @"The selected folder changed before read-state sync began. Confirm sync for the new folder.");
+                return nil;
+            }
             return ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
                 folderURL, snapshot, operationError);
         } completion:^(id result, NSError *operationError) {
@@ -722,6 +746,12 @@ BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
             if (!strongSelf) return;
             strongSelf.syncInFlight = NO;
             if (!strongSelf.enabled) return;
+            NSString *currentFolderIdentifier = backupStore.selectedFolderConsentIdentifier;
+            if (!ApolloICloudReadStateOperationConsentIsCurrent(consentURL,
+                    consentedFolderIdentifier, currentFolderIdentifier)) {
+                [strongSelf selectedFolderDidChange:nil];
+                return;
+            }
             NSDictionary *folderJournal = ApolloICloudReadStateValidatedJournal(result);
             if (!folderJournal || operationError) {
                 strongSelf.available = NO;

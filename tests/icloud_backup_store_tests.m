@@ -129,6 +129,9 @@ int main(void) {
               @"selected folder stores a resolvable coordinated bookmark");
         Check([fm fileExistsAtPath:marker],
               @"stored bookmark resolves to the marker-bearing folder");
+        Check([selectingStore.selectedFolderConsentIdentifier
+            isEqualToString:selectingStore.capturedSelection[@"folderIdentifier"]],
+              @"new folder selection keeps one stable consent identity");
         NSURL *selectionRoot = nil;
         BOOL selectionScoped = NO;
         NSURL *selectedDirectory = [selectingStore resolveDirectoryWithError:&selectionError
@@ -136,6 +139,28 @@ int main(void) {
         Check(selectionError == nil && [[selectedDirectory URLByResolvingSymlinksInPath].path
             isEqualToString:[cloud URLByResolvingSymlinksInPath].path],
               @"immediate refresh reopens the selected marker-bearing folder");
+        if (selectionScoped) [selectingStore endAccessingSelectedFolderURL:selectionRoot];
+
+        NSURL *legacy = [root URLByAppendingPathComponent:@"legacy" isDirectory:YES];
+        [fm createDirectoryAtURL:legacy withIntermediateDirectories:YES attributes:nil error:nil];
+        NSData *legacyBookmark = [legacy bookmarkDataWithOptions:NSURLBookmarkCreationMinimalBookmark
+            includingResourceValuesForKeys:nil relativeToURL:nil error:&selectionError];
+        selectingStore.capturedSelection = @{
+            @"bookmark": legacyBookmark,
+            @"name": @"legacy",
+            @"isBackupDirectory": @YES,
+            @"scope": @"legacy-consent-scope",
+        };
+        NSString *legacyConsentBefore = selectingStore.selectedFolderConsentIdentifier;
+        selectionRoot = nil;
+        selectionScoped = NO;
+        selectedDirectory = [selectingStore resolveDirectoryWithError:&selectionError
+            accessRoot:&selectionRoot scoped:&selectionScoped];
+        Check(selectionError == nil && selectedDirectory != nil &&
+              [legacyConsentBefore isEqualToString:@"legacy-consent-scope"] &&
+              [selectingStore.selectedFolderConsentIdentifier isEqualToString:legacyConsentBefore] &&
+              selectingStore.capturedSelection[@"folderIdentifier"] != nil,
+              @"legacy folder-marker migration preserves the consent identity");
         if (selectionScoped) [selectingStore endAccessingSelectedFolderURL:selectionRoot];
 
         ApolloTestDeniedICloudBackupStore *deniedStore = [ApolloTestDeniedICloudBackupStore new];

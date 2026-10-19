@@ -21,8 +21,12 @@ real backup folder containing credentials for development evidence.
   Confirm this installation remains opted out until the disclosure is accepted.
 - While sync is active, select a different folder. Confirm sync turns off and
   requires the disclosure to be accepted again for that exact folder.
-- Make the local consent marker temporarily undeletable, then turn sync off.
-  Confirm polling and uploads stop immediately even though cleanup reports an error.
+- Turn sync off, terminate Apollo, and relaunch it. Confirm the local disabled
+  tombstone keeps sync off and no polling or uploads resume without fresh consent.
+- While a sync is queued, select a different folder. Confirm the queued operation
+  cannot write old-folder history into the newly selected folder.
+- Upgrade a legacy selected-folder record without a marker UUID. Confirm the
+  marker migration retains the original consent identity and sync stays enabled.
 
 ## Real-device acceptance
 
