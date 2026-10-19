@@ -17,6 +17,10 @@ real backup folder containing credentials for development evidence.
   continues, the status explains the failure, and sync retries after foregrounding.
 - Revoke or stale the saved bookmark. Confirm the UI asks the user to reconnect
   the folder through Backup Settings instead of choosing a fallback container.
+- Restore a settings backup that was created while read-state sync was enabled.
+  Confirm this installation remains opted out until the disclosure is accepted.
+- While sync is active, select a different folder. Confirm sync turns off and
+  requires the disclosure to be accepted again for that exact folder.
 
 ## Real-device acceptance
 

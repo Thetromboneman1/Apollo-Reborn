@@ -11,6 +11,53 @@
 #endif
 #import <math.h>
 
+static NSNumber *const kConsentVersion = @1;
+
+BOOL ApolloICloudReadStateConsentAtURLMatchesFolder(NSURL *consentURL, NSString *folderIdentifier) {
+    if (!consentURL.isFileURL || folderIdentifier.length == 0 || folderIdentifier.length > 128) return NO;
+    NSData *data = [NSData dataWithContentsOfURL:consentURL options:NSDataReadingMappedIfSafe error:nil];
+    if (data.length == 0 || data.length > 4096) return NO;
+    id value = [NSPropertyListSerialization propertyListWithData:data options:0 format:nil error:nil];
+    if (![value isKindOfClass:NSDictionary.class]) return NO;
+    NSDictionary *consent = value;
+    return [consent[@"v"] isEqual:kConsentVersion] && [consent[@"enabled"] isEqual:@YES] &&
+        [consent[@"folder"] isKindOfClass:NSString.class] &&
+        [consent[@"folder"] isEqualToString:folderIdentifier];
+}
+
+BOOL ApolloICloudReadStateWriteConsentAtURL(NSURL *consentURL, BOOL enabled,
+                                             NSString *folderIdentifier, NSError **error) {
+    if (!consentURL.isFileURL) {
+        if (error) *error = [NSError errorWithDomain:@"ApolloICloudReadState" code:2
+            userInfo:@{NSLocalizedDescriptionKey: @"The local consent location is invalid."}];
+        return NO;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (!enabled) {
+        if (![fm fileExistsAtPath:consentURL.path]) return YES;
+        return [fm removeItemAtURL:consentURL error:error];
+    }
+    if (folderIdentifier.length == 0 || folderIdentifier.length > 128) {
+        if (error) *error = [NSError errorWithDomain:@"ApolloICloudReadState" code:2
+            userInfo:@{NSLocalizedDescriptionKey: @"Choose the iCloud Drive folder again before enabling sync."}];
+        return NO;
+    }
+    NSURL *directory = consentURL.URLByDeletingLastPathComponent;
+    NSDictionary *directoryAttributes = nil;
+    NSDataWritingOptions writingOptions = NSDataWritingAtomic;
+#if !defined(APOLLO_ICLOUD_READ_STATE_TESTS)
+    directoryAttributes = @{NSFileProtectionKey: NSFileProtectionComplete};
+    writingOptions |= NSDataWritingFileProtectionComplete;
+#endif
+    if (![fm createDirectoryAtURL:directory withIntermediateDirectories:YES
+        attributes:directoryAttributes error:error]) return NO;
+    [directory setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:@{
+        @"v": kConsentVersion, @"enabled": @YES, @"folder": folderIdentifier,
+    } format:NSPropertyListBinaryFormat_v1_0 options:0 error:error];
+    return data && [data writeToURL:consentURL options:writingOptions error:error];
+}
+
 static NSString *const kJournalVersion = @"v";
 static NSString *const kJournalWriter = @"w";
 static NSString *const kJournalClear = @"clear";
@@ -389,6 +436,17 @@ static NSURL *ApolloICloudReadStateURL(void) {
     return [support URLByAppendingPathComponent:@"ApolloReborn/ICloudReadState/state.plist"];
 }
 
+static NSURL *ApolloICloudReadStateConsentURL(void) {
+    return [ApolloICloudReadStateURL().URLByDeletingLastPathComponent
+        URLByAppendingPathComponent:@"consent.plist"];
+}
+
+BOOL ApolloICloudReadStateInstallationConsentEnabled(void) {
+    NSString *folderIdentifier = ApolloICloudBackupStore.sharedStore.selectedFolderConsentIdentifier;
+    return folderIdentifier && ApolloICloudReadStateConsentAtURLMatchesFolder(
+        ApolloICloudReadStateConsentURL(), folderIdentifier);
+}
+
 @interface ApolloICloudReadState ()
 @property (nonatomic) BOOL started;
 @property (nonatomic) BOOL available;
@@ -454,6 +512,8 @@ static NSURL *ApolloICloudReadStateURL(void) {
         name:UIApplicationDidBecomeActiveNotification object:nil];
     [nc addObserver:self selector:@selector(flushForLifecycle:)
         name:UIApplicationWillResignActiveNotification object:nil];
+    [nc addObserver:self selector:@selector(selectedFolderDidChange:)
+        name:ApolloICloudBackupStoreDidChangeNotification object:nil];
     [self captureLocalStateUsingHistoricalSeed:YES];
     [self syncWithSelectedFolderApplyingRemote:YES];
     self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 target:self
@@ -462,15 +522,22 @@ static NSURL *ApolloICloudReadStateURL(void) {
 
 - (BOOL)setEnabled:(BOOL)enabled error:(NSError **)error {
     NSAssert(NSThread.isMainThread, @"iCloud Drive read-state setting is main-thread owned");
-    if (enabled && !ApolloICloudBackupStore.sharedStore.hasSelectedFolder) {
+    NSString *folderIdentifier = ApolloICloudBackupStore.sharedStore.selectedFolderConsentIdentifier;
+    if (enabled && folderIdentifier.length == 0) {
         self.available = NO;
         self.availabilityMessage = @"Choose an iCloud Drive folder in Backup Settings first.";
         if (error) *error = ApolloICloudReadStateError(self.availabilityMessage);
         return NO;
     }
+    NSError *consentError = nil;
+    if (!ApolloICloudReadStateWriteConsentAtURL(ApolloICloudReadStateConsentURL(), enabled,
+                                                 folderIdentifier, &consentError)) {
+        if (error) *error = consentError ?: ApolloICloudReadStateError(
+            @"Could not save this installation's read-state sync consent.");
+        return NO;
+    }
     if (enabled && !self.journal) self.journal = [[self loadOrCreateJournal] mutableCopy];
     sICloudReadStateSyncEnabled = enabled;
-    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:UDKeyICloudFolderReadStateSyncEnabled];
     if (enabled) {
         self.started = NO;
         [self start];
@@ -487,6 +554,29 @@ static NSURL *ApolloICloudReadStateURL(void) {
             ApolloICloudReadStateDidChangeNotification object:self];
     }
     return YES;
+}
+
+- (void)selectedFolderDidChange:(__unused NSNotification *)note {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self selectedFolderDidChange:nil]; });
+        return;
+    }
+    if (self.enabled && !ApolloICloudReadStateInstallationConsentEnabled()) {
+        NSError *error = nil;
+        if (![self setEnabled:NO error:&error]) {
+            // Fail closed in memory even if the installation-local marker
+            // cannot be removed; startup validation will reject a mismatch.
+            sICloudReadStateSyncEnabled = NO;
+            [self.uploadTimer invalidate];
+            [self.pollTimer invalidate];
+            [NSNotificationCenter.defaultCenter removeObserver:self];
+            self.started = NO;
+            self.syncPending = NO;
+            self.availabilityMessage = @"Off — confirm sync for the newly selected folder.";
+            [NSNotificationCenter.defaultCenter postNotificationName:
+                ApolloICloudReadStateDidChangeNotification object:self];
+        }
+    }
 }
 
 - (void)refreshForLifecycle:(__unused NSNotification *)note {

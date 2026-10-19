@@ -27,6 +27,9 @@ typedef id _Nullable (^ApolloICloudSelectedFolderOperation)(NSURL *folderURL,
 @property (nonatomic, readonly, getter=isWorking) BOOL working;
 @property (atomic, readonly, copy, nullable) NSString *scopeIdentifier;
 @property (atomic, readonly, copy, nullable) NSString *selectedFolderName;
+// Stable, non-secret identity used to bind installation-local consent to the
+// exact folder the user selected. This never exposes the bookmark itself.
+@property (nonatomic, readonly, copy, nullable) NSString *selectedFolderConsentIdentifier;
 @property (nonatomic, readonly) BOOL hasSelectedFolder;
 
 - (void)refreshAvailabilityWithCompletion:(nullable void (^)(void))completion;

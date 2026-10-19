@@ -151,6 +151,14 @@ static NSURL *ApolloICloudBackupSelectionURL(void) {
     return [self selectedFolderState] != nil;
 }
 
+- (NSString *)selectedFolderConsentIdentifier {
+    NSDictionary *selection = [self selectedFolderState];
+    NSString *identifier = ApolloICloudBackupValidatedFolderIdentifier(selection[@"folderIdentifier"]);
+    if (identifier.length > 0) return identifier;
+    NSString *scope = [selection[@"scope"] isKindOfClass:NSString.class] ? selection[@"scope"] : nil;
+    return scope.length > 0 && scope.length <= 128 ? scope : nil;
+}
+
 - (BOOL)writeSelectedFolderState:(NSDictionary *)state error:(NSError **)error {
     NSURL *stateURL = ApolloICloudBackupSelectionURL();
     NSFileManager *fm = NSFileManager.defaultManager;

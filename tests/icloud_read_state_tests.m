@@ -154,6 +154,25 @@ int main(void) {
               @"invalid remote state fails closed without overwrite");
         [fm removeItemAtURL:fixture error:nil];
 
+        NSURL *consentDirectory = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+            URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+        NSURL *consentURL = [consentDirectory URLByAppendingPathComponent:@"consent.plist"];
+        NSError *consentError = nil;
+        BOOL consentWritten = ApolloICloudReadStateWriteConsentAtURL(consentURL, YES, @"folder-a", &consentError);
+        Check(consentWritten &&
+              consentError == nil && ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
+              @"installation-local consent matches the exact selected folder");
+        Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-b"),
+              @"changing selected folders requires fresh consent");
+        Check(ApolloICloudReadStateWriteConsentAtURL(consentURL, NO, nil, &consentError) &&
+              !ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
+              @"disabling removes installation-local consent");
+        [fm createDirectoryAtURL:consentDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+        [[@"malformed" dataUsingEncoding:NSUTF8StringEncoding] writeToURL:consentURL atomically:YES];
+        Check(!ApolloICloudReadStateConsentAtURLMatchesFolder(consentURL, @"folder-a"),
+              @"malformed installation-local consent fails closed");
+        [fm removeItemAtURL:consentDirectory error:nil];
+
         NSMutableDictionary *restored = [NSMutableDictionary dictionary];
         for (NSUInteger i = 0; i < 5000; i++) {
             restored[[NSString stringWithFormat:@"r%04lu", (unsigned long)i]] =

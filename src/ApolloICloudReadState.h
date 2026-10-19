@@ -16,6 +16,15 @@ FOUNDATION_EXPORT NSDictionary *ApolloICloudReadStateJournalByCapturing(
 // coordinated merge. Only the dedicated Apollo Reborn Sync namespace is used.
 FOUNDATION_EXPORT NSDictionary * _Nullable ApolloICloudReadStateMergeJournalAtSelectedFolderURL(
     NSURL *selectedFolderURL, NSDictionary *localJournal, NSError **error);
+// Consent is stored outside exported preferences and is valid only for the
+// exact selected-folder identity recorded when the user opted in.
+FOUNDATION_EXPORT BOOL ApolloICloudReadStateConsentAtURLMatchesFolder(
+    NSURL *consentURL, NSString *folderIdentifier);
+FOUNDATION_EXPORT BOOL ApolloICloudReadStateWriteConsentAtURL(
+    NSURL *consentURL, BOOL enabled, NSString * _Nullable folderIdentifier, NSError **error);
+#if !defined(APOLLO_ICLOUD_READ_STATE_TESTS)
+FOUNDATION_EXPORT BOOL ApolloICloudReadStateInstallationConsentEnabled(void);
+#endif
 
 __BEGIN_DECLS
 extern NSNotificationName const ApolloICloudReadStateDidChangeNotification;
