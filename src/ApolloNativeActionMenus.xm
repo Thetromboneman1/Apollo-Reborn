@@ -26,6 +26,9 @@ static char kApolloNativeActionMenuWrappedSourceActionKey;
 static char kApolloNativeActionMenuWindowPresenterKey;
 static char kApolloNativeActionMenuWindowRequestKey;
 static char kApolloNativeActionMenuSurfaceStateKey;
+
+static UIViewController *ApolloNativeActionMenuViewControllerForView(UIView *view);
+static UIViewController *ApolloNativeActionMenuContentControllerForView(UIView *view);
 static char kApolloMediaMenuPressLocationKey;
 
 static __weak UIView *sApolloNativeActionMenuSourceView = nil;
@@ -891,7 +894,40 @@ BOOL ApolloNativeActionMenuInvokePostsAction(UIViewController *postsViewControll
     return consumed;
 }
 
-static UIAction *ApolloNativeActionMenuAction(NSString *title, NSString *subtitle, UIImage *image, UIColor *tintColor, BOOL opensModeratorMenu, BOOL destructive, BOOL checked, BOOL enabled, id actionController, NSInteger row) {
+static BOOL ApolloNativeActionMenuPerformOwningControllerAction(id actionController,
+                                                                 uint16_t actionKind) {
+    // Find in Comments is the one native action whose handler reaches the
+    // CommentsViewController through ActionController.presentingViewController.
+    // The Liquid Glass replacement never presents ActionController, so that
+    // relationship is nil and kind 57 silently stops after dismissing the menu.
+    // Use Apollo's existing Cmd-F entry point on the controller that owns the
+    // captured source button. The same selector owns both classic and Glass
+    // search presentation (ApolloFindInCommentsGlass.xm hooks it on Glass).
+    if (actionKind != 57) return NO;
+
+    UIView *sourceView = objc_getAssociatedObject(actionController,
+                                                   &kApolloNativeActionMenuSourceViewKey);
+    UIViewController *owner = ApolloNativeActionMenuContentControllerForView(sourceView);
+    SEL selector = @selector(searchCommentsKeyCommandSelected);
+    if (![owner respondsToSelector:selector]) {
+        ApolloLog(@"[NativeActionMenu] Find in Comments owner unavailable; falling back to ActionController");
+        return NO;
+    }
+
+    __weak UIViewController *weakOwner = owner;
+    BOOL deferred = ApolloNativeActionMenuPerformAfterDismissal(actionController, ^{
+        UIViewController *strongOwner = weakOwner;
+        if (!strongOwner.viewIfLoaded.window || ![strongOwner respondsToSelector:selector]) return;
+        ApolloLog(@"[NativeActionMenu] Opening Find in Comments from its owning controller");
+        ((void (*)(id, SEL))objc_msgSend)(strongOwner, selector);
+    });
+    if (!deferred) {
+        ApolloLog(@"[NativeActionMenu] Find in Comments dismissal owner unavailable; falling back to ActionController");
+    }
+    return deferred;
+}
+
+static UIAction *ApolloNativeActionMenuAction(NSString *title, NSString *subtitle, UIImage *image, UIColor *tintColor, BOOL opensModeratorMenu, BOOL destructive, BOOL checked, BOOL enabled, id actionController, NSInteger row, uint16_t actionKind) {
     if (title.length == 0) {
         return nil;
     }
@@ -912,7 +948,9 @@ static UIAction *ApolloNativeActionMenuAction(NSString *title, NSString *subtitl
             // The moderator sheet this row opens gets its own saved layout.
             ApolloActionMenuArmModeratorFollowUp(actionController);
         }
-        ApolloNativeActionMenuSelectRow(actionController, row);
+        if (!ApolloNativeActionMenuPerformOwningControllerAction(actionController, actionKind)) {
+            ApolloNativeActionMenuSelectRow(actionController, row);
+        }
     }];
 
     ApolloNativeActionMenuStyleElementTitle(action, tintColor ? UIColor.labelColor : nil);
@@ -1125,7 +1163,7 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
         BOOL opensModeratorMenu = ApolloNativeActionKindOpensModeratorMenu(actionKind);
         UIColor *actionTintColor = opensModeratorMenu ? moderatorTintColor : menuTintColor;
         BOOL destructive = ApolloNativeActionMenuTitleIsDestructive(title);
-        UIAction *action = ApolloNativeActionMenuAction(title, subtitle, image, actionTintColor, opensModeratorMenu, destructive, NO, enabled, actionController, (NSInteger)i);
+        UIAction *action = ApolloNativeActionMenuAction(title, subtitle, image, actionTintColor, opensModeratorMenu, destructive, NO, enabled, actionController, (NSInteger)i, actionKind);
         if (action) {
             UIMenuElement *element = action;
             // actionKind 51 = Submit Post: swap the plain row for the quick
@@ -1151,7 +1189,7 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
             BOOL destructive = (*(uint8_t *)(element + 0x10) != 0) || ApolloNativeActionMenuTitleIsDestructive(title);
             BOOL checked = *(uint8_t *)(element + 0x12) != 0;
 
-            UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row);
+            UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row, UINT16_MAX);
             if (action) {
                 [textChildren addObject:action];
             }
@@ -1168,7 +1206,7 @@ static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderat
             BOOL destructive = (*(uint8_t *)(element + 0x10) != 0) || ApolloNativeActionMenuTitleIsDestructive(title);
             BOOL checked = *(uint8_t *)(element + 0x12) != 0;
 
-            UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row);
+            UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row, UINT16_MAX);
             if (action) {
                 [children addObject:action];
             }
@@ -1732,6 +1770,24 @@ static UIViewController *ApolloNativeActionMenuViewControllerForView(UIView *vie
         responder = responder.nextResponder;
     }
     return nil;
+}
+
+// Navigation-bar buttons belong to the navigation controller's view hierarchy,
+// not directly to the visible content controller. Resolve the actual content
+// owner before invoking an action whose state lives on that controller.
+static UIViewController *ApolloNativeActionMenuContentControllerForView(UIView *view) {
+    UIViewController *controller = ApolloNativeActionMenuViewControllerForView(view);
+    while (controller) {
+        UIViewController *next = nil;
+        if ([controller isKindOfClass:[UINavigationController class]]) {
+            next = ((UINavigationController *)controller).visibleViewController;
+        } else if ([controller isKindOfClass:[UITabBarController class]]) {
+            next = ((UITabBarController *)controller).selectedViewController;
+        }
+        if (!next || next == controller) break;
+        controller = next;
+    }
+    return controller;
 }
 
 // Apollo's banned-user screen still presents its 2017-era Swift
