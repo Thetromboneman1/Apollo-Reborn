@@ -44,7 +44,6 @@ extern BOOL sICloudReadStateSyncEnabled;
 extern BOOL sShowDeletedComments;
 extern BOOL sTapToRevealDeletedComments;
 extern BOOL sPassiveDeletedComments;
-extern BOOL sShowRecentlyReadThumbnails;
 extern BOOL sFeedTextPostThumbnails;
 // Default-on large-feed carousel for Reddit-native multi-image galleries.
 extern BOOL sFeedGalleryCarousel;

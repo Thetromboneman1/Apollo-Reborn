@@ -2007,12 +2007,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (ApolloSettingsSection *)buildPostsRecentlyReadSection {
     __weak typeof(self) weakSelf = self;
 
-    ApolloSettingsRow *readThumbnails =
-        [ApolloSettingsRow switchRowWithID:@"gen.readThumbnails"
-                                     title:@"Show Thumbnails"
-                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRecentlyReadThumbnails]; }
-                                  onToggle:^(UISwitch *sender) { [weakSelf showRecentlyReadThumbnailsSwitchToggled:sender]; }];
-
     ApolloSettingsRow *readPostMax =
         [ApolloSettingsRow customRowWithID:@"gen.readPostMax"
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
@@ -2078,8 +2072,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     iCloudReadStateStatus.enabled = ^BOOL { return NO; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Recently Read"
-                                             footer:@"Show thumbnails on posts you've already read, and cap how many Apollo remembers. Folder sync is optional and reuses the iCloud Drive folder selected in Backup Settings; stale or revoked access requires reconnecting that folder. Read state retries after offline periods; native comment highlighting uses received baselines after the next cold start."
-                                               rows:@[ readThumbnails, readPostMax, filterNSFWRR, iCloudReadState, iCloudReadStateStatus ]];
+                                             footer:@"Cap how many read posts Apollo remembers. Folder sync is optional and reuses the iCloud Drive folder selected in Backup Settings; stale or revoked access requires reconnecting that folder. Read state retries after offline periods; native comment highlighting uses received baselines after the next cold start."
+                                               rows:@[ readPostMax, filterNSFWRR, iCloudReadState, iCloudReadStateStatus ]];
 }
 
 // The "Open in App" screen now lives in native General → Open Links — see
@@ -5093,11 +5087,6 @@ replacementString:(NSString *)string {
 
 - (void)apollo_refreshFeedShortcutsPreviewAnimated:(BOOL)animated {
     (void)animated;
-}
-
-- (void)showRecentlyReadThumbnailsSwitchToggled:(UISwitch *)sender {
-    sShowRecentlyReadThumbnails = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sShowRecentlyReadThumbnails forKey:UDKeyShowRecentlyReadThumbnails];
 }
 
 - (void)collapsePinnedCommentsSwitchToggled:(UISwitch *)sender {
