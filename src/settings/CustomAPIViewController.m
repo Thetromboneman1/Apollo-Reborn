@@ -35,6 +35,7 @@
 #import "ApolloFavoritesSorting.h"
 #import "ApolloState.h"
 #import "ApolloScrollToTop.h"
+#import "ApolloSessionRestoration.h"
 #import "ApolloTabBarHideStyle.h"
 #import "ApolloDuoRail.h"
 #import "ApolloDuoCompatibility.h"
@@ -2007,12 +2008,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (ApolloSettingsSection *)buildPostsRecentlyReadSection {
     __weak typeof(self) weakSelf = self;
 
-    ApolloSettingsRow *readThumbnails =
-        [ApolloSettingsRow switchRowWithID:@"gen.readThumbnails"
-                                     title:@"Show Thumbnails"
-                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRecentlyReadThumbnails]; }
-                                  onToggle:^(UISwitch *sender) { [weakSelf showRecentlyReadThumbnailsSwitchToggled:sender]; }];
-
     ApolloSettingsRow *readPostMax =
         [ApolloSettingsRow customRowWithID:@"gen.readPostMax"
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
@@ -2078,8 +2073,8 @@ typedef NS_ENUM(NSInteger, Tag) {
     iCloudReadStateStatus.enabled = ^BOOL { return NO; };
 
     return [ApolloSettingsSection sectionWithTitle:@"Recently Read"
-                                             footer:@"Show thumbnails on posts you've already read, and cap how many Apollo remembers. Folder sync is optional and reuses the iCloud Drive folder selected in Backup Settings; stale or revoked access requires reconnecting that folder. Read state retries after offline periods; native comment highlighting uses received baselines after the next cold start."
-                                               rows:@[ readThumbnails, readPostMax, filterNSFWRR, iCloudReadState, iCloudReadStateStatus ]];
+                                             footer:@"Cap how many read posts Apollo remembers. Folder sync is optional and reuses the iCloud Drive folder selected in Backup Settings; stale or revoked access requires reconnecting that folder. Read state retries after offline periods; native comment highlighting uses received baselines after the next cold start."
+                                               rows:@[ readPostMax, filterNSFWRR, iCloudReadState, iCloudReadStateStatus ]];
 }
 
 // The "Open in App" screen now lives in native General → Open Links — see
@@ -2826,6 +2821,12 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
 - (ApolloSettingsSection *)buildMediaBrowsingSection {
     __weak typeof(self) weakSelf = self;
 
+    ApolloSettingsRow *restoreReadingSession =
+        [ApolloSettingsRow switchRowWithID:@"media.restoreReadingSession"
+                                     title:@"Restore Reading Session"
+                                      isOn:^BOOL { return sRestoreReadingSession; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf restoreReadingSessionSwitchToggled:sender]; }];
+
     ApolloSettingsRow *feedGalleries =
         [ApolloSettingsRow switchRowWithID:@"media.feedGalleryCarousel"
                                      title:@"Swipe Through Feed Galleries"
@@ -2858,8 +2859,8 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   onToggle:^(UISwitch *sender) { [weakSelf galleryAutoplayGIFsSwitchToggled:sender]; }];
 
     return [ApolloSettingsSection sectionWithTitle:@"Browsing"
-                                            footer:@"Swipe Through Feed Galleries: page through a gallery post's images without leaving the feed.\n\nSwipe Past Gallery to Navigate: at the first or last image, keep swiping to use your normal post swipes (vote, save, back or forward) instead of bouncing. From any image, a swipe that starts at the screen edge goes back or forward. Off by default.\n\nSwipe Up for Comments: in the fullscreen media viewer, swipe up or tap the comments button to open comments over the media. Off by default.\n\nPlay Videos / GIFs in Gallery View: video and GIF tiles play silently while they're on screen; tap one for the full-size viewer with sound. Paused in Low Power Mode."
-                                              rows:@[ feedGalleries, edgeSwipeNav, swipeComments, galleryAutoplayVideos, galleryAutoplayGIFs ]];
+                                            footer:@"Restore Reading Session: after iOS evicts Apollo, reopen the last feed, post and reading position on the next normal launch. Turn it off to delete the saved session immediately.\n\nSwipe Through Feed Galleries: page through a gallery post's images without leaving the feed.\n\nSwipe Past Gallery to Navigate: at the first or last image, keep swiping to use your normal post swipes (vote, save, back or forward) instead of bouncing. From any image, a swipe that starts at the screen edge goes back or forward. Off by default.\n\nSwipe Up for Comments: in the fullscreen media viewer, swipe up or tap the comments button to open comments over the media. Off by default.\n\nPlay Videos / GIFs in Gallery View: video and GIF tiles play silently while they're on screen; tap one for the full-size viewer with sound. Paused in Low Power Mode."
+                                              rows:@[ restoreReadingSession, feedGalleries, edgeSwipeNav, swipeComments, galleryAutoplayVideos, galleryAutoplayGIFs ]];
 }
 
 // NSFW Media. Lives here rather than in Apollo's native Filters & Blocks screen:
@@ -3579,6 +3580,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                       isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutomaticUpdateChecks]; }
                                   onToggle:^(UISwitch *sender) {
             [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyAutomaticUpdateChecks];
+            ApolloUpdateCheckIfNeeded();
         }];
     updateChecks.iconSystemName = @"arrow.down.circle";
     updateChecks.iconTileColor = [UIColor systemBlueColor];
@@ -4168,7 +4170,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     } else if ([sectionTitle isEqualToString:@"Privacy"]) {
         text = [[NSMutableAttributedString alloc]
             initWithString:(ApolloUpdateChecksAvailable()
-                ? @"Sends one anonymous heartbeat so we can estimate active Apollo Reborn installs. No Reddit activity, account details, or feature usage is collected. Update checks read the latest release info from GitHub once a day, and the update sheet reads its release notes from there too. GitHub only sees your IP address. More details can be found in our "
+                ? @"Sends one anonymous heartbeat so we can estimate active Apollo Reborn installs. No Reddit activity, account details, or feature usage is collected. Update checks read the latest release info from GitHub every 15 minutes while Apollo is active, and the update sheet reads its release notes from there too. Later silences reminders for that version for 24 hours. GitHub only sees your IP address. More details can be found in our "
                 : @"Sends one anonymous heartbeat so we can estimate active Apollo Reborn installs. No Reddit activity, account details, or feature usage is collected. More details can be found in our ")
             attributes:plainAttrs];
         [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"privacy policy"
@@ -5094,11 +5096,6 @@ replacementString:(NSString *)string {
     (void)animated;
 }
 
-- (void)showRecentlyReadThumbnailsSwitchToggled:(UISwitch *)sender {
-    sShowRecentlyReadThumbnails = sender.isOn;
-    [[NSUserDefaults standardUserDefaults] setBool:sShowRecentlyReadThumbnails forKey:UDKeyShowRecentlyReadThumbnails];
-}
-
 - (void)collapsePinnedCommentsSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyCollapsePinnedComments];
 }
@@ -5207,6 +5204,12 @@ replacementString:(NSString *)string {
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFeedGalleryCarouselChangedNotification object:nil];
     // The edge-swipe navigation row is only shown while the carousel is on.
     [self visibilityDidChange];
+}
+
+- (void)restoreReadingSessionSwitchToggled:(UISwitch *)sender {
+    sRestoreReadingSession = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyRestoreReadingSession];
+    ApolloSessionRestorationSetEnabled(sender.isOn);
 }
 
 - (void)galleryAutoplayVideosSwitchToggled:(UISwitch *)sender {

@@ -210,6 +210,28 @@ int main(void) {
               @"background detachment does not cancel a feed restore");
         Check(ApolloSessionStateViewportRestoreIsEligible(NO, NO, YES, YES, NO, NO),
               @"backgrounded feed remains resumable through queued retries");
+        Check(ApolloSessionStateShouldCancelForReaderScroll(YES, YES, YES, NO, YES),
+              @"reader drag cancels an active unfinished restore phase");
+        Check(!ApolloSessionStateShouldCancelForReaderScroll(NO, YES, YES, NO, YES),
+              @"reader drag cannot cancel without a pending restore");
+        Check(!ApolloSessionStateShouldCancelForReaderScroll(YES, NO, YES, NO, YES),
+              @"reader drag in another controller cannot cancel this restore");
+        Check(!ApolloSessionStateShouldCancelForReaderScroll(YES, YES, NO, NO, YES),
+              @"reader drag cannot cancel a phase before it starts");
+        Check(!ApolloSessionStateShouldCancelForReaderScroll(YES, YES, YES, YES, YES),
+              @"reader drag cannot reopen a finished restore phase");
+        Check(!ApolloSessionStateShouldCancelForReaderScroll(YES, YES, YES, NO, NO),
+              @"settled polling without a new drag does not cancel restore");
+        Check(ApolloSessionStateQueuedPhaseWorkShouldRun(YES, YES, NO),
+              @"queued work runs for its active unfinished restore phase");
+        Check(!ApolloSessionStateQueuedPhaseWorkShouldRun(YES, YES, YES),
+              @"finished detail stays terminal while feed remains pending");
+        Check(!ApolloSessionStateQueuedPhaseWorkShouldRun(YES, YES, YES),
+              @"finished feed stays terminal while detail remains pending");
+        Check(!ApolloSessionStateQueuedPhaseWorkShouldRun(NO, YES, NO),
+              @"queued work stops after the shared restore completes");
+        Check(!ApolloSessionStateQueuedPhaseWorkShouldRun(YES, NO, NO),
+              @"queued work stops when it belongs to an older generation");
         Check(ApolloSessionStateDetailRouteDeadlineShouldFinish(NO, NO),
               @"detail route deadline finishes when no controller appeared");
         Check(!ApolloSessionStateDetailRouteDeadlineShouldFinish(YES, NO),
@@ -307,10 +329,10 @@ int main(void) {
               @"unrelated more-comments branches are not expanded during restore");
 
         NSMutableDictionary *excessivePage = [valid mutableCopy];
-        excessivePage[ApolloSessionStateFeedPageKey] = @21;
+        excessivePage[ApolloSessionStateFeedPageKey] = @6;
         normalized = ApolloSessionStateNormalize(excessivePage, now, 7 * 86400);
         Check(normalized != nil && normalized[ApolloSessionStateFeedPageKey] == nil,
-              @"excessive page depth discarded");
+              @"page depth past the five-page replay cap is discarded");
 
         NSLog(@"PASS: %lu session-state checks", (unsigned long)checks);
     }

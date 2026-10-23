@@ -77,7 +77,6 @@ int main(void) {
             UDKeyLinkPreviewCommentsMode: @1,
             UDKeyLinkPreviewCardColorHex: @"",
             UDKeyHideTabBarTitles: @NO,
-            UDKeyShowRecentlyReadThumbnails: @YES,
             UDKeyReadPostMaxCount: @1000,
             UDKeyFilterNSFWRecentlyRead: @NO,
             UDKeyFeedTextPostThumbnails: @YES,
