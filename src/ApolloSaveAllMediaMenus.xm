@@ -512,6 +512,9 @@ static UIMenu *ApolloFullScreenWithoutSharing(UIMenu *menu) {
 
 %hook _TtC6Apollo21MediaViewerController
 - (void)scrollViewLongPressed:(UIGestureRecognizer *)recognizer {
+    // Only the legacy gesture needs explicit feedback. Real context-menu
+    // interactions already play UIKit's native pattern themselves.
+    ApolloFullScreenMediaHoldFeedback(recognizer);
     UIViewController *page = ApolloSaveAllPageForController((UIViewController *)self);
     ApolloFullScreenImageMenu *context = ApolloFullScreenImageContext(page, recognizer.view);
     if (!context) {
