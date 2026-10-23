@@ -69,7 +69,6 @@ void ApolloApplyRecommendedSettingsMigration(NSUserDefaults *defaults) {
 
         // Posts, feeds, and comments. Info-row and deleted-comment settings are
         // deliberately absent.
-        UDKeyShowRecentlyReadThumbnails: @YES,
         UDKeyReadPostMaxCount: @1000,
         UDKeyFilterNSFWRecentlyRead: @NO,
         UDKeyFeedTextPostThumbnails: @YES,
