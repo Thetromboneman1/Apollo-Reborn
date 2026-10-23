@@ -63,12 +63,12 @@ static void ApolloActionsResetBeforeNavigation(UIViewController *controller);
 // The customization is glass-only, but public refresh helpers can still be
 // called on the iOS 14 deployment floor. Keep newer item state access guarded.
 static BOOL ApolloActionsItemHidden(UIBarButtonItem *item) {
-    if (@available(iOS 16.0, *)) return item.hidden;
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) return item.hidden;
     return NO;
 }
 
 static void ApolloActionsSetItemHidden(UIBarButtonItem *item, BOOL hidden) {
-    if (@available(iOS 16.0, *)) item.hidden = hidden;
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) item.hidden = hidden;
 }
 
 // The post composer's Post and Done buttons keep Done's prominent style, whose

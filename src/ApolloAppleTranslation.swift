@@ -46,11 +46,18 @@ import Foundation
 #if canImport(Translation) && canImport(SwiftUI) && canImport(UIKit)
 import UIKit
 import SwiftUI
-import Translation
+// Keep Swift's autolink entry weak as well as the linker's framework flag.
+// Without this, some Xcode versions emit a strong load before our availability
+// checks can run on systems that do not ship Translation.
+@_weakLinked import Translation
 import OSLog
 import os
 
-@available(iOS 18.0, *)
+// Translation arrived on iOS in 18.0 but on Mac Catalyst only in 26.0. Without
+// the explicit macCatalyst clause, "iOS 18.0" implies macCatalyst 18.0 and the
+// Catalyst build fails ("'TranslationSession' is only available in Mac Catalyst
+// 26.0 or newer"). iOS builds are unaffected.
+@available(iOS 18.0, macCatalyst 26.0, *)
 private let appleTranslateLog = Logger(subsystem: "apollofix", category: "AppleTranslate")
 
 /// Tunables for Apple's one-time download prompt.
@@ -334,7 +341,11 @@ private final class ApolloAppleHiddenHost {
 /// Owns one queue + session per source language, the hidden SwiftUI probe host for
 /// sessions that need it, and Apple's download prompt. Main-actor isolated so every
 /// completion is delivered on the main thread (matching the other providers).
-@available(iOS 18.0, *)
+// Translation arrived on iOS in 18.0 but on Mac Catalyst only in 26.0. Without
+// the explicit macCatalyst clause, "iOS 18.0" implies macCatalyst 18.0 and the
+// Catalyst build fails ("'TranslationSession' is only available in Mac Catalyst
+// 26.0 or newer"). iOS builds are unaffected.
+@available(iOS 18.0, macCatalyst 26.0, *)
 @MainActor
 final class ApolloAppleTranslationCoordinator: ObservableObject {
     static let shared = ApolloAppleTranslationCoordinator()
@@ -961,7 +972,11 @@ final class ApolloAppleTranslationCoordinator: ObservableObject {
 
 /// Carries one `.translationTask` per hosted source language. Each task vends a
 /// `TranslationSession` for that source.
-@available(iOS 18.0, *)
+// Translation arrived on iOS in 18.0 but on Mac Catalyst only in 26.0. Without
+// the explicit macCatalyst clause, "iOS 18.0" implies macCatalyst 18.0 and the
+// Catalyst build fails ("'TranslationSession' is only available in Mac Catalyst
+// 26.0 or newer"). iOS builds are unaffected.
+@available(iOS 18.0, macCatalyst 26.0, *)
 private struct ApolloTranslationProbeHost: View {
     @ObservedObject var coordinator: ApolloAppleTranslationCoordinator
 
@@ -1055,7 +1070,7 @@ public final class ApolloAppleTranslator: NSObject {
                                        to target: String,
                                        completion: @escaping (String?, NSError?) -> Void) {
         #if canImport(Translation) && canImport(SwiftUI) && canImport(UIKit)
-        if #available(iOS 18.0, *) {
+        if #available(iOS 18.0, macCatalyst 26.0, *) {
             Task { @MainActor in
                 ApolloAppleTranslationCoordinator.shared.enqueue(text: text, source: source, target: target, completion: completion)
             }
@@ -1069,7 +1084,7 @@ public final class ApolloAppleTranslator: NSObject {
     /// Whether the on-device Apple translation backend can run on this OS (iOS 18+).
     @objc public static func isSupported() -> Bool {
         #if canImport(Translation) && canImport(SwiftUI) && canImport(UIKit)
-        if #available(iOS 18.0, *) { return true }
+        if #available(iOS 18.0, macCatalyst 26.0, *) { return true }
         #endif
         return false
     }
@@ -1100,7 +1115,7 @@ public final class ApolloAppleTranslator: NSObject {
     /// caches the base codes. Cheap to call repeatedly; safe from the main thread.
     @objc public static func warmSupportedLanguages() {
         #if canImport(Translation)
-        if #available(iOS 18.0, *) {
+        if #available(iOS 18.0, macCatalyst 26.0, *) {
             let shouldStart: Bool = supportedCodesQueue.sync {
                 let alreadyStarted = supportedWarmStarted
                 supportedWarmStarted = true
