@@ -276,6 +276,46 @@ NSDictionary<NSString *, NSNumber *> *ApolloLastReadCommentTotalsSnapshot(void) 
     }
 }
 
+NSDictionary<NSString *, NSDictionary *> *ApolloRawPostCommentSnapshots(void) {
+    NSData *data = [[NSUserDefaults standardUserDefaults] dataForKey:@"PostCommentsSnapshots"];
+    if (data.length == 0 || data.length > 2 * 1024 * 1024) return @{};
+    id decoded = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![decoded isKindOfClass:NSArray.class] || [decoded count] % 2 != 0) return @{};
+    NSMutableDictionary *snapshots = [NSMutableDictionary dictionaryWithCapacity:[decoded count] / 2];
+    for (NSUInteger i = 0; i + 1 < [decoded count]; i += 2) {
+        NSString *postID = [decoded[i] isKindOfClass:NSString.class] ? ApolloBarePostID(decoded[i]) : nil;
+        NSDictionary *snapshot = [decoded[i + 1] isKindOfClass:NSDictionary.class] ? decoded[i + 1] : nil;
+        NSNumber *timestamp = [snapshot[@"timestamp"] isKindOfClass:NSNumber.class] ? snapshot[@"timestamp"] : nil;
+        NSNumber *count = [snapshot[@"totalComments"] isKindOfClass:NSNumber.class] ? snapshot[@"totalComments"] : nil;
+        if (!postID.length || !timestamp || !count ||
+            CFGetTypeID((__bridge CFTypeRef)timestamp) == CFBooleanGetTypeID() ||
+            CFGetTypeID((__bridge CFTypeRef)count) == CFBooleanGetTypeID() ||
+            !isfinite(timestamp.doubleValue) || timestamp.doubleValue < 0 ||
+            !isfinite(count.doubleValue) || count.doubleValue < 0 || floor(count.doubleValue) != count.doubleValue) continue;
+        snapshots[postID] = @{ @"timestamp": timestamp, @"totalComments": @(count.longLongValue) };
+    }
+    return snapshots;
+}
+
+void ApolloApplySyncedPostReadState(NSArray<NSString *> *readIDs, NSData *commentSnapshots) {
+    NSMutableOrderedSet *normalized = [NSMutableOrderedSet orderedSet];
+    for (id rawID in readIDs) {
+        if (![rawID isKindOfClass:NSString.class]) continue;
+        NSString *postID = ApolloBarePostID(rawID);
+        if (postID.length) [normalized addObject:postID];
+    }
+    NSArray *projected = normalized.array;
+    [[NSUserDefaults standardUserDefaults] setObject:projected forKey:@"ReadPostIDs"];
+    if (commentSnapshots.length > 0) {
+        [[NSUserDefaults standardUserDefaults] setObject:commentSnapshots forKey:@"PostCommentsSnapshots"];
+    }
+    ApolloMutateTrackerSet(^(NSMutableOrderedSet *trackerSet) {
+        [trackerSet removeAllObjects];
+        [trackerSet addObjectsFromArray:projected];
+    });
+    ApolloSchedulePostReadStateDidChange();
+}
+
 // Flush the in-memory ReadPostIDs to NSUserDefaults so backup captures current state
 void ApolloFlushReadPostIDsToDefaults(void) {
     NSArray *postIDs = ApolloReadPostIDsSnapshot();
