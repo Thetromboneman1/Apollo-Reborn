@@ -2434,6 +2434,128 @@ static BOOL ApolloSimDebugHandleIntegratedMainCommand(NSString *contents) {
     return NO;
 }
 
+@interface ASDisplayNode (ApolloSimDebugDisplayGuard)
+- (void)setBounds:(CGRect)bounds;
+- (CALayer *)layer;
+- (void)displayImmediately;
+@end
+
+// "bitmapassert" command: push UIKit's legacy image context with a size
+// CGBitmapContextCreate rejects, so the SDK-gated assert behind #1097 can be
+// observed directly. A glass shell (Apollo relinked against the iOS 26 SDK)
+// raises NSInternalInconsistencyException; a classic shell pushes no context
+// and raises nothing.
+static void ApolloSimDebugBitmapAssert(void) {
+    @try {
+        UIGraphicsBeginImageContextWithOptions(CGSizeZero, NO, 0);
+        CGContextRef context = UIGraphicsGetCurrentContext();
+        ApolloLog(@"[SimDebugTap] bitmapassert: no exception, context %@", context ? @"pushed" : @"absent");
+        if (context) UIGraphicsEndImageContext();
+    } @catch (NSException *exception) {
+        ApolloLog(@"[SimDebugTap] bitmapassert: raised %@: %@", exception.name, exception.reason);
+    }
+}
+
+// "displayguard W H [capMP]" command: synchronously display a throwaway
+// ASTextNode with W x H pt bounds through the same
+// _displayBlockWithAsynchronous: path the display queue uses, optionally
+// setting ApolloAsyncDisplayGuard's pixel budget to capMP megapixels first
+// (restored afterwards), and log whether the node rendered, went to tiles
+// (ApolloTiledText takes text over the budget) or rendered nothing (skipped,
+// or its bitmap failed). A node that rendered nothing is displayed once more
+// a moment later, with the same budget: after a failed bitmap it comes back
+// in tiles.
+static ASTextNode *sApolloSimDebugDisplayGuardNode;
+
+static void ApolloSimDebugDisplayGuardTest(NSString *payload) {
+    NSMutableArray<NSString *> *numbers = [NSMutableArray array];
+    for (NSString *part in [payload componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
+        if (part.length > 0) [numbers addObject:part];
+    }
+    if (numbers.count < 2) { ApolloLog(@"[SimDebugTap] malformed displayguard: %@", payload); return; }
+    double width = numbers[0].doubleValue;
+    double height = numbers[1].doubleValue;
+    double capPixels = numbers.count >= 3 ? numbers[2].doubleValue * 1e6 : 0;
+    ApolloAsyncDisplayGuardSetMaxPixelsForTesting(capPixels);
+
+    ASTextNode *node = [[objc_getClass("ASTextNode") alloc] init];
+    node.attributedText = [[NSAttributedString alloc] initWithString:@"display guard test"
+                                                          attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:17]}];
+    [node setBounds:CGRectMake(0, 0, width, height)];
+    CALayer *layer = [node layer];
+    ApolloLog(@"[SimDebugTap] displayguard: displaying ASTextNode %.0fx%.0f pt (cap %.0f MP)",
+              width, height, ApolloAsyncDisplayGuardMaxPixels() / 1e6);
+    @try {
+        [node displayImmediately];
+        ApolloLog(@"[SimDebugTap] displayguard: returned, contents %@, tiled %@",
+                  layer.contents ? @"set" : @"nil", ApolloTiledTextNodeIsTiled(node) ? @"YES" : @"no");
+    } @catch (NSException *exception) {
+        ApolloLog(@"[SimDebugTap] displayguard: exception ESCAPED the guard, %@: %@", exception.name, exception.reason);
+    }
+    if (layer.contents || ApolloTiledTextNodeIsTiled(node)) {
+        ApolloAsyncDisplayGuardSetMaxPixelsForTesting(0);
+        return;
+    }
+    // Rendered nothing: if the bitmap failed, the guard has queued the switch
+    // to tiles on the main queue. Display again after it, under the same budget.
+    sApolloSimDebugDisplayGuardNode = node;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ASTextNode *retried = sApolloSimDebugDisplayGuardNode;
+        sApolloSimDebugDisplayGuardNode = nil;
+        @try {
+            [retried displayImmediately];
+            ApolloLog(@"[SimDebugTap] displayguard: second display, contents %@, tiled %@",
+                      [retried layer].contents ? @"set" : @"nil", ApolloTiledTextNodeIsTiled(retried) ? @"YES" : @"no");
+        } @catch (NSException *exception) {
+            ApolloLog(@"[SimDebugTap] displayguard: exception ESCAPED the guard on the second display, %@: %@", exception.name, exception.reason);
+        }
+        ApolloAsyncDisplayGuardSetMaxPixelsForTesting(0);
+    });
+}
+
+// "uploadalbumtest": exercises the installed NSURLSession album responder and
+// comment RTJSON adapter using recorded fixtures. No media or comment is sent
+// to Reddit/Imgur. The S3 key intentionally differs from the lease asset_id.
+static void ApolloSimDebugUploadAlbumTest(void) {
+    NSArray<NSString *> *ids = @[@"simfixtureasset1", @"simfixtureasset2"];
+    NSArray<NSString *> *keys = @[@"simfixturekey1.jpg", @"simfixturekey2.jpg"];
+    for (NSUInteger i = 0; i < ids.count; i++) {
+        NSURL *url = [NSURL URLWithString:[@"https://reddit-uploaded-media.s3-accelerate.amazonaws.com/" stringByAppendingString:keys[i]]];
+        ApolloRegisterRedditUploadedMedia(url, ids[i], @"image/jpeg", nil);
+    }
+    for (NSUInteger count = 1; count <= ids.count; count++) {
+        NSMutableURLRequest *album = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://imgur-apiv3.p.rapidapi.com/3/album"]];
+        album.HTTPMethod = @"POST";
+        album.HTTPBody = [[@"deletehashes=" stringByAppendingString:[[keys subarrayWithRange:NSMakeRange(0, count)] componentsJoinedByString:@","]] dataUsingEncoding:NSUTF8StringEncoding];
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:album completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSDictionary *root = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            NSDictionary *payload = [root[@"data"] isKindOfClass:NSDictionary.class] ? root[@"data"] : nil;
+            NSString *albumID = [payload[@"id"] isKindOfClass:NSString.class] ? payload[@"id"] : nil;
+            BOOL passed = !error && [response isKindOfClass:NSHTTPURLResponse.class] &&
+                [(NSHTTPURLResponse *)response statusCode] == 200 && [payload[@"images_count"] unsignedIntegerValue] == count && albumID.length > 0;
+            if (passed) {
+                NSString *text = [NSString stringWithFormat:@"Before [Album](https://imgur.com/a/%@/) after", albumID];
+                NSString *resolved = ApolloImageUploadResolveAlbumText(text);
+                passed = ![resolved containsString:@"imgur.com"];
+                for (NSUInteger i = 0; i < count; i++) passed &= [resolved containsString:keys[i]];
+                NSMutableURLRequest *comment = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://oauth.reddit.com/api/comment"]];
+                comment.HTTPMethod = @"POST";
+                NSCharacterSet *unreserved = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"];
+                comment.HTTPBody = [[@"thing_id=t3_fixture&text=" stringByAppendingString:[text stringByAddingPercentEncodingWithAllowedCharacters:unreserved]] dataUsingEncoding:NSUTF8StringEncoding];
+                NSURLRequest *rewritten = ApolloRedditMaybeRewriteCommentRequest(comment);
+                NSString *body = [[NSString alloc] initWithData:rewritten.HTTPBody encoding:NSUTF8StringEncoding];
+                NSString *decoded = body.stringByRemovingPercentEncoding;
+                passed &= [decoded containsString:@"richtext_json="] && ![decoded containsString:albumID];
+                for (NSUInteger i = 0; i < count; i++) passed &= [decoded containsString:ids[i]];
+            }
+            ApolloLog(@"[SimDebugTap] uploadalbumtest: %lu image(s) %@", (unsigned long)count, passed ? @"PASS" : @"FAIL");
+            NSString *path = [NSString stringWithFormat:@"/tmp/apollo-upload-album-%lu-result.txt", (unsigned long)count];
+            [(passed ? @"PASS" : @"FAIL") writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }];
+        [task resume];
+    }
+}
+
 static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *observer,
                                           CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     // Capture at notification receipt, before queueing main-thread delivery.
