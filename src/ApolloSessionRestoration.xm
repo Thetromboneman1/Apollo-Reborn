@@ -15,6 +15,7 @@
 #import "ApolloPerPostCommentSort.h"
 #import "ApolloSessionRestoration.h"
 #import "ApolloSessionState.h"
+#import "ApolloState.h"
 #import "ApolloSwiftRuntime.h"
 
 extern NSInteger ApolloPostsTypeTagFromViewController(UIViewController *viewController);
@@ -28,6 +29,7 @@ static const NSUInteger kApolloSessionRouteAttempts = 24;
 static const NSUInteger kApolloSessionDetailAnchorAttempts = 48;
 static const NSUInteger kApolloSessionFeedAnchorAttempts = 120;
 static const NSUInteger kApolloSessionMaximumMoreCommentsRequests = 4;
+static const NSInteger kApolloSessionMaximumFeedPage = 5;
 static const NSTimeInterval kApolloSessionRetryDelay = 0.25;
 static const NSTimeInterval kApolloSessionDetailRouteGrace = 0.75;
 
@@ -50,9 +52,27 @@ static __weak UIViewController *sApolloSessionFeedSortPreparedController;
 static __weak UIViewController *sApolloSessionPagingController;
 static NSInteger sApolloSessionLastRequestedPage = NSNotFound;
 static NSHashTable *sApolloSessionRequestedMoreComments;
+static NSUInteger sApolloSessionMoreCommentsRequestCount;
 static NSUInteger sApolloSessionRestoreGeneration;
 
 static void ApolloSessionRevalidatePendingNavigation(void);
+
+@interface ApolloSessionScrollMarker : NSObject
+@property(nonatomic, weak) UIViewController *controller;
+@property(nonatomic) BOOL detail;
+@property(nonatomic) NSUInteger generation;
+@end
+
+@implementation ApolloSessionScrollMarker
+@end
+
+@interface ApolloSessionScrollObserver : NSObject
+- (void)apollo_sessionPanChanged:(UIPanGestureRecognizer *)gesture;
+@end
+
+static const void *kApolloSessionScrollMarkerKey = &kApolloSessionScrollMarkerKey;
+static const void *kApolloSessionScrollObserverInstalledKey =
+    &kApolloSessionScrollObserverInstalledKey;
 
 static UIWindowScene *ApolloSessionOnlyForegroundScene(void) {
     UIWindowScene *only = nil;
@@ -283,17 +303,30 @@ static NSDictionary<NSString *, id> *ApolloSessionCapture(void) {
         ApolloSessionStateFeedURLKey: feedURL,
         ApolloSessionStateAccountScopeKey: accountScope,
     } mutableCopy];
-    NSDictionary *feedViewport = ApolloSessionViewport(feed, NO);
-    if (feedViewport[@"item"]) snapshot[ApolloSessionStateFeedItemKey] = feedViewport[@"item"];
-    if (feedViewport[@"delta"]) snapshot[ApolloSessionStateFeedDeltaKey] = feedViewport[@"delta"];
-    if (feedViewport[@"offset"]) snapshot[ApolloSessionStateFeedOffsetKey] = feedViewport[@"offset"];
-    snapshot[ApolloSessionStateFeedPageKey] = @(MIN(20, ApolloSessionCurrentFeedPage(feed)));
+    NSInteger feedPage = ApolloSessionCurrentFeedPage(feed);
+    if (feedPage <= kApolloSessionMaximumFeedPage) {
+        NSDictionary *feedViewport = ApolloSessionViewport(feed, NO);
+        if (feedViewport[@"item"]) snapshot[ApolloSessionStateFeedItemKey] = feedViewport[@"item"];
+        if (feedViewport[@"delta"]) snapshot[ApolloSessionStateFeedDeltaKey] = feedViewport[@"delta"];
+        if (feedViewport[@"offset"]) snapshot[ApolloSessionStateFeedOffsetKey] = feedViewport[@"offset"];
+        snapshot[ApolloSessionStateFeedPageKey] = @(feedPage);
+    } else {
+        snapshot[ApolloSessionStateFeedPageKey] = @0;
+    }
     ApolloSessionCaptureOptionalEnum(snapshot, feed, "currentSort", ApolloSessionStateFeedSortKey, 1, 6);
     ApolloSessionCaptureOptionalEnum(snapshot, feed, "currentTimeSort",
                                      ApolloSessionStateFeedTimeSortKey, 1, 7);
 
     UIViewController *comments = sApolloSessionCommentsController;
-    if (comments && comments.navigationController.topViewController == comments) {
+    UIViewController *(^tabChild)(UIViewController *) = ^UIViewController *(UIViewController *controller) {
+        while (controller.parentViewController &&
+               ![controller.parentViewController isKindOfClass:UITabBarController.class]) {
+            controller = controller.parentViewController;
+        }
+        return controller;
+    };
+    if (comments && tabChild(comments) == tabChild(feed) &&
+        comments.navigationController.topViewController == comments) {
         NSDictionary *detailViewport = ApolloSessionViewport(comments, YES);
         NSString *detailURL = ApolloSessionDetailURL(comments);
         if (detailURL) snapshot[ApolloSessionStateDetailURLKey] = detailURL;
@@ -313,6 +346,10 @@ static NSDictionary<NSString *, id> *ApolloSessionCapture(void) {
 
 static void ApolloSessionPersist(void) {
     if (!NSThread.isMainThread) return;
+    if (!sRestoreReadingSession) {
+        [[NSFileManager defaultManager] removeItemAtPath:ApolloSessionFilePath() error:nil];
+        return;
+    }
     ApolloSessionRevalidatePendingNavigation();
     if (ApolloSessionStateShouldDeferPersistence(sApolloSessionPendingRestore != nil,
                                                  sApolloSessionFeedViewportFinished,
@@ -324,7 +361,10 @@ static void ApolloSessionPersist(void) {
         return;
     }
     NSDictionary *snapshot = ApolloSessionCapture();
-    if (!snapshot) return;
+    if (!snapshot) {
+        [[NSFileManager defaultManager] removeItemAtPath:ApolloSessionFilePath() error:nil];
+        return;
+    }
     NSString *path = ApolloSessionFilePath();
     NSString *directory = path.stringByDeletingLastPathComponent;
     NSError *error = nil;
@@ -342,9 +382,24 @@ static void ApolloSessionPersist(void) {
               snapshot[ApolloSessionStateDetailURLKey] ? @" and open post" : @"");
 }
 
+static UINavigationController *ApolloSessionNavigationControllerForTabChild(UIViewController *child) {
+    if (!child) return nil;
+    if ([child isKindOfClass:UINavigationController.class]) {
+        return (UINavigationController *)child;
+    }
+    if ([child isKindOfClass:UISplitViewController.class]) {
+        for (UIViewController *column in [(UISplitViewController *)child viewControllers].reverseObjectEnumerator) {
+            UINavigationController *navigation = ApolloSessionNavigationControllerForTabChild(column);
+            if (navigation) return navigation;
+        }
+    }
+    return child.navigationController;
+}
+
 static UINavigationController *ApolloSessionSelectedNavigation(id tabs) {
     if (![tabs isKindOfClass:UITabBarController.class]) return nil;
-    return ApolloNavigationControllerForTabChild([(UITabBarController *)tabs selectedViewController]);
+    return ApolloSessionNavigationControllerForTabChild(
+        [(UITabBarController *)tabs selectedViewController]);
 }
 
 static BOOL ApolloSessionOpenHomeFeed(void) {
@@ -430,6 +485,56 @@ static void ApolloSessionCancelFeedForRouteChange(void) {
         ApolloSessionFinishViewport(YES);
     }
     ApolloSessionFinishViewport(NO);
+}
+
+@implementation ApolloSessionScrollObserver
+
+- (void)apollo_sessionPanChanged:(UIPanGestureRecognizer *)gesture {
+    ApolloSessionScrollMarker *marker =
+        objc_getAssociatedObject(gesture, kApolloSessionScrollMarkerKey);
+    if (!marker || marker.generation != sApolloSessionRestoreGeneration) return;
+    BOOL phaseStarted = marker.detail ? sApolloSessionDetailViewportStarted
+                                      : sApolloSessionFeedViewportStarted;
+    BOOL phaseFinished = marker.detail ? sApolloSessionDetailViewportFinished
+                                       : sApolloSessionFeedViewportFinished;
+    if (!ApolloSessionStateShouldCancelForReaderScroll(
+            sApolloSessionPendingRestore != nil,
+            ApolloSessionControllerOwnsRestore(marker.controller),
+            phaseStarted, phaseFinished,
+            gesture.state == UIGestureRecognizerStateBegan)) return;
+    objc_setAssociatedObject(gesture, kApolloSessionScrollMarkerKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloLog(@"[SessionRestore] Reader started scrolling the %@ during restore; leaving it there",
+              marker.detail ? @"post" : @"feed");
+    if (marker.detail) ApolloSessionFinishViewport(YES);
+    else ApolloSessionCancelFeedForRouteChange();
+}
+
+@end
+
+static ApolloSessionScrollObserver *ApolloSessionSharedScrollObserver(void) {
+    static ApolloSessionScrollObserver *observer = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ observer = [ApolloSessionScrollObserver new]; });
+    return observer;
+}
+
+static void ApolloSessionObserveReaderScroll(UIViewController *controller, BOOL detail) {
+    UITableView *table = ApolloSessionTableView(controller);
+    UIPanGestureRecognizer *gesture = table.panGestureRecognizer;
+    if (!gesture) return;
+    if (![objc_getAssociatedObject(gesture, kApolloSessionScrollObserverInstalledKey) boolValue]) {
+        [gesture addTarget:ApolloSessionSharedScrollObserver()
+                    action:@selector(apollo_sessionPanChanged:)];
+        objc_setAssociatedObject(gesture, kApolloSessionScrollObserverInstalledKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    ApolloSessionScrollMarker *marker = [ApolloSessionScrollMarker new];
+    marker.controller = controller;
+    marker.detail = detail;
+    marker.generation = sApolloSessionRestoreGeneration;
+    objc_setAssociatedObject(gesture, kApolloSessionScrollMarkerKey, marker,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static BOOL ApolloSessionFeedOwnsPendingNavigation(void) {
@@ -525,24 +630,25 @@ static BOOL ApolloSessionRequestNextFeedPage(UIViewController *controller) {
 static BOOL ApolloSessionRequestMoreCommentsForAnchor(UIViewController *controller,
                                                       NSString *identifier) {
     if (!controller || identifier.length == 0 ||
-        sApolloSessionRequestedMoreComments.count >= kApolloSessionMaximumMoreCommentsRequests) {
+        sApolloSessionMoreCommentsRequestCount >= kApolloSessionMaximumMoreCommentsRequests) {
         return NO;
     }
     UITableView *table = ApolloSessionTableView(controller);
-    Class moreCellClass = objc_getClass("_TtC6Apollo20MoreCommentsCellNode");
     SEL tapSelector = NSSelectorFromString(@"moreCommentsCellTappedWithMoreComments:");
-    if (!table || !moreCellClass || ![controller respondsToSelector:tapSelector]) return NO;
+    if (!table || !ApolloClassMoreCommentsCellNode ||
+        ![controller respondsToSelector:tapSelector]) return NO;
     for (NSInteger section = 0; section < table.numberOfSections; section++) {
         for (NSInteger row = 0; row < [table numberOfRowsInSection:section]; row++) {
             id node = ApolloSessionNode(controller,
                 [NSIndexPath indexPathForRow:row inSection:section]);
-            if (![node isKindOfClass:moreCellClass]) continue;
+            if (![node isKindOfClass:ApolloClassMoreCommentsCellNode]) continue;
             id moreComments = ApolloObjectIvar(node, "moreComments");
             if (!moreComments || [sApolloSessionRequestedMoreComments containsObject:moreComments] ||
                 ![moreComments respondsToSelector:@selector(children)]) continue;
             id children = ((id (*)(id, SEL))objc_msgSend)(moreComments, @selector(children));
             if (!ApolloSessionStateMoreCommentsChildrenContainIdentifier(children, identifier)) continue;
             [sApolloSessionRequestedMoreComments addObject:moreComments];
+            sApolloSessionMoreCommentsRequestCount++;
             ((void (*)(id, SEL, id))objc_msgSend)(controller, tapSelector, moreComments);
             ApolloLog(@"[SessionRestore] Requested the comment branch containing saved anchor %@",
                       identifier);
@@ -553,7 +659,8 @@ static BOOL ApolloSessionRequestMoreCommentsForAnchor(UIViewController *controll
 }
 
 static void ApolloSessionStartDetailRoute(void) {
-    if (sApolloSessionDetailRouteStarted) return;
+    if (sApolloSessionDetailRouteStarted || !sApolloSessionPendingRestore ||
+        sApolloSessionDetailViewportFinished) return;
     sApolloSessionDetailRouteStarted = YES;
     NSString *detailURL = sApolloSessionPendingRestore[ApolloSessionStateDetailURLKey];
     if (!detailURL.length) {
@@ -563,7 +670,10 @@ static void ApolloSessionStartDetailRoute(void) {
     NSUInteger generation = sApolloSessionRestoreGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kApolloSessionRetryDelay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (generation != sApolloSessionRestoreGeneration || !sApolloSessionPendingRestore) return;
+        if (!ApolloSessionStateQueuedPhaseWorkShouldRun(
+                sApolloSessionPendingRestore != nil,
+                generation == sApolloSessionRestoreGeneration,
+                sApolloSessionDetailViewportFinished)) return;
         if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
             // Foregrounding schedules the route again after Apollo has
             // reattached the feed controller's window.
@@ -586,7 +696,10 @@ static void ApolloSessionStartDetailRoute(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(kApolloSessionDetailAnchorAttempts * kApolloSessionRetryDelay * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (generation == sApolloSessionRestoreGeneration && sApolloSessionPendingRestore &&
+            if (ApolloSessionStateQueuedPhaseWorkShouldRun(
+                    sApolloSessionPendingRestore != nil,
+                    generation == sApolloSessionRestoreGeneration,
+                    sApolloSessionDetailViewportFinished) &&
                 ApolloSessionStateDetailRouteDeadlineShouldFinish(
                     sApolloSessionDetailControllerSeen, sApolloSessionDetailViewportFinished)) {
                 ApolloLog(@"[SessionRestore] Saved post did not become available; keeping restored feed");
@@ -598,13 +711,20 @@ static void ApolloSessionStartDetailRoute(void) {
 }
 
 static void ApolloSessionScheduleDetailRoute(NSUInteger generation) {
-    if (sApolloSessionDetailRouteStarted ||
+    BOOL canSchedule = ApolloSessionStateQueuedPhaseWorkShouldRun(
+            sApolloSessionPendingRestore != nil,
+            generation == sApolloSessionRestoreGeneration,
+            sApolloSessionDetailViewportFinished);
+    if (!canSchedule || sApolloSessionDetailRouteStarted ||
         ![sApolloSessionPendingRestore[ApolloSessionStateDetailURLKey] length]) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  (int64_t)(kApolloSessionDetailRouteGrace * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (generation != sApolloSessionRestoreGeneration || !sApolloSessionPendingRestore ||
-            sApolloSessionDetailRouteStarted) return;
+        BOOL shouldRun = ApolloSessionStateQueuedPhaseWorkShouldRun(
+                sApolloSessionPendingRestore != nil,
+                generation == sApolloSessionRestoreGeneration,
+                sApolloSessionDetailViewportFinished);
+        if (!shouldRun || sApolloSessionDetailRouteStarted) return;
         if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
         if (!ApolloSessionFeedOwnsPendingNavigation()) {
             ApolloLog(@"[SessionRestore] Newer navigation suppressed the saved post route");
@@ -622,6 +742,12 @@ static void ApolloSessionScheduleDetailRoute(NSUInteger generation) {
 
 static void ApolloSessionRestoreViewport(UIViewController *controller, BOOL detail,
                                          NSUInteger attempt, NSUInteger generation) {
+    BOOL phaseFinished = detail ? sApolloSessionDetailViewportFinished
+                                : sApolloSessionFeedViewportFinished;
+    if (!ApolloSessionStateQueuedPhaseWorkShouldRun(
+            sApolloSessionPendingRestore != nil,
+            generation == sApolloSessionRestoreGeneration,
+            phaseFinished)) return;
     UINavigationController *navigation = controller.navigationController;
     BOOL visible = controller.viewIfLoaded.window != nil;
     BOOL top = navigation.topViewController == controller;
@@ -633,7 +759,6 @@ static void ApolloSessionRestoreViewport(UIViewController *controller, BOOL deta
         topController != controller && ApolloClassCommentsViewController &&
         [topController isMemberOfClass:ApolloClassCommentsViewController] &&
         ApolloSessionCommentsControllerMatchesPendingDetail(topController);
-    if (generation != sApolloSessionRestoreGeneration || !sApolloSessionPendingRestore) return;
     if (!detail && !ApolloSessionStateFeedURLMatchesSavedRoute(
                        ApolloSessionFeedURL(controller),
                        sApolloSessionPendingRestore[ApolloSessionStateFeedURLKey])) {
@@ -659,6 +784,13 @@ static void ApolloSessionRestoreViewport(UIViewController *controller, BOOL deta
     if (!ApolloSessionStateViewportRestoreIsEligible(
             detail, visible, top, inStack, underRestoredDetail, applicationActive)) return;
     UITableView *table = ApolloSessionTableView(controller);
+    if (table.isTracking || table.isDragging || table.isDecelerating) {
+        ApolloLog(@"[SessionRestore] Reader scrolled the %@ during restore; leaving it there",
+                  detail ? @"post" : @"feed");
+        if (detail) ApolloSessionFinishViewport(YES);
+        else ApolloSessionCancelFeedForRouteChange();
+        return;
+    }
     NSString *itemKey = detail ? ApolloSessionStateDetailItemKey : ApolloSessionStateFeedItemKey;
     NSString *deltaKey = detail ? ApolloSessionStateDetailDeltaKey : ApolloSessionStateFeedDeltaKey;
     NSString *offsetKey = detail ? ApolloSessionStateDetailOffsetKey : ApolloSessionStateFeedOffsetKey;
@@ -715,7 +847,10 @@ static void ApolloSessionWaitForSortedFeed(UIViewController *controller,
                                            BOOL observedContentChange,
                                            NSUInteger attempt,
                                            NSUInteger generation) {
-    if (generation != sApolloSessionRestoreGeneration || !sApolloSessionPendingRestore) return;
+    if (!ApolloSessionStateQueuedPhaseWorkShouldRun(
+            sApolloSessionPendingRestore != nil,
+            generation == sApolloSessionRestoreGeneration,
+            sApolloSessionFeedViewportFinished)) return;
     NSString *savedURL = sApolloSessionPendingRestore[ApolloSessionStateFeedURLKey];
     if (!ApolloSessionStateFeedURLMatchesSavedRoute(ApolloSessionFeedURL(controller), savedURL)) {
         ApolloLog(@"[SessionRestore] Feed changed while waiting for sorted rows; cancelling feed phase");
@@ -745,7 +880,10 @@ static void ApolloSessionWaitForSortedFeed(UIViewController *controller,
 }
 
 static void ApolloSessionRouteFeed(NSUInteger attempt, NSUInteger generation) {
-    if (generation != sApolloSessionRestoreGeneration || !sApolloSessionPendingRestore) return;
+    if (!ApolloSessionStateQueuedPhaseWorkShouldRun(
+            sApolloSessionPendingRestore != nil,
+            generation == sApolloSessionRestoreGeneration,
+            sApolloSessionFeedViewportFinished)) return;
     if (ApolloSessionOpenURLString(sApolloSessionPendingRestore[ApolloSessionStateFeedURLKey])) return;
     if (attempt + 1 >= kApolloSessionRouteAttempts) {
         ApolloLog(@"[SessionRestore] Timed out opening saved feed");
@@ -757,6 +895,12 @@ static void ApolloSessionRouteFeed(NSUInteger attempt, NSUInteger generation) {
 }
 
 static void ApolloSessionConsiderInitialRestore(BOOL preferLiveAccount) {
+    if (!sRestoreReadingSession) {
+        sApolloSessionInitialRestoreConsidered = YES;
+        sApolloSessionAccountReadyRetryPending = NO;
+        [[NSFileManager defaultManager] removeItemAtPath:ApolloSessionFilePath() error:nil];
+        return;
+    }
     if (!ApolloSessionStateAccountReadyMayRetry(
             sApolloSessionInitialRestoreConsidered,
             sApolloSessionAccountReadyRetryPending,
@@ -808,9 +952,21 @@ static void ApolloSessionConsiderInitialRestore(BOOL preferLiveAccount) {
     sApolloSessionPagingController = nil;
     sApolloSessionLastRequestedPage = NSNotFound;
     sApolloSessionRequestedMoreComments = [NSHashTable weakObjectsHashTable];
+    sApolloSessionMoreCommentsRequestCount = 0;
     NSUInteger generation = ++sApolloSessionRestoreGeneration;
     ApolloLog(@"[SessionRestore] Cold launch has a recent reading session");
     ApolloSessionRouteFeed(0, generation);
+}
+
+void ApolloSessionRestorationSetEnabled(BOOL enabled) {
+    if (enabled) return;
+    sApolloSessionPendingRestore = nil;
+    sApolloSessionAccountReadyRetryPending = NO;
+    sApolloSessionDeleteSnapshotAfterRestore = NO;
+    sApolloSessionRequestedMoreComments = nil;
+    sApolloSessionMoreCommentsRequestCount = 0;
+    ++sApolloSessionRestoreGeneration;
+    [[NSFileManager defaultManager] removeItemAtPath:ApolloSessionFilePath() error:nil];
 }
 
 static void ApolloSessionHandleAccountReady(void) {
@@ -845,8 +1001,10 @@ static void ApolloSessionHandleAccountReady(void) {
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig(animated);
-    sApolloSessionFeedController = (UIViewController *)self;
-    sApolloSessionCommentsController = nil;
+    if (!sApolloSessionPendingRestore || ApolloSessionControllerOwnsRestore((UIViewController *)self)) {
+        sApolloSessionFeedController = (UIViewController *)self;
+        sApolloSessionCommentsController = nil;
+    }
     if (!ApolloSessionControllerOwnsRestore((UIViewController *)self)) return;
     NSDictionary *pending = sApolloSessionPendingRestore;
     if (pending && ApolloSessionStateFeedURLMatchesSavedRoute(
@@ -865,6 +1023,7 @@ static void ApolloSessionHandleAccountReady(void) {
                 @selector(reloadPostsWithNotification:), nil);
         }
         sApolloSessionFeedViewportStarted = YES;
+        ApolloSessionObserveReaderScroll((UIViewController *)self, NO);
         NSUInteger generation = sApolloSessionRestoreGeneration;
         ApolloSessionScheduleDetailRoute(generation);
         if (changedSort) {
@@ -900,6 +1059,7 @@ static void ApolloSessionHandleAccountReady(void) {
         ApolloSessionCommentsControllerMatchesPendingDetail((UIViewController *)self)) {
         sApolloSessionDetailControllerSeen = YES;
         sApolloSessionDetailViewportStarted = YES;
+        ApolloSessionObserveReaderScroll((UIViewController *)self, YES);
         ApolloSessionRestoreViewport((UIViewController *)self, YES, 0,
                                      sApolloSessionRestoreGeneration);
     }
@@ -948,6 +1108,7 @@ static void ApolloSessionHandleAccountReady(void) {
     }
     ApolloSessionConsiderInitialRestore(NO);
     if (sApolloSessionPendingRestore && !sApolloSessionDetailRouteStarted &&
+        !sApolloSessionDetailViewportFinished &&
         [sApolloSessionPendingRestore[ApolloSessionStateDetailURLKey] length]) {
         ApolloSessionScheduleDetailRoute(sApolloSessionRestoreGeneration);
     }

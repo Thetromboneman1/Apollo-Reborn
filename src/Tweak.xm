@@ -3884,6 +3884,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyEnableFlairColors: @NO,
                                     UDKeyBoldPostTitles: @NO,
                                     UDKeyFeedTextPostThumbnails: @YES,
+                                    UDKeyRestoreReadingSession: @YES,
                                     UDKeyFeedGalleryCarousel: @YES,
                                     UDKeyFeedGalleryEdgeSwipeNav: @YES,
                                     UDKeyGalleryAutoplayVideos: @YES,
@@ -4056,6 +4057,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
         [[NSUserDefaults standardUserDefaults] setBool:NO forKey:UDKeyPassiveDeletedComments];
     }
     sFeedTextPostThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedTextPostThumbnails];
+    sRestoreReadingSession = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyRestoreReadingSession];
     sFeedGalleryCarousel = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedGalleryCarousel];
     sFeedGalleryEdgeSwipeNav = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedGalleryEdgeSwipeNav];
     sGalleryAutoplayVideos = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyGalleryAutoplayVideos];

@@ -21,6 +21,7 @@ BOOL sShowDeletedComments = NO;
 BOOL sTapToRevealDeletedComments = NO;
 BOOL sPassiveDeletedComments = NO;
 BOOL sFeedTextPostThumbnails = YES;
+BOOL sRestoreReadingSession = YES;
 BOOL sFeedGalleryCarousel = YES;
 BOOL sFeedGalleryEdgeSwipeNav = YES;
 BOOL sGalleryAutoplayVideos = YES;
