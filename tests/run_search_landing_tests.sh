@@ -40,3 +40,5 @@ xcrun --sdk macosx swiftc -parse-as-library -O -warnings-as-errors \
     "$test_repo_root/tests/search_ivar_bridge_tests.swift" \
     -o "$test_build_dir/search_ivar_bridge_tests"
 "$test_build_dir/search_ivar_bridge_tests"
+
+test "$(grep -c '@_cdecl("ApolloSwiftCopyFirstObjectArrayElement")' "$test_repo_root/src/ApolloSwiftIvarBridge.swift")" -eq 1

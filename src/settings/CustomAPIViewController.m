@@ -4,6 +4,8 @@
 #import "ApolloSettingsShortcutsViewController.h"
 #import "ApolloSearchLandingPreferences.h"
 #import "settings/CustomAPIViewController.h"
+#import "settings/ApolloSetupAssistant.h"
+#import "ApolloSignInSplash.h"
 #import "settings/ApolloSiriSettingsViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloAppIcon.h"
@@ -39,6 +41,7 @@
 #import "ApolloTabBarHideStyle.h"
 #import "ApolloDuoRail.h"
 #import "ApolloDuoCompatibility.h"
+#import "ApolloDuoSplitView.h"
 #import "ApolloTagFilters.h"
 #import "ApolloBadgeBookScraper.h"   // ApolloBadgeBookInvalidate() — Clear Tweak Caches
 #import "ApolloUserProfileCache.h"
@@ -499,7 +502,9 @@ static CGFloat ApolloFeedShortcutsPreviewSideBySideCenterOffset(ApolloFeedShortc
     self.shortcutItemViewsByIndex = [itemViewsByIndex copy];
 
     if (usesShortcutLayout) {
-        UIColor *separatorColor = UIColor.separatorColor;
+        UIColor *separatorColor = ApolloThemeSeparatorColor()
+            ?: self.hostTableView.separatorColor
+            ?: UIColor.separatorColor;
         self.shortcutSeparators = ApolloFeedShortcutInstallLayout(self,
                                                                    shortcutItems,
                                                                    contentViews,
@@ -1317,6 +1322,12 @@ typedef NS_ENUM(NSInteger, Tag) {
 }
 
 - (ApolloSettingsSection *)buildSetupSection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *assistant =
+        [ApolloSettingsRow buttonRowWithID:@"setup.assistant" title:@"Setup Assistant"
+            action:^{ ApolloSetupAssistantPresentFrom(weakSelf); }];
+    assistant.iconSystemName = @"wand.and.stars";
+    assistant.iconTileColor = UIColor.systemPurpleColor;
     ApolloSettingsRow *apiKeys =
         [self hubDisclosureRowWithID:@"setup.apiKeys"
                                title:@"Accounts & API Keys"
@@ -1328,7 +1339,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     apiKeys.iconTileColor = [UIColor systemGrayColor];
     return [ApolloSettingsSection sectionWithTitle:@"Setup"
                                             footer:@"Your Reddit sign-in credentials, plus optional Imgur, Giphy and Image Chest keys for uploads and GIFs, and a Kagi Session Link for searching Reddit with Kagi."
-                                              rows:@[ apiKeys ]];
+                                              rows:@[ assistant, apiKeys ]];
 }
 
 - (ApolloSettingsSection *)buildFeaturesSection {
@@ -2256,13 +2267,16 @@ typedef NS_ENUM(NSInteger, Tag) {
                                  onSelect:^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            ApolloSettingsPresentPicker(self, [self cellForRowID:@"interface.inboxBadgeColor"],
+            ApolloSettingsPresentLivePicker(self, [self cellForRowID:@"interface.inboxBadgeColor"],
                                         @"Unread Badge Color", @[@"Red", @"Theme Accent"],
                                         [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? 1 : 0,
                                         ^(NSInteger pickedIndex) {
                 [NSUserDefaults.standardUserDefaults setBool:(pickedIndex == 1) forKey:UDKeyInboxBadgeUseThemeAccent];
                 [NSNotificationCenter.defaultCenter postNotificationName:ApolloInboxBadgeChangedNotification object:nil];
-                [weakSelf reloadRowWithID:@"interface.inboxBadgeColor"];
+                // Keep the existing row in place while its sheet dismisses.
+                UITableViewCell *cell = [weakSelf cellForRowID:@"interface.inboxBadgeColor"];
+                cell.detailTextLabel.text = pickedIndex == 1 ? @"Theme Accent" : @"Red";
+                [cell setNeedsLayout];
             });
         }];
     inboxBadgeColor.configure = ^(UITableViewCell *cell) {
@@ -2394,7 +2408,10 @@ typedef NS_ENUM(NSInteger, Tag) {
         footer = [footer stringByAppendingString:@"\n\nSwipe Tab Bar to Navigate disables the native drag-to-switch-tab gesture."];
     }
     if (ApolloDuoUsesAdaptiveBars()) {
-        footer = [footer stringByAppendingString:@"\n\nOn iPhone Duo, Hide Tab Bar on Scroll, Hide Style, Scroll Behavior, and Swipe Tab Bar to Navigate apply only while open in portrait. The side rail always stays visible. Hide Header on Scroll works independently in every pose."];
+        NSString *duoFooter = @"On iPhone Duo, Hide Tab Bar on Scroll, Hide Style, Scroll Behavior, and Swipe Tab Bar to Navigate apply only while open in portrait. The side rail always stays visible. Hide Header on Scroll works independently in every pose.";
+        footer = footer.length > 0
+            ? [footer stringByAppendingFormat:@"\n\n%@", duoFooter]
+            : duoFooter;
     }
     return [ApolloSettingsSection sectionWithTitle:@"Tab Bar"
                                             footer:footer
@@ -3090,6 +3107,27 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             return ApolloSettingsRouteInstantiate(@"feed-shortcuts");
         }];
 
+    ApolloSettingsRow *panelStyle =
+        [ApolloSettingsRow valueRowWithID:@"sub.panelStyle"
+                                   title:@"Subreddit Panel Style"
+                                  detail:^NSString * {
+            return sDuoSubredditPanelGlassEnabled ? @"Liquid Glass" : @"Standard";
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"sub.panelStyle"],
+                @"Subreddit Panel Style", @[ @"Standard", @"Liquid Glass" ],
+                sDuoSubredditPanelGlassEnabled ? 1 : 0, ^(NSInteger picked) {
+                    BOOL glassEnabled = picked == 1;
+                    if (sDuoSubredditPanelGlassEnabled == glassEnabled) return;
+                    sDuoSubredditPanelGlassEnabled = glassEnabled;
+                    [NSUserDefaults.standardUserDefaults setBool:glassEnabled
+                        forKey:UDKeyDuoSubredditPanelGlassEnabled];
+                    [weakSelf reloadRowWithID:@"sub.panelStyle"];
+                    ApolloDuoSplitScheduleUpdate();
+                });
+        }];
+    panelStyle.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+
     // Pushes the dedicated Subreddit Sections screen: the FOLLOWING section
     // for followed users, drag-to-reorder for the special sections, and a
     // live preview of the list layout (see ApolloSubredditSectionsViewController).
@@ -3128,7 +3166,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   }];
     return [ApolloSettingsSection sectionWithTitle:@"Subreddit List"
                                             footer:nil
-                                              rows:@[ feedShortcuts, subredditSections,
+                                              rows:@[ feedShortcuts, subredditSections, panelStyle,
                                                       perAccountFavorites, sortFavoritesAlphabetically, confirmFavoriteToggle ]];
 }
 
@@ -3709,7 +3747,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                 cell.detailTextLabel.numberOfLines = 0;
             }
             cell.textLabel.text = @"Bug Reports";
-            cell.detailTextLabel.text = @"Report a problem and optionally attach Reborn logs";
+            cell.detailTextLabel.text = @"Report a problem. Your Reborn debug log is attached automatically";
             cell.imageView.image = ApolloEmojiSettingsIcon(@"\U0001F41B", [UIColor systemRedColor], 29.0);
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -4451,6 +4489,33 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
 
 #pragma mark - Export Logs
 
+// A .log file rather than a raw string, so it can be saved to Files and
+// attached to a GitHub bug report or the web report form as a file (GitHub
+// caps issue text at 64K characters, far below a session log). One fixed
+// folder, emptied per export, so repeated exports don't accumulate in tmp.
+// Returns nil if the file couldn't be written.
+static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSURL *folder = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+                        URLByAppendingPathComponent:@"ApolloRebornLogExport" isDirectory:YES];
+    [fileManager removeItemAtURL:folder error:nil];
+    NSError *error = nil;
+    if (![fileManager createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&error]) {
+        ApolloLogError(@"[ExportLogs] couldn't create the export folder: %@", error.localizedDescription);
+        return nil;
+    }
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.dateFormat = @"yyyy-MM-dd-HHmmss";
+    NSString *filename = [NSString stringWithFormat:@"apollo-reborn-%@.log", [formatter stringFromDate:[NSDate date]]];
+    NSURL *fileURL = [folder URLByAppendingPathComponent:filename isDirectory:NO];
+    if (![logs writeToURL:fileURL atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+        ApolloLogError(@"[ExportLogs] couldn't write the log file: %@", error.localizedDescription);
+        return nil;
+    }
+    return fileURL;
+}
+
 - (void)exportLogs {
     UIAlertController *spinner = [UIAlertController alertControllerWithTitle:@"Collecting logs…"
                                                                     message:@"\n"
@@ -4467,9 +4532,12 @@ static NSDictionary *ApolloWidgetAccountCredentials(void) {
     [self presentViewController:spinner animated:YES completion:^{
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             NSString *logs = ApolloCollectLogs();
+            NSURL *logFile = ApolloWriteExportedLogFile(logs);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [spinner dismissViewControllerAnimated:YES completion:^{
-                    UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:@[logs] applicationActivities:nil];
+                    // Fall back to sharing the text if the file write failed.
+                    NSArray *items = logFile ? @[ logFile ] : @[ logs ];
+                    UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
 
                     UIPopoverPresentationController *popover = activityVC.popoverPresentationController;
                     if (popover) {
@@ -5554,6 +5622,39 @@ replacementString:(NSString *)string {
 }
 @end
 
+@implementation ApolloSetupAPIKeyViewController
+- (NSString *)apollo_screenTitle { return @"Reddit API Key"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    ApolloSettingsSection *source = [self buildAPIKeysDefaultSection];
+    NSSet *ids = [NSSet setWithArray:@[@"api.redditKey", @"api.redditSecret", @"api.redirectURI"]];
+    NSMutableArray *fields = [NSMutableArray array];
+    for (ApolloSettingsRow *row in source.rows) {
+        if ([ids containsObject:row.rowID]) [fields addObject:row];
+    }
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *signIn = [ApolloSettingsRow buttonRowWithID:@"setup.apiSignIn" title:@"Sign In with Reddit"
+        action:^{
+            [weakSelf.view endEditing:YES];
+            if (!sRedditClientId.length) {
+                [weakSelf showAlertWithTitle:@"Reddit API Key Required" message:@"Enter your Reddit API key above before signing in."];
+                return;
+            }
+            if (!ApolloStartAPIKeySignIn()) {
+                [weakSelf showAlertWithTitle:@"Unable to Start Sign-In" message:@"Return to setup and try again once Apollo has finished loading."];
+            }
+        }];
+    ApolloSettingsRow *help = [ApolloSettingsRow buttonRowWithID:@"setup.apiHelp" title:@"Help with Reddit Sign-In"
+        action:^{ [weakSelf pushTroubleshootingViewController]; }];
+    return @[
+        [ApolloSettingsSection sectionWithTitle:@"Reddit Credentials"
+            footer:@"Enter the client ID from your Reddit app as the API key. Installed-app clients do not need a secret. Leave Redirect URI empty to use the Apollo default. Credentials are saved as you edit; your feature preset is applied only when you finish setup."
+            rows:fields],
+        [ApolloSettingsSection sectionWithTitle:nil footer:@"After signing in, return to Setup Assistant to choose your preferences. Optional upload and GIF keys can be added later."
+            rows:@[signIn, help]],
+    ];
+}
+@end
+
 @implementation ApolloPostsFeedsViewController
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
@@ -5592,6 +5693,10 @@ replacementString:(NSString *)string {
 - (NSString *)apollo_screenTitle { return @"Subreddits"; }
 - (void)viewDidLoad {
     [super viewDidLoad];
+    // Keep native handles available beside the three Search sections without
+    // making the rest of this settings page behave like an edit-only list.
+    self.tableView.allowsSelectionDuringEditing = YES;
+    [self setEditing:YES animated:NO];
     // Own the gap above this untitled first section. UIKit's implicit grouped
     // top spacing depends on the navigation bar's scroll observation and can
     // collapse after a child page is popped, visibly moving the whole form.

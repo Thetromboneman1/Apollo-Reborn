@@ -3,8 +3,11 @@
 // switching can keep addressing that object. Only its visible contents change
 // at an unfold/fold boundary. UIKit owns all column frames and transitions.
 #import "ApolloDuoSplitView.h"
+#import "ApolloDuoNavigationGestures.h"
 #import "ApolloMediaHinge.h"
-#import "ApolloDuoSearchRecents.h"
+#import "ApolloSearchRecents.h"
+#import "ApolloSearchVisitRecording.h"
+#import "ApolloClasses.h"
 #import "ApolloDuoAccount.h"
 #import "ApolloDuoSubsChrome.h"
 #import "ApolloThemeRuntime.h"
@@ -203,6 +206,10 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
 @property(nonatomic, weak) UINavigationController *postsNavigation;
 @property(nonatomic, strong) UIView *listContainer;
 @property(nonatomic, strong) UIVisualEffectView *listGlass;
+@property(nonatomic) BOOL listUsesGlass;
+@property(nonatomic) BOOL listStyleApplied;
+- (void)updateListAppearance;
+- (void)restoreListSurfaceColors;
 @property(nonatomic, strong) UINavigationBar *listNavigationBar;
 @property(nonatomic, strong) UIControl *listDismiss;
 @property(nonatomic, strong) UIButton *listButton;
@@ -270,10 +277,7 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
         [self.listDismiss addTarget:self action:@selector(dismissList) forControlEvents:UIControlEventTouchUpInside];
         self.listDismiss.hidden = YES;
         [self.view addSubview:self.listDismiss];
-        UIVisualEffect *effect;
-        if (@available(iOS 26.0, *)) effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
-        else effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
-        self.listGlass = [[UIVisualEffectView alloc] initWithEffect:effect];
+        self.listGlass = [[UIVisualEffectView alloc] initWithEffect:nil];
         self.listGlass.layer.cornerRadius = 28;
         self.listGlass.clipsToBounds = YES;
         // Move a plain container so the material and list travel together.
@@ -387,13 +391,14 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
         }
         self.originalListInsets = self.subredditList.topViewController.additionalSafeAreaInsets;
         [self.subredditList setNavigationBarHidden:YES animated:NO];
+        [self updateListAppearance];
     }
     if (self.accountHeader) {
         self.accountHeaderClip = [UIView new];
         self.accountHeaderClip.clipsToBounds = YES;
         [self.accountHeaderClip addSubview:self.accountHeader];
         [self.view addSubview:self.accountHeaderClip];
-        [self.view addSubview:self.accountsButton];
+        if (self.accountsButton) [self.view addSubview:self.accountsButton];
         [self.view addSubview:self.moreButton];
         [self.view addSubview:self.sidebarNavigationBar];
         if (self.profileBackButton) [self.view addSubview:self.profileBackButton];
@@ -417,8 +422,42 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
     ApolloDuoPostsStopGeometry(self.searchNavigation.viewIfLoaded);
     [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
 }
-- (void)prepareListGlass {
-    ApolloDuoSplitPrepareOverlaySurface(self.subredditList.view);
+- (void)updateListAppearance {
+    if (!self.subredditList || !self.listGlass) return;
+    BOOL changed = !self.listStyleApplied || self.listUsesGlass != sDuoSubredditPanelGlassEnabled;
+    BOOL refreshRows = self.listStyleApplied && changed;
+    self.listUsesGlass = sDuoSubredditPanelGlassEnabled;
+    if (changed) {
+        // Keep the same controller, panel geometry, and native Add/Edit items.
+        // Standard restores Apollo's own surfaces instead of clearing them for
+        // the material; it does not change the app-wide Liquid Glass setting.
+        [self restoreListSurfaceColors];
+        UIVisualEffect *effect = nil;
+        if (self.listUsesGlass) {
+            if (@available(iOS 26.0, *)) effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+            else effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
+        }
+        self.listGlass.effect = effect;
+        self.listStyleApplied = YES;
+    }
+    NSString *panelTitle = self.listUsesGlass ? @"" : @"Subreddits";
+    if (![self.listNavigationBar.topItem.title isEqualToString:panelTitle])
+        self.listNavigationBar.topItem.title = panelTitle;
+    self.listGlass.backgroundColor = self.listUsesGlass ? UIColor.clearColor
+        : (ApolloThemeSubredditListBackgroundColor() ?: UIColor.systemBackgroundColor);
+    // Re-vend only on an explicit style change, never on scroll/layout.
+    if (refreshRows) [ApolloDuoSplitFindTable(self.subredditList.view) reloadData];
+    if (self.listUsesGlass && self.listVisible)
+        ApolloDuoSplitPrepareOverlaySurface(self.subredditList.view);
+}
+- (void)restoreListSurfaceColors {
+    self.updatingListSurfaces = YES;
+    for (UIView *view in self.listBackgrounds) {
+        id color = [self.listBackgrounds objectForKey:view];
+        view.backgroundColor = color == NSNull.null ? nil : color;
+    }
+    self.updatingListSurfaces = NO;
+    self.listBackgrounds = nil;
 }
 - (void)endListEditing {
     UIViewController *root = self.subredditList.viewControllers.firstObject;
@@ -427,13 +466,7 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
 - (void)restoreListBackgrounds {
     [self endListEditing];
     ApolloDuoSubsChromeSetPopupNavigationBar(self.subredditList.viewControllers.firstObject, nil);
-    self.updatingListSurfaces = YES;
-    for (UIView *view in self.listBackgrounds) {
-        id color = [self.listBackgrounds objectForKey:view];
-        view.backgroundColor = color == NSNull.null ? nil : color;
-    }
-    self.updatingListSurfaces = NO;
-    self.listBackgrounds = nil;
+    [self restoreListSurfaceColors];
     self.subredditList.viewControllers.firstObject.additionalSafeAreaInsets = self.originalListInsets;
     [self.subredditList setNavigationBarHidden:NO animated:NO];
 }
@@ -536,7 +569,7 @@ static void ApolloDuoSlideView(UIView *view, CGFloat from, CGFloat to, NSTimeInt
         [table setContentOffset:CGPointMake(-table.adjustedContentInset.left,
                                            -table.adjustedContentInset.top) animated:NO];
         [table layoutIfNeeded];
-        [self prepareListGlass];
+        [self updateListAppearance];
     }
     self.listDismiss.hidden = NO;
     self.listContainer.hidden = NO;
@@ -714,12 +747,28 @@ static BOOL ApolloDuoSafeAreaInsetsMatch(UIEdgeInsets a, UIEdgeInsets b) {
     [self scheduleSplitSafeAreaSync];
     if (self.subredditList) {
         CGFloat width = MIN(360, self.view.bounds.size.width - 96);
+        BOOL portrait = self.view.bounds.size.width <= self.view.bounds.size.height;
+        CGFloat bottom = CGRectGetMaxY(self.view.bounds) - 12;
+        if (portrait) {
+            // The floating bottom tab bar overlays this full-height host.
+            // Reserve its native layout frame, not the animated glass platter,
+            // so the drawer stays clear without resizing as the bar minimizes.
+            bottom -= self.view.safeAreaInsets.bottom;
+            UITabBar *tabBar = self.tabBarController.tabBar;
+            if (tabBar.window && tabBar.window == self.view.window) {
+                CGRect barFrame = [tabBar convertRect:tabBar.bounds toView:self.view];
+                if (!CGRectIsEmpty(barFrame) && CGRectGetWidth(barFrame) > CGRectGetHeight(barFrame)
+                    && CGRectGetMidY(barFrame) > CGRectGetMidY(self.view.bounds)) {
+                    bottom = MIN(bottom, CGRectGetMinY(barFrame) - 12);
+                }
+            }
+        }
+        CGFloat height = MAX(0, bottom - 12);
         self.listDismiss.frame = self.view.bounds;
         // Bounds/center stay independent of the presentation transform.
-        self.listContainer.bounds = CGRectMake(0, 0, width, self.view.bounds.size.height - 24);
-        self.listContainer.center = CGPointMake(12 + width / 2, self.view.bounds.size.height / 2);
+        self.listContainer.bounds = CGRectMake(0, 0, width, height);
+        self.listContainer.center = CGPointMake(12 + width / 2, 12 + height / 2);
         self.listGlass.frame = self.listContainer.bounds;
-        BOOL portrait = self.view.bounds.size.width <= self.view.bounds.size.height;
         // The drawer covers/intercepts its underlying controls. Keep the
         // navigation items installed so opening it never reflows the bar.
         self.listButton.hidden = NO;
@@ -795,6 +844,12 @@ static BOOL ApolloDuoSafeAreaInsetsMatch(UIEdgeInsets a, UIEdgeInsets b) {
 @property(nonatomic, strong) UINavigationController *secondary;
 @property(nonatomic, strong) UINavigationController *feed;
 @property(nonatomic, copy) NSArray *feedActions;
+// The feed page whose actions feedActions were taken from: the stack can hold
+// several feeds (split links push them), and only the visible one is hidden.
+@property(nonatomic, weak) UINavigationItem *feedActionsItem;
+// A pushed feed whose Back is hidden while paired: the rail's Back already
+// closes the thread first, so a second Back in the feed pane is redundant.
+@property(nonatomic, weak) UINavigationItem *feedBackHiddenItem;
 @property(nonatomic, strong) NSArray<UIViewController *> *lastSettings;
 @property(nonatomic, copy) NSString *kind;
 @property(nonatomic, copy) NSString *sidebarTitle;
@@ -843,6 +898,7 @@ BOOL ApolloDuoSplitIsResizing(void) {
 }
 
 BOOL ApolloDuoSplitIsUnfolded(void) {
+    if (!ApolloDeviceIsDuo()) return NO;
     UITabBarController *tabs = (id)ApolloMainTabBarController();
     if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone
         || ![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return NO;
@@ -939,7 +995,23 @@ static void ApolloDuoSplitLink(UINavigationController *nav, ApolloDuoSplitState 
 
 UINavigationController *ApolloDuoSplitDetailNavigation(UINavigationController *nav) {
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, NO);
+    // A Back addressed to a visible pane belongs to that pane. Only the outer
+    // shell / drawer forwards Back to whichever content is currently showing.
+    if (nav == state.feed || nav == state.secondary) return nav;
     return state.split && !state.changing ? (state.feed && !state.host.postsShowingDetail ? state.feed : state.secondary) : nav;
+}
+
+BOOL ApolloDuoSplitAllowsNavigationSwipe(UINavigationController *nav) {
+    ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, NO);
+    if (state.changing) return NO;
+    if (!state.split) return YES;
+    return !state.host.listVisible && (nav == state.feed || nav == state.secondary);
+}
+
+BOOL ApolloDuoSplitCanRevealPostsListWithSwipe(UINavigationController *nav) {
+    ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, NO);
+    return state.split && !state.changing && state.feed == nav
+        && !state.host.listVisible && nav.viewControllers.count == 1;
 }
 
 UIViewController *ApolloDuoSplitRootController(UINavigationController *nav) {
@@ -985,13 +1057,17 @@ BOOL ApolloDuoSplitIsOwnAccountController(UIViewController *controller) {
     return NO;
 }
 
+static NSUInteger ApolloDuoFeedStackKeptCount(UINavigationController *feed);
+
 BOOL ApolloDuoSplitSuppressesFeedActions(UIViewController *controller) {
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(controller.navigationController, NO);
     // Portrait moves the comments stack onto this navigation controller.
-    // Suppression belongs to its Posts root, not every page temporarily
-    // sharing that controller during a rotation or fold transition.
-    return state.feed && state.host.postsColumnsPaired
-        && controller == state.feed.viewControllers.firstObject;
+    // Suppression belongs to the visible feed page (the Posts root, or a feed
+    // a split link pushed), not every page temporarily sharing that controller
+    // during a rotation or fold transition.
+    if (!state.feed || !state.host.postsColumnsPaired) return NO;
+    NSUInteger feedPages = ApolloDuoFeedStackKeptCount(state.feed);
+    return feedPages && controller == state.feed.viewControllers[feedPages - 1];
 }
 
 static ApolloDuoSplitHost *ApolloDuoSubredditOverlayHost(UIView *view) {
@@ -1007,6 +1083,10 @@ static ApolloDuoSplitHost *ApolloDuoSubredditOverlayHost(UIView *view) {
 
 BOOL ApolloDuoSplitIsSubredditOverlayView(UIView *view) {
     return ApolloDuoSubredditOverlayHost(view) != nil;
+}
+
+BOOL ApolloDuoSplitIsGlassSubredditOverlayView(UIView *view) {
+    return ApolloDuoSubredditOverlayHost(view).listUsesGlass;
 }
 
 // Only native list surfaces belong to the drawer material. Walking every
@@ -1042,7 +1122,7 @@ static BOOL ApolloDuoListOwnsSurface(UIView *view, ApolloDuoSplitHost *host) {
 UIColor *ApolloDuoSplitOverlayBackground(UIView *view, UIColor *color) {
     if (!NSThread.isMainThread) return color;
     ApolloDuoSplitHost *host = ApolloDuoSubredditOverlayHost(view);
-    if (!host || host.updatingListSurfaces || !ApolloDuoListOwnsSurface(view, host)) return color;
+    if (!host || !host.listUsesGlass || host.updatingListSurfaces || !ApolloDuoListOwnsSurface(view, host)) return color;
     if (!host.listBackgrounds) host.listBackgrounds = [NSMapTable weakToStrongObjectsMapTable];
     // Theme updates and reused cells may change while the drawer is hidden.
     // Preserve the latest requested native color, not the first light-mode one.
@@ -1052,7 +1132,7 @@ UIColor *ApolloDuoSplitOverlayBackground(UIView *view, UIColor *color) {
 
 void ApolloDuoSplitPrepareOverlaySurface(UIView *surface) {
     ApolloDuoSplitHost *host = ApolloDuoSubredditOverlayHost(surface);
-    if (!host || host.updatingListSurfaces) return;
+    if (!host || !host.listUsesGlass || host.updatingListSurfaces) return;
     if (!host.listBackgrounds) host.listBackgrounds = [NSMapTable weakToStrongObjectsMapTable];
     host.updatingListSurfaces = YES;
     NSMutableArray *views = [NSMutableArray arrayWithObject:surface];
@@ -1103,14 +1183,15 @@ static BOOL ApolloDuoSplitShouldOpen(UITabBarController *tabs) {
         && tabs == sDuoSplitKnownTabs;
 }
 
-// Observe the public hinge interaction on the tab container, rather than
-// inferring a book posture from window size. A side window can have the same
-// aspect ratio as a cover display; neither should acquire a second column.
-// Resolve the iOS 27.1 API dynamically so device builds using the 26 SDK keep
-// working, as do older iPhones. UIHingeStatusPartiallyOpen is documented as 2.
+// Book posture comes from the division reserved region, not window size (a
+// side window can match a cover display's aspect) and not the hinge reading,
+// per Apple's Duo layout guidance (https://developer.apple.com/forums/thread/847644).
 static BOOL ApolloDuoSplitWantsHalfWidth(UITabBarController *tabs) {
-    return [objc_getAssociatedObject(tabs, &kDuoSplitHingeStatus) integerValue] == 2;
+    return !CGRectIsNull(ApolloDuoActiveVerticalDivision(tabs.view));
 }
+
+// The hinge interaction only prompts a re-check of that region. Resolve the
+// iOS 27.1 API dynamically so 26 SDK device builds and older iPhones work.
 
 static void ApolloDuoSplitObserveHinge(UITabBarController *tabs) {
     if (objc_getAssociatedObject(tabs, &kDuoSplitHingeInteraction)) return;
@@ -1126,10 +1207,14 @@ static void ApolloDuoSplitObserveHinge(UITabBarController *tabs) {
             NSInteger previous = [objc_getAssociatedObject(owner, &kDuoSplitHingeStatus) integerValue];
             if (previous == status) return;
             objc_setAssociatedObject(owner, &kDuoSplitHingeStatus, @(status), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            ApolloLog(@"[DuoSplit] hinge status %ld -> %ld", (long)previous, (long)status);
+            ApolloLog(@"[DuoSplit] hinge status %ld -> %ld; re-checking the division region", (long)previous, (long)status);
             // Defer containment work out of UIKit's interaction delivery. The
             // normal update also prepares the tabs that are not selected.
             ApolloDuoSplitScheduleUpdate();
+            // The division region may publish a beat after the hinge reading;
+            // check once more instead of depending on the hinge update rate.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ ApolloDuoSplitScheduleUpdate(); });
         };
         id<UIInteraction> interaction = ((id (*)(id, SEL, id))objc_msgSend)([cls alloc], NSSelectorFromString(@"initWithUpdateHandler:"), handler);
         objc_setAssociatedObject(tabs, &kDuoSplitHingeInteraction, interaction, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1149,10 +1234,19 @@ static void ApolloDuoSplitApplySidebarWidth(ApolloDuoSplitState *state, BOOL hal
     // UIKit may keep an earlier sidebar width across column replacement.
     // Bound both ends for Posts so its actual divider stays at the midpoint.
     CGFloat maximum = postsLandscape ? half : (state.feed || halfWidth ? CGFLOAT_MAX : 420.0);
-    CGFloat minimum = postsLandscape ? half : 240.0;
+    // Settings' widest native row is "Touch ID & Passcode" + its value +
+    // disclosure: a third of the flat inner display (~317pt) cut "Off" to "O".
+    // Give that sidebar enough room for the value at the default text size.
+    CGFloat sidebarMinimum = [state.kind isEqualToString:@"settings"] ? 340.0 : 240.0;
+    CGFloat minimum = postsLandscape ? half : sidebarMinimum;
     if (split.maximumPrimaryColumnWidth != maximum) split.maximumPrimaryColumnWidth = maximum;
     if (split.minimumPrimaryColumnWidth != minimum) split.minimumPrimaryColumnWidth = minimum;
     CGFloat fraction = halfWidth || state.feed ? 0.5 : 1.0 / 3.0;
+    if (halfWidth && !state.feed && canvas.width > 0.0) {
+        // End the sidebar at the fold itself rather than an assumed midpoint.
+        CGRect fold = ApolloDuoActiveVerticalDivision(state.host.view);
+        if (!CGRectIsNull(fold)) fraction = MIN(0.7, MAX(0.3, CGRectGetMinX(fold) / canvas.width));
+    }
     if (split.preferredPrimaryColumnWidthFraction != fraction) split.preferredPrimaryColumnWidthFraction = fraction;
     if (@available(iOS 26.0, *)) {
         // UIKit's default secondary minimum (532pt on this inner display)
@@ -1179,6 +1273,22 @@ static BOOL ApolloDuoPostsUsesSplit(ApolloDuoSplitState *state) {
     return state.host.postsSplitEnabled && ApolloDuoPostsHasLandscapeColumns(state);
 }
 
+
+// Feed pages (subreddits and multireddits, whether opened from a split link or
+// pushed while the split was off) belong on the feed stack; only the pages
+// above the last of them are thread pages for the right pane.
+static char kDuoFeedLinkPage;
+static NSUInteger ApolloDuoFeedStackKeptCount(UINavigationController *feed) {
+    NSArray *pages = feed.viewControllers;
+    NSUInteger kept = MIN(pages.count, (NSUInteger)1);
+    for (NSUInteger index = 1; index < pages.count; index++) {
+        UIViewController *page = pages[index];
+        if ([objc_getAssociatedObject(page, &kDuoFeedLinkPage) boolValue]
+            || (ApolloClassPostsViewController && [page isKindOfClass:ApolloClassPostsViewController])) kept = index + 1;
+    }
+    return kept;
+}
+
 static void ApolloDuoPostsSyncColumnsWithAnimation(ApolloDuoSplitState *state, BOOL animateDisplayMode) {
     if (!state.feed || !state.split || state.changing) return;
     if (sDuoSplitResizingTabs || !ApolloDuoPostsHasLandscapeColumns(state)) {
@@ -1193,16 +1303,17 @@ static void ApolloDuoPostsSyncColumnsWithAnimation(ApolloDuoSplitState *state, B
     UIEdgeInsets desiredInsets = state.host.originalListInsets;
     desiredInsets.right = -inheritedRight;
     if (!UIEdgeInsetsEqualToEdgeInsets(currentInsets, desiredInsets)) listRoot.additionalSafeAreaInsets = desiredInsets;
-    if (state.host.listVisible) [state.host prepareListGlass];
+    [state.host updateListAppearance];
     // Full-width comments stay on Apollo's native feed navigation stack.
     // Only a real split (or its width-toggle preparation) needs two stacks.
     // Never migrate a page while Apollo's native push/pop owns its transition.
     BOOL separateComments = ApolloDuoPostsHasLandscapeColumns(state)
         && (state.host.postsSplitEnabled || state.postsTogglingSplit);
-    if (separateComments && state.feed.viewControllers.count > 1 && !state.feed.transitionCoordinator) {
-        NSArray *pushed = [state.feed.viewControllers subarrayWithRange:NSMakeRange(1, state.feed.viewControllers.count - 1)];
+    NSUInteger feedKept = ApolloDuoFeedStackKeptCount(state.feed);
+    if (separateComments && state.feed.viewControllers.count > feedKept && !state.feed.transitionCoordinator) {
+        NSArray *pushed = [state.feed.viewControllers subarrayWithRange:NSMakeRange(feedKept, state.feed.viewControllers.count - feedKept)];
         state.changing = YES;
-        [state.feed setViewControllers:@[state.feed.viewControllers.firstObject] animated:NO];
+        [state.feed setViewControllers:[state.feed.viewControllers subarrayWithRange:NSMakeRange(0, feedKept)] animated:NO];
         [state.secondary setViewControllers:[@[state.secondary.viewControllers.firstObject] arrayByAddingObjectsFromArray:pushed] animated:NO];
         state.changing = NO;
     }
@@ -1213,7 +1324,8 @@ static void ApolloDuoPostsSyncColumnsWithAnimation(ApolloDuoSplitState *state, B
         NSArray *destinations = [state.secondary.viewControllers subarrayWithRange:NSMakeRange(1, state.secondary.viewControllers.count - 1)];
         state.changing = YES;
         [state.secondary setViewControllers:@[state.secondary.viewControllers.firstObject] animated:NO];
-        [state.feed setViewControllers:[@[state.feed.viewControllers.firstObject] arrayByAddingObjectsFromArray:destinations] animated:NO];
+        [state.feed setViewControllers:[[state.feed.viewControllers subarrayWithRange:NSMakeRange(0, feedKept)]
+                                           arrayByAddingObjectsFromArray:destinations] animated:NO];
         state.changing = NO;
     }
     [state.host.viewIfLoaded setNeedsLayout];
@@ -1233,7 +1345,21 @@ static void ApolloDuoPostsSyncColumnsWithAnimation(ApolloDuoSplitState *state, B
     // The stack was just merged in portrait, so its top item can now belong
     // to comments. Restore the cached trophy/feed actions only to the Posts
     // root; assigning them to the top item replaces the thread's own actions.
-    UINavigationItem *feedItem = state.feed.viewControllers.firstObject.navigationItem;
+    // The last feed page, not the top one: the merged stack can end in comments.
+    NSUInteger feedPages = ApolloDuoFeedStackKeptCount(state.feed);
+    UINavigationItem *feedItem = feedPages ? state.feed.viewControllers[feedPages - 1].navigationItem : nil;
+    UINavigationItem *backItem = paired && feedPages > 1 ? feedItem : nil;
+    if (state.feedBackHiddenItem != backItem) {
+        state.feedBackHiddenItem.hidesBackButton = NO;
+        backItem.hidesBackButton = YES;
+        state.feedBackHiddenItem = backItem;
+    }
+    if (paired && state.feedActions && state.feedActionsItem != feedItem) {
+        // A different feed page is showing now; give the previous one back
+        // its actions before hiding this one's.
+        state.feedActionsItem.rightBarButtonItems = state.feedActions;
+        state.feedActions = nil;
+    }
     if (paired) {
         if (!state.feedActions) {
             // Cache Apollo's actions only. Host controls are owned by the
@@ -1247,11 +1373,13 @@ static void ApolloDuoPostsSyncColumnsWithAnimation(ApolloDuoSplitState *state, B
                 [actions addObject:item];
             }
             state.feedActions = actions;
+            state.feedActionsItem = feedItem;
         }
         feedItem.rightBarButtonItems = @[];
     } else if (state.feedActions) {
-        feedItem.rightBarButtonItems = state.feedActions;
+        (state.feedActionsItem ?: feedItem).rightBarButtonItems = state.feedActions;
         state.feedActions = nil;
+        state.feedActionsItem = nil;
     }
     if (detail) {
         BOOL retainedColumns = [split viewControllerForColumn:UISplitViewControllerColumnPrimary] == state.feed
@@ -1593,7 +1721,17 @@ static void ApolloDuoPostsToggleSplit(ApolloDuoSplitState *state) {
     void (^commitTables)(void) = ^{
         [surface layoutIfNeeded];
         for (UINavigationController *navigation in @[state.feed, state.secondary]) {
-            UITableView *table = ApolloDuoSplitFindTable(navigation.topViewController.viewIfLoaded);
+            // The secondary keeps full-screen bounds while UIKit moves its
+            // leading safe area. Invalidate the retained native page as well
+            // as the host, so the table inherits the new column before Texture
+            // measures it instead of waiting for the next scroll callback.
+            UIView *pageView = navigation.topViewController.viewIfLoaded;
+            [navigation.view setNeedsLayout];
+            [pageView setNeedsLayout];
+            [navigation.view layoutIfNeeded];
+            [pageView layoutIfNeeded];
+            UITableView *table = ApolloDuoSplitFindTable(pageView);
+            ApolloDuoRailPrepareTableForTransition(table);
             ApolloDuoMediaPrepareTableForTransition(table);
             SEL commit = NSSelectorFromString(@"waitUntilAllUpdatesAreCommitted");
             if ([table respondsToSelector:commit]) ((void (*)(id, SEL))objc_msgSend)(table, commit);
@@ -1785,8 +1923,14 @@ static BOOL ApolloDuoSplitSelectRow(UIViewController *root, NSSet<NSString *> *l
 }
 
 extern void ApolloHiddenContentPresentFromProfile(UIViewController *profile);
+extern void ApolloRecentlyReadPresentFromViewController(UIViewController *fromViewController);
 void ApolloDuoAccountOpenShortcut(UIViewController *profile, NSString *title) {
     if (!profile || !title.length) return;
+    // Recently Read is a tweak row sharing Friends' native row.
+    if ([title isEqualToString:@"Recently Read"]) {
+        ApolloRecentlyReadPresentFromViewController(profile);
+        return;
+    }
     // Hidden & Deleted is a tweak-owned row nested beside Saved; every other
     // shortcut is the native row with this label, selected through Apollo.
     if ([title isEqualToString:@"Hidden & Deleted"]) {
@@ -1926,6 +2070,7 @@ static void ApolloDuoAccountSelect(ApolloDuoSplitState *state, NSString *title) 
     }
     state.selectingAccountShortcut = YES;
     if ([title isEqualToString:@"Hidden & Deleted"]) ApolloHiddenContentPresentFromProfile(state.root);
+    else if ([title isEqualToString:@"Recently Read"]) ApolloRecentlyReadPresentFromViewController(state.root);
     else ApolloDuoSplitSelectRow(state.root, [NSSet setWithObject:title]);
     state.selectingAccountShortcut = NO;
     [state.host.view setNeedsLayout];
@@ -2017,8 +2162,12 @@ static void ApolloDuoSearchUpdateBackItem(ApolloDuoSplitState *state) {
 
 static void ApolloDuoAccountPrepareHost(ApolloDuoSplitState *state, ApolloDuoSplitHost *host) {
     UIViewController *profile = state.root;
+    BOOL ownAccount = ApolloDuoSplitIsOwnAccountController(profile);
     host.accountHeader = ApolloDuoAccountProfileHeader(profile);
     UINavigationBar *sidebarBar = [[UINavigationBar alloc] init];
+    // Only hosts the sidebar button over the banner; ApolloProgressiveBlur
+    // skips it so no frosted square appears behind the button.
+    sidebarBar.accessibilityIdentifier = @"ApolloReborn.duo-sidebar-bar";
     UINavigationBarAppearance *sidebarAppearance = [UINavigationBarAppearance new];
     [sidebarAppearance configureWithTransparentBackground];
     sidebarBar.standardAppearance = sidebarAppearance;
@@ -2065,22 +2214,25 @@ static void ApolloDuoAccountPrepareHost(ApolloDuoSplitState *state, ApolloDuoSpl
         host.profileBackButton = back;
     }
     __weak ApolloDuoSplitState *weakState = state;
-    UIButton *accounts = [UIButton buttonWithType:UIButtonTypeSystem];
     UIButtonConfiguration *configuration;
-    if (@available(iOS 26.0, *)) configuration = [UIButtonConfiguration glassButtonConfiguration];
-    else configuration = [UIButtonConfiguration tintedButtonConfiguration];
-    configuration.baseForegroundColor = UIColor.labelColor;
-    configuration.image = [UIImage systemImageNamed:@"person.2" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightRegular]];
-    configuration.contentInsets = NSDirectionalEdgeInsetsZero;
-    accounts.accessibilityLabel = @"Accounts";
-    configuration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
-    accounts.configuration = configuration;
-    [accounts addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
-        UIViewController *root = weakState.root;
-        SEL selector = NSSelectorFromString(@"accountsBarButtonItemTappedWithSender:");
-        if ([root respondsToSelector:selector]) ((void (*)(id, SEL, id))objc_msgSend)(root, selector, nil);
-    }] forControlEvents:UIControlEventTouchUpInside];
-    host.accountsButton = accounts;
+    if (ownAccount) {
+        UIButton *accounts = [UIButton buttonWithType:UIButtonTypeSystem];
+        if (@available(iOS 26.0, *)) configuration = [UIButtonConfiguration glassButtonConfiguration];
+        else configuration = [UIButtonConfiguration tintedButtonConfiguration];
+        configuration.baseForegroundColor = UIColor.labelColor;
+        configuration.image = [UIImage systemImageNamed:@"person.2" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightRegular]];
+        configuration.contentInsets = NSDirectionalEdgeInsetsZero;
+        accounts.accessibilityLabel = @"Accounts";
+        configuration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+        accounts.configuration = configuration;
+        [accounts addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+            UIViewController *root = weakState.root;
+            SEL selector = @selector(accountsBarButtonItemTappedWithSender:);
+            if ([root respondsToSelector:selector]) ((void (*)(id, SEL, id))objc_msgSend)(root, selector, nil);
+        }] forControlEvents:UIControlEventTouchUpInside];
+        accounts.tintColor = UIColor.labelColor;
+        host.accountsButton = accounts;
+    }
     UIButton *more = [UIButton buttonWithType:UIButtonTypeSystem];
     if (@available(iOS 26.0, *)) configuration = [UIButtonConfiguration glassButtonConfiguration];
     else configuration = [UIButtonConfiguration tintedButtonConfiguration];
@@ -2092,14 +2244,25 @@ static void ApolloDuoAccountPrepareHost(ApolloDuoSplitState *state, ApolloDuoSpl
     configuration.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
     more.configuration = configuration;
     more.accessibilityLabel = @"More Options";
-    UIAction *trophies = [UIAction actionWithTitle:@"Trophies" image:[UIImage systemImageNamed:@"trophy"] identifier:nil handler:^(__unused UIAction *action) {
-        ApolloDuoAccountSelect(weakState, @"Trophies");
-    }];
-    UIMenu *nativeMenu = ApolloProfileMoreMenuForController(profile);
-    more.menu = [UIMenu menuWithTitle:@"" children:[(nativeMenu.children ?: @[]) arrayByAddingObject:trophies]];
-    more.showsMenuAsPrimaryAction = YES;
+    if (ownAccount) {
+        UIAction *trophies = [UIAction actionWithTitle:@"Trophies" image:[UIImage systemImageNamed:@"trophy"] identifier:nil handler:^(__unused UIAction *action) {
+            ApolloDuoAccountSelect(weakState, @"Trophies");
+        }];
+        UIMenu *nativeMenu = ApolloProfileMoreMenuForController(profile);
+        more.menu = [UIMenu menuWithTitle:@"" children:[(nativeMenu.children ?: @[]) arrayByAddingObject:trophies]];
+        more.showsMenuAsPrimaryAction = YES;
+    } else {
+        // Visited profiles use Apollo's own actions for that user. The native
+        // menu hook anchors its presentation to this button in the dashboard.
+        __weak UIButton *weakMore = more;
+        [more addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+            UIViewController *root = weakState.root;
+            SEL selector = @selector(moreOptionsBarButtonItemTappedWithSender:);
+            if ([root respondsToSelector:selector])
+                ((void (*)(id, SEL, id))objc_msgSend)(root, selector, weakMore);
+        }] forControlEvents:UIControlEventTouchUpInside];
+    }
     host.moreButton = more;
-    accounts.tintColor = UIColor.labelColor;
     more.tintColor = ApolloNavigationChromeColor();
 }
 
@@ -2165,9 +2328,13 @@ static void ApolloDuoSplitOpen(ApolloDuoSplitState *state) {
     [sDuoSplitDeferredPresentations removeObject:state];
     NSArray *stack = [outer.viewControllers copy];
     NSUInteger rootIndex = 0;
-    // The most recently opened profile owns the dashboard, regardless of tab.
-    for (NSUInteger index = 1; index < stack.count; index++) {
-        if ([ApolloDuoSplitKind(stack[index]) isEqualToString:@"account"]) rootIndex = index;
+    // Only landscape has a profile dashboard. Portrait keeps visited profiles
+    // on the Posts navigation stack; promoting one to Account here would make
+    // the next update collapse it, then reopen Posts and repeat indefinitely.
+    if (ApolloDuoSplitShouldOpen((id)outer.tabBarController)) {
+        for (NSUInteger index = 1; index < stack.count; index++) {
+            if ([ApolloDuoSplitKind(stack[index]) isEqualToString:@"account"]) rootIndex = index;
+        }
     }
     if (rootIndex) {
         state.tabRoot = state.root;
@@ -2185,6 +2352,10 @@ static void ApolloDuoSplitOpen(ApolloDuoSplitState *state) {
     // display's compact traits. Pin the split itself before attaching either
     // column: a parent override applied afterward is too late and UIKit starts
     // a compact-column merge during viewWillTransitionToSize:.
+    // Apple advises observing size classes rather than overriding them
+    // (https://developer.apple.com/forums/thread/847644). This pin is limited
+    // to our own split on Duo and goes away with it; the tab container keeps
+    // UIKit's traits (logged as "[DuoRail] native horizontalSizeClass").
     if (@available(iOS 17.0, *)) {
         split.traitOverrides.horizontalSizeClass = UIUserInterfaceSizeClassRegular;
     }
@@ -2234,12 +2405,18 @@ static void ApolloDuoSplitOpen(ApolloDuoSplitState *state) {
     if (posts) {
         state.feed = [[outer.class alloc] init];
         ApolloDuoSplitLink(state.feed, state);
-        NSArray *feedPages = detail.count ? @[detail.firstObject] : @[[UIViewController new]];
+        // Leading subreddit/feed pages stay on the left; only what follows
+        // them (posts, comments) belongs in the thread pane.
+        NSUInteger feedCount = detail.count ? 1 : 0;
+        while (feedCount < detail.count && ApolloClassPostsViewController
+               && [detail[feedCount] isKindOfClass:ApolloClassPostsViewController]) feedCount++;
+        NSArray *feedPages = feedCount ? [detail subarrayWithRange:NSMakeRange(0, feedCount)] : @[[UIViewController new]];
         [state.secondary setViewControllers:@[] animated:NO];
         [state.feed setViewControllers:feedPages animated:NO];
         UIViewController *backstop = [UIViewController new];
         backstop.title = @"Feed";
-        NSArray *comments = detail.count > 1 ? [detail subarrayWithRange:NSMakeRange(1, detail.count - 1)] : @[];
+        NSArray *comments = detail.count > feedCount
+            ? [detail subarrayWithRange:NSMakeRange(feedCount, detail.count - feedCount)] : @[];
         [state.secondary setViewControllers:[@[backstop] arrayByAddingObjectsFromArray:comments] animated:NO];
         // The host may already have loaded while the outer stack was changed.
         // Recreate it with the overlay configured before viewDidLoad.
@@ -2299,6 +2476,8 @@ static void ApolloDuoSplitOpen(ApolloDuoSplitState *state) {
     [outer setNavigationBarHidden:YES animated:NO];
     // The compatibility phone can retain a compact horizontal size class on
     // its wide inner display. The width/rail gate above is authoritative.
+    // Cleared in ApolloDuoSplitClose. If that log shows UIKit publishing
+    // regular when unfolded, both pins can become trait observation instead.
     [outer setOverrideTraitCollection:[UITraitCollection traitCollectionWithHorizontalSizeClass:UIUserInterfaceSizeClassRegular]
               forChildViewController:host];
     state.needsDefault = detail.count == 0;
@@ -2327,8 +2506,13 @@ static void ApolloDuoSplitClose(ApolloDuoSplitState *state, BOOL preserveDetail)
         // Stop suppressing the feed before its item setter runs, then discard
         // this presentation's snapshot so reopening cannot reuse stale items.
         state.host.postsColumnsPaired = NO;
-        if (state.feedActions) state.feed.viewControllers.firstObject.navigationItem.rightBarButtonItems = state.feedActions;
+        if (state.feedActions) {
+            (state.feedActionsItem ?: state.feed.viewControllers.firstObject.navigationItem).rightBarButtonItems = state.feedActions;
+        }
         state.feedActions = nil;
+        state.feedActionsItem = nil;
+        state.feedBackHiddenItem.hidesBackButton = NO;
+        state.feedBackHiddenItem = nil;
         NSArray *comments = detail.count > 1 ? [detail subarrayWithRange:NSMakeRange(1, detail.count - 1)] : @[];
         detail = [state.feed.viewControllers arrayByAddingObjectsFromArray:comments];
         [state.feed setViewControllers:@[] animated:NO];
@@ -2439,12 +2623,17 @@ static void ApolloDuoSplitUpdate(void) {
         BOOL postsOpen = [state.kind isEqualToString:@"subreddits"] && ApolloDuoSplitIsUnfolded();
         if (!open && !postsOpen) ApolloDuoSplitClose(state, NO);
         else {
-            // Native Swift pushes can bypass the ObjC push hook. Normalize a
-            // newly visited profile before rebuilding its full-width header.
-            for (UIViewController *page in [state.secondary.viewControllers copy]) {
-                if (page != state.root && [ApolloDuoSplitKind(page) isEqualToString:@"account"]) {
-                    ApolloDuoSplitClose(state, YES);
-                    break;
+            // Native Swift pushes can bypass the ObjC push hook. On rotation
+            // into landscape, a profile may also still be on the portrait feed
+            // stack. Normalize either path before installing its dashboard.
+            if (open) {
+                NSArray *pages = [(state.feed.viewControllers ?: @[])
+                    arrayByAddingObjectsFromArray:state.secondary.viewControllers ?: @[]];
+                for (UIViewController *page in pages) {
+                    if (page != state.root && [ApolloDuoSplitKind(page) isEqualToString:@"account"]) {
+                        ApolloDuoSplitClose(state, YES);
+                        break;
+                    }
                 }
             }
             // Search stays full-width until a result is opened. Once it has
@@ -2527,7 +2716,199 @@ static BOOL ApolloDuoSplitHasDeferredPresentationInWindow(UIWindow *window) {
 }
 %end
 
+// Feed links opened from either pane of the landscape feed/comments split
+// (a subreddit name on a feed row, in the post header or in a comment).
+// Posts, comment permalinks, subreddit pages (wiki/sidebar/rules) and profiles
+// keep their existing routes; only subreddit/multireddit feeds come here:
+// - the subreddit already shown on the left (e.g. the post header): no-op;
+// - any other feed: show it full width like a subreddit-list selection, but
+//   pushed on the feed stack so Back returns to the previous feed and thread.
+static char kDuoFeedLinkReturnDetail;
+static BOOL sDuoSplitPushingFeedLink;
+
+@interface ApolloDuoFeedLinkReturn : NSObject
+@property(nonatomic, copy) NSArray<UIViewController *> *detail;
+@property(nonatomic, weak) UIViewController *openedFeed;
+@end
+@implementation ApolloDuoFeedLinkReturn
+@end
+
+static BOOL ApolloDuoPostsRouteFeedLink(ApolloDuoSplitState *state, UINavigationController *nav,
+                                       UIViewController *page, BOOL animated) {
+    // Drawer selections arrive through the primary/outer stacks and keep their
+    // root-replacing path.
+    if ((nav != state.secondary && nav != state.feed) || !state.split || !ApolloDuoPostsUsesSplit(state)
+        || !ApolloClassPostsViewController || ![page isKindOfClass:ApolloClassPostsViewController]) return NO;
+    UIViewController *visibleFeed = state.feed.topViewController;
+    NSString *target = ApolloNamedSubredditForPostsController(page);
+    NSString *current = ApolloNamedSubredditForPostsController(visibleFeed);
+    if (target.length && current.length && [target caseInsensitiveCompare:current] == NSOrderedSame) {
+        ApolloLog(@"[DuoSplit] feed link to the subreddit already on the left; ignored");
+        return YES;
+    }
+    NSArray *detail = state.secondary.viewControllers.count > 1
+        ? [state.secondary.viewControllers subarrayWithRange:NSMakeRange(1, state.secondary.viewControllers.count - 1)] : @[];
+    BOOL animate = animated && !UIAccessibilityIsReduceMotionEnabled();
+    state.needsDefault = NO;
+    UIView *surface = state.host.view;
+    // One coordinated animation: snapshot both panes, settle the final
+    // layout underneath (thread closed, feed pushed) without animation, then
+    // slide the thread out to the right and fade the old feed out while the
+    // new feed fades in at full width. Running a native push alongside the
+    // column animation instead flung retained surfaces across the screen.
+    UIView *feedSnapshot = nil, *threadSnapshot = nil;
+    if (animate && surface.window) {
+        [surface layoutIfNeeded];
+        CGRect pane = ApolloDuoPostsDetailPane(state);
+        if (!CGRectIsNull(pane) && !CGRectIsEmpty(pane)) {
+            CGRect feedRect = CGRectMake(0, 0, CGRectGetMinX(pane), CGRectGetHeight(surface.bounds));
+            feedSnapshot = [surface resizableSnapshotViewFromRect:feedRect afterScreenUpdates:NO withCapInsets:UIEdgeInsetsZero];
+            feedSnapshot.frame = feedRect;
+            threadSnapshot = [surface resizableSnapshotViewFromRect:pane afterScreenUpdates:NO withCapInsets:UIEdgeInsetsZero];
+            threadSnapshot.frame = pane;
+        }
+    }
+    // Close the thread first: an unpaired feed keeps its own bar actions,
+    // which the split would otherwise discard while the page is pushed.
+    UIViewController *backstop = state.secondary.viewControllers.firstObject;
+    [state.secondary setViewControllers:backstop ? @[backstop] : @[] animated:NO];
+    ApolloDuoPostsSyncColumns(state);
+    objc_setAssociatedObject(page, &kDuoFeedLinkPage, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    sDuoSplitPushingFeedLink = YES;
+    [state.feed pushViewController:page animated:NO];
+    sDuoSplitPushingFeedLink = NO;
+    [surface layoutIfNeeded];
+    if (feedSnapshot && threadSnapshot) {
+        for (UIView *snapshot in @[feedSnapshot, threadSnapshot]) {
+            snapshot.userInteractionEnabled = NO;
+            [surface addSubview:snapshot];
+        }
+        UIView *incoming = state.feed.view;
+        incoming.alpha = 0.0;
+        incoming.transform = CGAffineTransformMakeTranslation(48.0, 0.0);
+        CGFloat travel = CGRectGetMaxX(surface.bounds) - CGRectGetMinX(threadSnapshot.frame);
+        [UIView animateWithDuration:0.42 delay:0 usingSpringWithDamping:1.0 initialSpringVelocity:0
+                            options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                         animations:^{
+            threadSnapshot.transform = CGAffineTransformMakeTranslation(travel, 0.0);
+            feedSnapshot.transform = CGAffineTransformMakeTranslation(-48.0, 0.0);
+            feedSnapshot.alpha = 0.0;
+            incoming.alpha = 1.0;
+            incoming.transform = CGAffineTransformIdentity;
+        } completion:^(__unused BOOL finished) {
+            [feedSnapshot removeFromSuperview];
+            [threadSnapshot removeFromSuperview];
+            incoming.alpha = 1.0;
+            incoming.transform = CGAffineTransformIdentity;
+        }];
+    }
+    if (detail.count && visibleFeed && [state.feed.viewControllers containsObject:page]) {
+        // Recorded after the push, so re-shows during it never count as Back.
+        ApolloDuoFeedLinkReturn *ret = [ApolloDuoFeedLinkReturn new];
+        ret.detail = detail;
+        ret.openedFeed = page;
+        objc_setAssociatedObject(visibleFeed, &kDuoFeedLinkReturnDetail, ret, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [state.host setListVisible:NO animated:animate];
+    ApolloLog(@"[DuoSplit] feed link %@ opened full width; Back restores %lu thread page(s)",
+              target ?: @"(multireddit/feed)", (unsigned long)detail.count);
+    return YES;
+}
+
+// Back to a feed that a link left: restore its retained thread in the current
+// presentation, including when rotation or folding removed the paired columns.
+static void ApolloDuoPostsRestoreFeedLinkDetail(ApolloDuoSplitState *state,
+                                               UINavigationController *navigation,
+                                               UIViewController *controller) {
+    ApolloDuoFeedLinkReturn *ret = objc_getAssociatedObject(controller, &kDuoFeedLinkReturnDetail);
+    NSArray *detail = ret.detail;
+    // Only a real Back: the feed the link opened has left the stack.
+    if (!detail.count || !navigation || controller != navigation.topViewController || state.changing
+        || (state.feed && navigation != state.feed)
+        || (ret.openedFeed && [navigation.viewControllers containsObject:ret.openedFeed])) return;
+    if (!state.feed || !ApolloDuoPostsUsesSplit(state)) {
+        // Native didShow has completed the pop. Keep these exact controllers
+        // (and their reading positions) on the single stack until columns return.
+        state.changing = YES;
+        [navigation setViewControllers:[navigation.viewControllers arrayByAddingObjectsFromArray:detail] animated:NO];
+        state.changing = NO;
+    } else if (!state.secondary.viewControllers.firstObject) {
+        // A column transition has not supplied its backstop yet. Retain the
+        // record rather than consuming history that cannot be installed.
+        return;
+    } else if (detail.count == 1) {
+        ApolloDuoPostsSetDetail(state, detail.firstObject, YES);
+    } else {
+        UIViewController *backstop = state.secondary.viewControllers.firstObject;
+        [state.secondary setViewControllers:[@[backstop] arrayByAddingObjectsFromArray:detail] animated:NO];
+        ApolloDuoPostsSyncColumns(state);
+    }
+    objc_setAssociatedObject(controller, &kDuoFeedLinkReturnDetail, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!state.feed || !ApolloDuoPostsUsesSplit(state)) ApolloDuoPostsSyncColumns(state);
+    ApolloLog(@"[DuoSplit] Back from a feed link; restored %lu thread page(s)", (unsigned long)detail.count);
+}
+
+// Back from a feed a link opened: return to the previous feed with its thread
+// in one animation (the mirror of the forward one) instead of a native pop
+// followed by the thread sliding back in. Returns the popped page, or nil to
+// leave the pop to UIKit (interactive swipes, or a thread is open).
+static UIViewController *ApolloDuoPostsPopFeedLink(ApolloDuoSplitState *state, BOOL animated) {
+    NSArray<UIViewController *> *pages = state.feed.viewControllers;
+    if (!state.split || state.changing || pages.count < 2 || !ApolloDuoPostsUsesSplit(state)
+        || state.secondary.viewControllers.count > 1) return nil;
+    UIGestureRecognizerState swipe = state.feed.interactivePopGestureRecognizer.state;
+    if (swipe == UIGestureRecognizerStateBegan || swipe == UIGestureRecognizerStateChanged) return nil;
+    UIViewController *top = pages.lastObject, *previous = pages[pages.count - 2];
+    ApolloDuoFeedLinkReturn *ret = objc_getAssociatedObject(previous, &kDuoFeedLinkReturnDetail);
+    if (![objc_getAssociatedObject(top, &kDuoFeedLinkPage) boolValue] || !ret.detail.count) return nil;
+
+    UIView *surface = state.host.view;
+    BOOL animate = animated && surface.window && !UIAccessibilityIsReduceMotionEnabled();
+    UIView *snapshot = nil;
+    if (animate) {
+        [surface layoutIfNeeded];
+        snapshot = [surface snapshotViewAfterScreenUpdates:NO];
+        snapshot.frame = surface.bounds;
+        snapshot.userInteractionEnabled = NO;
+    }
+    // Settle the final split underneath: previous feed on the left, its
+    // thread on the right.
+    objc_setAssociatedObject(previous, &kDuoFeedLinkReturnDetail, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [state.feed setViewControllers:[pages subarrayWithRange:NSMakeRange(0, pages.count - 1)] animated:NO];
+    UIViewController *backstop = state.secondary.viewControllers.firstObject;
+    [state.secondary setViewControllers:[(backstop ? @[backstop] : @[]) arrayByAddingObjectsFromArray:ret.detail] animated:NO];
+    ApolloDuoPostsSyncColumns(state);
+    [surface layoutIfNeeded];
+    ApolloLog(@"[DuoSplit] Back from a feed link; restored %lu thread page(s)%@",
+              (unsigned long)ret.detail.count, animate ? @" (animated)" : @"");
+    if (!snapshot) return top;
+
+    [surface addSubview:snapshot];
+    UIView *feedView = state.feed.view, *threadView = state.secondary.view;
+    CGFloat travel = CGRectGetMaxX(surface.bounds) - CGRectGetMinX([threadView convertRect:threadView.bounds toView:surface]);
+    feedView.alpha = 0.0;
+    feedView.transform = CGAffineTransformMakeTranslation(-48.0, 0.0);
+    threadView.transform = CGAffineTransformMakeTranslation(MAX(0.0, travel), 0.0);
+    [surface bringSubviewToFront:snapshot];
+    [UIView animateWithDuration:0.42 delay:0 usingSpringWithDamping:1.0 initialSpringVelocity:0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        snapshot.alpha = 0.0;
+        snapshot.transform = CGAffineTransformMakeTranslation(48.0, 0.0);
+        feedView.alpha = 1.0;
+        feedView.transform = CGAffineTransformIdentity;
+        threadView.transform = CGAffineTransformIdentity;
+    } completion:^(__unused BOOL finished) {
+        [snapshot removeFromSuperview];
+        feedView.alpha = 1.0;
+        feedView.transform = CGAffineTransformIdentity;
+        threadView.transform = CGAffineTransformIdentity;
+    }];
+    return top;
+}
+
 static BOOL ApolloDuoSplitRoutePush(UINavigationController *nav, UIViewController *page, BOOL animated) {
+    if (sDuoSplitPushingFeedLink) return NO;
     // UIKit pushes column containers while adapting a split. Those are native
     // containment operations, not sidebar selections. Redirecting the secondary
     // navigation controller into its own stack raises a UIKit assertion.
@@ -2535,10 +2916,20 @@ static BOOL ApolloDuoSplitRoutePush(UINavigationController *nav, UIViewControlle
         [page isKindOfClass:UISplitViewController.class]) return NO;
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, YES);
     if (state.split && !state.changing && [ApolloDuoSplitKind(page) isEqualToString:@"account"]) {
-        ApolloDuoSplitNavigateProfile(state, page, YES);
-        return YES;
+        if (ApolloDuoSplitShouldOpen((id)state.outer.tabBarController)) {
+            ApolloDuoSplitNavigateProfile(state, page, YES);
+            return YES;
+        }
+        // The portrait drawer is an overlay, not a profile sidebar. Push onto
+        // the retained feed so native Back returns to the previous page.
+        if (state.feed && (nav == state.primary || nav == state.outer)) {
+            [state.feed pushViewController:page animated:animated];
+            [state.host setListVisible:NO animated:animated];
+            return YES;
+        }
     }
     if (state.feed && !state.changing) {
+        if (ApolloDuoPostsRouteFeedLink(state, nav, page, animated)) return YES;
         if (state.host.postsColumnsPaired && (nav == state.feed || nav == state.outer)) {
             NSString *incomingPost = ApolloDuoCommentsPostID(page);
             NSString *visiblePost = ApolloDuoCommentsPostID(state.secondary.topViewController);
@@ -2714,29 +3105,6 @@ static void ApolloDuoSplitRememberSettings(UINavigationController *nav) {
     else if (nav == state.secondary && stack.count) state.lastSettings = [stack copy];
 }
 
-// Read the synchronous model identity, never the title pill: titles may be
-// localized or temporarily describe the prior page during an asynchronous load.
-// PostsType.subreddit stores its Swift String in the first two words and tag 0
-// at +0x20 (the same native layout used by SubredditHeaders/AutoHideMetaFeeds).
-static NSString *ApolloDuoNamedSubredditForPostsController(UIViewController *controller) {
-    Class postsClass = NSClassFromString(@"Apollo.PostsViewController");
-    if (!postsClass || ![controller isKindOfClass:postsClass]) return nil;
-    Ivar type = class_getInstanceVariable(controller.class, "currentPostsType");
-    if (!type) return nil;
-    ptrdiff_t offset = ivar_getOffset(type);
-    if (offset < 0 || (size_t)offset + 0x21 > class_getInstanceSize(controller.class)) return nil;
-    const uint8_t *storage = (const uint8_t *)(__bridge const void *)controller + offset;
-    if (storage[0x20] != 0) return nil;
-    uint64_t words[2] = {0, 0};
-    memcpy(words, storage, sizeof(words));
-    NSString *name = ApolloDecodeSwiftString(words[0], words[1]);
-    if (name.length == 0) return nil;
-    // Apollo encodes these built-in feeds as the same enum case. They retain
-    // their native reselect behavior; this guard is only for subreddit rows.
-    if ([@[@"all", @"popular", @"mod", @"random", @"randnsfw"] containsObject:name.lowercaseString]) return nil;
-    return name;
-}
-
 static NSIndexPath *(*sApolloDuoListWillSelectOriginal)(id, SEL, UITableView *, NSIndexPath *);
 static NSIndexPath *ApolloDuoListWillSelect(id controller, SEL selector, UITableView *table, NSIndexPath *path) {
     NSIndexPath *candidate = sApolloDuoListWillSelectOriginal
@@ -2751,7 +3119,11 @@ static NSIndexPath *ApolloDuoListWillSelect(id controller, SEL selector, UITable
     // didSelect into native section space later, so resolving a row there would
     // double-map reordered/FOLLOWING sections and could suppress the wrong row.
     NSString *target = ApolloSubredditListNameAtIndexPath(table, candidate);
-    NSString *current = ApolloDuoNamedSubredditForPostsController(state.feed.viewControllers.firstObject);
+    // Linked feeds retain earlier feeds in Back history. Portrait can also
+    // append comments, so compare with the last feed rather than either end.
+    NSUInteger feedPages = ApolloDuoFeedStackKeptCount(state.feed);
+    UIViewController *visibleFeed = feedPages ? state.feed.viewControllers[feedPages - 1] : nil;
+    NSString *current = ApolloNamedSubredditForPostsController(visibleFeed);
     if (target.length == 0 || current.length == 0
         || [target caseInsensitiveCompare:current] != NSOrderedSame) return candidate;
 
@@ -2808,12 +3180,20 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
 @interface ApolloDuoSplitNavigation : UINavigationController @end
 %group ApolloDuoSplitNavigationHooks
 %hook ApolloDuoSplitNavigation
+- (void)viewDidLoad {
+    %orig;
+    ApolloDuoInstallBackSwipe((id)self);
+}
 - (void)navigationController:(UINavigationController *)navigation didShowViewController:(UIViewController *)controller animated:(BOOL)animated {
     %orig(navigation, controller, animated);
+    ApolloDuoInstallBackSwipe(navigation);
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(navigation, NO);
     // Native didShow finalizes the bar after push/pop and column migration.
     // Relayout the host then so it does not keep the outgoing Back reservation.
-    if (navigation == state.feed) [state.host.viewIfLoaded setNeedsLayout];
+    if (navigation == state.feed) {
+        [state.host.viewIfLoaded setNeedsLayout];
+    }
+    ApolloDuoPostsRestoreFeedLinkDetail(state, navigation, controller);
 }
 - (void)setNavigationBarHidden:(BOOL)hidden animated:(BOOL)animated {
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(self, NO);
@@ -2826,11 +3206,14 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
 }
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gesture {
     UINavigationController *nav = (id)self;
+    Ivar leftIvar = class_getInstanceVariable(nav.class, "leftScreenEdgePanGestureRecognizer");
+    BOOL back = leftIvar && object_getIvar(self, leftIvar) == gesture;
+    // One owner for backward navigation, including when folded. Apollo's old
+    // edge pan otherwise competes with the pane-aware swipe and can pop twice.
+    if (back && ApolloDuoHasBackSwipe(nav)) return NO;
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(self, NO);
     if (!state.split || state.changing) return %orig(gesture);
-    Ivar leftIvar = class_getInstanceVariable(nav.class, "leftScreenEdgePanGestureRecognizer");
     Ivar rightIvar = class_getInstanceVariable(nav.class, "rightScreenEdgePanGestureRecognizer");
-    BOOL back = leftIvar && object_getIvar(self, leftIvar) == gesture;
     BOOL forward = rightIvar && object_getIvar(self, rightIvar) == gesture;
     if (!back && !forward) return %orig(gesture);
     // The outer controller now contains a host, not a browsable page. Its
@@ -2855,9 +3238,9 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
     // slug. Split replacement may lay out before window attachment and omit
     // appearance callbacks; titles/about models can also arrive later.
     NSString *visited = ApolloDuoSplitIsUnfolded() && ((UINavigationController *)self).viewIfLoaded.window
-        ? ApolloDuoNamedSubredditForPostsController(controller) : nil;
+        ? ApolloNamedSubredditForPostsController(controller) : nil;
     if (ApolloDuoSplitRoutePush(self, controller, animated)) {
-        if (visited.length) ApolloDuoSearchRecordVisit(visited);
+        if (visited.length) ApolloSearchRecordVisit(visited);
         return;
     }
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(self, NO);
@@ -2868,7 +3251,6 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
         [state.secondary setNavigationBarHidden:NO animated:NO];
     }
     %orig(controller, state.changing ? NO : animated);
-    if (visited.length) ApolloDuoSearchRecordVisit(visited);
     [state.host.viewIfLoaded setNeedsLayout];
     ApolloDuoSplitRememberSettings(self);
 }
@@ -2904,6 +3286,10 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
         ApolloDuoAccountSetPages(state, [detail.viewControllers subarrayWithRange:NSMakeRange(0, detail.viewControllers.count - 1)]);
         return page;
     }
+    if (state.feed && self == state.feed) {
+        UIViewController *popped = ApolloDuoPostsPopFeedLink(state, animated);
+        if (popped) return popped;
+    }
     UIViewController *page = %orig(animated);
     [state.host.viewIfLoaded setNeedsLayout];
     ApolloDuoSplitScheduleUpdate();
@@ -2919,6 +3305,7 @@ static void ApolloDuoInstallListReselectionGuard(Class listClass) {
 }
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
+    ApolloDuoInstallBackSwipe((id)self);
     ApolloDuoSplitScheduleUpdate();
 }
 %end
@@ -3199,6 +3586,10 @@ static CGFloat ApolloDuoEmptyStateCenterX(UILabel *label, CGFloat nativeX) {
 %end
 
 %ctor {
+    if (!ApolloDeviceIsDuo()) {
+        ApolloLog(@"[DuoSplit] not an iPhone Duo; split view hooks NOT installed");
+        return;
+    }
     Class comments = NSClassFromString(@"Apollo.CommentsViewController");
     if (comments) %init(ApolloDuoCommentsLayoutHooks, ApolloDuoCommentsPage = comments);
     [NSNotificationCenter.defaultCenter addObserverForName:@"ApolloDuoFeedLayoutDidChange"

@@ -214,6 +214,7 @@ public func ApolloSwiftCopyOptionalStringArray(_ storage: UnsafeRawPointer?) -> 
     return Unmanaged.passRetained(value as NSArray).toOpaque()
 }
 
+
 // Apollo's native menu hosts a SwiftUI type that the tweak cannot name. A
 // protocol conformance on the generic hosting controller provides access to
 // its public sizing API without casting that unknown content to AnyView.

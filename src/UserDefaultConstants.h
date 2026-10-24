@@ -3,6 +3,11 @@
 static NSString *const UDKeySettingsTabShortcuts = @"SettingsTabShortcuts";
 
 // UserDefaults keys
+// Not registered: absence distinguishes upgrades from fresh installs before
+// constructors write preferences. 1 pending, 2 completed/restored, 3 skipped,
+// 4 existing installation. The preset records a starting point, never a policy.
+static NSString *const UDKeySetupAssistantState = @"ApolloRebornSetupAssistantState";
+static NSString *const UDKeySetupPreset = @"ApolloRebornSetupPreset";
 // Optional iOS 27 Siri framework's preference; default OFF. The actor owns
 // state, with no duplicate BOOL mirror (Shortcuts can change it out of UI).
 static NSString *const UDKeySiriContentIndexing = @"ApolloSiriContentEnabled";
@@ -389,6 +394,9 @@ static NSString *const UDKeyTabBarSwipeNavigation = @"TabBarSwipeNavigation";
 // Experimental large post cards on Duo's opened landscape display:
 // 0 = Original (default), 2 = Focused feed; value 1 is retired.
 static NSString *const UDKeyDuoLandscapeFeedLayout = @"DuoLandscapeFeedLayout";
+// Open Duo subreddit panel appearance: NO = Standard
+// (default), YES = Liquid Glass. The panel keeps the same size and navigation.
+static NSString *const UDKeyDuoSubredditPanelGlassEnabled = @"DuoSubredditPanelGlassEnabled";
 // When ON, press-and-hold anywhere on a post info row (score, comments,
 // timestamp, 🌐 translation marker…) shows the glass-slider magnifier loupe: the
 // row is zoomed in a Liquid Glass card, sliding moves the selection pill

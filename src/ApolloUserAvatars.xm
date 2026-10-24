@@ -186,7 +186,11 @@ static const void *kApolloProfileTabAvatarImageMarkerKey = &kApolloProfileTabAva
 @interface ApolloProfileHeaderView : UIView <UIGestureRecognizerDelegate, UIPopoverPresentationControllerDelegate>
 @property(nonatomic) BOOL duoLandscape;
 @property(nonatomic, strong) CAGradientLayer *duoBannerMask;
-@property(nonatomic, strong) UIImageView *bannerImageView;
+// Open landscape lays the identity text and stat cards straight over the
+// banner (no details backdrop). This page-colored wash keeps them readable on
+// busy banner art; it lives inside the banner so the fade mask applies too.
+@property(nonatomic, strong) CAGradientLayer *duoTextScrim;
+@property(nonatomic, strong) ApolloTopAnchoredImageView *bannerImageView;
 @property(nonatomic, strong) id bannerPreviewFeedback;
 @property(nonatomic, strong) UIView *detailsBackgroundView;
 @property(nonatomic, strong) UIImageView *avatarImageView;
@@ -549,6 +553,13 @@ static NSString *ApolloProfileSettingsPreviewYearClubTitle(NSTimeInterval create
 
 @implementation ApolloProfileHeaderView
 
+// The closed Duo rail arrives as a safe-area change; re-center the identity
+// on the content column right away rather than on the next scroll.
+- (void)safeAreaInsetsDidChange {
+    [super safeAreaInsetsDidChange];
+    if (ApolloDuoDeviceDetected()) [self setNeedsLayout];
+}
+
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
@@ -556,7 +567,8 @@ static NSString *ApolloProfileSettingsPreviewYearClubTitle(NSTimeInterval create
         // background (any custom theme, dark, or light) shows through directly.
         self.backgroundColor = [UIColor clearColor];
 
-        _bannerImageView = [[UIImageView alloc] init];
+        _bannerImageView = [[ApolloTopAnchoredImageView alloc] init];
+        _bannerImageView.anchorsTop = YES;
         _bannerImageView.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.12];
         _bannerImageView.contentMode = UIViewContentModeScaleAspectFill;
         _bannerImageView.clipsToBounds = YES;
@@ -1269,8 +1281,31 @@ static UIFont *ApolloProfileClassicNameFont(void) {
     return [self.badgeBookView preferredHeightForWidth:bodyWidth];
 }
 
+// Beside the closed Duo rail the header still spans the full width (its banner
+// and backdrop run under the rail), but its identity and bio must lay out in the
+// same content column as the stat cards, or the name/bio centre on the full
+// width and the bio's last words run under the rail.
+- (CGFloat)apollo_contentWidthForWidth:(CGFloat)width {
+    // Only beside a visible rail, and only from a live measurement: a stale
+    // inset from another pose would squeeze the header everywhere else.
+    if (CGRectGetWidth(self.bounds) <= 0.0) return width;
+    CGFloat inset = 0.0;
+    CGFloat liveRight = ApolloDuoRailHasVisibleSideBar() ? ApolloProfileDuoContentRightEdgeInView(self) : NAN;
+    if (isfinite(liveRight)) {
+        inset = MAX(0.0, CGRectGetWidth(self.bounds) - liveRight);
+    } else if (ApolloDuoCurrentMode() == ApolloDuoModeClosed && !ApolloDuoSplitIsUnfolded()
+               && self.statCardsTrailingInset >= 40.0) {
+        // First layout on the closed screen can run before the rail is
+        // attached; use the install-time rail measurement instead of
+        // centering on the full width until the next scroll.
+        inset = self.statCardsTrailingInset;
+    }
+    if (!(inset > 0.0) || inset >= width * 0.5) return width;
+    return width - inset;
+}
+
 - (CGFloat)preferredHeightForWidth:(CGFloat)width {
-    ApolloIdentityHeaderLayout identity = [self apollo_identityForWidth:width];
+    ApolloIdentityHeaderLayout identity = [self apollo_identityForWidth:[self apollo_contentWidthForWidth:width]];
     return [self apollo_layoutBodyForLayout:identity apply:NO] + ApolloIdentityHeaderBottomPadding();
 }
 
@@ -1417,6 +1452,7 @@ static UIFont *ApolloProfileClassicNameFont(void) {
         CGFloat width = self.bounds.size.width;
         BOOL native = !sShowDetailedProfiles;
         if (!native && !sProfileHeaderImmersive) {
+            self.duoTextScrim.hidden = YES;
             [self apollo_layoutDuoCompactForWidth:width apply:YES];
             return;
         }
@@ -1487,6 +1523,25 @@ static UIFont *ApolloProfileClassicNameFont(void) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         self.duoBannerMask.frame = self.bannerImageView.bounds;
+        if (!self.duoTextScrim) {
+            self.duoTextScrim = [CAGradientLayer layer];
+            // Behind the name/social column only, clear by the stat cards
+            // (they carry their own glass), so the banner art stays visible.
+            self.duoTextScrim.startPoint = CGPointMake(0, 0.5);
+            self.duoTextScrim.endPoint = CGPointMake(1, 0.5);
+            self.duoTextScrim.locations = @[@0, @0.3, @0.55];
+            [self.bannerImageView.layer addSublayer:self.duoTextScrim];
+        }
+        UIColor *page = [(ApolloThemePageBackgroundColor() ?: UIColor.systemBackgroundColor)
+            resolvedColorWithTraitCollection:self.traitCollection];
+        // A light page washes art out much faster than a dark one darkens it.
+        BOOL lightPage = ApolloColorIsLight(page);
+        CGFloat strongest = lightPage ? 0.15 : 0.3, middle = lightPage ? 0.06 : 0.15;
+        self.duoTextScrim.colors = @[(id)[page colorWithAlphaComponent:strongest].CGColor,
+                                     (id)[page colorWithAlphaComponent:middle].CGColor,
+                                     (id)[page colorWithAlphaComponent:0.0].CGColor];
+        self.duoTextScrim.hidden = native || self.bannerImageView.hidden;
+        self.duoTextScrim.frame = self.bannerImageView.bounds;
         [CATransaction commit];
         self.aboutLabel.hidden = YES;
         self.aboutToggleButton.hidden = YES;
@@ -1523,11 +1578,18 @@ static UIFont *ApolloProfileClassicNameFont(void) {
         }
         return;
     }
-    CGFloat width = self.bounds.size.width;
+    self.duoTextScrim.hidden = YES;
+    CGFloat fullWidth = self.bounds.size.width;
+    CGFloat width = [self apollo_contentWidthForWidth:fullWidth];
     ApolloIdentityHeaderLayout identity = [self apollo_identityForWidth:width];
-    self.bannerImageView.frame = identity.bannerFrame;
+    CGRect bannerFrame = identity.bannerFrame;
+    if (width < fullWidth && CGRectGetWidth(bannerFrame) > 0.0) {
+        // Keep the banner art and its crop across the full header, rail included.
+        bannerFrame.size.width = fullWidth;
+    }
+    self.bannerImageView.frame = bannerFrame;
     CGFloat bannerH = [self apollo_bannerHeight];
-    self.detailsBackgroundView.frame = CGRectMake(0.0, bannerH, width,
+    self.detailsBackgroundView.frame = CGRectMake(0.0, bannerH, fullWidth,
                                                   MAX(0.0, self.bounds.size.height - bannerH));
 
     // Avatar style: Square (2) → rounded square; Full/Circle → circle.
@@ -1602,7 +1664,7 @@ static UIFont *ApolloProfileClassicNameFont(void) {
 }
 
 - (void)apollo_toggleAboutExpanded {
-    CGFloat aboutWidth = [self apollo_identityForWidth:self.bounds.size.width].bodyWidth;
+    CGFloat aboutWidth = [self apollo_identityForWidth:[self apollo_contentWidthForWidth:self.bounds.size.width]].bodyWidth;
     if (!self.aboutExpanded && ![self apollo_aboutTruncatesForNatural:[self apollo_aboutNaturalHeightForWidth:aboutWidth]]) return;
     self.aboutExpanded = !self.aboutExpanded;
     self.aboutLabel.numberOfLines = self.aboutExpanded ? 0 : ApolloProfileAboutCollapsedLines;
@@ -1778,7 +1840,8 @@ static UIFont *ApolloProfileClassicNameFont(void) {
         self.aboutLabel.numberOfLines = ApolloProfileAboutCollapsedLines;
     }
     self.aboutLabel.text = aboutText;
-    ApolloLog(@"[UserAvatars] Profile username=%@ isLoggedIn=%@", username ?: @"nil", isLoggedInAccount ? @"YES" : @"NO");
+    // u/ prefix so the export scrub tags the name like every other u/ line.
+    ApolloLog(@"[UserAvatars] Profile u/%@ isLoggedIn=%@", username ?: @"(none)", isLoggedInAccount ? @"YES" : @"NO");
     // Follow / Message row: shown on someone else's real profile only — never on
     // your own account (that gets the "..." menu's Edit Profile instead) and
     // never for the [deleted] placeholder, and gated by the viewer's Actions
@@ -3780,6 +3843,17 @@ void ApolloDuoAccountRestoreProfile(UIViewController *profile) {
     objc_setAssociatedObject(profile, &kApolloDuoRestoreProfileTop, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(profile, &kApolloDuoHostedProfileHeader, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloProfileScheduleInstallOrUpdateHeader(profile);
+    // The fold may still be moving the page onto the cover display when the
+    // header install runs; retry the pending top until it applies (a no-op
+    // once it has, or once the user scrolls).
+    __weak UIViewController *weakProfile = profile;
+    for (NSNumber *delay in @[@0.35, @0.8, @1.5]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *live = weakProfile;
+            if (live) ApolloProfileRestorePendingDuoTop(live);
+        });
+    }
 }
 
 static void ApolloProfileLayoutWrappedHeader(UIView *wrappedHeader,
@@ -4425,13 +4499,13 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
         objc_setAssociatedObject(viewControllerObject, kApolloProfileWrappedHeaderKey, wrappedHeader, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(viewControllerObject, kApolloProfileOriginalHeaderKey, originalHeader, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         tableView.tableHeaderView = wrappedHeader;
-        ApolloLog(@"[UserAvatars] Installed profile header class=%@ vc=%p table=%p username=%@ nativeHeader=%@", className, viewControllerObject, tableView, username, originalHeader ? NSStringFromClass([originalHeader class]) : @"nil");
+        ApolloLog(@"[UserAvatars] Installed profile header class=%@ vc=%p table=%p u/%@ nativeHeader=%@", className, viewControllerObject, tableView, username, originalHeader ? NSStringFromClass([originalHeader class]) : @"nil");
     } else {
         CGRect frameBeforeLayout = wrappedHeader.frame;
         ApolloProfileLayoutWrappedHeader(wrappedHeader, header, originalHeader, width);
         if (!CGRectEqualToRect(frameBeforeLayout, wrappedHeader.frame)) {
             tableView.tableHeaderView = wrappedHeader;
-            ApolloLog(@"[UserAvatars] Resized profile header class=%@ vc=%p username=%@ width=%.1f", className, viewControllerObject, username, width);
+            ApolloLog(@"[UserAvatars] Resized profile header class=%@ vc=%p u/%@ width=%.1f", className, viewControllerObject, username, width);
         }
     }
 
@@ -4465,7 +4539,7 @@ static void ApolloProfileInstallOrUpdateHeader(id viewControllerObject) {
         if (!CGRectEqualToRect(frameBeforeCachedInfo, wrappedHeader.frame)) {
             tableView.tableHeaderView = wrappedHeader;
         }
-        ApolloLog(@"[UserAvatars] Loading profile header images class=%@ vc=%p username=%@", className, viewControllerObject, username);
+        ApolloLog(@"[UserAvatars] Loading profile header images class=%@ vc=%p u/%@", className, viewControllerObject, username);
     }
     // New (Immersive) → the melt compositor (blurred banner behind the identity).
     // Classic (Compact) → no compositor; the banner shows flat in its own region and
@@ -5236,12 +5310,18 @@ static void ApolloInlineAvatarFireBatchNow(void) {
 // preload range at once → fire promptly once a burst accumulates; a slow trickle of
 // cells is gathered over a short window so it still collapses into one request rather
 // than many 1-id calls. Main-thread only, so the statics need no locking.
-// YES when `fullName` joined a batch (and will be looked up within ~0.6s).
-static BOOL ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
+// YES when any of `fullNames` joined a batch (and will be looked up within ~0.6s).
+// All of them join before the burst check, so a feed page's authors leave as one.
+static BOOL ApolloInlineAvatarEnqueueFullNamesForBatch(NSArray<NSString *> *fullNames) {
     if (!sShowUserAvatars) return NO;
-    if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) return NO;
-    if (!sApolloPendingBatchFullNames) sApolloPendingBatchFullNames = [NSMutableSet set];
-    [sApolloPendingBatchFullNames addObject:fullName];
+    BOOL joined = NO;
+    for (NSString *fullName in fullNames) {
+        if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) continue;
+        if (!sApolloPendingBatchFullNames) sApolloPendingBatchFullNames = [NSMutableSet set];
+        [sApolloPendingBatchFullNames addObject:fullName];
+        joined = YES;
+    }
+    if (!joined) return NO;
     if (sApolloPendingBatchFullNames.count >= 25) {
         ApolloInlineAvatarFireBatchNow();
         return YES;
@@ -5252,6 +5332,11 @@ static BOOL ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
         ApolloInlineAvatarFireBatchNow();
     });
     return YES;
+}
+
+// YES when `fullName` joined a batch.
+static BOOL ApolloInlineAvatarEnqueueFullNameForBatch(NSString *fullName) {
+    return fullName ? ApolloInlineAvatarEnqueueFullNamesForBatch(@[fullName]) : NO;
 }
 
 // Read the comment cell's own RDKComment (the same safe ivar path the avatar binding
@@ -5269,10 +5354,33 @@ static void ApolloInlineAvatarBatchEnqueueFromCommentCell(id cell) {
     if (ApolloInlineAvatarEnqueueFullNameForBatch(fullName)) ApolloInlineAvatarNoteQueuedForBatch(username);
 }
 
+// The t3_ fullname of the post a feed cell shows, from the same `link` model its
+// author is read from (ApolloUsernameFromCell): the ivar, else a getter.
+static NSString *ApolloPostFullNameFromCell(id cell) {
+    id link = ApolloObjectIvarValue(cell, @"link");
+    SEL linkSEL = NSSelectorFromString(@"link");
+    if (!link && [cell respondsToSelector:linkSEL]) link = ((id (*)(id, SEL))objc_msgSend)(cell, linkSEL);
+    if (![link respondsToSelector:@selector(fullName)]) return nil;
+    @try {
+        id fullName = ((id (*)(id, SEL))objc_msgSend)(link, @selector(fullName));
+        return [fullName isKindOfClass:[NSString class]] ? fullName : nil;
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
 // Reduce Rate Limiting only: queue a feed post's author for the same batch,
 // using the t2_ fullname noted from the feed listing (Apollo's RDKLink has no
 // author fullname of its own). Without the setting, feed avatars keep their
 // own lookups and the collectible frames that come with them.
+//
+// The rest of the post's listing page goes with it (#1438). A feed scroll brings
+// posts into the preload range one or two at a time, so the 0.6s window above
+// used to send a batch every second or so while scrolling, often for a single
+// author, and that alone could spend an API-Key-Free session's Reddit budget in
+// a few minutes. With the page's uncached authors queued together it's one batch
+// per page: the page's later posts find their authors cached, or already asked
+// for (the cache drops those before sending anything).
 static void ApolloInlineAvatarBatchEnqueueFromPostCell(id cell) {
     if (!cell || !ApolloReduceRateLimitingActive()) return;
     NSString *username = ApolloUsernameFromCell(cell, @"link");
@@ -5280,7 +5388,11 @@ static void ApolloInlineAvatarBatchEnqueueFromPostCell(id cell) {
     ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
     if ([cache cachedInfoForUsername:username].iconURL) return;
     NSString *fullName = [cache authorFullNameForUsername:username];
-    if (ApolloInlineAvatarEnqueueFullNameForBatch(fullName)) ApolloInlineAvatarNoteQueuedForBatch(username);
+    if (![fullName hasPrefix:@"t2_"]) return;
+    NSMutableArray<NSString *> *batch = [NSMutableArray arrayWithObject:fullName];
+    NSArray<NSString *> *pageFullNames = [cache uncachedAuthorFullNamesOnPageOfPost:ApolloPostFullNameFromCell(cell)];
+    if (pageFullNames.count > 0) [batch addObjectsFromArray:pageFullNames];
+    if (ApolloInlineAvatarEnqueueFullNamesForBatch(batch)) ApolloInlineAvatarNoteQueuedForBatch(username);
 }
 
 // ASSizeRange { CGSize min; CGSize max; } — same -layoutSpecThatFits: ABI
@@ -5470,7 +5582,7 @@ static void ApolloAvatarApplySubredditIconToSharePreview(id postInfo, NSString *
             BOOL hideUsernames = ApolloReadBoolIvar(node, "hideUsernames", NO);
             BOOL hideSubreddit = ApolloReadBoolIvar(node, "hideSubreddit", NO);
             NSString *username = ApolloUsernameFromCell(node, @"link");
-            ApolloLog(@"[UserAvatars] Share preview layout details=%d hideUsernames=%d hideSubreddit=%d username=%@ node=%p",
+            ApolloLog(@"[UserAvatars] Share preview layout details=%d hideUsernames=%d hideSubreddit=%d u/%@ node=%p",
                       includePostDetails, hideUsernames, hideSubreddit, username, node);
             // No author line without post details; no avatar when usernames
             // are hidden — the rendered text won't contain the author.

@@ -28,11 +28,49 @@ Do **not** add the setting to `ApolloBackupRestore.m`'s statics re-sync block: s
 
 ## ApolloSettingsForm quick reference
 
+### Setup Assistant
+
+`ApolloSetupAssistant` is a four-page modal UIKit pager (connect/restore, starting
+point, appearance, summary), with decorative artwork, swipe navigation and a
+fixed footer. All Settings/search/deep-link entry points present the same sheet.
+Its optional feature and privacy details use the shared form layer.
+`ApolloSetupPreset` owns the Foundation-only preset maps and the first-launch
+classification. The bootstrap snapshots persistent domains
+in `+load`, before constructor migrations/unlock flags can make a new install
+look configured. Existing preference domains are conservatively excluded from
+automatic onboarding; the Settings route `setup-assistant` stays available and
+starts with **Keep My Settings** for existing users.
+
+Preset, appearance and privacy choices live in a draft until Finish. Credentials
+and explicitly requested backup operations use their existing save/restore flows.
+Finish writes ordinary defaults once and requests one clean restart when effective
+values changed; no preset is reapplied on an upgrade. Liquid Glass's latched global
+is never changed live. A successful restore marks setup complete even for old or
+mid-setup backups. Skip suppresses automatic setup without applying the draft.
+
+Keep authentication, privacy, filters, sound, experimental services, AI and
+translation out of feature presets. If adding a preset-owned feature, put its key
+in **every** map so selecting Classic can reverse Full Featured. Changes to the
+map and launch policy are checked by `tests/run_setup_preset_tests.sh`.
+
+Manual verification: use a separate simulator/bundle ID with an empty data domain;
+check welcome appears without What's New/update prompts, each preset changes the
+sample and checkmark without writing its defaults, Back preserves the draft,
+Skip survives relaunch, Finish persists the chosen map and reopens without setup,
+and existing/restored preferences never trigger automatic onboarding. Run the
+Settings route again: Keep My Settings + Keep Current Appearance must preserve
+customisations. Exercise privacy disclosure on screen, supported/unsupported Glass
+builds, light/dark, Dynamic Type and iPad rotation. Account sign-in and backup import
+should be validated with private test credentials/backups outside the repository.
+
+### Form API
+
 Full API docs in `ApolloSettingsForm.h`. The load-bearing rules:
 
 - **Indices are derived, never computed.** The dataSource serves a visibility snapshot; `visible` blocks are only evaluated at load and inside `visibilityDidChange` (which diffs and animates the insert/delete for you). Refer to rows by identity: `reloadRowWithID:`, `cellForRowID:` (also your popover `sourceView` anchor), `indexPathForRowID:`.
 - **Row kinds**: `switchRow` (isOn/onToggle blocks, optional `.enabled`), `valueRow` (detail block; Value1), `disclosureRow` (push block), `buttonRow` (accent action text), `customRow` (escape hatch — the block owns the cell). Blocks are retained by the VC via the row model — capture `weakSelf`, not `self`, or you leak the screen.
 - **`ApolloSettingsPresentPicker`** replaces the hand-rolled "(Current)" action sheets. It fires `apply` on ANY pick **including re-picking the current option** (legacy sheet semantics some handlers rely on) — apply blocks must be idempotent. Sheets needing a message body or extra actions stay bespoke; anchor them to `cellForRowID:`.
+- **`ApolloSettingsPresentLivePicker`** uses the same sheet, applying once before dismissal through a signature-checked UIKit hook, with the public handler as fallback. Use only for synchronous in-place updates; **never push or present a controller** from its callback. Update visible cells instead of reloading rows during dismissal. Cancel and other pickers keep their normal behavior.
 - **Dynamic row lists** (rows generated per data item inside `buildForm`, like Translation's skip-languages): refresh with `rebuildSectionContainingRowID:withRowAnimation:`, not `rebuildForm` — a full `reloadData` reconfigures every section's cells and clobbers in-progress text-field edits elsewhere on the screen.
 - **When to reach for `customRow`**: bespoke cells (preview cards, status subtitles, centered labels), text-field rows (keep the tag-based `UITextFieldDelegate` machinery — it's index-immune by design), and anything whose color must NOT be the accent (e.g. destructive red — `buttonRow` tags the cell for accent action text).
 - **The form holds plain-title header heights.** Once it answers a footer's height (next rule), UIKit stops stripping the next header's top padding, so a header it sizes again after that comes back 7.3pt shorter than it opened. The form holds each titled header at the height it had the first time it was shown and serves that from `heightForHeaderInSection:`, so updates passes (row reloads in `viewWillAppear:`, rows appearing or disappearing) leave headers where they were. If your screen overrides `heightForHeaderInSection:`, return `[super tableView:heightForHeaderInSection:]` for the sections you don't special-case; if you override `willDisplayHeaderView:`, call super.

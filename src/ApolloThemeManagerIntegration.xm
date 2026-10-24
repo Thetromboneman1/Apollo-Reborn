@@ -1085,6 +1085,11 @@ static UIImage *CustomPickerSwatch(void) {
         %orig(tv, [NSIndexPath indexPathForRow:ip.row - 1 inSection:0]);
         [tv reloadData];
         ApolloThemePickerRestoreDuoTabMetrics();
+
+        // Refresh the Inbox badge after selecting a stock Apollo theme.
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:ApolloInboxBadgeChangedNotification
+                          object:nil];
         return;
     }
     %orig;
