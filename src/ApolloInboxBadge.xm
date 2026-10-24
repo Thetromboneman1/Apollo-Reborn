@@ -5,6 +5,7 @@
 #import <math.h>
 
 #import "ApolloCommon.h"
+#import "ApolloClasses.h"
 #import "ApolloThemeRuntime.h"
 #import "UserDefaultConstants.h"
 
@@ -188,7 +189,7 @@ static void ApolloInboxBadgeApply(UITabBarController *controller) {
         // Liquid Glass badge visually consistent.
         NSMutableArray<UIView *> *glassBadges = [NSMutableArray array];
         ApolloInboxBadgeCollectViews(tabBar,
-                                     NSClassFromString(@"_UIBarBadgeView"),
+                                     ApolloClassUIBarBadgeView,
                                      glassBadges);
 
         for (UIView *badge in glassBadges) {
@@ -412,7 +413,7 @@ static UIColor *ApolloInboxBadgeColorForLabel(UILabel *label) {
     UIView *badge = nil;
 
     while (ancestor) {
-        if ([ancestor isKindOfClass:NSClassFromString(@"_UIBarBadgeView")]) {
+        if ([ancestor isKindOfClass:ApolloClassUIBarBadgeView]) {
             badge = ancestor;
             break;
         }
@@ -439,7 +440,7 @@ static UIColor *ApolloInboxBadgeColorForLabel(UILabel *label) {
 
             ApolloInboxBadgeCollectViews(
                 tabBar,
-                NSClassFromString(@"_UIBarBadgeView"),
+                ApolloClassUIBarBadgeView,
                 badges
             );
 
@@ -559,7 +560,7 @@ static UIColor *ApolloInboxBadgeInterceptColor(UIView *badge, UIColor *requested
         // Only intercept the Inbox item's native badge.
         NSMutableArray<UIView *> *badges = [NSMutableArray array];
         ApolloInboxBadgeCollectViews(
-            tabBar, NSClassFromString(@"_UIBarBadgeView"), badges);
+            tabBar, ApolloClassUIBarBadgeView, badges);
 
         // Avoid modifying ambiguous or unexpected hierarchies.
         if (badges.count != 1 || badges.firstObject != badge) {

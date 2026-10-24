@@ -1320,8 +1320,8 @@ static BOOL ApolloBlueskyStatusMeansGone(NSError *error, NSInteger status) {
                 ApolloLogError(@"[LinkPreviews] Bluesky post fetch failed host=%@ status=%ld err=%@",
                           ApolloLinkPreviewHost(url), (long)httpResponse.statusCode, error.localizedDescription);
                 if (ApolloBlueskyStatusMeansGone(error, httpResponse.statusCode)) {
-                    ApolloLog(@"[LinkPreviews] Bluesky post is gone (HTTP %ld); caching the unavailable card actor=%@",
-                              (long)httpResponse.statusCode, actor);
+                    ApolloLog(@"[LinkPreviews] Bluesky post is gone (HTTP %ld); caching the unavailable card actor=%lu chars",
+                              (long)httpResponse.statusCode, (unsigned long)actor.length);
                     completion(ApolloBlueskyUnavailablePostPreview(actor));
                     return;
                 }
@@ -1335,8 +1335,9 @@ static BOOL ApolloBlueskyStatusMeansGone(NSError *error, NSInteger status) {
             if (![post isKindOfClass:[NSDictionary class]]) {
                 // A 200 whose thread is a notFoundPost / blockedPost stub.
                 if (thread) {
-                    ApolloLog(@"[LinkPreviews] Bluesky post is gone (%@); caching the unavailable card actor=%@",
-                              [thread[@"$type"] isKindOfClass:[NSString class]] ? thread[@"$type"] : @"no post", actor);
+                    ApolloLog(@"[LinkPreviews] Bluesky post is gone (%@); caching the unavailable card actor=%lu chars",
+                              [thread[@"$type"] isKindOfClass:[NSString class]] ? thread[@"$type"] : @"no post",
+                              (unsigned long)actor.length);
                     completion(ApolloBlueskyUnavailablePostPreview(actor));
                     return;
                 }
