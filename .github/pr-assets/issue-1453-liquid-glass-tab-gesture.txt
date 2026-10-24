@@ -1,0 +1,52 @@
+Apollo Reborn issue #1453 simulator evidence
+============================================
+
+Commit under test:
+  1e900df8d12055addf78cf604709606953e9b0d0
+
+Environment:
+  Xcode 27.1 (27A9275)
+  iOS 27.1 simulator
+  iPhone 16 Pro simulator
+  Apollo 3.9.0 with Liquid Glass enabled
+  Existing populated authenticated feed
+
+Driver scope:
+  Apollo's simulator debug bridge delivered synthetic UIKit touch phases through
+  UIApplication. This did not invoke the operating system Home recognizer and was
+  not a physical iPhone 17 Pro Max / iOS 27.0.1 reproduction.
+
+Observed checks:
+
+  Before upward Home-like touch:
+    selected=0 tabs=5
+
+  Command:
+    swipe (205,840) -> (265,650), 20 steps, 10 ms per step
+
+  Apollo log:
+    13:36:44.648 [LiquidGlassTabBar] Preserving tab during a vertical or inactive gesture
+    13:36:44.858 [SimDebugTap] swipe delivered (205,840)->(265,650) over 20 x 10 ms
+
+  After upward Home-like touch:
+    selected=0 tabs=5
+
+  Intentional horizontal command:
+    swipe (80,840) -> (300,840), 24 steps, 15 ms per step
+
+  Apollo log:
+    13:37:01.701 [SimDebugTap] swipe delivered (80,840)->(300,840) over 24 x 15 ms
+
+  After intentional horizontal touch:
+    selected=3 tabs=5
+
+  Separate rapid lifecycle check:
+    Posts selected before upward touch: selected=0 tabs=5
+    Foregrounded Settings during a two-second held upward touch, then immediately returned
+    Apollo returned on Posts: selected=0 tabs=5
+    Ordinary Search tap after reactivation: selected=3 tabs=5
+
+Privacy treatment:
+  The published GIF is cropped to the bottom tab interaction. Feed text below the
+  bar is covered, and the account label is covered and marked "account redacted".
+  The raw full-screen recording is not published.
