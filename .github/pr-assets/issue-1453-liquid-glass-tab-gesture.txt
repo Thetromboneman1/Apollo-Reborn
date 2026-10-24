@@ -2,7 +2,7 @@ Apollo Reborn issue #1453 simulator evidence
 ============================================
 
 Commit under test:
-  1e900df8d12055addf78cf604709606953e9b0d0
+  d49ec7f7581268b17aede25bad5f4e672281719b
 
 Environment:
   Xcode 27.1 (27A9275)
@@ -25,8 +25,8 @@ Observed checks:
     swipe (205,840) -> (265,650), 20 steps, 10 ms per step
 
   Apollo log:
-    13:36:44.648 [LiquidGlassTabBar] Preserving tab during a vertical or inactive gesture
-    13:36:44.858 [SimDebugTap] swipe delivered (205,840)->(265,650) over 20 x 10 ms
+    13:47:10.236 [LiquidGlassTabBar] Preserving tab during a vertical or inactive gesture
+    13:47:10.449 [SimDebugTap] swipe delivered (205,840)->(265,650) over 20 x 10 ms
 
   After upward Home-like touch:
     selected=0 tabs=5
@@ -35,7 +35,7 @@ Observed checks:
     swipe (80,840) -> (300,840), 24 steps, 15 ms per step
 
   Apollo log:
-    13:37:01.701 [SimDebugTap] swipe delivered (80,840)->(300,840) over 24 x 15 ms
+    13:47:28.523 [SimDebugTap] swipe delivered (80,840)->(300,840) over 24 x 15 ms
 
   After intentional horizontal touch:
     selected=3 tabs=5
