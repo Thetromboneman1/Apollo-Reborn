@@ -91,6 +91,11 @@ static NSString *ApolloNewVideoPostBareID(NSString *linkID) {
     return [linkID hasPrefix:@"t3_"] ? [linkID substringFromIndex:3] : linkID;
 }
 
+static NSString *ApolloNewVideoPostLogThing(NSString *bareID) {
+    NSString *fullName = bareID.length > 0 ? [@"t3_" stringByAppendingString:bareID] : nil;
+    return ApolloLogOwnThing(fullName);
+}
+
 static BOOL ApolloNewVideoPostLinkHasVideo(id link) {
     return [link respondsToSelector:@selector(mediaVideo)] && [(RDKLink *)link mediaVideo] != nil;
 }
@@ -256,8 +261,8 @@ static void ApolloNewVideoPostSettle(NSString *bareID, NSDate *settleStart, NSUI
         return;
     }
     if (staleScreens.count > 0) {
-        ApolloLog(@"[NewVideoPost] %lu comments screen(s) for t3_%@ still show the poster after %lu upgrade(s); leaving them",
-                  (unsigned long)staleScreens.count, bareID, (unsigned long)upgrades);
+        ApolloLog(@"[NewVideoPost] %lu comments screen(s) for %@ still show the poster after %lu upgrade(s); leaving them",
+                  (unsigned long)staleScreens.count, ApolloNewVideoPostLogThing(bareID), (unsigned long)upgrades);
     }
     [sApolloNewVideoPostSettling removeObject:bareID];
 }
@@ -300,12 +305,12 @@ static void ApolloNewVideoPostPoll(NSString *bareID, NSDate *pollStart, NSUInteg
     // Nobody is looking at the post any more: stop. Opening it again restarts.
     if (ApolloNewVideoPostCommentsControllers(bareID).count == 0) {
         [sApolloNewVideoPostPolling removeObject:bareID];
-        ApolloLog(@"[NewVideoPost] Stopped waiting for t3_%@: its comments are closed", bareID);
+        ApolloLog(@"[NewVideoPost] Stopped waiting for %@: its comments are closed", ApolloNewVideoPostLogThing(bareID));
         return;
     }
     if (![ApolloClassRDKClient sharedClient]) {
         [sApolloNewVideoPostPolling removeObject:bareID];
-        ApolloLog(@"[NewVideoPost] Stopped waiting for t3_%@: no Reddit client", bareID);
+        ApolloLog(@"[NewVideoPost] Stopped waiting for %@: no Reddit client", ApolloNewVideoPostLogThing(bareID));
         return;
     }
     ApolloNewVideoPostFetchLink(bareID, ^(id link, NSError *error) {
@@ -313,19 +318,19 @@ static void ApolloNewVideoPostPoll(NSString *bareID, NSDate *pollStart, NSUInteg
             [sApolloNewVideoPostPolling removeObject:bareID];
             ApolloNewVideoPostNoteReady(bareID, link);
             NSDate *submittedAt = sApolloNewVideoPostSubmittedAt[bareID];
-            ApolloLog(@"[NewVideoPost] t3_%@ has its video now (check %lu, %.1fs after posting)", bareID,
+            ApolloLog(@"[NewVideoPost] %@ has its video now (check %lu, %.1fs after posting)", ApolloNewVideoPostLogThing(bareID),
                       (unsigned long)(attempt + 1), submittedAt ? -[submittedAt timeIntervalSinceNow] : -1.0);
             ApolloNewVideoPostStartSettling(bareID);
             return;
         }
         NSTimeInterval elapsed = -[pollStart timeIntervalSinceNow];
         if (attempt == 0 || error) {
-            ApolloLog(@"[NewVideoPost] t3_%@ is still processing (check %lu, link=%@, error=%@)", bareID,
+            ApolloLog(@"[NewVideoPost] %@ is still processing (check %lu, link=%@, error=%@)", ApolloNewVideoPostLogThing(bareID),
                       (unsigned long)(attempt + 1), link ? @"yes" : @"no", error.localizedDescription ?: @"none");
         }
         if (elapsed >= kApolloNewVideoPostWatchLimit) {
             [sApolloNewVideoPostPolling removeObject:bareID];
-            ApolloLog(@"[NewVideoPost] Gave up waiting for t3_%@'s video after %.0fs", bareID, elapsed);
+            ApolloLog(@"[NewVideoPost] Gave up waiting for %@'s video after %.0fs", ApolloNewVideoPostLogThing(bareID), elapsed);
             return;
         }
         NSTimeInterval delay = kApolloNewVideoPostPollDelays[MIN(attempt, kApolloNewVideoPostPollDelayCount - 1)];
@@ -354,8 +359,8 @@ static void ApolloNewVideoPostCommentsAppeared(UIViewController *controller) {
     if (!sApolloNewVideoPostPolling) sApolloNewVideoPostPolling = [NSMutableSet new];
     if ([sApolloNewVideoPostPolling containsObject:bareID]) return;
     [sApolloNewVideoPostPolling addObject:bareID];
-    ApolloLog(@"[NewVideoPost] Comments for t3_%@ opened %.1fs after posting; waiting for its video",
-              bareID, -[submittedAt timeIntervalSinceNow]);
+    ApolloLog(@"[NewVideoPost] Comments for %@ opened %.1fs after posting; waiting for its video",
+              ApolloNewVideoPostLogThing(bareID), -[submittedAt timeIntervalSinceNow]);
     ApolloNewVideoPostPoll(bareID, [NSDate date], 0);
 }
 
@@ -378,13 +383,13 @@ static void ApolloNewVideoPostHoldCheck(NSString *bareID, NSDate *holdStart, voi
         NSTimeInterval elapsed = -[holdStart timeIntervalSinceNow];
         if (ApolloNewVideoPostLinkHasVideo(link)) {
             ApolloNewVideoPostNoteReady(bareID, link);
-            ApolloLog(@"[NewVideoPost] t3_%@ has its video %.1fs after the submit; showing Posted! now", bareID, elapsed);
+            ApolloLog(@"[NewVideoPost] %@ has its video %.1fs after the submit; showing Posted! now", ApolloNewVideoPostLogThing(bareID), elapsed);
             deliver(YES);
             return;
         }
         if (elapsed + kApolloNewVideoPostHoldInterval > kApolloNewVideoPostHoldLimit) {
-            ApolloLog(@"[NewVideoPost] t3_%@ is still processing after %.0fs (link=%@, error=%@); showing Posted! now, its comments switch to the video once it's ready",
-                      bareID, elapsed, link ? @"yes" : @"no", error.localizedDescription ?: @"none");
+            ApolloLog(@"[NewVideoPost] %@ is still processing after %.0fs (link=%@, error=%@); showing Posted! now, its comments switch to the video once it's ready",
+                      ApolloNewVideoPostLogThing(bareID), elapsed, link ? @"yes" : @"no", error.localizedDescription ?: @"none");
             deliver(NO);
             return;
         }
@@ -412,12 +417,12 @@ void ApolloNewVideoPostDeliverWhenPlayable(NSString *linkID, dispatch_block_t de
     dispatch_async(dispatch_get_main_queue(), ^{
         ApolloNewVideoPostNoteSubmitted(bareID);
         if (![ApolloClassRDKClient sharedClient]) {
-            ApolloLog(@"[NewVideoPost] No Reddit client to check t3_%@; showing Posted! right away", bareID);
+            ApolloLog(@"[NewVideoPost] No Reddit client to check %@; showing Posted! right away", ApolloNewVideoPostLogThing(bareID));
             finish(NO);
             return;
         }
-        ApolloLog(@"[NewVideoPost] Holding Posted! for video post t3_%@ until Reddit attaches the video (up to %.0fs)",
-                  bareID, kApolloNewVideoPostHoldLimit);
+        ApolloLog(@"[NewVideoPost] Holding Posted! for video post %@ until Reddit attaches the video (up to %.0fs)",
+                  ApolloNewVideoPostLogThing(bareID), kApolloNewVideoPostHoldLimit);
         NSDate *holdStart = [NSDate date];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kApolloNewVideoPostHoldFirstCheck * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{

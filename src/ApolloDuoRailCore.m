@@ -422,14 +422,14 @@ CGRect ApolloDuoActiveVerticalDivision(UIView *view) {
     // Resolve the public iOS 27.1 API dynamically for the device build's iOS 26 SDK.
     if (@available(iOS 27.1, *)) {
         UIWindow *window = view.window;
-        Class kindClass = NSClassFromString(@"UIViewReservedRegionKind");
-        SEL query = NSSelectorFromString(@"reservedRegionsOfKind:");
+        Class kindClass = ApolloClassUIViewReservedRegionKind;
+        SEL query = @selector(reservedRegionsOfKind:);
         if (!window || !kindClass || ![window respondsToSelector:query]) return CGRectNull;
-        id kind = ((id (*)(id, SEL))objc_msgSend)(kindClass, NSSelectorFromString(@"divisionRegionKind"));
+        id kind = ((id (*)(id, SEL))objc_msgSend)(kindClass, @selector(divisionRegionKind));
         NSArray *regions = ((id (*)(id, SEL, id))objc_msgSend)(window, query, kind);
         for (id region in regions) {
-            if (!((BOOL (*)(id, SEL))objc_msgSend)(region, NSSelectorFromString(@"isActive"))) continue;
-            CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(region, NSSelectorFromString(@"frame"));
+            if (!((BOOL (*)(id, SEL))objc_msgSend)(region, @selector(isActive))) continue;
+            CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(region, @selector(frame));
             // A portrait/tabletop fold is horizontal; only the book arrangement
             // splits content into side-by-side halves.
             if (CGRectGetHeight(frame) <= CGRectGetWidth(frame)) continue;
