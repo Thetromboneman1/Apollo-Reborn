@@ -119,7 +119,7 @@ static BOOL ApolloPostInfoIsInCommentsHeader(ASDisplayNode *node) {
         return YES;
     }
 
-    Class headerClass = objc_getClass("_TtC6Apollo22CommentsHeaderCellNode");
+    Class headerClass = ApolloClassCommentsHeaderCellNode;
     if (!headerClass) return NO;
 
     ASDisplayNode *parent = node.supernode;
