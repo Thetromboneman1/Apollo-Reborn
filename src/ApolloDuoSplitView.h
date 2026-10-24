@@ -14,8 +14,14 @@ CGRect ApolloDuoSplitContentFrame(UIViewController *controller, UIView *coordina
 BOOL ApolloDuoSplitIsAccountFeedController(UIViewController *controller);
 BOOL ApolloDuoSplitIsOwnAccountController(UIViewController *controller);
 BOOL ApolloDuoSplitIsSubredditOverlayView(UIView *view);
+/// Appearance only; both styles remain overlays for geometry and navigation.
+BOOL ApolloDuoSplitIsGlassSubredditOverlayView(UIView *view);
 BOOL ApolloDuoSplitIsSidebarController(UIViewController *controller);
 BOOL ApolloDuoSplitRevealPostsList(UINavigationController *navigation);
+/// Excludes containment controllers, the open drawer, and adapting columns.
+BOOL ApolloDuoSplitAllowsNavigationSwipe(UINavigationController *navigation);
+/// Only the Posts feed root can open its closed drawer with an edge swipe.
+BOOL ApolloDuoSplitCanRevealPostsListWithSwipe(UINavigationController *navigation);
 /// Returns from a visited profile dashboard to its retained Posts Back stack.
 BOOL ApolloDuoSplitReturnFromVisitedProfile(UINavigationController *navigation);
 BOOL ApolloDuoSplitShowSidebar(UINavigationController *navigation);

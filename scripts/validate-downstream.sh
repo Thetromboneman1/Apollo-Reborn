@@ -32,6 +32,7 @@ bash "$ROOT/tests/push_validated_docs_test.sh"
 python3 "$ROOT/tests/upstream_pr_batch_test.py"
 python3 "$ROOT/tests/upstream_batch_preservation_test.py"
 python3 "$ROOT/tests/pr_ipa_authorization_test.py"
+python3 "$ROOT/tests/integration_review_regression_test.py"
 
 if [[ "$BUILD" == true ]]; then
   : "${THEOS:?THEOS must point to a Theos checkout for --build}"

@@ -1,9 +1,11 @@
 #import "ApolloDuoAccount.h"
 #import "ApolloDuoRail.h"
 #import "ApolloDuoSplitView.h"
+#import "ApolloClasses.h"
 #import "ApolloCommon.h"
 #import "ApolloThemeRuntime.h"
 #import "ApolloTextureDecls.h"
+#import "ApolloSwiftRuntime.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -22,9 +24,15 @@ void ApolloDuoRailRefreshGlyphs(void) {
 
 struct ApolloDuoSizeRange { CGSize min; CGSize max; };
 @interface ASTableView : UITableView
+- (void)relayoutItems;
+- (void)endUpdatesAnimated:(BOOL)animated completion:(void (^)(BOOL))completion;
+- (void)waitUntilAllUpdatesAreCommitted;
 @end
 
 @interface _TtC6Apollo22CommentsViewController : UIViewController
+@end
+
+@interface _TtC6Apollo19PostsViewController : UIViewController
 @end
 
 @interface _TtC6Apollo20FloatingActionButton : UIButton
@@ -46,6 +54,45 @@ static UIViewController *ApolloDuoTableController(UITableView *table) {
     }
     return nil;
 }
+
+// Apollo 1.15.11's CommentsViewController.viewDidLayoutSubviews positions this
+// pinned control at view.height - tabBar.bounds.height - 55 - 10. A Duo rail
+// is almost as tall as the view, so the native Y becomes negative. It is an
+// overlay on rootNode, not a table footer. Use the visible comments safe area
+// for both axes, including the leading inset of the right split pane.
+static CGRect ApolloDuoFullThreadFrame(ASDisplayNode *node, CGRect frame) {
+    if (!NSThread.isMainThread || !ApolloDeviceIsDuo() || !ApolloDuoRailHasVisibleSideBar()) return frame;
+    ASDisplayNode *parentNode = node.supernode;
+    if (!parentNode.isNodeLoaded) return frame;
+    UIView *parent = parentNode.view;
+    UIViewController *comments = nil;
+    for (UIResponder *responder = parent; responder; responder = responder.nextResponder) {
+        if (ApolloClassCommentsViewController && [responder isKindOfClass:ApolloClassCommentsViewController]) {
+            comments = (id)responder;
+            break;
+        }
+    }
+    // Never reposition another control merely because it uses the same class.
+    if (!comments.isViewLoaded || ApolloObjectIvar(comments, "viewFullPostNode") != node) return frame;
+    CGRect pane = [comments.view convertRect:comments.view.safeAreaLayoutGuide.layoutFrame toView:parent];
+    CGFloat height = CGRectGetHeight(frame);
+    if (!isfinite(height) || height <= 0.0 || CGRectIsNull(pane) || CGRectIsInfinite(pane)
+        || CGRectGetWidth(pane) <= 20.0 || CGRectGetHeight(pane) < height + 20.0) return frame;
+    return CGRectMake(CGRectGetMinX(pane) + 10.0, CGRectGetMaxY(pane) - height - 10.0,
+                      CGRectGetWidth(pane) - 20.0, height);
+}
+
+@interface ApolloDuoFullThreadNode : ASDisplayNode
+@end
+%group ApolloDuoFullThreadHooks
+%hook ApolloDuoFullThreadNode
+- (void)setFrame:(CGRect)frame {
+    // Repair the native write at its source rather than scheduling another
+    // layout or modifying the table's size/insets from a layout callback.
+    %orig(ApolloDuoFullThreadFrame((id)self, frame));
+}
+%end
+%end
 
 static BOOL ApolloDuoIsAccountFeedTable(UITableView *table) {
     if (!table) return NO;
@@ -80,6 +127,14 @@ static void ApolloDuoSyncOuterCellBackground(_ASTableViewCell *cell) {
         // restoring its node color during reuse/layout flashes card-colored bands
         // behind the rail between scroll callbacks.
         background = UIColor.clearColor;
+    } else if (!accountFeed) {
+        // Feed/comment nodes are opaque, so UIKit's full-width selection view
+        // only ever shows in the strip behind the rail. Apollo builds it once
+        // per theme, so after a light/dark switch a row opened and closed
+        // again showed the old theme's color there. The profile's shortcut
+        // rows clip theirs in NavigationActions instead.
+        BOOL besideRail = CGRectGetWidth(cell.bounds) - CGRectGetWidth(cell.contentView.bounds) >= 1.0;
+        if (cell.selectedBackgroundView.hidden != besideRail) cell.selectedBackgroundView.hidden = besideRail;
     }
     if (cell.backgroundColor != background && ![cell.backgroundColor isEqual:background]) {
         cell.backgroundColor = background;
@@ -99,7 +154,7 @@ static void ApolloDuoSyncCellBackground(ASCellNode *node) {
 
 static UIColor *ApolloDuoAccountFeedNodeBackground(ASCellNode *node, UIColor *requested) {
     if (!NSThread.isMainThread || !node.isNodeLoaded) return requested;
-    if (ApolloDuoSplitIsSubredditOverlayView(node.view)) return UIColor.clearColor;
+    if (ApolloDuoSplitIsGlassSubredditOverlayView(node.view)) return UIColor.clearColor;
     NSString *name = NSStringFromClass(node.class);
     if (![name hasSuffix:@"CommentCellNode"] && ![name hasSuffix:@"PostCellNode"]) return requested;
     UIView *parent = node.view.superview;
@@ -111,11 +166,138 @@ static UIColor *ApolloDuoAccountFeedNodeBackground(ASCellNode *node, UIColor *re
     return ApolloThemeCardBackgroundColor() ?: requested;
 }
 
+static char kApolloDuoMeasuredWidthKey, kApolloDuoWidthRefreshPendingKey, kApolloDuoWidthRefreshingKey;
+
+void ApolloDuoRailPrepareTableForTransition(UITableView *table) {
+    if (!NSThread.isMainThread || !table.window
+        || [objc_getAssociatedObject(table, &kApolloDuoWidthRefreshingKey) boolValue]) return;
+    CGFloat width = ApolloDuoRailFeedContentWidth(table);
+    if (!isfinite(width) || width <= 0.0) return;
+    NSNumber *previous = objc_getAssociatedObject(table, &kApolloDuoMeasuredWidthKey);
+    if (previous && fabs(previous.doubleValue - width) < 0.5) return;
+    if (![table respondsToSelector:@selector(relayoutItems)]
+        || ![table respondsToSelector:@selector(endUpdatesAnimated:completion:)]
+        || ![table respondsToSelector:@selector(waitUntilAllUpdatesAreCommitted)]) return;
+
+    // A secondary table can retain full-screen bounds while its leading safe
+    // area changes. Texture's bounds-width cache therefore sees no resize.
+    // Commit the new node widths AND row heights in one native transaction;
+    // relayoutItems alone leaves UITableView's old heights until a scroll.
+    objc_setAssociatedObject(table, &kApolloDuoMeasuredWidthKey, @(width), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(table, &kApolloDuoWidthRefreshingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ASTableView *texture = (ASTableView *)table;
+    [texture waitUntilAllUpdatesAreCommitted];
+    CGFloat visibleTop = table.contentOffset.y + table.adjustedContentInset.top;
+    NSIndexPath *anchor = nil;
+    for (NSIndexPath *path in table.indexPathsForVisibleRows) {
+        if (CGRectGetMaxY([table rectForRowAtIndexPath:path]) > visibleTop) {
+            anchor = path;
+            break;
+        }
+    }
+    CGFloat anchorOffset = anchor ? CGRectGetMinY([table rectForRowAtIndexPath:anchor]) - visibleTop : 0.0;
+    [UIView performWithoutAnimation:^{
+        [texture beginUpdates];
+        [texture relayoutItems];
+        [texture endUpdatesAnimated:NO completion:nil];
+        [texture waitUntilAllUpdatesAreCommitted];
+        [table setNeedsLayout];
+        [table layoutIfNeeded];
+        // Rewrapping rows above the viewport changes their combined height.
+        // Keep the same visible comment at the same distance below the header.
+        if (anchor && !table.dragging && !table.decelerating
+            && anchor.section < table.numberOfSections
+            && anchor.row < [table numberOfRowsInSection:anchor.section]) {
+            CGFloat offset = CGRectGetMinY([table rectForRowAtIndexPath:anchor])
+                - anchorOffset - table.adjustedContentInset.top;
+            CGFloat minimum = -table.adjustedContentInset.top;
+            CGFloat maximum = MAX(minimum, table.contentSize.height - table.bounds.size.height + table.adjustedContentInset.bottom);
+            [table setContentOffset:CGPointMake(table.contentOffset.x, MIN(maximum, MAX(minimum, offset))) animated:NO];
+            [table layoutIfNeeded];
+        }
+    }];
+    objc_setAssociatedObject(table, &kApolloDuoWidthRefreshingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [DuoMeasure] committed column width %.1f (was %.1f)", width, previous.doubleValue);
+}
+
+// Keep the reading position across fold/unfold. A full-width feed is resized
+// by UIKit itself: rows rewrap while contentOffset stays in points, so the
+// wider display lands posts further down. Anchor the first visible row
+// before the transition and restore it once the new layout commits.
+static char kApolloDuoFoldAnchorKey;
+
+static void ApolloDuoCollectVisibleTables(UIView *view, NSMutableArray<UITableView *> *tables, NSUInteger depth) {
+    if (!view || view.hidden || view.alpha < 0.01 || depth > 24) return;
+    if (ApolloClassASTableView && [view isKindOfClass:ApolloClassASTableView]) {
+        // Feeds only. The Account page restores its own top after a fold;
+        // anchoring its Overview list here landed the page on Overview.
+        UIViewController *owner = ApolloDuoTableController((UITableView *)view);
+        if (ApolloClassPostsViewController && [owner isKindOfClass:ApolloClassPostsViewController])
+            [tables addObject:(UITableView *)view];
+        return;
+    }
+    for (UIView *subview in view.subviews) ApolloDuoCollectVisibleTables(subview, tables, depth + 1);
+}
+
+static NSArray<UITableView *> *ApolloDuoFoldAnchorTables(UITabBarController *tabs) {
+    NSMutableArray<UITableView *> *tables = [NSMutableArray array];
+    ApolloDuoCollectVisibleTables(tabs.selectedViewController.viewIfLoaded, tables, 0);
+    return tables;
+}
+
+static void ApolloDuoCaptureFoldAnchor(UITableView *table) {
+    if (!table.window || table.indexPathsForVisibleRows.count == 0) return;
+    CGFloat visibleTop = table.contentOffset.y + table.adjustedContentInset.top;
+    for (NSIndexPath *path in table.indexPathsForVisibleRows) {
+        CGRect rect = [table rectForRowAtIndexPath:path];
+        if (CGRectGetMaxY(rect) <= visibleTop) continue;
+        // Store the offset as a fraction of the row so a row that rewraps to
+        // a different height keeps the same part on screen.
+        CGFloat fraction = rect.size.height > 0.0 ? (visibleTop - CGRectGetMinY(rect)) / rect.size.height : 0.0;
+        objc_setAssociatedObject(table, &kApolloDuoFoldAnchorKey,
+            @[path, @(MAX(0.0, MIN(1.0, fraction)))], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+}
+
+static void ApolloDuoRestoreFoldAnchor(UITableView *table, BOOL finalPass) {
+    NSArray *anchor = objc_getAssociatedObject(table, &kApolloDuoFoldAnchorKey);
+    if (finalPass) objc_setAssociatedObject(table, &kApolloDuoFoldAnchorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (anchor.count != 2 || !table.window || table.dragging || table.decelerating || table.tracking) return;
+    NSIndexPath *path = anchor[0];
+    if (path.section >= table.numberOfSections || path.row >= [table numberOfRowsInSection:path.section]) return;
+    SEL commit = @selector(waitUntilAllUpdatesAreCommitted);
+    if ([table respondsToSelector:commit]) ((void (*)(id, SEL))objc_msgSend)(table, commit);
+    [table layoutIfNeeded];
+    CGRect rect = [table rectForRowAtIndexPath:path];
+    CGFloat offset = CGRectGetMinY(rect) + rect.size.height * [anchor[1] doubleValue] - table.adjustedContentInset.top;
+    CGFloat minimum = -table.adjustedContentInset.top;
+    CGFloat maximum = MAX(minimum, table.contentSize.height - table.bounds.size.height + table.adjustedContentInset.bottom);
+    offset = MIN(maximum, MAX(minimum, offset));
+    if (fabs(offset - table.contentOffset.y) < 0.5) return;
+    ApolloLog(@"[DuoRail] fold anchor: row %ld.%ld offset %.1f -> %.1f%@", (long)path.section, (long)path.row,
+              table.contentOffset.y, offset, finalPass ? @" (final)" : @"");
+    [table setContentOffset:CGPointMake(table.contentOffset.x, offset) animated:NO];
+}
+
 // Apollo moves the comments jump button from scroll handling after the
 // controller's layout callbacks have returned. Keep the visible comments
 // controller so the button's own final geometry writes can be clamped too.
 static __weak UIViewController *sApolloDuoActiveComments;
-static BOOL sApolloDuoClampingJumpButton;
+static BOOL sApolloDuoClampingFloatingButton;
+
+static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
+    if (sApolloDuoClampingFloatingButton) return;
+    sApolloDuoClampingFloatingButton = YES;
+    for (UIResponder *responder = button.nextResponder; responder; responder = responder.nextResponder) {
+        if ([responder isKindOfClass:UIViewController.class]) {
+            ApolloDuoRailAdjustHideReadButton((UIViewController *)responder);
+            break;
+        }
+    }
+    ApolloDuoCoverAdjustJumpButton(sApolloDuoActiveComments);
+    sApolloDuoClampingFloatingButton = NO;
+}
 
 %group ApolloDuoRailTabs
 
@@ -133,12 +315,24 @@ static BOOL sApolloDuoClampingJumpButton;
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previous {
     %orig;
+    // UIKit's own size class for the tab container (never overridden): shows
+    // whether the split's size-class pins in ApolloDuoSplitView are needed.
+    UITraitCollection *traits = ((UIViewController *)self).traitCollection;
+    if (traits.horizontalSizeClass != previous.horizontalSizeClass) {
+        ApolloLog(@"[DuoRail] native horizontalSizeClass %ld -> %ld (view %@, mode %d)",
+                  (long)previous.horizontalSizeClass, (long)traits.horizontalSizeClass,
+                  NSStringFromCGSize(((UIViewController *)self).view.bounds.size), ApolloDuoCurrentMode());
+    }
     ApolloDuoRailSync();
 }
 
 - (void)viewWillTransitionToSize:(CGSize)size
        withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    NSArray<UITableView *> *anchored = ApolloDuoFoldAnchorTables((UITabBarController *)self);
+    for (UITableView *table in anchored) ApolloDuoCaptureFoldAnchor(table);
     %orig;
+    NSHashTable<UITableView *> *tables = [NSHashTable weakObjectsHashTable];
+    for (UITableView *table in anchored) [tables addObject:table];
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> context) {
         (void)context;
         ApolloDuoRailSync();
@@ -146,7 +340,14 @@ static BOOL sApolloDuoClampingJumpButton;
         (void)context;
         // Let the split host finish its resize before deciding whether the
         // resulting bottom bar can minimize again.
-        dispatch_async(dispatch_get_main_queue(), ^{ ApolloDuoRailSync(); });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ApolloDuoRailSync();
+            for (UITableView *table in tables) ApolloDuoRestoreFoldAnchor(table, NO);
+        });
+        // Media and Focused cards can settle their heights a beat later.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            for (UITableView *table in tables) ApolloDuoRestoreFoldAnchor(table, YES);
+        });
     }];
 }
 
@@ -221,28 +422,19 @@ static BOOL sApolloDuoClampingJumpButton;
     [table.backgroundView setNeedsLayout];
     CGFloat width = ApolloDuoRailFeedContentWidth(table);
     if (width <= 0.0) return;
-    static char measuredWidthKey, refreshPendingKey;
-    NSNumber *previous = objc_getAssociatedObject(table, &measuredWidthKey);
-    objc_setAssociatedObject(table, &measuredWidthKey, @(width), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSNumber *previous = objc_getAssociatedObject(table, &kApolloDuoMeasuredWidthKey);
     if (previous && fabs(previous.doubleValue - width) < 0.5) return;
-    if ([objc_getAssociatedObject(table, &refreshPendingKey) boolValue]) return;
-    objc_setAssociatedObject(table, &refreshPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    // The split sidebar changes the safe area without changing the backing
-    // table bounds. Texture's bounds-width cache therefore leaves offscreen
-    // rows measured for the old column. Remeasure existing nodes once after
-    // UIKit has applied the new insets, without reloading their content.
+    if ([objc_getAssociatedObject(table, &kApolloDuoWidthRefreshPendingKey) boolValue]) return;
+    objc_setAssociatedObject(table, &kApolloDuoWidthRefreshPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Coalesce safe-area notifications outside UIKit's layout callback. A
+    // split-button transition calls the same helper synchronously, making this
+    // queued pass a no-op once that destination width has already committed.
     __weak UITableView *weakTable = table;
     dispatch_async(dispatch_get_main_queue(), ^{
         UITableView *liveTable = weakTable;
         if (!liveTable) return;
-        objc_setAssociatedObject(liveTable, &refreshPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (!liveTable.window || ApolloDuoRailFeedContentWidth(liveTable) <= 0.0) return;
-        SEL relayout = NSSelectorFromString(@"relayoutItems");
-        if ([liveTable respondsToSelector:relayout]) {
-            [UIView performWithoutAnimation:^{
-                ((void (*)(id, SEL))objc_msgSend)(liveTable, relayout);
-            }];
-        }
+        objc_setAssociatedObject(liveTable, &kApolloDuoWidthRefreshPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloDuoRailPrepareTableForTransition(liveTable);
     });
 }
 
@@ -256,7 +448,8 @@ static BOOL sApolloDuoClampingJumpButton;
         ApolloDuoSyncCellBackground(((_ASTableViewCell *)cell).node);
     }
     CGFloat width = ApolloDuoRailFeedContentWidth((UITableView *)self);
-    if (ApolloDuoSplitIsResizing() && width > 0.0
+    BOOL refreshingWidth = [objc_getAssociatedObject(self, &kApolloDuoWidthRefreshingKey) boolValue];
+    if ((ApolloDuoSplitIsResizing() || refreshingWidth) && width > 0.0
         && fabs(CGRectGetWidth(cell.contentView.bounds) - width) > 0.5) {
         // Texture's cell callback remeasures the node from contentView.bounds,
         // bypassing the data-controller constraint above. During reparenting
@@ -358,7 +551,21 @@ static BOOL sApolloDuoClampingJumpButton;
 
 %end
 
-// The scroll path sets FloatingActionButton geometry after the comments
+%hook _TtC6Apollo19PostsViewController
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    ApolloDuoRailAdjustHideReadButton((UIViewController *)self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloDuoRailAdjustHideReadButton((UIViewController *)self);
+}
+
+%end
+
+// The scroll path sets FloatingActionButton geometry after the feed/comments
 // controller's delegate callbacks. Clamp after those writes rather than
 // racing them from scrollViewDidScroll:. The guard lets the helper assign the
 // corrected frame without recursively entering this hook.
@@ -366,20 +573,12 @@ static BOOL sApolloDuoClampingJumpButton;
 
 - (void)setFrame:(CGRect)frame {
     %orig(frame);
-    UIViewController *comments = sApolloDuoActiveComments;
-    if (!comments || sApolloDuoClampingJumpButton) return;
-    sApolloDuoClampingJumpButton = YES;
-    ApolloDuoCoverAdjustJumpButton(comments);
-    sApolloDuoClampingJumpButton = NO;
+    ApolloDuoAdjustFloatingActionButton(self);
 }
 
 - (void)setCenter:(CGPoint)center {
     %orig(center);
-    UIViewController *comments = sApolloDuoActiveComments;
-    if (!comments || sApolloDuoClampingJumpButton) return;
-    sApolloDuoClampingJumpButton = YES;
-    ApolloDuoCoverAdjustJumpButton(comments);
-    sApolloDuoClampingJumpButton = NO;
+    ApolloDuoAdjustFloatingActionButton(self);
 }
 
 %end
@@ -403,7 +602,13 @@ static BOOL sApolloDuoClampingJumpButton;
 %end
 
 %ctor {
+    if (!ApolloDeviceIsDuo()) {
+        ApolloLog(@"[DuoRail] not an iPhone Duo; rail adapters NOT installed");
+        return;
+    }
     %init;
+    Class fullThread = objc_getClass("_TtC6Apollo16ViewFullPostNode");
+    if (fullThread) %init(ApolloDuoFullThreadHooks, ApolloDuoFullThreadNode = fullThread);
     Class tabs = objc_getClass("_TtC6Apollo22ApolloTabBarController");
     if (!tabs) {
         ApolloLog(@"[DuoRail] ApolloTabBarController missing; rail inactive");

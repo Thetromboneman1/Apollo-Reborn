@@ -32,6 +32,8 @@
 #import "ApolloRedgifsErrorCards.h"
 #import "Tweak.h"
 #import "settings/CustomAPIViewController.h"
+#import "settings/ApolloSetupAssistant.h"
+#import "settings/ApolloSetupPreset.h"
 #import "settings/ApolloAutomaticBackup.h"
 #import "Version.h"
 #import "UserDefaultConstants.h"
@@ -1100,7 +1102,10 @@ static void ApolloLogAccountSnapshot(NSString *reason) {
 
     ApolloLoginDiag(@"[AccountSnapshot] %@ | device=%@ | keychain: len=%ld status=%d accessible=%@ | defaults: len=%ld index=%ld accounts=%ld withUser=%ld | mirror: len=%ld | active=%@",
                     reason, ApolloProtectedDataString(), kcLen, (int)kcStatus, accessible ?: @"?",
-                    defaultsLen, (long)index, (long)acctCount, (long)acctWithUser, mirrorLen, active ?: @"(nil)");
+                    defaultsLen, (long)index, (long)acctCount, (long)acctWithUser, mirrorLen,
+                    // A fingerprint, not the name: this file outlives sign-outs and
+                    // account removals, so the export scrub can't know every name in it.
+                    active.length ? [@"#" stringByAppendingString:ApolloLogFingerprint(active.lowercaseString)] : @"(nil)");
     // The access-group breakdown (root-cause confirmation) — separate line to keep both legible.
     ApolloLoginDiag(@"[AccountBlobGroups] %@ | %@", reason, ApolloAccountsBlobGroupBreakdown(keychainItems, kcStatus));
 }
@@ -3960,6 +3965,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeySettingsIconAppearance: @(ApolloSettingsIconAppearanceLight),
                                     UDKeyTabBarSwipeNavigation: @NO,
                                     UDKeyDuoLandscapeFeedLayout: @0,
+                                    UDKeyDuoSubredditPanelGlassEnabled: @NO,
                                     UDKeyLiquidGlassEnabled: @YES,
                                     UDKeyIconRowMagnifier: @YES,
                                     UDKeyInfoRowTapUpvote: @YES,
@@ -4284,6 +4290,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // reload it here: UIKit and early hook constructors use that launch choice.
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
     sDuoLandscapeFeedLayout = [standardDefaults integerForKey:UDKeyDuoLandscapeFeedLayout];
+    sDuoSubredditPanelGlassEnabled = [standardDefaults boolForKey:UDKeyDuoSubredditPanelGlassEnabled];
     // Value 1 belonged to the removed side-by-side experiment. Keep Focused
     // feed at 2 so existing selections survive this menu cleanup.
     if (sDuoLandscapeFeedLayout != 0 && sDuoLandscapeFeedLayout != 2) {
@@ -4727,12 +4734,17 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // Mirror the selected app icon for Bark notification icon passthrough.
     ApolloBarkCaptureInitialIconSelection();
 
+    ApolloSetupAssistantStart();
+
     // Redirect user to Custom API settings if no API credentials are set — but not
     // when at least one web-session account is configured (no API key is expected
     // for those). Checked by configured-account count, not the active account, so
     // this doesn't depend on which account happens to be current right now.
-    if ([sRedditClientId length] == 0 && !(sWebJSONEnabled && ApolloWebSessionUsernames().count > 0)) {
+    if ([standardDefaults integerForKey:UDKeySetupAssistantState] == ApolloSetupStateExistingInstall &&
+        !ApolloSetupAssistantBlocksLaunchPrompts() &&
+        [sRedditClientId length] == 0 && !(sWebJSONEnabled && ApolloWebSessionUsernames().count > 0)) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (ApolloSetupAssistantBlocksLaunchPrompts()) return;
             UIWindow *mainWindow = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).windows.firstObject;
             UITabBarController *tabBarController = (UITabBarController *)mainWindow.rootViewController;
             // Navigate to Settings tab
@@ -4762,6 +4774,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
+        if (ApolloSetupAssistantBlocksLaunchPrompts()) return;
         ApolloSendUsageHeartbeatIfNeeded();
         ApolloUpdateCheckIfNeeded();
     }];

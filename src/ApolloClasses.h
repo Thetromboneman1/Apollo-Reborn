@@ -124,6 +124,8 @@ extern Class ApolloClassUICornerConfiguration;
 extern Class ApolloClassUIDropShadowView;
 extern Class ApolloClassUIFloatingTabBarSelectionContainerView;
 extern Class ApolloClassUIGlassEffect;
+// UIKit._UITabBarItemPlatterView (Swift): the tab platter of the iOS 27 floating/side-rail tab bar.
+extern Class ApolloClassUITabBarItemPlatterView;
 extern Class ApolloClassUIKBKeyView;
 extern Class ApolloClassUIKBVisualEffectView;
 extern Class ApolloClassUINavigationBarHostedViewContainer;
@@ -131,6 +133,7 @@ extern Class ApolloClassUINavigationBarPlatterGlassView;
 extern Class ApolloClassUINavigationBarPlatterView;
 extern Class ApolloClassUINavigationBarTitleControl;
 extern Class ApolloClassUIScrollEdgeEffectStyle;
+extern Class ApolloClassUIViewReservedRegionKind;
 extern Class ApolloClassUserCommentsViewController;
 
 // TextInputUI is soft-linked by UIKit and loads the first time the keyboard

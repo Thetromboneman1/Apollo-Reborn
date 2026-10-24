@@ -20,12 +20,22 @@ BOOL ApolloDuoUsesAdaptiveBars(void);
 /// unfolded portrait. Other devices keep their existing policy.
 BOOL ApolloDuoAllowsTabBarScrollHiding(void);
 
+/// The active vertical division (book-posture fold) reserved region, converted
+/// into `view`'s coordinates, or CGRectNull when there is none. Use this for
+/// layout decisions: Apple's guidance is to lay out from the arrangement and
+/// reserved-region APIs, keeping hinge readings for live effects only.
+CGRect ApolloDuoActiveVerticalDivision(UIView *view);
+
 /// Refresh the cached window mode without changing UIKit's tab bar.
 void ApolloDuoRailSync(void);
 
 /// Mark Apollo's Texture feed tables before a navigation push measures them.
 void ApolloDuoRailPrepareFeedContent(UIViewController *controller);
 CGFloat ApolloDuoRailFeedContentWidth(UITableView *table);
+
+/// Commit Texture node widths and row heights after a column safe-area change,
+/// retaining the top visible row. No-op when the usable width has not changed.
+void ApolloDuoRailPrepareTableForTransition(UITableView *table);
 
 /// Refresh native tab layout after Apollo replaces or retints its glyphs.
 void ApolloDuoRailRefreshGlyphs(void);
@@ -41,5 +51,8 @@ BOOL ApolloDuoCoverChromeIsActive(void);
 
 /// Keep the comments jump button clear of Duo's system chrome and tab rail.
 void ApolloDuoCoverAdjustJumpButton(UIViewController *comments);
+
+/// Keep Hide Read Posts inside its feed pane and clear of the trailing rail.
+void ApolloDuoRailAdjustHideReadButton(UIViewController *posts);
 
 __END_DECLS

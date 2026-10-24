@@ -8,6 +8,8 @@
 #import "ApolloDuoCompatibility.h"
 #import "ApolloDeviceDisplay.h"
 #import "ApolloAutoHideTabBar.h"
+#import "ApolloClasses.h"
+#import "ApolloThemeRuntime.h"
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <string.h>
@@ -44,6 +46,8 @@ static BOOL ApolloDuoRailDualDisplays(void) {
 }
 
 static int ApolloDuoRailModeForTabs(UITabBarController *tabs) {
+    // Regular phones are always Phone mode, whatever the window geometry.
+    if (!ApolloDeviceIsDuo()) return ApolloDuoModePhone;
     if (![tabs isKindOfClass:[UITabBarController class]] || !tabs.isViewLoaded) {
         return ApolloDuoModePhone;
     }
@@ -70,6 +74,7 @@ BOOL ApolloDuoDeviceDetected(void) {
     // keep it through folds and temporarily detached bars. Never cache an early
     // NO, and never inspect UIKit geometry from a SpriteKit background callback.
     static atomic_bool knownDuo = false;
+    if (!ApolloDeviceIsDuo()) return NO;
     if (atomic_load_explicit(&knownDuo, memory_order_relaxed)) return YES;
     if (!NSThread.isMainThread ||
         UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return NO;
@@ -80,7 +85,7 @@ BOOL ApolloDuoDeviceDetected(void) {
 }
 
 BOOL ApolloDuoUsesAdaptiveBars(void) {
-    if (!IsLiquidGlass() || UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return NO;
+    if (!ApolloDeviceIsDuo() || !IsLiquidGlass() || UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return NO;
     UITabBarController *tabs = (id)ApolloMainTabBarController();
     if (![tabs isKindOfClass:UITabBarController.class]) return NO;
     NSNumber *known = objc_getAssociatedObject(tabs, &kApolloDuoAdaptiveBarsKey);
@@ -311,6 +316,37 @@ void ApolloDuoCoverAdjustJumpButton(UIViewController *comments) {
     if (moved) button.frame = frame;
 }
 
+void ApolloDuoRailAdjustHideReadButton(UIViewController *posts) {
+    if (!ApolloClassPostsViewController || ![posts isKindOfClass:ApolloClassPostsViewController]
+        || !posts.isViewLoaded || !ApolloDuoRailHasVisibleSideBar()) return;
+    Ivar ivar = class_getInstanceVariable(posts.class, "hideReadPostsButton");
+    id object = ivar ? object_getIvar(posts, ivar) : nil;
+    UIView *button = [object isKindOfClass:UIView.class] ? object : nil;
+    UIView *container = button.superview;
+    if (!container.window || container.window != posts.view.window) return;
+
+    // Native feed layout and scroll callbacks position this button using the
+    // backing table's full width. The table can extend underneath both the
+    // trailing rail and the comments pane. Convert the feed's *visible* safe
+    // area into the button parent's coordinates; a scrolling parent's bounds
+    // origin is its content offset, not zero.
+    CGRect pane = [posts.view convertRect:posts.view.safeAreaLayoutGuide.layoutFrame toView:container];
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    CGRect rail = [tabs.tabBar convertRect:tabs.tabBar.bounds toView:container];
+    CGFloat leading = MAX(CGRectGetMinX(container.bounds), CGRectGetMinX(pane));
+    CGFloat trailing = MIN(CGRectGetMaxX(container.bounds), CGRectGetMaxX(pane));
+    trailing = MIN(trailing, CGRectGetMinX(rail) - 15.0);
+    CGRect frame = button.frame;
+    if (trailing - leading < CGRectGetWidth(frame)) return;
+    CGFloat x = MIN(MAX(CGRectGetMinX(frame), leading), trailing - CGRectGetWidth(frame));
+    // Preserve Apollo's vertical scroll/hide animation and avoid another
+    // geometry write once the button already clears the rail.
+    if (fabs(x - frame.origin.x) > 0.5) {
+        frame.origin.x = x;
+        button.frame = frame;
+    }
+}
+
 void ApolloDuoRailAlignFeedScrollIndicator(UIScrollView *scrollView) {
     if (!scrollView) return;
     UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
@@ -350,7 +386,61 @@ void ApolloDuoRailAlignFeedScrollIndicator(UIScrollView *scrollView) {
     }
 }
 
+// The side rail's tab platter is hosted by UIKit's floating-bar container, not
+// inside the UITabBar, so the accent Apollo assigns to tabBar.tintColor never
+// reaches it and the selected tab inherits the window's system blue. (The open
+// portrait bottom bar does sit in the UITabBar and shows the accent.) Give the
+// platter the theme accent directly.
+static BOOL ApolloDuoRailTintPlatters(UIView *view, UIColor *accent, NSUInteger depth) {
+    if (!view || depth > 16) return NO;
+    if ([view isKindOfClass:ApolloClassUITabBarItemPlatterView]) {
+        if (![view.tintColor isEqual:accent]) view.tintColor = accent;
+        return YES;
+    }
+    BOOL found = NO;
+    for (UIView *subview in view.subviews) found |= ApolloDuoRailTintPlatters(subview, accent, depth + 1);
+    return found;
+}
+
+static void ApolloDuoRailApplyAccent(UITabBarController *tabs) {
+    if (!ApolloClassUITabBarItemPlatterView || !ApolloDuoRailHasVisibleSideBar()) return;
+    UIColor *accent = ApolloThemeAccentColor() ?: tabs.tabBar.tintColor;
+    if (!accent) return;
+    // The platter lives under the tab container's floating-bar subtree only;
+    // never walk the content hierarchy.
+    for (UIView *container in tabs.view.subviews) {
+        if (![NSStringFromClass(container.class) isEqualToString:@"_UITabContainerView"]) continue;
+        for (UIView *floating in container.subviews) {
+            if ([NSStringFromClass(floating.class) isEqualToString:@"_UIFloatingBarContainerView"]) {
+                ApolloDuoRailTintPlatters(floating, accent, 0);
+            }
+        }
+    }
+}
+
+CGRect ApolloDuoActiveVerticalDivision(UIView *view) {
+    // Resolve the public iOS 27.1 API dynamically for the device build's iOS 26 SDK.
+    if (@available(iOS 27.1, *)) {
+        UIWindow *window = view.window;
+        Class kindClass = ApolloClassUIViewReservedRegionKind;
+        SEL query = @selector(reservedRegionsOfKind:);
+        if (!window || !kindClass || ![window respondsToSelector:query]) return CGRectNull;
+        id kind = ((id (*)(id, SEL))objc_msgSend)(kindClass, @selector(divisionRegionKind));
+        NSArray *regions = ((id (*)(id, SEL, id))objc_msgSend)(window, query, kind);
+        for (id region in regions) {
+            if (!((BOOL (*)(id, SEL))objc_msgSend)(region, @selector(isActive))) continue;
+            CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(region, @selector(frame));
+            // A portrait/tabletop fold is horizontal; only the book arrangement
+            // splits content into side-by-side halves.
+            if (CGRectGetHeight(frame) <= CGRectGetWidth(frame)) continue;
+            return [view convertRect:frame fromView:window];
+        }
+    }
+    return CGRectNull;
+}
+
 void ApolloDuoRailSync(void) {
+    if (!ApolloDeviceIsDuo()) return;
     UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
     if (![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return;
     int mode = ApolloDuoRailModeForTabs(tabs);
@@ -367,4 +457,5 @@ void ApolloDuoRailSync(void) {
         objc_setAssociatedObject(tabs, &kApolloDuoAdaptiveBarsKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     ApolloScheduleDuoBarPolicyUpdate(tabs);
+    if (mode != ApolloDuoModePhone) ApolloDuoRailApplyAccent(tabs);
 }

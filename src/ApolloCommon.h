@@ -3,6 +3,20 @@
 #import <os/log.h>
 #import <Security/SecBase.h>
 #import <objc/message.h>
+#import "ApolloLogRedaction.h"
+
+/// The backing `UIView` of an ASDisplayNode-like object, or nil if it has none.
+///
+/// Texture's node classes have no headers here, so call sites used to message an
+/// `id` directly. That does not compile for Mac Catalyst: UIKit's umbrella there
+/// reaches AppKit (via NSToolbar+UIKitAdditions.h), so a bare `-view` on `id`
+/// resolves to NSViewController's declaration and yields `NSView *`, which is a
+/// hard error under ARC. Naming the signature at the call site keeps one
+/// definition of "ask a node for its view" for every platform.
+static inline UIView *ApolloNodeView(id node) {
+    if (![node respondsToSelector:@selector(view)]) return nil;
+    return ((UIView *(*)(id, SEL))objc_msgSend)(node, @selector(view));
+}
 
 @class CASpringAnimation;
 
@@ -26,8 +40,9 @@
 //
 // The in-memory levels have no wrapper: call os_log_info / os_log_debug
 // directly with ApolloFixLog() and a C-literal format that starts with
-// "[ApolloFix] [Tag] ". They never reach exports and belong to chatty call
-// sites and hot paths (per cell, per layout pass, per scroll tick, per touch).
+// "[ApolloFix] [Tag] ". The exporter drops them (it keeps Notice and up), and
+// they belong to chatty call sites and hot paths (per cell, per layout pass,
+// per scroll tick, per touch).
 // Debug is off unless something asks for it (log stream --level debug, log
 // config, a profile), and Apple's macros check the level before touching the
 // arguments, so a disabled debug line costs one os_log_type_enabled call and
@@ -37,6 +52,13 @@
 // os_log_error directly too. In every direct call each dynamic string or
 // object needs %{public}@ / %{public}s, or it is <private> in exports;
 // integers, floats, bools and %p are public by default.
+//
+// Exports are shared publicly (bug reports become GitHub issues). The exporter
+// masks URLs, u/ names, the signed-in accounts and token-shaped values
+// (ApolloLogRedaction.h), but it cannot recognise free text. Never log a
+// secret, message/comment/post text, a title, a search query, a prompt or a
+// handle: log its length, a count, a bool, the host, or error domain + code
+// (not `%@` of an NSError, whose userInfo carries the failing URL).
 #define ApolloLog(fmt, ...) ApolloLogEmit(OS_LOG_TYPE_DEFAULT, @"[ApolloFix] " fmt, ##__VA_ARGS__)
 #define ApolloLogError(fmt, ...) ApolloLogEmit(OS_LOG_TYPE_ERROR, @"[ApolloFix] " fmt, ##__VA_ARGS__)
 #define ApolloLogFault(fmt, ...) ApolloLogEmit(OS_LOG_TYPE_FAULT, @"[ApolloFix] " fmt, ##__VA_ARGS__)
@@ -97,6 +119,10 @@ NSURLSessionDataTask *ApolloStartBoundedDataRequest(
 BOOL IsLiquidGlass(void);
 // Build/runtime capability, independent of the selected appearance.
 BOOL ApolloLiquidGlassCanToggle(void);
+// Hardware capability, decided once before any %ctor: YES only on a device
+// with more than one built-in logical display (iPhone Duo, iOS 27+). Duo-only
+// hook groups install only when this is YES, so regular phones never run them.
+BOOL ApolloDeviceIsDuo(void);
 
 NSURL *ApolloURLByConvertingResolvedURLToApolloScheme(NSURL *url);
 BOOL ApolloRouteResolvedURLViaApolloScheme(NSURL *resolvedURL);

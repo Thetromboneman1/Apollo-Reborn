@@ -78,6 +78,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloSessionState.m \
     $(SRC_DIR)/ApolloSessionRestoration.xm \
+    $(SRC_DIR)/ApolloLogRedaction.m \
     $(SRC_DIR)/ApolloInlineImageMetadata.m \
     $(SRC_DIR)/ApolloDeviceGeometry.m \
     $(SRC_DIR)/ApolloDeviceDisplay.m \
@@ -85,6 +86,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloDuoSplitView.xm \
     $(SRC_DIR)/ApolloDuoAccount.m \
     $(SRC_DIR)/ApolloDuoRailCore.m \
+    $(SRC_DIR)/ApolloDuoNavigationGestures.m \
     $(SRC_DIR)/ApolloDuoRail.xm \
     $(SRC_DIR)/ApolloDuoSubsChrome.m \
     $(SRC_DIR)/ApolloDuoSubsChromeHooks.xm \
@@ -96,6 +98,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
     $(SRC_DIR)/settings/ApolloSettingsTableViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsForm.m \
+    $(SRC_DIR)/settings/ApolloSetupPreset.m \
+    $(SRC_DIR)/settings/ApolloSetupAssistant.m \
     $(SRC_DIR)/settings/ApolloSettingsShortcutsViewController.m \
     $(SRC_DIR)/settings/ApolloSettingsPinnedPreview.m \
     $(SRC_DIR)/settings/ApolloProfilePicturesPreview.m \
@@ -176,6 +180,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloGalleryOrientation.xm \
     $(SRC_DIR)/ApolloBannedProfile.xm \
     $(SRC_DIR)/ApolloImageUploadHost.xm \
+    $(SRC_DIR)/ApolloNewVideoPost.xm \
     $(SRC_DIR)/ApolloPhotoPostComposerScrollFix.xm \
     $(SRC_DIR)/ApolloMarkdownToolbarGif.xm \
     $(SRC_DIR)/ApolloComposerToolbarTint.xm \
@@ -197,6 +202,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSwipeUpComments.xm \
     $(SRC_DIR)/ApolloMediaMetadata.m \
     $(SRC_DIR)/ApolloMediaAutoplay.m \
+    $(SRC_DIR)/ApolloVideoVisibility.m \
     $(SRC_DIR)/ApolloCommentsCollapse.xm \
     $(SRC_DIR)/ApolloCommentHeaderLayout.xm \
     $(SRC_DIR)/ApolloMaintainerTint.m \
@@ -215,6 +221,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSettingsNativeInjections.xm \
     $(SRC_DIR)/ApolloPerPostCommentSort.xm \
     $(SRC_DIR)/ApolloURLOpenCommentSort.xm \
+    $(SRC_DIR)/ApolloLiquidGlassTabGesture.m \
     $(SRC_DIR)/ApolloLiquidGlass.xm \
     $(SRC_DIR)/ApolloNavigationActions.xm \
     $(SRC_DIR)/ApolloNavigationTitlePresentation.xm \
@@ -338,6 +345,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloThemeAISheets.m \
     $(SRC_DIR)/ApolloThemeAIOverlay.m \
     $(SRC_DIR)/ApolloThemeManagerViewController.m \
+    $(SRC_DIR)/ApolloInactiveTabIcons.xm \
     $(SRC_DIR)/ApolloThemeGalleryViewController.m \
     $(SRC_DIR)/ApolloThemeManagerIntegration.xm \
     $(SRC_DIR)/ApolloThemeIntegrations.xm \
@@ -351,8 +359,6 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloSubredditSwitcherSheet.xm \
     $(SRC_DIR)/ApolloSearchHeaderOverlapFix.xm \
     $(SRC_DIR)/ApolloSearchTabFixes.xm \
-    $(SRC_DIR)/ApolloDuoSearchLandingViewController.m \
-    $(SRC_DIR)/ApolloDuoSearchRecents.m \
     $(SRC_DIR)/ApolloSearchLandingViewController.m \
     $(SRC_DIR)/ApolloSearchRecents.m \
     $(SRC_DIR)/ApolloSearchLandingPreferences.m \
