@@ -2326,7 +2326,8 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     // A pane's primary navigation bar can extend underneath UIKit's sidebar.
     // Its physical midpoint is then inside the occluded region. Fit and center
     // within the usable header unless Duo already supplied a narrower column.
-    if (CGRectIsNull(columnBounds) && ApolloPaneUsesUnifiedChrome(bar)) {
+    if (CGRectIsNull(columnBounds) &&
+        (ApolloPaneUsesUnifiedChrome(bar) || ApolloDuoUsesCoverContentInsets())) {
         titleBounds.origin.x = leftLimit;
         titleBounds.size.width = MAX(0.0, rightLimit - leftLimit);
     }
