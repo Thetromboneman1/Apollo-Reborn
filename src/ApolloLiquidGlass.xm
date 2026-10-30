@@ -2236,6 +2236,15 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
     UIEdgeInsets chromeInsets = ApolloDeviceChromeInsetsForView(bar);
     CGFloat leftLimit = CGRectGetMinX(bar.bounds) + chromeInsets.left;
     CGFloat rightLimit = CGRectGetMaxX(bar.bounds) - chromeInsets.right;
+    // A pane's primary navigation bar can extend underneath UIKit's sidebar.
+    // Its physical midpoint is then inside the occluded region, not the middle
+    // of the visible feed. Fit/center in the usable header, including RTL's
+    // trailing sidebar. iPhone keeps its existing whole-bar centering policy.
+    CGRect titleBounds = bar.bounds;
+    if (ApolloPaneUsesUnifiedChrome(bar) || ApolloDuoUsesCoverContentInsets()) {
+        titleBounds.origin.x = leftLimit;
+        titleBounds.size.width = MAX(0, rightLimit - leftLimit);
+    }
     UIView *jumpBar = ApolloFindJumpBar(titleControl);
     BOOL searching = jumpBar && ApolloJumpBarIsSearching(jumpBar);
     BOOL searchActions = NO;
@@ -2280,6 +2289,10 @@ static BOOL ApolloRecenterTitleControl(ApolloNavigationTitleGlassController *con
             // Keep fitting independent of the expanded actions. A separate
             // bounded collision offset below moves only titles needing room.
             if (ApolloNavigationActionsViewIsInManagedRoots(child, managedRoots)) continue;
+            // The outgoing page's actions linger for a moment after a stack
+            // change. Fitting to them squeezed Subreddits to "S" until a later
+            // pass refit it (or never, when no later pass came).
+            if (ApolloNavigationActionsViewIsStaleForItem(child, bar.topItem)) continue;
             if (child.hidden || child.alpha < 0.01) continue;
             NSString *className = NSStringFromClass(child.class);
             // Exclude both titles and their hosts during navigation.
@@ -2617,7 +2630,11 @@ static void ApolloPokeTitleLayoutNearPlatter(UIView *fromView) {
     }
 }
 
-%group ApolloLGPlatterPoke
+// Bar-level title/action refresh and hosted-title hit testing. These touch only
+// classes that exist on every Liquid Glass runtime, so they are kept out of the
+// platter group below: iOS 27 dropped _UINavigationBarPlatterView, which left
+// pane titles unrefitted after sidebar and column-width changes there.
+%group ApolloLGNavigationBarRefresh
 
 // MARK: - Keep translated titles reachable through their native host
 //
@@ -2681,6 +2698,10 @@ static BOOL ApolloHostedTitleContainsPoint(UIView *container, CGPoint point, UIE
 }
 
 %end
+
+%end
+
+%group ApolloLGPlatterPoke
 
 %hook _UINavigationBarPlatterView
 
@@ -2795,6 +2816,7 @@ void ApolloNavigationTitlesRefresh(void) {
     }];
     // _UINavigationBarPlatterView only exists on iOS 26+ — register the poke
     // hooks only when the class is present so older runtimes skip it cleanly.
+    %init(ApolloLGNavigationBarRefresh);
     if (objc_getClass("_UINavigationBarPlatterView")) {
         %init(ApolloLGPlatterPoke);
     }

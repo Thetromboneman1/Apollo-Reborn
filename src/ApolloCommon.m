@@ -14,6 +14,8 @@
 #include <stdatomic.h>
 #import <Security/Security.h>
 #import "ApolloClasses.h"
+#import "ApolloAccountCredentials.h"
+#import "ApolloWebSessionStore.h"
 #import "ApolloDeviceIdentity.h"
 #include <sys/sysctl.h>
 #import "ApolloAccountCredentials.h"

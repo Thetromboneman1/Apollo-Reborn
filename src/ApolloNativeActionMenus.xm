@@ -678,7 +678,7 @@ static UIView *ApolloNativeActionMenuResolveSourceView(id sender, id owner) {
     // UIKit detaches a rail item's view when moving it into overflow.
     // Its still-visible overflow control is the stable presentation anchor.
     if ([sender isKindOfClass:UIBarButtonItem.class] && [owner isKindOfClass:UIViewController.class]) {
-        if (@available(iOS 16.0, *)) {
+        if (@available(iOS 16.0, macCatalyst 16.0, *)) {
             sourceView = ApolloNativeActionMenuViewForObject(((UIViewController *)owner).navigationItem.overflowPresentationSource);
             if (sourceView.window) return sourceView;
         }

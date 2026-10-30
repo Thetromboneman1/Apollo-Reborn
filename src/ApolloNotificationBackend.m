@@ -273,7 +273,6 @@ static NSString *ApolloActiveNotificationAccountIdentifier(void) {
     return accountIdentifier;
 }
 #endif
-
 // `/v1/device/<apns>/account/<id>` for a log line: every segment after
 // `device`, `account`, `accounts` or `watcher(s)` is an identifier.
 __attribute__((unused)) // only referenced from ApolloLog, which host tests compile out

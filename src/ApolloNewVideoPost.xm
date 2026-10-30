@@ -91,11 +91,6 @@ static NSString *ApolloNewVideoPostBareID(NSString *linkID) {
     return [linkID hasPrefix:@"t3_"] ? [linkID substringFromIndex:3] : linkID;
 }
 
-static NSString *ApolloNewVideoPostLogThing(NSString *bareID) {
-    NSString *fullName = bareID.length > 0 ? [@"t3_" stringByAppendingString:bareID] : nil;
-    return ApolloLogOwnThing(fullName);
-}
-
 static BOOL ApolloNewVideoPostLinkHasVideo(id link) {
     return [link respondsToSelector:@selector(mediaVideo)] && [(RDKLink *)link mediaVideo] != nil;
 }
@@ -261,8 +256,8 @@ static void ApolloNewVideoPostSettle(NSString *bareID, NSDate *settleStart, NSUI
         return;
     }
     if (staleScreens.count > 0) {
-        ApolloLog(@"[NewVideoPost] %lu comments screen(s) for %@ still show the poster after %lu upgrade(s); leaving them",
-                  (unsigned long)staleScreens.count, ApolloNewVideoPostLogThing(bareID), (unsigned long)upgrades);
+        ApolloLog(@"[NewVideoPost] %lu comments screen(s) for t3_%@ still show the poster after %lu upgrade(s); leaving them",
+                  (unsigned long)staleScreens.count, bareID, (unsigned long)upgrades);
     }
     [sApolloNewVideoPostSettling removeObject:bareID];
 }
@@ -305,12 +300,12 @@ static void ApolloNewVideoPostPoll(NSString *bareID, NSDate *pollStart, NSUInteg
     // Nobody is looking at the post any more: stop. Opening it again restarts.
     if (ApolloNewVideoPostCommentsControllers(bareID).count == 0) {
         [sApolloNewVideoPostPolling removeObject:bareID];
-        ApolloLog(@"[NewVideoPost] Stopped waiting for %@: its comments are closed", ApolloNewVideoPostLogThing(bareID));
+        ApolloLog(@"[NewVideoPost] Stopped waiting for t3_%@: its comments are closed", bareID);
         return;
     }
     if (![ApolloClassRDKClient sharedClient]) {
         [sApolloNewVideoPostPolling removeObject:bareID];
-        ApolloLog(@"[NewVideoPost] Stopped waiting for %@: no Reddit client", ApolloNewVideoPostLogThing(bareID));
+        ApolloLog(@"[NewVideoPost] Stopped waiting for t3_%@: no Reddit client", bareID);
         return;
     }
     ApolloNewVideoPostFetchLink(bareID, ^(id link, NSError *error) {
@@ -318,19 +313,19 @@ static void ApolloNewVideoPostPoll(NSString *bareID, NSDate *pollStart, NSUInteg
             [sApolloNewVideoPostPolling removeObject:bareID];
             ApolloNewVideoPostNoteReady(bareID, link);
             NSDate *submittedAt = sApolloNewVideoPostSubmittedAt[bareID];
-            ApolloLog(@"[NewVideoPost] %@ has its video now (check %lu, %.1fs after posting)", ApolloNewVideoPostLogThing(bareID),
+            ApolloLog(@"[NewVideoPost] t3_%@ has its video now (check %lu, %.1fs after posting)", bareID,
                       (unsigned long)(attempt + 1), submittedAt ? -[submittedAt timeIntervalSinceNow] : -1.0);
             ApolloNewVideoPostStartSettling(bareID);
             return;
         }
         NSTimeInterval elapsed = -[pollStart timeIntervalSinceNow];
         if (attempt == 0 || error) {
-            ApolloLog(@"[NewVideoPost] %@ is still processing (check %lu, link=%@, error=%@)", ApolloNewVideoPostLogThing(bareID),
+            ApolloLog(@"[NewVideoPost] t3_%@ is still processing (check %lu, link=%@, error=%@)", bareID,
                       (unsigned long)(attempt + 1), link ? @"yes" : @"no", error.localizedDescription ?: @"none");
         }
         if (elapsed >= kApolloNewVideoPostWatchLimit) {
             [sApolloNewVideoPostPolling removeObject:bareID];
-            ApolloLog(@"[NewVideoPost] Gave up waiting for %@'s video after %.0fs", ApolloNewVideoPostLogThing(bareID), elapsed);
+            ApolloLog(@"[NewVideoPost] Gave up waiting for t3_%@'s video after %.0fs", bareID, elapsed);
             return;
         }
         NSTimeInterval delay = kApolloNewVideoPostPollDelays[MIN(attempt, kApolloNewVideoPostPollDelayCount - 1)];
@@ -359,8 +354,8 @@ static void ApolloNewVideoPostCommentsAppeared(UIViewController *controller) {
     if (!sApolloNewVideoPostPolling) sApolloNewVideoPostPolling = [NSMutableSet new];
     if ([sApolloNewVideoPostPolling containsObject:bareID]) return;
     [sApolloNewVideoPostPolling addObject:bareID];
-    ApolloLog(@"[NewVideoPost] Comments for %@ opened %.1fs after posting; waiting for its video",
-              ApolloNewVideoPostLogThing(bareID), -[submittedAt timeIntervalSinceNow]);
+    ApolloLog(@"[NewVideoPost] Comments for t3_%@ opened %.1fs after posting; waiting for its video",
+              bareID, -[submittedAt timeIntervalSinceNow]);
     ApolloNewVideoPostPoll(bareID, [NSDate date], 0);
 }
 
@@ -376,26 +371,30 @@ static void ApolloNewVideoPostNoteSubmitted(NSString *bareID) {
     [sApolloNewVideoPostReadyLinks removeObjectForKey:bareID];
 }
 
-// One check of the hold: deliver as soon as the post has its video, or once
-// the next check would land past the limit.
-static void ApolloNewVideoPostHoldCheck(NSString *bareID, NSDate *holdStart, void (^deliver)(BOOL playable)) {
+// One check of the hold: shows Posted! as soon as the post has its video, else
+// checks again. The limit is a timer of its own (below), and once Posted! is
+// out no further check starts.
+static void ApolloNewVideoPostHoldCheck(NSString *bareID, NSDate *holdStart, BOOL (^delivered)(void), dispatch_block_t deliver) {
+    if (delivered()) return;
     ApolloNewVideoPostFetchLink(bareID, ^(id link, NSError *error) {
         NSTimeInterval elapsed = -[holdStart timeIntervalSinceNow];
-        if (ApolloNewVideoPostLinkHasVideo(link)) {
-            ApolloNewVideoPostNoteReady(bareID, link);
-            ApolloLog(@"[NewVideoPost] %@ has its video %.1fs after the submit; showing Posted! now", ApolloNewVideoPostLogThing(bareID), elapsed);
-            deliver(YES);
+        if (delivered()) {
+            // The limit passed while this lookup was still out.
+            ApolloLog(@"[NewVideoPost] A check for t3_%@ came back %.1fs after the submit, after Posted! went out; ignoring it", bareID, elapsed);
             return;
         }
-        if (elapsed + kApolloNewVideoPostHoldInterval > kApolloNewVideoPostHoldLimit) {
-            ApolloLog(@"[NewVideoPost] %@ is still processing after %.0fs (link=%@, error=%@); showing Posted! now, its comments switch to the video once it's ready",
-                      ApolloNewVideoPostLogThing(bareID), elapsed, link ? @"yes" : @"no", error.localizedDescription ?: @"none");
-            deliver(NO);
+        if (ApolloNewVideoPostLinkHasVideo(link)) {
+            ApolloNewVideoPostNoteReady(bareID, link);
+            ApolloLog(@"[NewVideoPost] t3_%@ has its video %.1fs after the submit; showing Posted! now", bareID, elapsed);
+            deliver();
             return;
+        }
+        if (error) {
+            ApolloLog(@"[NewVideoPost] Couldn't check t3_%@ for its video %.1fs after the submit: %@", bareID, elapsed, error.localizedDescription);
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kApolloNewVideoPostHoldInterval * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            ApolloNewVideoPostHoldCheck(bareID, holdStart, deliver);
+            ApolloNewVideoPostHoldCheck(bareID, holdStart, delivered, deliver);
         });
     });
 }
@@ -403,30 +402,41 @@ static void ApolloNewVideoPostHoldCheck(NSString *bareID, NSDate *holdStart, voi
 void ApolloNewVideoPostDeliverWhenPlayable(NSString *linkID, dispatch_block_t deliver) {
     NSString *bareID = ApolloNewVideoPostBareID(linkID);
     // Callers are the submit response transform: always hand the response on,
-    // on a background queue like the transform's other completions.
+    // exactly once, on a background queue like the transform's other completions.
+    // Past the !bareID case, `delivered` is only touched on the main queue.
     __block BOOL delivered = NO;
-    void (^finish)(BOOL) = ^(__unused BOOL playable) {
-        if (delivered || !deliver) return;
+    dispatch_block_t finish = ^{
+        if (delivered) return;
         delivered = YES;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), deliver);
+        if (deliver) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), deliver);
     };
     if (!bareID) {
-        finish(NO);
+        finish();
         return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         ApolloNewVideoPostNoteSubmitted(bareID);
         if (![ApolloClassRDKClient sharedClient]) {
-            ApolloLog(@"[NewVideoPost] No Reddit client to check %@; showing Posted! right away", ApolloNewVideoPostLogThing(bareID));
-            finish(NO);
+            ApolloLog(@"[NewVideoPost] No Reddit client to check t3_%@; showing Posted! right away", bareID);
+            finish();
             return;
         }
-        ApolloLog(@"[NewVideoPost] Holding Posted! for video post %@ until Reddit attaches the video (up to %.0fs)",
-                  ApolloNewVideoPostLogThing(bareID), kApolloNewVideoPostHoldLimit);
+        ApolloLog(@"[NewVideoPost] Holding Posted! for video post t3_%@ until Reddit attaches the video (up to %.0fs)",
+                  bareID, kApolloNewVideoPostHoldLimit);
         NSDate *holdStart = [NSDate date];
+        // The limit runs on its own timer rather than after a check: a lookup
+        // that stalls (connectivity dropping right after the submit) only comes
+        // back when its request times out, well past the limit.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kApolloNewVideoPostHoldLimit * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (delivered) return;
+            ApolloLog(@"[NewVideoPost] t3_%@ still has no video after %.0fs; showing Posted! now, its comments switch to the video once it's ready",
+                      bareID, kApolloNewVideoPostHoldLimit);
+            finish();
+        });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kApolloNewVideoPostHoldFirstCheck * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            ApolloNewVideoPostHoldCheck(bareID, holdStart, finish);
+            ApolloNewVideoPostHoldCheck(bareID, holdStart, ^BOOL { return delivered; }, finish);
         });
     });
 }

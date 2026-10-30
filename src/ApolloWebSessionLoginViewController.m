@@ -57,13 +57,13 @@ static const NSTimeInterval kFarFutureCookieInterval = 10000.0 * 24 * 60 * 60;
 // Consecutive harvest attempts that found an incomplete session (see the
 // completeness gate in _harvestAndFinishForUser:).
 @property (nonatomic) NSUInteger harvestAttempts;
-@property (nonatomic) BOOL legacyOSNoticeShown;
 @end
 
 // How many times the harvest may defer back to the 2s auth poll while waiting
 // for a complete session (missing token_v2/reddit_session/modhash) before
-// proceeding with whatever is there — ~10s total, bounded so sessions whose
-// /api/me.json omits the modhash still finish.
+// proceeding with whatever is there — ~10s total, bounded so flows that never
+// produce a given cookie (e.g. sessions whose /api/me.json omits the modhash)
+// still finish.
 static const NSUInteger kMaxIncompleteHarvestAttempts = 5;
 
 // Off-screen WKWebView that refreshes a stale stored session from the shared
@@ -181,6 +181,14 @@ static const NSTimeInterval kReharvestTimeout = 25.0;
                              target:self
                              action:@selector(_cancelTapped)];
 
+    // No Old Reddit option or iOS < 16 rewrite here (the OAuth sign-in keeps
+    // its own for the consent step). old.reddit.com/login has served Reddit's
+    // new sign-in page since Reddit limited Old Reddit to accounts that used it
+    // recently (seen 2026-10-02 and 2026-10-27, iOS 15 user agent included), so
+    // it gained nothing, and on that host the /api/me.json probe below gets the
+    // gate's sign-in page instead of JSON for any account Old Reddit won't
+    // serve, leaving the sign-in waiting forever.
+
     // Persistent store (unlike the OAuth flow's nonPersistentDataStore): the
     // whole point is keeping the harvested session cookie around.
     WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
@@ -230,15 +238,6 @@ static const NSTimeInterval kReharvestTimeout = 25.0;
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    if (![self _isModernRedditSupported] && !self.legacyOSNoticeShown) {
-        self.legacyOSNoticeShown = YES;
-        UIAlertController *notice = [UIAlertController
-            alertControllerWithTitle:@"Current Reddit Sign-In Required"
-                             message:@"Reddit no longer provides a reliable legacy sign-in fallback. Apollo will try Reddit's current sign-in page, but it may not render on iOS 15 or earlier. If it does not, creating or refreshing an API-Key-Free session requires iOS 16 or later; existing saved sessions continue until they expire."
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [notice addAction:[UIAlertAction actionWithTitle:@"Continue" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:notice animated:YES completion:nil];
-    }
     // The modern login form submits via fetch without a full page navigation, so
     // didFinishNavigation alone can miss the moment auth completes. Poll the auth
     // state while visible. The probe is gated on pageLoaded, so it's inert until
@@ -574,7 +573,7 @@ static void ApolloWebSessionHarvestFromCookieStore(WKHTTPCookieStore *cookieStor
                 return;
             }
             if (!complete) {
-                ApolloLog(@"[WebJSON] Proceeding with an incomplete session for u/%@ after %lu attempts (token_v2=%d reddit_session=%d modhash=%d)",
+                ApolloLog(@"[WebJSON] Proceeding with an incomplete session for u/%@ after %lu attempts (token_v2=%d reddit_session=%d modhash=%d) — some sessions never produce every field",
                           username, (unsigned long)s2.harvestAttempts, hasTokenV2, hasRedditSession, modhash.length > 0);
             }
             [s2.authPollTimer invalidate];
@@ -609,11 +608,6 @@ static void ApolloWebSessionHarvestFromCookieStore(WKHTTPCookieStore *cookieStor
 }
 
 #pragma mark - Plumbing
-
-- (BOOL)_isModernRedditSupported {
-    if (@available(iOS 16, *)) return YES;
-    return NO;
-}
 
 - (void)_cancelTapped {
     ApolloLog(@"[WebJSON] User cancelled web session login");

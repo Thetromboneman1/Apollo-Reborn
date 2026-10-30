@@ -330,7 +330,7 @@ static NSArray<NSDictionary *> *ApolloBBParseAchievementTags(NSString *html) {
     return out;
 }
 
-#pragma mark - Shared joins
+#pragma mark - Shared joins (used by both the direct and WebView paths)
 
 // Raw scraped trophy dicts {title, image, bio?, dest?} -> catalogue-joined items.
 static NSArray<ApolloBadgeItem *> *ApolloBBTrophyItemsFromRaw(NSArray *raw) {
@@ -600,6 +600,48 @@ static void ApolloBBGetHTML(NSString *urlString, NSString *cookieHeader,
         NSString *html = (status == 200 && data.length)
             ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
         completion(html, status, error.code, elapsed, (long)data.length);
+    }];
+    [task resume];
+}
+
+// GET www.reddit.com/user/<name>/trophies.json with the session cookie:
+// the same TrophyList (`t6` dicts) as the OAuth trophies API, and the same
+// trophies in the same order Old Reddit's Trophy Case showed (checked on 3
+// accounts 2026-10-02). It replaced scraping old.reddit.com/user/<name>,
+// which Reddit now limits to accounts with recent Old Reddit use. Without a
+// cookie www answers 403, so callers send this only with one. completion(items
+// or nil, status, errorCode, elapsed, bytes) on the session's background
+// queue, like ApolloBBGetHTML; items is nil unless the answer was a TrophyList.
+static void ApolloBBGetTrophiesJSON(NSString *escapedUsername, NSString *cookieHeader,
+                                    void (^completion)(NSArray<ApolloBadgeItem *> *items, NSInteger status,
+                                                       NSInteger errorCode, double elapsed, long bytes)) {
+    NSString *urlString = [NSString stringWithFormat:@"https://www.reddit.com/user/%@/trophies.json?raw_json=1", escapedUsername];
+    // Probe-tagged like ApolloBBGetHTML, so the Web JSON rewrite leaves it alone.
+    NSURL *url = ApolloWebJSONProbeURL([NSURL URLWithString:urlString]);
+    if (!url) { completion(nil, 0, 0, 0, 0); return; }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:kApolloBBDesktopUA forHTTPHeaderField:@"User-Agent"];
+    [request setValue:cookieHeader forHTTPHeaderField:@"Cookie"];
+
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    NSURLSessionDataTask *task = [ApolloBBDirectSession() dataTaskWithRequest:request
+                                                           completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        double elapsed = CFAbsoluteTimeGetCurrent() - t0;
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+        NSMutableArray<ApolloBadgeItem *> *items = nil;
+        id json = (status == 200 && data.length) ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSDictionary *body = [json isKindOfClass:[NSDictionary class]] && [json[@"data"] isKindOfClass:[NSDictionary class]]
+            ? json[@"data"] : nil;
+        if ([json[@"kind"] isEqual:@"TrophyList"] && [body[@"trophies"] isKindOfClass:[NSArray class]]) {
+            items = [NSMutableArray array];
+            for (NSDictionary *entry in body[@"trophies"]) {
+                if (![entry isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *d = [entry[@"data"] isKindOfClass:[NSDictionary class]] ? entry[@"data"] : nil;
+                ApolloBadgeItem *item = d ? ApolloBBItemFromAPITrophyDict(d) : nil;
+                if (item) [items addObject:item];
+            }
+        }
+        completion(items, status, error.code, elapsed, (long)data.length);
     }];
     [task resume];
 }
@@ -1137,7 +1179,44 @@ void ApolloBadgeBookFetch(NSString *rawUsername, void (^completion)(ApolloUserBa
         NSString *cookieHeader = ApolloActiveWebSession().cookieHeader;
         NSString *escaped = ApolloBBEscapedUsername(username);
 
-        // ---- Leg 1: achievements page ----
+        // ---- Leg 1: trophies.json (the Trophy Case) ----
+        // Only with a web-session cookie: www refuses it without one. Without
+        // a cookie (an API-key account) Leg 3's OAuth call takes this leg's
+        // place in directPending — the old.reddit.com page this used to scrape
+        // sent such accounts to Old Reddit's sign-in gate every time. Parse on
+        // the session's background queue; only the joined results cross to the
+        // main thread (result/state are main-thread-only).
+        BOOL apiLegStandsIn = cookieHeader.length == 0;
+        if (!apiLegStandsIn) {
+            ApolloBBGetTrophiesJSON(escaped, cookieHeader, ^(NSArray<ApolloBadgeItem *> *items, NSInteger status,
+                                                             NSInteger errorCode, double elapsed, long bytes) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (items) {
+                        if (!result.trophiesResolved) {
+                            result.trophies = items;
+                            result.trophiesResolved = YES;
+                        }
+                        ApolloLog(@"[BadgeBook][perf] u/%@ trophies.json %.2fs (%ldB) -> %lu trophies",
+                                  username, elapsed, bytes, (unsigned long)result.trophies.count);
+                        componentSettled();
+                    } else if (status == 404) {
+                        // Account gone — "no trophies" is the definitive answer.
+                        userGone = YES;
+                        result.trophies = @[];
+                        result.trophiesResolved = YES;
+                        ApolloLog(@"[BadgeBook][perf] u/%@ trophies.json 404 — user not found", username);
+                        componentSettled();
+                    } else {
+                        if (ApolloBBIsOfflineErrorCode(errorCode)) sawOfflineError = YES;
+                        ApolloLog(@"[BadgeBook][perf] u/%@ trophies.json direct GET failed (%.2fs http=%ld err=%ld %ldB)",
+                                  username, elapsed, (long)status, (long)errorCode, bytes);
+                    }
+                    if (--directPending == 0) maybeFallback();
+                });
+            });
+        }
+
+        // ---- Leg 2: achievements page ----
         if ([ApolloBadgeBookCatalog shared].isLoaded) {
             NSString *achURL = [NSString stringWithFormat:@"https://www.reddit.com/user/%@/achievements/", escaped];
             ApolloBBGetHTML(achURL, cookieHeader, ^(NSString *html, NSInteger status, NSInteger errorCode, double elapsed, long bytes) {
@@ -1168,15 +1247,16 @@ void ApolloBadgeBookFetch(NSString *rawUsername, void (^completion)(ApolloUserBa
             // catalogue to join against.
         }
 
-        // ---- Leg 2: official trophies API ----
+        // ---- Leg 3 (parallel accelerator): official trophies API ----
+        // Also the trophy leg itself when Leg 1 didn't go out (apiLegStandsIn).
         ApolloBBFetchTrophiesViaAPI(username, ^(NSArray<ApolloBadgeItem *> *apiTrophies, BOOL apiOK) {
-            if (apiOK && !result.trophiesResolved) {
+            if (apiOK && !result.trophiesResolved) {          // else Leg 1 won, or the API is still dead
                 result.trophies = apiTrophies ?: @[];
                 result.trophiesResolved = YES;
                 ApolloLog(@"[BadgeBook][perf] u/%@ trophies via API in %.2fs", username, CFAbsoluteTimeGetCurrent() - t0);
                 componentSettled();
             }
-            if (--directPending == 0) maybeFallback();
+            if (apiLegStandsIn && --directPending == 0) maybeFallback();
         });
     };
     if ([NSThread isMainThread]) work();

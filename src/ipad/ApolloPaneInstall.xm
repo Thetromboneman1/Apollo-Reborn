@@ -492,10 +492,13 @@ static BOOL ApolloPaneInstallIntoTabBarController(UITabBarController *tabBarCont
 %end
 
 %ctor {
+    // The invitation must run while the layout is still off. It has its own
+    // gate, because it also reaches glass-off users who can turn glass on.
+    ApolloIPadLayoutWelcomeStart();
+    // iPhone never loads any of this: the idiom check comes first, so the hook
+    // is not even installed on a device that can never run the pane layout.
     // Install only on supported OS/device combinations and explicit opt-in.
     if (!ApolloPaneLayoutSupported()) return;
-    // The invitation must run while the layout is still off.
-    ApolloIPadLayoutWelcomeStart();
 
     if (!ApolloPaneLayoutEnabled()) {
         ApolloLog(@"[PaneInstall] supported device, pane layout off (UDKeyIPadPaneLayout); hook not installed");

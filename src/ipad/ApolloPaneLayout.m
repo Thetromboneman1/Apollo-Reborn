@@ -42,6 +42,10 @@ static NSMapTable<UINavigationController *, UISplitViewController *> *sPaneNavig
 static NSMapTable<UINavigationItem *, UINavigationController *> *sPaneItemOwners;
 
 BOOL ApolloPaneLayoutSupported(void) {
+    return ApolloPaneLayoutDeviceSupported() && IsLiquidGlass();
+}
+
+BOOL ApolloPaneLayoutDeviceSupported(void) {
     static BOOL supported = NO;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -53,6 +57,11 @@ BOOL ApolloPaneLayoutSupported(void) {
             supported = idiom == UIUserInterfaceIdiomPad || idiom == UIUserInterfaceIdiomPhone;
         } else if (@available(iOS 18.0, *)) {
             supported = UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad;
+#if APOLLO_SIM_BUILD
+            // Development only: exercise an actual phone idiom at cold narrow
+            // launch and through resizing. Never spoof UIDevice or global traits.
+            supported |= [NSProcessInfo.processInfo.environment[@"APOLLO_SIM_ADAPTIVE_PHONE"] boolValue];
+#endif
         }
     });
     return supported;
