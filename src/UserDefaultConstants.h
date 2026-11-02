@@ -836,6 +836,12 @@ static NSString *const UDKeyDevvitInteractivePosts = @"DevvitInteractivePosts";
 // only consulted while DevvitInteractivePosts is on.
 static NSString *const UDKeyDevvitFeedWidgets = @"DevvitFeedWidgets";
 
+// For You-only content filter. Devvit games, polls, brackets and live-score
+// posts are removed as whole posts during /api/info hydration. This does not
+// change Devvit rendering in other feeds or comments. Default OFF.
+static NSString *const UDKeyHomeFeedHideInteractivePosts = @"HomeFeedHideInteractivePosts";
+static NSString *const ApolloForYouFeedFilterChangedNotification = @"ApolloForYouFeedFilterChangedNotification";
+
 // Floating Post Tabs: chat-heads-style bubbles (max 5) that keep posts open
 // for instant return, created from the comments "..." menu. Default OFF
 // (opt-in). See ApolloFloatingTabs.xm.

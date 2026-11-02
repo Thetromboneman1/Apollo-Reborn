@@ -2215,6 +2215,12 @@ typedef NS_ENUM(NSInteger, Tag) {
                                   onToggle:^(UISwitch *sender) { [weakSelf devvitFeedPostsSwitchToggled:sender]; }];
     devvitFeedPosts.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; };
 
+    ApolloSettingsRow *hideInteractiveForYou =
+        [ApolloSettingsRow switchRowWithID:@"gen.hideInteractiveForYou"
+                                     title:@"Hide Interactive Posts in For You"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyHomeFeedHideInteractivePosts]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf hideInteractiveForYouSwitchToggled:sender]; }];
+
     ApolloSettingsRow *restoreReadingSession =
         [ApolloSettingsRow switchRowWithID:@"media.restoreReadingSession"
                                      title:@"Restore Reading Session"
@@ -2222,8 +2228,8 @@ typedef NS_ENUM(NSInteger, Tag) {
                                   onToggle:^(UISwitch *sender) { [weakSelf restoreReadingSessionSwitchToggled:sender]; }];
 
     return [ApolloSettingsSection sectionWithTitle:@"Feed"
-                                            footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nSmoother Video Scrolling: prepares feed videos in the background and lets video posts finish drawing right after they scroll in instead of holding the frame for them. Turn off to get Apollo's original behavior back.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments.\n\nRestore Reading Session: after iOS evicts Apollo, reopen the last feed, post and reading position on the next normal launch. Turn it off to delete the saved session immediately."
-                                              rows:@[ textPostThumbnails, infoRow, feedScrubber, videoScrollSmoothing, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts, restoreReadingSession ]];
+                                            footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nSmoother Video Scrolling: prepares feed videos in the background and lets video posts finish drawing right after they scroll in instead of holding the frame for them. Turn off to get Apollo's original behavior back.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments.\n\nHide Interactive Posts in For You: removes Devvit games, interactive polls, brackets and live-score posts from For You only. It does not hide ordinary Reddit polls or affect other feeds and comments.\n\nRestore Reading Session: after iOS evicts Apollo, reopen the last feed, post and reading position on the next normal launch. Turn it off to delete the saved session immediately."
+                                              rows:@[ textPostThumbnails, infoRow, feedScrubber, videoScrollSmoothing, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts, hideInteractiveForYou, restoreReadingSession ]];
 }
 
 - (ApolloSettingsSection *)buildPostsFloatingTabsSection {
@@ -5378,6 +5384,11 @@ replacementString:(NSString *)string {
     sDevvitFeedWidgets = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sDevvitFeedWidgets forKey:UDKeyDevvitFeedWidgets];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloDevvitFeedOwnershipChangedNotification object:nil];
+}
+
+- (void)hideInteractiveForYouSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyHomeFeedHideInteractivePosts];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloForYouFeedFilterChangedNotification object:nil];
 }
 
 - (void)liveCommentsFollowSwitchToggled:(UISwitch *)sender {

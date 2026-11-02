@@ -3903,6 +3903,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeySportsClipsInlineVideo: @YES,
                                     UDKeyDevvitInteractivePosts: @NO,
                                     UDKeyDevvitFeedWidgets: @YES,
+                                    UDKeyHomeFeedHideInteractivePosts: @NO,
                                     UDKeyFloatingPostTabs: @NO,
                                     UDKeyFloatingPostTabsMagnet: @YES,
                                     UDKeyFloatingPostTabsPreview: @YES,

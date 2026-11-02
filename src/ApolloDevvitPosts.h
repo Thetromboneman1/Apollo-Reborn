@@ -1,4 +1,6 @@
-// ApolloDevvitPosts.h — detection surface shared with Community Highlights.
+// ApolloDevvitPosts.h — detection surface shared with Community Highlights
+// and For You. The Foundation-only implementation is in
+// ApolloDevvitPostDetection.m; the live widget renderer is ApolloDevvitPosts.xm.
 //
 // A Devvit ("Developer Platform") custom post — a live match thread, a game,
 // a bracket — is only identifiable by the old-Reddit fallback text Reddit puts
@@ -21,6 +23,9 @@ extern NSString *const ApolloDevvitFeedOwnershipChangedNotification;
 
 // The raw marker test: YES when `selfText` is Reddit's old-Reddit fallback body
 // for a custom post. Feature-flag agnostic — callers apply their own gate.
+#ifdef __cplusplus
+extern "C" {
+#endif
 BOOL ApolloDevvitSelfTextIsInteractive(NSString *selfText);
 
 // Same test, additionally requiring the fallback's sh.reddit.com link to point
@@ -33,6 +38,9 @@ BOOL ApolloDevvitSelfTextIsInteractiveForPostID(NSString *selfText, NSString *po
 
 // Same test against a t3 post's `data` dictionary (JSON API shape).
 BOOL ApolloDevvitPostDataIsInteractive(NSDictionary *postData);
+#ifdef __cplusplus
+}
+#endif
 
 // YES while interactive posts render as their real live widget in FEED cards —
 // i.e. the feed, not a highlights card, is the right owner for such a post.

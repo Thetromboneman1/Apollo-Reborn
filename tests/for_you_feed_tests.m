@@ -67,17 +67,54 @@ static NSDictionary *Child(NSString *name, BOOL hidden) {
     return @{ @"kind": @"t3", @"data": @{ @"name": name, @"hidden": @(hidden), @"title": name } };
 }
 
+static NSDictionary *InteractiveChild(NSString *name) {
+    NSString *postID = [name hasPrefix:@"t3_"] ? [name substringFromIndex:3] : name;
+    NSString *fallback = [NSString stringWithFormat:
+        @"This post contains content not supported on old Reddit. "
+         "[Click here to view the full post](https://sh.reddit.com/r/test/comments/%@/title/)", postID];
+    return @{ @"kind": @"t3", @"data": @{
+        @"name": name, @"id": postID, @"hidden": @NO, @"is_self": @YES,
+        @"selftext": fallback, @"title": @"Interactive payload"
+    } };
+}
+
 static void TestChildren(void) {
     NSDictionary *response = @{ @"kind": @"Listing", @"data": @{ @"children": @[
         Child(@"t3_c", NO), Child(@"t3_a", NO), Child(@"t3_b", YES),
         @{ @"kind": @"t1", @"data": @{ @"name": @"t1_x" } },
     ] } };
-    NSArray *ordered = ApolloForYouFeedOrderedChildren(response, @[ @"t3_a", @"t3_b", @"t3_missing", @"t3_c" ]);
+    NSArray *ordered = ApolloForYouFeedOrderedChildren(response, @[ @"t3_a", @"t3_b", @"t3_missing", @"t3_c" ], NO);
     NSArray *names = [ordered valueForKeyPath:@"data.name"];
     CHECK([names isEqualToArray:(@[ @"t3_a", @"t3_c" ])], "ordered %s", names.description.UTF8String);
-    NSArray *fromArray = ApolloForYouFeedOrderedChildren(@[ @{}, response ], @[ @"t3_c" ]);
+    NSArray *fromArray = ApolloForYouFeedOrderedChildren(@[ @{}, response ], @[ @"t3_c" ], NO);
     CHECK(fromArray.count == 1, "array-wrapped response");
-    CHECK(ApolloForYouFeedOrderedChildren(@"junk", @[ @"t3_a" ]).count == 0, "junk response");
+    CHECK(ApolloForYouFeedOrderedChildren(@"junk", @[ @"t3_a" ], NO).count == 0, "junk response");
+
+    NSDictionary *nativePoll = @{ @"kind": @"t3", @"data": @{
+        @"name": @"t3_poll", @"id": @"poll", @"hidden": @NO, @"is_self": @YES,
+        @"selftext": @"Choose your favorite option.", @"poll_data": @{ @"voting_end_timestamp": @1 }
+    } };
+    NSDictionary *mismatchedFallback = @{ @"kind": @"t3", @"data": @{
+        @"name": @"t3_summary", @"id": @"summary", @"hidden": @NO, @"is_self": @YES,
+        @"selftext": @"This post contains content not supported on old Reddit. "
+                       "[Click here](https://sh.reddit.com/r/test/comments/elsewhere/title/)"
+    } };
+    NSDictionary *mixed = @{ @"kind": @"Listing", @"data": @{ @"children": @[
+        InteractiveChild(@"t3_game"), nativePoll, Child(@"t3_normal", NO),
+        mismatchedFallback, @{ @"kind": @"t3", @"data": @{ @"name": @"t3_ad", @"promoted": @YES } },
+    ] } };
+    NSArray *filtered = ApolloForYouFeedOrderedChildren(mixed,
+        @[ @"t3_game", @"t3_poll", @"t3_normal", @"t3_summary", @"t3_ad" ], YES);
+    CHECK([[filtered valueForKeyPath:@"data.name"] isEqualToArray:
+           (@[ @"t3_poll", @"t3_normal", @"t3_summary" ])],
+          "mixed filtering %s", [[filtered valueForKeyPath:@"data.name"] description].UTF8String);
+    NSDictionary *onlyInteractive = @{ @"kind": @"Listing", @"data": @{ @"children": @[
+        InteractiveChild(@"t3_game1"), InteractiveChild(@"t3_game2")
+    ] } };
+    CHECK(ApolloForYouFeedOrderedChildren(onlyInteractive,
+        @[ @"t3_game1", @"t3_game2" ], YES).count == 0, "fully filtered batch");
+    CHECK(!ApolloForYouFeedShouldStopAfterFilteredBatches(2), "two filtered batches stay bounded but continue");
+    CHECK(ApolloForYouFeedShouldStopAfterFilteredBatches(3), "three filtered batches stop the session");
 
     NSDictionary *listing = ApolloForYouFeedListing(ordered, @"foryou:s:2");
     CHECK([listing[@"data"][@"after"] isEqual:@"foryou:s:2"], "after");

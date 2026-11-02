@@ -60,10 +60,17 @@ double ApolloForYouFeedRateLimitReset(NSDictionary *_Nullable headers);
 
 // The `data.children` of an /api/info response (NSDictionary listing, or an
 // NSArray whose last element is one — RDKClient accepts both), reordered to
-// `orderedIDs`, dropping anything that isn't a t3 the user hasn't hidden.
-// Children the response lacks are skipped.
+// `orderedIDs`, dropping anything that isn't a visible, non-promoted t3.
+// When requested, Devvit custom posts are identified from their classic-JSON
+// payload (self post + old-Reddit fallback linking its own ID) and dropped too.
+// Children the response lacks are skipped. Native Reddit polls are preserved.
 NSArray<NSDictionary *> *ApolloForYouFeedOrderedChildren(id _Nullable infoResponse,
-                                                         NSArray<NSString *> *orderedIDs);
+                                                         NSArray<NSString *> *orderedIDs,
+                                                         BOOL hideInteractivePosts);
+
+// A fully filtered first page must not drain an entire personalized feed in a
+// tight loop. Three consecutive hydration batches is the bounded stop policy.
+BOOL ApolloForYouFeedShouldStopAfterFilteredBatches(NSUInteger consecutiveFilteredBatches);
 
 // A listing response RDKClient parses like any other: {kind: Listing, data:
 // {children, after, before: null, dist}}. `after` nil = no next page.
