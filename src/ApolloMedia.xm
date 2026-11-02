@@ -1205,7 +1205,8 @@ static NSDictionary *ApolloGalleryRepairedMetadata(RDKLink *link, NSDictionary *
 }
 
 - (NSDictionary *)mediaMetadata {
-    return ApolloGalleryRepairedMetadata(self, %orig);
+    NSDictionary *originalMetadata = %orig;
+    return ApolloGalleryRepairedMetadata(self, originalMetadata);
 }
 
 - (NSString *)selfText {
