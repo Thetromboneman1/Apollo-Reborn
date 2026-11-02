@@ -24,6 +24,37 @@ static NSUInteger probes;
 static NSUInteger merges;
 static BOOL ApolloWebJSONURLIsProbe(NSURL *url) { (void)url; return NO; }
 static NSString *ApolloWebJSONAccountFromURL(NSURL *url) { (void)url; return @"alice"; }
+typedef NS_ENUM(NSInteger, ApolloWebJSONRoute) {
+    ApolloWebJSONRouteWww = 0,
+};
+typedef NS_ENUM(NSInteger, ApolloWebJSONRouteAuth) {
+    ApolloWebJSONRouteAuthCookie = 0,
+    ApolloWebJSONRouteAuthBearer,
+};
+static NSInteger ApolloWebJSONRouteFromURL(NSURL *url) { (void)url; return -1; }
+static ApolloWebJSONRouteAuth ApolloWebJSONRouteGetAuth(ApolloWebJSONRoute route) { (void)route; return ApolloWebJSONRouteAuthCookie; }
+static NSString *ApolloWebJSONRouteRequestedPath(ApolloWebJSONRoute route, NSString *path) { (void)route; return path; }
+static BOOL ApolloWebJSONRouteResponseIsRefusal(NSHTTPURLResponse *response) { (void)response; return NO; }
+static BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path) { (void)path; return NO; }
+static BOOL ApolloWebJSONRequestIsSearchRead(NSString *method, NSString *path) { (void)method; (void)path; return NO; }
+static BOOL ApolloWebJSONRouteRequestMayRetry(NSString *method, NSString *path) { (void)method; return [path containsString:@"/r/all"]; }
+static BOOL ApolloWebJSONRouteResponseIsSignInGate(NSHTTPURLResponse *response) { (void)response; return NO; }
+static BOOL ApolloWebJSONRouteHealthNoteBlockPage(NSString *account, NSString *method, NSString *path, ApolloWebJSONRoute route, NSTimeInterval now) {
+    (void)account; (void)method; (void)path; (void)route; (void)now; return NO;
+}
+static NSString *ApolloWebJSONRouteName(ApolloWebJSONRoute route) { (void)route; return @"www"; }
+static NSString *ApolloWebJSONRouteHealthGroup(NSString *method, NSString *path) { (void)method; return path; }
+static NSTimeInterval ApolloWebJSONRouteCooldownRemaining(NSString *account, NSString *method, NSString *path, ApolloWebJSONRoute route, NSTimeInterval now) {
+    (void)account; (void)method; (void)path; (void)route; (void)now; return 0;
+}
+static void ApolloWebJSONRouteHealthNoteSuccess(NSString *account, NSString *method, NSString *path, ApolloWebJSONRoute route, NSTimeInterval now) {
+    (void)account; (void)method; (void)path; (void)route; (void)now;
+}
+static void ApolloWebJSONInvalidateOAuthBearerForAccount(NSString *username, NSString *bearer) { (void)username; (void)bearer; }
+static void ApolloWebJSONNoteWebBearerResponse(NSURLRequest *request, NSHTTPURLResponse *response) { (void)request; (void)response; }
+static void ApolloWebJSONRecordRateLimit(NSString *username, NSURLRequest *request, NSHTTPURLResponse *response) {
+    (void)username; (void)request; (void)response;
+}
 @interface TestTask : NSObject
 @property(copy) void (^completion)(NSData *, NSURLResponse *, NSError *);
 - (void)resume;
