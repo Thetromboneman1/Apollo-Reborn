@@ -105,6 +105,17 @@ static void TestHomePaths(void) {
     }
 }
 
+static void TestHomeIdentity(void) {
+    CHECK(ApolloForYouFeedIsHomeIdentity(6, @"Home", nil), "controller title identifies Home");
+    CHECK(ApolloForYouFeedIsHomeIdentity(6, nil, @"Home"), "JumpBar title identifies Liquid Glass Home");
+    CHECK(!ApolloForYouFeedIsHomeIdentity(6, nil, nil), "tag alone is not enough");
+    CHECK(!ApolloForYouFeedIsHomeIdentity(0, @"Home", @"Home"), "wrong PostsType rejected");
+
+    CHECK(ApolloForYouFeedShouldApplyInitialEnable(YES, NO), "private build applies once");
+    CHECK(!ApolloForYouFeedShouldApplyInitialEnable(YES, YES), "sentinel preserves later native sort");
+    CHECK(!ApolloForYouFeedShouldApplyInitialEnable(NO, NO), "ordinary builds keep default off");
+}
+
 int main(void) {
     @autoreleasepool {
         TestParse();
@@ -113,6 +124,7 @@ int main(void) {
         TestChildren();
         TestTokens();
         TestHomePaths();
+        TestHomeIdentity();
     }
     if (sFailures) {
         fprintf(stderr, "%d failure(s)\n", sFailures);

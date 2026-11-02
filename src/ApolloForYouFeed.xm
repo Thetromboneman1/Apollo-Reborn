@@ -84,6 +84,8 @@ static NSString *const kApolloFYFeed = @"for-you";
 static NSString *const kApolloFYTitle = @"For You";
 static NSString *const kApolloFYSymbol = @"sparkles";
 static NSString *const kApolloFYErrorDomain = @"ApolloForYouFeed";
+static NSString *const kApolloFYInitialEnableInfoKey = @"ApolloInitialHomeFeedForYou";
+static NSString *const kApolloFYInitialEnableAppliedKey = @"HomeFeedForYouInitialEnableApplied";
 
 static const NSUInteger kApolloFYPageSize = 25;           // posts per page handed to Apollo
 static const NSUInteger kApolloFYHydrateBatch = 100;      // /api/info's own maximum
@@ -419,14 +421,48 @@ static ApolloFYSession *ApolloFYNewSession(NSString *username, NSString *cookieH
 
 #pragma mark - Sort button
 
+static UIView *ApolloFYFindJumpBar(UIView *root) {
+    if (!root) return nil;
+    if (ApolloClassJumpBar && [root isMemberOfClass:ApolloClassJumpBar]) return root;
+    for (UIView *child in root.subviews) {
+        UIView *match = ApolloFYFindJumpBar(child);
+        if (match) return match;
+    }
+    return nil;
+}
+
+static NSString *ApolloFYVisibleLabelText(UIView *root) {
+    if (!root || root.hidden || root.alpha < 0.01) return nil;
+    if ([root isKindOfClass:UILabel.class]) {
+        NSString *text = ((UILabel *)root).text;
+        if (text.length) return text;
+    }
+    for (UIView *child in root.subviews) {
+        NSString *text = ApolloFYVisibleLabelText(child);
+        if (text.length) return text;
+    }
+    return nil;
+}
+
+static NSString *ApolloFYJumpBarTitle(UIViewController *vc) {
+    // Liquid Glass hosts JumpBar in UINavigationBar instead of leaving Home in
+    // navigationItem.title. Read the visible view hierarchy rather than
+    // Swift Optional ivar storage, which is not object-layout safe.
+    UIView *jumpBar = ApolloFYFindJumpBar(vc.navigationController.navigationBar);
+    if (!jumpBar) jumpBar = ApolloFYFindJumpBar(vc.view);
+    return ApolloFYVisibleLabelText(jumpBar) ?: jumpBar.accessibilityLabel;
+}
+
 static UIViewController *ApolloFYHomeOwner(UIViewController *vc) {
     Class postsClass = ApolloClassPostsViewController;
     if (!postsClass || ![vc isKindOfClass:postsClass]) return nil;
-    // Home's PostsType tag is 6 (ApolloGalleryMenu.xm measured it); the nav
-    // title is the second lock, as there.
-    if (ApolloPostsTypeTagFromViewController(vc) != 6) return nil;
-    NSString *title = vc.navigationItem.title ?: vc.title;
-    return [title isEqualToString:@"Home"] ? vc : nil;
+    // Home's PostsType tag is 6 (ApolloGalleryMenu.xm measured it). Classic
+    // Apollo keeps the second lock in the controller title; Liquid Glass moves
+    // it into JumpBar and leaves both controller title properties empty.
+    NSInteger tag = ApolloPostsTypeTagFromViewController(vc);
+    NSString *controllerTitle = vc.navigationItem.title ?: vc.title;
+    NSString *jumpBarTitle = ApolloFYJumpBarTitle(vc);
+    return ApolloForYouFeedIsHomeIdentity(tag, controllerTitle, jumpBarTitle) ? vc : nil;
 }
 
 static char kApolloFYOriginalSortImageKey;
@@ -689,6 +725,14 @@ static void ApolloFYWrapNativeSortActions(NSArray<UIMenuElement *> *elements) {
 %end
 
 %ctor {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL buildRequestsEnable = [[NSBundle.mainBundle objectForInfoDictionaryKey:kApolloFYInitialEnableInfoKey] boolValue];
+    BOOL alreadyApplied = [defaults boolForKey:kApolloFYInitialEnableAppliedKey];
+    if (ApolloForYouFeedShouldApplyInitialEnable(buildRequestsEnable, alreadyApplied)) {
+        [defaults setBool:YES forKey:UDKeyHomeFeedForYou];
+        [defaults setBool:YES forKey:kApolloFYInitialEnableAppliedKey];
+        ApolloLog(@"[ForYou] applied private-build initial enable");
+    }
     sApolloFYQueue = dispatch_queue_create("com.apolloreborn.foryou", DISPATCH_QUEUE_SERIAL);
     sApolloFYSessions = [NSMutableDictionary dictionary];
     sApolloFYSignedOutUsers = [NSMutableSet set];

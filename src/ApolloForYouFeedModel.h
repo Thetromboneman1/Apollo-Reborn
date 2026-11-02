@@ -81,6 +81,17 @@ BOOL ApolloForYouFeedParseToken(NSString *_Nullable token, NSString *_Nullable *
 // "%@.json" with no prefix). Every other feed has a prefix (r/…, user/…).
 BOOL ApolloForYouFeedIsHomeListingPath(NSString *_Nullable path);
 
+// PostsType tag 6 is Home in Apollo 1.15.11. Liquid Glass moves the visible
+// title into JumpBar, leaving the view controller/navigation titles empty, so
+// callers may supply either title as the second identity lock.
+BOOL ApolloForYouFeedIsHomeIdentity(NSInteger postsTypeTag,
+                                    NSString *_Nullable controllerTitle,
+                                    NSString *_Nullable jumpBarTitle);
+
+// A private build can ask to turn For You on once. The persisted sentinel
+// keeps a later native-sort selection reversible across future launches.
+BOOL ApolloForYouFeedShouldApplyInitialEnable(BOOL buildRequestsEnable, BOOL alreadyApplied);
+
 #ifdef __cplusplus
 }
 #endif

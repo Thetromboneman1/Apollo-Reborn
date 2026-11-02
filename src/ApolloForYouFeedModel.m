@@ -189,3 +189,12 @@ BOOL ApolloForYouFeedIsHomeListingPath(NSString *path) {
     });
     return [homePaths containsObject:p.lowercaseString];
 }
+
+BOOL ApolloForYouFeedIsHomeIdentity(NSInteger postsTypeTag, NSString *controllerTitle, NSString *jumpBarTitle) {
+    if (postsTypeTag != 6) return NO;
+    return [controllerTitle isEqualToString:@"Home"] || [jumpBarTitle isEqualToString:@"Home"];
+}
+
+BOOL ApolloForYouFeedShouldApplyInitialEnable(BOOL buildRequestsEnable, BOOL alreadyApplied) {
+    return buildRequestsEnable && !alreadyApplied;
+}
