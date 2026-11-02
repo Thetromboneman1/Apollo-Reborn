@@ -295,10 +295,11 @@ static const void *kApolloSFDisplayStyledKey = &kApolloSFDisplayStyledKey;
     tapGesture.delegate = self;
     [self.view addGestureRecognizer:tapGesture];
     // Let standard cells grow for Dynamic Type and long localized labels.
-    // Returning UITableViewAutomaticDimension from the delegate below keeps
-    // explicit row.height blocks authoritative while avoiding 44pt clipping.
+    // Custom/subtitle cells and Liquid Glass retain UIKit's automatic sizing.
+    // The delegate measures ordinary classic rows; explicit row.height blocks
+    // remain authoritative in both designs.
     self.tableView.rowHeight = UITableViewAutomaticDimension;
-    self.tableView.estimatedRowHeight = 52.0;
+    self.tableView.estimatedRowHeight = IsLiquidGlass() ? 52.0 : 44.0;
     [self rebuildForm];
 }
 
@@ -788,7 +789,15 @@ static void ApolloSFAddPath(NSMutableDictionary<NSNumber *, NSMutableArray<NSInd
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
     ApolloSettingsRow *row = [self apollo_sf_rowAtIndexPath:indexPath];
-    return row.height ? row.height() : tableView.rowHeight;
+    if (row.height) return row.height();
+    if (!IsLiquidGlass() && row && row.kind != ApolloSFRowKindCustom &&
+        !row.detailAsSubtitle && !row.configure) {
+        CGFloat accessoryWidth = row.kind == ApolloSFRowKindSwitch ? 67.0
+            : (row.kind == ApolloSFRowKindDisclosure ? 24.0 : 0.0);
+        return ApolloSettingsClassicRowHeight(tableView, row.title,
+            row.detail ? row.detail() : nil, row.iconSystemName != nil, accessoryWidth);
+    }
+    return tableView.rowHeight;
 }
 
 #pragma mark section header heights

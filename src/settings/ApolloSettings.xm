@@ -569,8 +569,15 @@ static UITableView *ApolloRootSettingsTableInView(UIView *view) {
         // This is the existing single owner of the root table, not a second
         // delegate/remapper layered onto Apollo's General screen.
         if (ApolloPaneSplitControllerFor((UIViewController *)self) &&
-            UIContentSizeCategoryIsAccessibilityCategory(tableView.traitCollection.preferredContentSizeCategory))
+            UIContentSizeCategoryIsAccessibilityCategory(tableView.traitCollection.preferredContentSizeCategory)) {
             return UITableViewAutomaticDimension;
+        }
+        // These replace native rows with different index paths. Ask Apollo for
+        // its ordinary General row's height in classic mode, rather than using
+        // the roomier Liquid Glass minimum for both designs.
+        if (!IsLiquidGlass()) {
+            return %orig(tableView, [NSIndexPath indexPathForRow:0 inSection:1]);
+        }
         return MAX(52.0, ceil(ApolloSettingsFont(UIFontTextStyleBody, tableView.traitCollection).lineHeight) + 22.0);
     }
     return %orig;

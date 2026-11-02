@@ -1,7 +1,9 @@
 #import "ApolloActionMenu.h"
 #import "ApolloActionMenuLayout.h"
+#import "ApolloCommentNavigator.h"
 #import "ApolloCommon.h"
 #import "ApolloNativeActionMenus.h"
+#import "ApolloProfileMoreMenu.h"
 #import "ApolloNavigationActions.h"
 #import "ApolloNativeActionMetadata.h"
 #import "ApolloSwiftRuntime.h"
@@ -901,6 +903,7 @@ static BOOL ApolloNativeActionMenuPerformPendingDirectAction(id actionController
     sApolloNativeDirectActionSourceView = nil;
     sApolloNativeDirectActionKind = UINT16_MAX;
 
+    ApolloActionMenuPrepareControllerForDirectAction(actionController);
     NSInteger row = ApolloNativeActionMenuRowForActionKind(actionController, actionKind);
     if (row == NSNotFound) {
         ApolloLog(@"[NativeActionMenu] Posts action kind %u unavailable", actionKind);
@@ -2699,6 +2702,8 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 
 %hook _TtC6Apollo26ApolloNavigationController
 - (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    ApolloCommentNavigatorPreparePresentation(viewControllerToPresent);
+    if (!ApolloProfileMoreMenuPreparePresentation((UIViewController *)self, viewControllerToPresent)) return;
     if (ApolloNativeActionMenuPerformPendingDirectAction(viewControllerToPresent)) {
         if (completion) completion();
         return;
@@ -2716,6 +2721,8 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
 %hook UIViewController
 
 - (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    ApolloCommentNavigatorPreparePresentation(viewControllerToPresent);
+    if (!ApolloProfileMoreMenuPreparePresentation((UIViewController *)self, viewControllerToPresent)) return;
     if (ApolloNativeActionMenuPerformPendingDirectAction(viewControllerToPresent)) {
         if (completion) completion();
         return;
