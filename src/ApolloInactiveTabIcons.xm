@@ -124,11 +124,18 @@ static UITabBarItem *ApolloTabItemForIcon(UIImageView *icon,
         }
     }
 
+    BOOL rightToLeft =
+        bar.effectiveUserInterfaceLayoutDirection ==
+        UIUserInterfaceLayoutDirectionRightToLeft;
+
     [buttons sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
         CGFloat x = CGRectGetMidX(a.frame);
         CGFloat y = CGRectGetMidX(b.frame);
-        return x < y ? NSOrderedAscending :
-               x > y ? NSOrderedDescending : NSOrderedSame;
+
+        if (x == y) return NSOrderedSame;
+        if (rightToLeft)
+            return x > y ? NSOrderedAscending : NSOrderedDescending;
+        return x < y ? NSOrderedAscending : NSOrderedDescending;
     }];
 
     NSUInteger index = [buttons indexOfObject:button];
