@@ -867,6 +867,19 @@ static void ApolloPresentFeatureRequestsChooser(UIViewController *aboutVC,
 %end
 %end
 
+%group ApolloSettingsLivePicker
+%hook UIAlertController
+
+- (void)_dismissAnimated:(BOOL)animated
+    triggeringAction:(UIAlertAction *)action
+    triggeredByPopoverDimmingView:(BOOL)fromDimmingView
+    dismissCompletion:(void (^)(void))completion {
+    ApolloSettingsApplyLivePickerAction(action);
+    %orig(animated, action, fromDimmingView, completion);
+}
+
+%end
+%end
 %hook SettingsPortraitLockViewController
 
 - (void)viewDidLoad {
