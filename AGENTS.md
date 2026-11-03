@@ -31,6 +31,16 @@ Device `make package` defaults to `TARGET := iphone:clang:26.0:14.0`. Keep this 
 
 The iOS 27.1 SDK declares `SupportedTargets.iphoneos.MinimumDeploymentTarget = 15.0` in `SDKSettings.json`. Pinning that SDK by name does **not** bypass its minimum. A developer-only newer-SDK build must explicitly select both SDK and a compatible deployment target, for example `make package APOLLO_DEVICE_SDK=27.1 APOLLO_DEVICE_DEPLOY=15.0`; that artifact does not support iOS 14. The Makefile rejects alternate SDK pins without an explicit iOS 15-or-newer deployment target. Check the selected SDK's metadata for any higher minimum. Explicit command-line `TARGET` remains authoritative; the simulator script supplies `TARGET=simulator:clang:latest:15.0` and bypasses device defaults.
 
+For the private iOS 27 device-update workflow, use the matching SDK installed in the selected Xcode and set both its SDK root and the iOS 15 floor explicitly. Build 365 was verified with Xcode 27.2 using:
+
+```sh
+THEOS=/Users/corn/theos \
+THEOS_PLATFORM_SDK_ROOT=/Applications/Xcode.app/Contents/Developer \
+make -j2 package FINALPACKAGE=1 APOLLO_DEVICE_SDK=27.2 APOLLO_DEVICE_DEPLOY=15.0
+```
+
+Do not fall back to the default iOS 26 device SDK for a private build containing iOS 27 framework references: that configuration reaches the linker and then fails with undefined iOS 27 symbols. If Xcode 27.1 is restored, use the equivalent explicit `27.1` SDK pin with the same iOS 15 deployment floor.
+
 Theos merges SDK candidates from `$THEOS_SDKS_PATH` (`$THEOS/sdks`) and the selected Xcode's SDK directory (see `$THEOS/makefiles/targets/_common/darwin_head.mk`). It matches the folder name `iPhoneOS<version>.sdk`. A real `iPhoneOS26.0.sdk` under `$THEOS/sdks` therefore supplies the release SDK without changing the Xcode.app bundle or switching the host's active toolchain. `DEVELOPER_DIR` is respected.
 
 **The simulator needs its current SDK.** A simulator binary links to the host's system libraries. Pairing an old Simulator SDK with a newer compiler is incompatible; see the simulator section below. The simulator uses a local-only iOS 15 deployment floor. This does not change the device release floor.
