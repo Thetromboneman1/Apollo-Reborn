@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- Add **TrollStore** to the in-app update chooser for existing TrollStore installations, with an in-place IPA hand-off.
+
 ## [v4.0.1] - 2026-10-30
 
 ### Performance

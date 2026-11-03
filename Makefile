@@ -532,6 +532,11 @@ endif
 # ApolloAppleTranslation.swift) only exists on iOS 18.0+. Weak-link it so the tweak still
 # loads on older iOS, where the Apple provider is gated off at runtime.
 ApolloReborn_LDFLAGS += -weak_framework Translation
+# Keep SwiftUI translation dependencies optional on older iOS releases.
+ApolloReborn_LDFLAGS += -weak_framework _Translation_SwiftUI
+ifneq ($(wildcard $(SYSROOT)/System/Library/Frameworks/SwiftUICore.framework),)
+ApolloReborn_LDFLAGS += -weak_framework SwiftUICore
+endif
 # Xcode 27 warns that its bundled libc++ no longer supports deployment below
 # iOS 15. Keep the established iOS 14 target buildable while treating every
 # other warning as an error; runtime availability guards remain authoritative.
