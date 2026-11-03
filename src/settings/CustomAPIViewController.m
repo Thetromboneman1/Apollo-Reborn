@@ -6,6 +6,7 @@
 #import "settings/CustomAPIViewController.h"
 #import "settings/ApolloSetupAssistant.h"
 #import "ApolloSignInSplash.h"
+#import "ApolloSpelling.h"
 #import "settings/ApolloSiriSettingsViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloAppIcon.h"
@@ -279,7 +280,7 @@ static NSString *ApolloIPadPaneLayoutSettingDetail(void) {
             ? @"Will turn on after Apollo quits and reopens. The current single-column layout remains active until then."
             : @"Will turn off after Apollo quits and reopens. The current iPad Layout remains active until then.";
     }
-    return @"Beta on iPadOS 26 or newer. Keep favourites in the sidebar and read posts and comments side by side. You can switch back anytime. Reopen Apollo to apply changes.";
+    return @"Beta on iPadOS 26 or newer. Keep favorites in the sidebar and read posts and comments side by side. You can switch back anytime. Reopen Apollo to apply changes.";
 }
 
 @interface ApolloFeedShortcutsPreviewState : NSObject
@@ -2746,7 +2747,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     };
 
     NSString *displayNavigationFooter =
-    @"True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
+    @"Spelling applies to screens as they open; reopen Apollo to update everything. True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
 
     if (IsLiquidGlass()) {
         displayNavigationFooter = [displayNavigationFooter stringByAppendingString:
@@ -2773,6 +2774,48 @@ typedef NS_ENUM(NSInteger, Tag) {
                 });
         }];
 
+    NSArray<NSString *> *spellingTitles = @[ @"American", @"British" ];
+    void (^applySpelling)(NSInteger) = ^(NSInteger picked) {
+        ApolloSpellingSetStyle(picked == 1 ? ApolloSpellingStyleBritish : ApolloSpellingStyleAmerican);
+        // Other loaded lists (the subreddit list in another tab) pick it up now too.
+        ApolloSpellingReloadLoadedTables(weakSelf.tableView);
+        // Rebuild so this screen's own labels pick up the new spelling. Cell labels skip
+        // a set whose text matches what they show, so clear them first.
+        [weakSelf performUpdateKeepingVisibleRowsInPlace:^{
+            for (UITableViewCell *cell in weakSelf.tableView.visibleCells) {
+                cell.textLabel.text = nil;
+                cell.detailTextLabel.text = nil;
+            }
+            [weakSelf rebuildForm];
+        }];
+    };
+    // Liquid Glass uses the native pull-down like the other Interface pickers; the
+    // standard build keeps the action sheet.
+    ApolloSettingsRow *spelling = IsLiquidGlass()
+        ? [ApolloSettingsRow customRowWithID:@"interface.spelling"
+                                        cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:@"ApolloSpellingMenu"];
+            if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                                      reuseIdentifier:@"ApolloSpellingMenu"];
+            NSInteger current = ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0;
+            cell.textLabel.text = @"Spelling";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.accessoryView = ApolloSettingsMenuButton(@"Spelling", spellingTitles[current],
+                                                          spellingTitles, current, applySpelling);
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        } onSelect:nil]
+        : [ApolloSettingsRow valueRowWithID:@"interface.spelling"
+                                      title:@"Spelling"
+                                     detail:^NSString * {
+            return spellingTitles[ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0];
+        }
+                                   onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.spelling"],
+                @"Spelling", spellingTitles, ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0,
+                applySpelling);
+        }];
+
     NSArray<NSString *> *trueBlackTitles = @[ @"Off", @"Dark Mode Only", @"Light Mode Only", @"Always" ];
     ApolloSettingsRow *trueBlackKeyboard =
         [ApolloSettingsRow valueRowWithID:@"interface.trueBlackKeyboard"
@@ -2793,7 +2836,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
                                             footer:displayNavigationFooter
-                                              rows:@[ scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect ]];
+                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden

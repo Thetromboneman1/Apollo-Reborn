@@ -4,6 +4,7 @@
 #import <QuartzCore/QuartzCore.h>
 
 #import "ApolloCommon.h"
+#import "ApolloSpelling.h"
 
 typedef NS_ENUM(NSInteger, ApolloSFRowKind) {
     ApolloSFRowKindSwitch = 0,
@@ -658,13 +659,14 @@ static void ApolloSFAddPath(NSMutableDictionary<NSNumber *, NSMutableArray<NSInd
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if ((NSUInteger)section >= _visibleSections.count) return nil;
-    return _visibleSections[(NSUInteger)section].title;
+    return ApolloSpellingApply(_visibleSections[(NSUInteger)section].title);
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if ((NSUInteger)section >= _visibleSections.count) return nil;
     ApolloSettingsSection *model = _visibleSections[(NSUInteger)section];
-    return model.footer;
+    // In the label's spelling, so footer measurement and lookups see the text shown.
+    return ApolloSpellingApply(model.footer);
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
