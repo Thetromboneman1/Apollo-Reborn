@@ -82,6 +82,7 @@ BOOL sIPadPaneLayout = NO;     // opt-in (default OFF via registerDefaults, UDKe
 BOOL sTabBarSwipeNavigation = NO;   // opt-in (default OFF via registerDefaults, UDKeyTabBarSwipeNavigation); Liquid Glass only, see ApolloLiquidGlass.xm
 NSInteger sDuoLandscapeFeedLayout = 0;
 BOOL sDuoSubredditPanelGlassEnabled = NO;
+BOOL sDuoTabletopVideoEnabled = NO;
 BOOL sKeepSearchBarInPlace = NO;
 ApolloSettingsIconAppearance sSettingsIconAppearance = ApolloSettingsIconAppearanceLight;
 BOOL sIconRowMagnifier = YES;   // effective default ON via registerDefaults (UDKeyIconRowMagnifier)
