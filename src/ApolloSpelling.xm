@@ -1,10 +1,9 @@
-// British spelling: rewrites American words in UI chrome text as it is set.
-//
-// Only setters that carry interface text are hooked (labels, buttons, navigation/tab/bar items,
-// alerts, menus, segmented controls, list content configurations). Reddit content is drawn by
-// Texture text nodes, which are left alone, so posts and comments keep their author's spelling.
-// Words attached to "/", "@", "#" or "." (r/colors, u/FavoriteUser, colors.com) are skipped, and
-// American mode returns before doing any work.
+// British spelling for interface text. Automatic setters accept only immutable
+// compile-time NSString literals. Account names, community names and other
+// runtime content must retain their exact spelling even when their value equals
+// an interface word. Trusted dynamic chrome can opt in via ApolloSpellingApply.
+// Attributed strings no longer carry reliable literal provenance, so their
+// generic setters are left alone; convert trusted text before building them.
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import "ApolloSpelling.h"
@@ -140,6 +139,14 @@ NSString *ApolloSpellingCanonical(NSString *text) {
     return result;
 }
 
+// Identity/provenance, never a value or prefix heuristic: a tagged, mutable,
+// bridged or otherwise dynamically created string does not become trusted merely
+// because it happens to contain the same bytes as one of our interface literals.
+static NSString *ApolloSpellingApplyInterfaceLiteral(NSString *text) {
+    if (sSpellingStyle != ApolloSpellingStyleBritish) return text;
+    return text && object_getClass(text) == object_getClass(@"") ? ApolloSpellingApply(text) : text;
+}
+
 static void CollectTables(UIView *view, UIView *except, Class textureTable, NSMutableArray<UITableView *> *out, int depth) {
     if (!view || view == except || depth > 12) return;
     if ([view isKindOfClass:UITableView.class] && !(textureTable && [view isKindOfClass:textureTable])) {
@@ -182,18 +189,6 @@ void ApolloSpellingReloadLoadedTables(UIView *except) {
     ApolloLog(@"[Spelling] reloaded %lu loaded table(s) for the new style", (unsigned long)seen.count);
 }
 
-// Replaces word by word so each keeps the attributes of the run it sits in.
-static NSAttributedString *ApolloSpellingApplyAttributed(NSAttributedString *text) {
-    if (![text isKindOfClass:NSAttributedString.class]) return text;
-    NSArray<NSTextCheckingResult *> *matches = SpellingMatches(text.string);
-    if (!matches) return text;
-    NSMutableAttributedString *result = [text mutableCopy];
-    for (NSTextCheckingResult *match in matches.reverseObjectEnumerator) {
-        [result replaceCharactersInRange:match.range withString:BritishFor([text.string substringWithRange:match.range])];
-    }
-    return result;
-}
-
 ApolloSpellingStyle ApolloSpellingCurrentStyle(void) {
     return sSpellingStyle;
 }
@@ -205,69 +200,64 @@ void ApolloSpellingSetStyle(ApolloSpellingStyle style) {
 }
 
 %hook UILabel
-- (void)setText:(NSString *)text { text = ApolloSpellingApply(text); %orig(text); }
-- (void)setAttributedText:(NSAttributedString *)text { text = ApolloSpellingApplyAttributed(text); %orig(text); }
+- (void)setText:(NSString *)text { text = ApolloSpellingApplyInterfaceLiteral(text); %orig(text); }
 %end
 
 %hook UIButton
-- (void)setTitle:(NSString *)title forState:(UIControlState)state { title = ApolloSpellingApply(title); %orig(title, state); }
-- (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state {
-    title = ApolloSpellingApplyAttributed(title);
-    %orig(title, state);
-}
+- (void)setTitle:(NSString *)title forState:(UIControlState)state { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title, state); }
 %end
 
 %hook UINavigationItem
-- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
-- (void)setBackButtonTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
+- (void)setBackButtonTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
 %end
 
 %hook UIBarButtonItem
-- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
 %end
 
 %hook UITabBarItem
-- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
 %end
 
 %hook UIAlertController
-- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
-- (void)setMessage:(NSString *)message { message = ApolloSpellingApply(message); %orig(message); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
+- (void)setMessage:(NSString *)message { message = ApolloSpellingApplyInterfaceLiteral(message); %orig(message); }
 %end
 
 %hook UIAlertAction
 + (instancetype)actionWithTitle:(NSString *)title style:(UIAlertActionStyle)style handler:(id)handler {
-    title = ApolloSpellingApply(title);
+    title = ApolloSpellingApplyInterfaceLiteral(title);
     return %orig(title, style, handler);
 }
 %end
 
 %hook UIAction
 + (instancetype)actionWithTitle:(NSString *)title image:(UIImage *)image identifier:(UIActionIdentifier)identifier handler:(id)handler {
-    title = ApolloSpellingApply(title);
+    title = ApolloSpellingApplyInterfaceLiteral(title);
     return %orig(title, image, identifier, handler);
 }
-- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
 %end
 
 %hook UIMenu
 + (instancetype)menuWithTitle:(NSString *)title image:(UIImage *)image identifier:(UIMenuIdentifier)identifier options:(UIMenuOptions)options children:(NSArray *)children {
-    title = ApolloSpellingApply(title);
+    title = ApolloSpellingApplyInterfaceLiteral(title);
     return %orig(title, image, identifier, options, children);
 }
 %end
 
 %hook UISegmentedControl
-- (void)setTitle:(NSString *)title forSegmentAtIndex:(NSUInteger)segment { title = ApolloSpellingApply(title); %orig(title, segment); }
+- (void)setTitle:(NSString *)title forSegmentAtIndex:(NSUInteger)segment { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title, segment); }
 - (void)insertSegmentWithTitle:(NSString *)title atIndex:(NSUInteger)segment animated:(BOOL)animated {
-    title = ApolloSpellingApply(title);
+    title = ApolloSpellingApplyInterfaceLiteral(title);
     %orig(title, segment, animated);
 }
 %end
 
 %hook UIListContentConfiguration
-- (void)setText:(NSString *)text { text = ApolloSpellingApply(text); %orig(text); }
-- (void)setSecondaryText:(NSString *)text { text = ApolloSpellingApply(text); %orig(text); }
+- (void)setText:(NSString *)text { text = ApolloSpellingApplyInterfaceLiteral(text); %orig(text); }
+- (void)setSecondaryText:(NSString *)text { text = ApolloSpellingApplyInterfaceLiteral(text); %orig(text); }
 %end
 
 %ctor {

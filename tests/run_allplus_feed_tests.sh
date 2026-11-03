@@ -32,6 +32,6 @@ xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror \
 
 # Each scenario starts a fresh process: the rewrite's buffer, owner and
 # generation are static.
-for scenario in cold-start refresh-cache account-switch account-switch-before-load mixed-auth sort-restricted disable-in-flight disable-flag-only; do
+for scenario in listing-url-shapes cold-start refresh-cache account-switch account-switch-before-load mixed-auth sort-restricted disable-in-flight disable-flag-only; do
     "$test_build_dir/tests" "$scenario"
 done
