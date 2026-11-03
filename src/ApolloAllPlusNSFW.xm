@@ -74,7 +74,13 @@ static BOOL IsRAllPath(NSURL *url) {
     NSArray<NSString *> *parts = url.pathComponents;
     NSUInteger rIdx = [parts indexOfObject:@"r"];
     if (rIdx == NSNotFound || rIdx + 1 >= parts.count) return NO;
-    return [parts[rIdx + 1] caseInsensitiveCompare:@"all"] == NSOrderedSame;
+    NSString *subreddit = parts[rIdx + 1].lowercaseString;
+    // Web JSON appends the suffix to a bare listing's subreddit segment,
+    // whereas sorted listings carry it on the sort segment instead.
+    if ([subreddit hasSuffix:@".json"]) {
+        subreddit = [subreddit substringToIndex:subreddit.length - 5];
+    }
+    return [subreddit isEqualToString:@"all"];
 }
 
 // Sort segment following "all" in the path, e.g. "/r/all/top.json" -> "top";

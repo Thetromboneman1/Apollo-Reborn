@@ -137,6 +137,38 @@ static void SignIn(NSString *username, NSString *bearer) {
 
 #pragma mark - scenarios
 
+// The Web JSON transport rewrites a bare /r/all request to /r/all.json.
+// Both spellings must start the search and merge its answer on a later page,
+// while lookalike subreddit names must leave the buffer and searches alone.
+static void TestListingURLShapes(void) {
+    SignIn(@"alice", @"tokA");
+    NSArray *page = @[ Child(@"t3_native", 500, kNow) ];
+    for (NSString *path in @[@"/r/all", @"/r/all.json", @"/r/ALL.JSON",
+                            @"/r/All/hot.json", @"/r/All/BEST.JSON", @"/r/all/rising"]) {
+        ApolloAllPlusInvalidate();
+        Drain();
+        NSUInteger before = sRequests.count;
+        NSString *url = [@"https://oauth.reddit.com" stringByAppendingString:path];
+        CHECK(Rewrite(url, page) == nil, @"%@ cold page stays stock", path);
+        CHECK(sRequests.count == before + 1, @"%@ must start one background search", path);
+        if (sRequests.count != before + 1) continue;
+        Complete(sRequests[before], @[Child(@"t3_candidate", 100000, kNow)], nil);
+        NSArray *names = Rewrite([url stringByAppendingString:@"?after=t3_nextpage"], page);
+        CHECK([names isEqual:(@[@"t3_candidate", @"t3_native"])],
+              @"%@ must merge the candidate on the next page, got %@", path, names);
+    }
+
+    NSUInteger requests = sRequests.count;
+    NSUInteger generation = sAPGeneration;
+    for (NSString *path in @[@"/r/all.jsonish", @"/r/all.json.json", @"/r/allen.json",
+                            @"/r/cats/hot.json", @"/user/all.json", @"/r/", @"/r/all/new.json"]) {
+        NSString *url = [@"https://oauth.reddit.com" stringByAppendingString:path];
+        CHECK(Rewrite(url, page) == nil, @"%@ must remain stock", path);
+    }
+    CHECK(sRequests.count == requests, @"non-All/hot listings start no search");
+    CHECK(sAPGeneration == generation, @"non-All/hot listings do not reset the load");
+}
+
 // (f) Cold start: page 1 stays stock while the first search runs; once it has
 // answered, page 2 merges the candidate that outranks the weakest native, and
 // the one that doesn't stays buffered.
@@ -336,6 +368,7 @@ int main(int argc, const char *argv[]) {
         sRequests = [NSMutableArray array];
         sUserAgent = @"Apollo/1.15.11 fixture";
         NSDictionary<NSString *, dispatch_block_t> *scenarios = @{
+            @"listing-url-shapes": ^{ TestListingURLShapes(); },
             @"cold-start": ^{ TestColdStart(); },
             @"refresh-cache": ^{ TestRefreshFromCache(); },
             @"account-switch": ^{ TestAccountSwitch(); },

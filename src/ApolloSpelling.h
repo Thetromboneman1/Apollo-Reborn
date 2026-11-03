@@ -1,8 +1,9 @@
 // Spelling style for UI text: American (default, Apollo's own spelling) or British.
 //
 // Tweak strings are written in American spelling to match Apollo's binary. When British is
-// picked, ApolloSpelling.xm rewrites UI chrome text (labels, titles, menus, alerts) as it is set,
-// so Apollo's native strings and the tweak's follow the same choice.
+// picked, ApolloSpelling.xm automatically rewrites compile-time interface literals.
+// Runtime content (including bare account/community names) and attributed setters
+// are unchanged. Trusted dynamic interface text opts in with ApolloSpellingApply.
 #import <UIKit/UIKit.h>
 
 #ifdef __cplusplus
@@ -17,7 +18,8 @@ typedef NS_ENUM(NSInteger, ApolloSpellingStyle) {
 ApolloSpellingStyle ApolloSpellingCurrentStyle(void);
 // Saves the style; text set from now on follows it. Text already on screen keeps its spelling.
 void ApolloSpellingSetStyle(ApolloSpellingStyle style);
-// Returns `text` in the current style (unchanged in American mode or when nothing matches).
+// Explicitly converts trusted interface text in the current style (unchanged in American mode
+// or when nothing matches). Never pass account/community identifiers or user content.
 NSString *ApolloSpellingApply(NSString *text);
 // Returns `text` with British spellings turned back into American, whatever the current style.
 // Use it before matching text read back from on-screen labels against American literals.
