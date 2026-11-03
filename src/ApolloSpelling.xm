@@ -205,64 +205,69 @@ void ApolloSpellingSetStyle(ApolloSpellingStyle style) {
 }
 
 %hook UILabel
-- (void)setText:(NSString *)text { %orig(ApolloSpellingApply(text)); }
-- (void)setAttributedText:(NSAttributedString *)text { %orig(ApolloSpellingApplyAttributed(text)); }
+- (void)setText:(NSString *)text { text = ApolloSpellingApply(text); %orig(text); }
+- (void)setAttributedText:(NSAttributedString *)text { text = ApolloSpellingApplyAttributed(text); %orig(text); }
 %end
 
 %hook UIButton
-- (void)setTitle:(NSString *)title forState:(UIControlState)state { %orig(ApolloSpellingApply(title), state); }
+- (void)setTitle:(NSString *)title forState:(UIControlState)state { title = ApolloSpellingApply(title); %orig(title, state); }
 - (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state {
-    %orig(ApolloSpellingApplyAttributed(title), state);
+    title = ApolloSpellingApplyAttributed(title);
+    %orig(title, state);
 }
 %end
 
 %hook UINavigationItem
-- (void)setTitle:(NSString *)title { %orig(ApolloSpellingApply(title)); }
-- (void)setBackButtonTitle:(NSString *)title { %orig(ApolloSpellingApply(title)); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
+- (void)setBackButtonTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
 %end
 
 %hook UIBarButtonItem
-- (void)setTitle:(NSString *)title { %orig(ApolloSpellingApply(title)); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
 %end
 
 %hook UITabBarItem
-- (void)setTitle:(NSString *)title { %orig(ApolloSpellingApply(title)); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
 %end
 
 %hook UIAlertController
-- (void)setTitle:(NSString *)title { %orig(ApolloSpellingApply(title)); }
-- (void)setMessage:(NSString *)message { %orig(ApolloSpellingApply(message)); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
+- (void)setMessage:(NSString *)message { message = ApolloSpellingApply(message); %orig(message); }
 %end
 
 %hook UIAlertAction
 + (instancetype)actionWithTitle:(NSString *)title style:(UIAlertActionStyle)style handler:(id)handler {
-    return %orig(ApolloSpellingApply(title), style, handler);
+    title = ApolloSpellingApply(title);
+    return %orig(title, style, handler);
 }
 %end
 
 %hook UIAction
 + (instancetype)actionWithTitle:(NSString *)title image:(UIImage *)image identifier:(UIActionIdentifier)identifier handler:(id)handler {
-    return %orig(ApolloSpellingApply(title), image, identifier, handler);
+    title = ApolloSpellingApply(title);
+    return %orig(title, image, identifier, handler);
 }
-- (void)setTitle:(NSString *)title { %orig(ApolloSpellingApply(title)); }
+- (void)setTitle:(NSString *)title { title = ApolloSpellingApply(title); %orig(title); }
 %end
 
 %hook UIMenu
 + (instancetype)menuWithTitle:(NSString *)title image:(UIImage *)image identifier:(UIMenuIdentifier)identifier options:(UIMenuOptions)options children:(NSArray *)children {
-    return %orig(ApolloSpellingApply(title), image, identifier, options, children);
+    title = ApolloSpellingApply(title);
+    return %orig(title, image, identifier, options, children);
 }
 %end
 
 %hook UISegmentedControl
-- (void)setTitle:(NSString *)title forSegmentAtIndex:(NSUInteger)segment { %orig(ApolloSpellingApply(title), segment); }
+- (void)setTitle:(NSString *)title forSegmentAtIndex:(NSUInteger)segment { title = ApolloSpellingApply(title); %orig(title, segment); }
 - (void)insertSegmentWithTitle:(NSString *)title atIndex:(NSUInteger)segment animated:(BOOL)animated {
-    %orig(ApolloSpellingApply(title), segment, animated);
+    title = ApolloSpellingApply(title);
+    %orig(title, segment, animated);
 }
 %end
 
 %hook UIListContentConfiguration
-- (void)setText:(NSString *)text { %orig(ApolloSpellingApply(text)); }
-- (void)setSecondaryText:(NSString *)text { %orig(ApolloSpellingApply(text)); }
+- (void)setText:(NSString *)text { text = ApolloSpellingApply(text); %orig(text); }
+- (void)setSecondaryText:(NSString *)text { text = ApolloSpellingApply(text); %orig(text); }
 %end
 
 %ctor {

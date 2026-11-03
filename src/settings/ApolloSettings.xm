@@ -899,20 +899,6 @@ static void ApolloPresentFeatureRequestsChooser(UIViewController *aboutVC,
 
 %end
 
-%group ApolloSettingsLivePicker
-%hook UIAlertController
-
-- (void)_dismissAnimated:(BOOL)animated
-    triggeringAction:(UIAlertAction *)action
-    triggeredByPopoverDimmingView:(BOOL)fromDimmingView
-    dismissCompletion:(void (^)(void))completion {
-    ApolloSettingsApplyLivePickerAction(action);
-    %orig(animated, action, fromDimmingView, completion);
-}
-
-%end
-%end
-
 %ctor {
     SEL dismissSelector = NSSelectorFromString(@"_dismissAnimated:triggeringAction:triggeredByPopoverDimmingView:dismissCompletion:");
     Method dismissMethod = class_getInstanceMethod(UIAlertController.class, dismissSelector);
