@@ -12,6 +12,8 @@
 
 __BEGIN_DECLS
 
+extern Class ApolloClassUIViewReservedRegionKind;
+
 extern Class ApolloClassASBackgroundLayoutSpec;
 extern Class ApolloClassASBatchContext;
 extern Class ApolloClassASButtonNode;
@@ -30,6 +32,7 @@ extern Class ApolloClassASRatioLayoutSpec;
 extern Class ApolloClassASStackLayoutSpec;
 extern Class ApolloClassASTableNode;
 extern Class ApolloClassASTableView;
+extern Class ApolloClassASTableViewCell;
 extern Class ApolloClassASTableViewController;
 extern Class ApolloClassASTextNode;
 extern Class ApolloClassASTextNode2;
@@ -62,6 +65,7 @@ extern Class ApolloClassComposeViewController;
 extern Class ApolloClassCrosspostNode;
 extern Class ApolloClassCrosspostPerformViewController;
 extern Class ApolloClassDualStateButtonNode;
+extern Class ApolloClassEmptyStateLabel;
 extern Class ApolloClassFLAnimatedImage;
 extern Class ApolloClassFLAnimatedImageView;
 extern Class ApolloClassJumpBar;
@@ -117,6 +121,8 @@ extern Class ApolloClassThinSeparatorCellNode;
 extern Class ApolloClassMessageInputBar;
 extern Class ApolloClassTranslatorViewController;
 extern Class ApolloClassUIBarBadgeView;
+// A navigation item's button on the iOS 26/27 bars, including the Duo's vertical rail.
+extern Class ApolloClassUIButtonBarButton;
 extern Class ApolloClassUIButtonLabel;
 extern Class ApolloClassUIContextMenuListView;
 extern Class ApolloClassUIContextMenuPlatformMetricsGlass;

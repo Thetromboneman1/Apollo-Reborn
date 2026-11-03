@@ -389,6 +389,8 @@ static NSString *const UDKeyIPadPaneLayout = @"IPadPaneLayout";
 static NSString *const UDKeyIPadLayoutWelcomeSeen = @"IPadLayoutWelcomeSeen";
 // True Black Keyboard mode: 0 Off (default), 1 Dark Only, 2 Light Only, 3 Always.
 static NSString *const UDKeyTrueBlackKeyboardMode = @"TrueBlackKeyboardMode";
+// Spelling of interface text: 0 American (default, Apollo's own), 1 British. See ApolloSpelling.xm.
+static NSString *const UDKeySpellingStyle = @"SpellingStyle";
 // Settings icons: 0 = System, 1 = Light (default), 2 = Dark.
 static NSString *const UDKeySettingsIconAppearance = @"SettingsIconAppearance";
 // Glass builds only. Default ON. Applied once before UIKit/Logos startup;
@@ -404,6 +406,13 @@ static NSString *const UDKeyDuoLandscapeFeedLayout = @"DuoLandscapeFeedLayout";
 // Open Duo subreddit panel appearance: NO = Standard
 // (default), YES = Liquid Glass. The panel keeps the same size and navigation.
 static NSString *const UDKeyDuoSubredditPanelGlassEnabled = @"DuoSubredditPanelGlassEnabled";
+// Opt-in tabletop video layout on a partly folded Duo. Default OFF.
+static NSString *const UDKeyDuoTabletopVideoEnabled = @"DuoTabletopVideoEnabled";
+static NSString *const ApolloDuoVideoLayoutDidChangeNotification = @"ApolloDuoVideoLayoutDidChangeNotification";
+// Subreddit quick-switcher (feed title tap, Posts tab long press): YES = the
+// tweak's Modern search sheet (default on Duo), NO = Apollo's Classic inline popup
+// (default elsewhere; it doesn't carry over a Duo unfold).
+static NSString *const UDKeySubredditSwitcherSheetEnabled = @"SubredditSwitcherSheetEnabled";
 // When ON, press-and-hold anywhere on a post info row (score, comments,
 // timestamp, 🌐 translation marker…) shows the glass-slider magnifier loupe: the
 // row is zoomed in a Liquid Glass card, sliding moves the selection pill
@@ -836,6 +845,12 @@ static NSString *const UDKeyDevvitInteractivePosts = @"DevvitInteractivePosts";
 // only consulted while DevvitInteractivePosts is on.
 static NSString *const UDKeyDevvitFeedWidgets = @"DevvitFeedWidgets";
 
+// For You-only content filter. Devvit games, polls, brackets and live-score
+// posts are removed as whole posts during /api/info hydration. This does not
+// change Devvit rendering in other feeds or comments. Default OFF.
+static NSString *const UDKeyHomeFeedHideInteractivePosts = @"HomeFeedHideInteractivePosts";
+static NSString *const ApolloForYouFeedFilterChangedNotification = @"ApolloForYouFeedFilterChangedNotification";
+
 // Floating Post Tabs: chat-heads-style bubbles (max 5) that keep posts open
 // for instant return, created from the comments "..." menu. Default OFF
 // (opt-in). See ApolloFloatingTabs.xm.
@@ -889,6 +904,13 @@ static NSString *const UDKeyActionMenuPreviewPinned = @"ActionMenuPreviewPinned"
 static NSString *const UDKeyActionMenuLastPresented = @"ActionMenuLastPresented";
 // Posted (object = the context id) whenever a menu's order or hidden set changes.
 static NSString *const ApolloActionMenuLayoutsChangedNotification = @"ApolloActionMenuLayoutsChangedNotification";
+
+// All+ r/all: blend NSFW posts into r/all the way old Reddit's r/all showed
+// them (see ApolloAllPlusNSFW.xm / ApolloAllPlusMerge.m). Opt-in, default OFF.
+static NSString *const UDKeyAllPlusNSFWEnabled = @"AllPlusNSFWEnabled";
+// User boost added to candidate hot-rank on the r/all merge.
+// double in [0.0, 2.0]; 0.0 = pure hot-merge. Set from the settings slider.
+static NSString *const UDKeyAllPlusNSFWBoost = @"AllPlusNSFWBoost";
 
 // The last TWEAK_VERSION (without the leading "v") the What's New sheet was
 // shown for (or silently advanced past, when a version has no catalog entry).

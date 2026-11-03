@@ -25,12 +25,15 @@ this fork owns only reviewed downstream changes and local build validation.
 7. Merge into fork `main` only when every frozen exact head is present and the
    full validation job passes.
 
-Upstream PRs 1383, 1401, and 1413 are intentionally excluded from fork
-integration. The snapshot records their state but does not select or merge their
-heads. If GitHub reports that an excluded PR was merged, or if upstream `main`
-contains a commit whose recorded source is one of those PRs, automation stops
-before assembling or publishing a candidate and requires manual upstream-main
-review. Do not remove an exclusion merely to make a sync green.
+Draft upstream PR 1592 is excluded from the phone release by owner decision.
+It removes Classic appearance and prevents older backups from restoring that
+setting. The snapshot records its state but does not select or merge its head.
+PR 1383 is included in this fork integration; PRs 1401 and 1413 have already
+merged upstream and their changes are present through upstream `main`. If
+GitHub reports that an excluded PR was merged, or if upstream `main` contains
+a commit whose recorded source is that PR, automation stops before assembling
+or publishing a candidate and requires manual upstream-main review. Do not
+remove an exclusion merely to make a sync green.
 
 This guard follows pull-request identity and the PR number recorded in normal
 GitHub squash/merge commit subjects. It cannot prove semantic absence when the

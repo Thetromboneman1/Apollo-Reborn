@@ -60,10 +60,17 @@ double ApolloForYouFeedRateLimitReset(NSDictionary *_Nullable headers);
 
 // The `data.children` of an /api/info response (NSDictionary listing, or an
 // NSArray whose last element is one — RDKClient accepts both), reordered to
-// `orderedIDs`, dropping anything that isn't a t3 the user hasn't hidden.
-// Children the response lacks are skipped.
+// `orderedIDs`, dropping anything that isn't a visible, non-promoted t3.
+// When requested, Devvit custom posts are identified from their classic-JSON
+// payload (self post + old-Reddit fallback linking its own ID) and dropped too.
+// Children the response lacks are skipped. Native Reddit polls are preserved.
 NSArray<NSDictionary *> *ApolloForYouFeedOrderedChildren(id _Nullable infoResponse,
-                                                         NSArray<NSString *> *orderedIDs);
+                                                         NSArray<NSString *> *orderedIDs,
+                                                         BOOL hideInteractivePosts);
+
+// A fully filtered first page must not drain an entire personalized feed in a
+// tight loop. Three consecutive hydration batches is the bounded stop policy.
+BOOL ApolloForYouFeedShouldStopAfterFilteredBatches(NSUInteger consecutiveFilteredBatches);
 
 // A listing response RDKClient parses like any other: {kind: Listing, data:
 // {children, after, before: null, dist}}. `after` nil = no next page.
@@ -80,6 +87,17 @@ BOOL ApolloForYouFeedParseToken(NSString *_Nullable token, NSString *_Nullable *
 // "hot.json", ...: -[RDKClient frontPageLinksWithCategory:...] formats
 // "%@.json" with no prefix). Every other feed has a prefix (r/…, user/…).
 BOOL ApolloForYouFeedIsHomeListingPath(NSString *_Nullable path);
+
+// PostsType tag 6 is Home in Apollo 1.15.11. Liquid Glass moves the visible
+// title into JumpBar, leaving the view controller/navigation titles empty, so
+// callers may supply either title as the second identity lock.
+BOOL ApolloForYouFeedIsHomeIdentity(NSInteger postsTypeTag,
+                                    NSString *_Nullable controllerTitle,
+                                    NSString *_Nullable jumpBarTitle);
+
+// A private build can ask to turn For You on once. The persisted sentinel
+// keeps a later native-sort selection reversible across future launches.
+BOOL ApolloForYouFeedShouldApplyInitialEnable(BOOL buildRequestsEnable, BOOL alreadyApplied);
 
 #ifdef __cplusplus
 }

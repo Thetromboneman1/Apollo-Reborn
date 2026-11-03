@@ -194,7 +194,7 @@ static void ApolloDuoSyncCellBackground(ASCellNode *node) {
     if (!node.isNodeLoaded || !ApolloDuoRailHasVisibleSideBar()) return;
     UIView *ancestor = node.view.superview;
     while (ancestor && ![ancestor isKindOfClass:UITableViewCell.class]) ancestor = ancestor.superview;
-    if ([ancestor isKindOfClass:NSClassFromString(@"_ASTableViewCell")]) {
+    if ([ancestor isKindOfClass:ApolloClassASTableViewCell]) {
         _ASTableViewCell *cell = (_ASTableViewCell *)ancestor;
         // A queued update must never repaint a cell recycled for another node.
         if (cell.node == node) ApolloDuoSyncOuterCellBackground(cell);
@@ -275,6 +275,26 @@ void ApolloDuoRailPrepareTableForTransition(UITableView *table) {
 // before the transition and restore it once the new layout commits.
 static char kApolloDuoFoldAnchorKey;
 
+// The anchor's restore passes run after the transition and again 0.3s later.
+// A scroll the reader starts in that window wins: restoring after the finger
+// lifts would put the feed back and make the first scroll look ignored.
+@interface ApolloDuoFoldAnchorDragObserver : NSObject
++ (instancetype)shared;
+- (void)panChanged:(UIPanGestureRecognizer *)pan;
+@end
+@implementation ApolloDuoFoldAnchorDragObserver
++ (instancetype)shared {
+    static ApolloDuoFoldAnchorDragObserver *observer;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ observer = [self new]; });
+    return observer;
+}
+- (void)panChanged:(UIPanGestureRecognizer *)pan {
+    if (pan.state != UIGestureRecognizerStateBegan) return;
+    objc_setAssociatedObject(pan.view, &kApolloDuoFoldAnchorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+@end
+
 static void ApolloDuoCollectVisibleTables(UIView *view, NSMutableArray<UITableView *> *tables, NSUInteger depth) {
     if (!view || view.hidden || view.alpha < 0.01 || depth > 24) return;
     if (ApolloClassASTableView && [view isKindOfClass:ApolloClassASTableView]) {
@@ -305,6 +325,9 @@ static void ApolloDuoCaptureFoldAnchor(UITableView *table) {
         CGFloat fraction = rect.size.height > 0.0 ? (visibleTop - CGRectGetMinY(rect)) / rect.size.height : 0.0;
         objc_setAssociatedObject(table, &kApolloDuoFoldAnchorKey,
             @[path, @(MAX(0.0, MIN(1.0, fraction)))], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // UIKit ignores a target-action pair that is already registered.
+        [table.panGestureRecognizer addTarget:[ApolloDuoFoldAnchorDragObserver shared]
+                                       action:@selector(panChanged:)];
         return;
     }
 }
@@ -450,10 +473,17 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
 - (void)tableView:(UITableView *)table willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)path {
     %orig(table, cell, path);
     ApolloDuoAccountGridDisplayCell((UITableView *)self, cell, path);
-    if ([cell isKindOfClass:NSClassFromString(@"_ASTableViewCell")]) {
+    if ([cell isKindOfClass:ApolloClassASTableViewCell]) {
         ASCellNode *node = ((_ASTableViewCell *)cell).node;
-        node.backgroundColor = ApolloDuoAccountFeedNodeBackground(node, node.backgroundColor);
-        ApolloDuoSyncCellBackground(node);
+        UIColor *current = node.backgroundColor;
+        UIColor *wanted = ApolloDuoAccountFeedNodeBackground(node, current);
+        // Assigning re-enters the ASCellNode setBackgroundColor: hook, which
+        // already syncs the outer cell; only sync directly when nothing changed.
+        if (wanted != current && ![wanted isEqual:current]) {
+            node.backgroundColor = wanted;
+        } else {
+            ApolloDuoSyncCellBackground(node);
+        }
     }
 }
 
@@ -493,7 +523,7 @@ static void ApolloDuoAdjustFloatingActionButton(UIView *button) {
     // color updates intentionally skip the outer UIKit cell. Sync that
     // existing surface once it becomes exposed again, including during the
     // transient sizing callback below. This changes no Texture geometry.
-    if ([cell isKindOfClass:NSClassFromString(@"_ASTableViewCell")]) {
+    if ([cell isKindOfClass:ApolloClassASTableViewCell]) {
         ApolloDuoSyncCellBackground(((_ASTableViewCell *)cell).node);
     }
     CGFloat width = ApolloDuoRailFeedContentWidth((UITableView *)self);

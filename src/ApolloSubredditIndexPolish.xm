@@ -15,6 +15,7 @@
 #import "UserDefaultConstants.h"
 #import "palhome/ApolloPalHomeViewController.h"
 #import "ApolloClasses.h"
+#import "ApolloSpelling.h"
 
 static BOOL ApolloSubredditEnhancementsEnabled(void) {
     return sSubredditListEnhancements || ApolloDuoRequiresSubredditEnhancements();
@@ -1239,7 +1240,7 @@ static void ApolloSubredditIndexApplyCellMarginsOnce(UITableViewCell *cell) {
 }
 
 static BOOL ApolloSubredditIndexStringLooksLikeSubredditName(NSString *string) {
-    NSString *trimmed = [string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *trimmed = [ApolloSpellingCanonical(string) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return NO;
 
     static NSSet<NSString *> *blocked;
@@ -1273,7 +1274,7 @@ static BOOL ApolloSubredditIndexStringLooksLikeSubredditName(NSString *string) {
 }
 
 static BOOL ApolloSubredditIndexStringLooksLikeHeaderTitle(NSString *string) {
-    NSString *trimmed = [string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *trimmed = [ApolloSpellingCanonical(string) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return NO;
     if ([trimmed isEqualToString:@"FAVORITES"] || [trimmed isEqualToString:@"MODERATOR"] || [trimmed isEqualToString:@"MULTIREDDITS"]) return YES;
     if ([trimmed isEqualToString:@"FOLLOWING"]) return YES; // ApolloFollowingSection's synthetic section

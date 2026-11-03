@@ -6,6 +6,7 @@
 #import "settings/CustomAPIViewController.h"
 #import "settings/ApolloSetupAssistant.h"
 #import "ApolloSignInSplash.h"
+#import "ApolloSpelling.h"
 #import "settings/ApolloSiriSettingsViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloAppIcon.h"
@@ -25,6 +26,7 @@
 #import "ApolloMessageDraftStore.h"
 #import "ApolloDevvitPosts.h"        // ApolloDevvitFeedOwnershipChangedNotification
 #import "ApolloFloatingTabs.h"       // close-all / fan-out entry points for the toggles
+#import "ApolloAllPlusNSFW.h"        // ApolloAllPlusInvalidate() -- drop cached candidates on toggle
 #import "settings/ApolloAISettingsViewController.h"
 #import "ApolloWebSessionStore.h"
 #import "ApolloReduceRateLimiting.h"
@@ -278,7 +280,7 @@ static NSString *ApolloIPadPaneLayoutSettingDetail(void) {
             ? @"Will turn on after Apollo quits and reopens. The current single-column layout remains active until then."
             : @"Will turn off after Apollo quits and reopens. The current iPad Layout remains active until then.";
     }
-    return @"Beta on iPadOS 26 or newer. Keep favourites in the sidebar and read posts and comments side by side. You can switch back anytime. Reopen Apollo to apply changes.";
+    return @"Beta on iPadOS 26 or newer. Keep favorites in the sidebar and read posts and comments side by side. You can switch back anytime. Reopen Apollo to apply changes.";
 }
 
 @interface ApolloFeedShortcutsPreviewState : NSObject
@@ -569,6 +571,61 @@ static BOOL ApolloInterfaceSupportsBarScrollSettings(void) {
 // A height pass for restyled link footers is queued (see
 // -apollo_refreshFooterTextViews).
 @property (nonatomic) BOOL footerLinkHeightPassPending;
+@end
+
+// A UISlider that suspends ancestor pan/swipe/edge gestures while the user is
+// dragging it. Apollo's settings live in horizontally swipe-navigable panes, and
+// that swipe recognizer (plus the table's scroll pan) otherwise steals the
+// slider's left/right drag -- you'd have to drag UP first to make the swipe fail
+// before the slider would track. beginTracking fires on touchesBegan, before any
+// ancestor recognizer decides on the subsequent moves, so disabling them here
+// lets the slider own the horizontal drag; they're restored when tracking ends.
+@interface ApolloAPSlider : UISlider
+@property (nonatomic, strong) NSMutableArray<UIGestureRecognizer *> *apSuspended;
+@end
+
+@implementation ApolloAPSlider
+- (UIViewController *)apOwningViewController {
+    UIResponder *r = self.nextResponder;
+    while (r && ![r isKindOfClass:[UIViewController class]]) r = r.nextResponder;
+    return (UIViewController *)r;
+}
+- (void)apSuspendAncestorGestures {
+    if (!self.apSuspended) self.apSuspended = [NSMutableArray array];
+    // Disable EVERY enabled gesture recognizer on the whole ancestor chain (up
+    // through the window) for the duration of the drag. Apollo's swipe-to-exit
+    // gesture isn't necessarily a stock UIPan/Swipe/ScreenEdge subclass, so
+    // class-filtering missed it; during a slider drag nothing else needs to
+    // recognize, and everything is restored the moment tracking ends.
+    for (UIView *v = self.superview; v; v = v.superview) {
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            if (gr.isEnabled) { gr.enabled = NO; [self.apSuspended addObject:gr]; }
+        }
+    }
+    // The interactive-pop gesture can live on the nav controller's view (not
+    // always on the ancestor chain we can see); disable it explicitly too.
+    UIGestureRecognizer *pop = [self apOwningViewController].navigationController.interactivePopGestureRecognizer;
+    if (pop && pop.isEnabled) { pop.enabled = NO; [self.apSuspended addObject:pop]; }
+}
+- (void)apRestoreAncestorGestures {
+    for (UIGestureRecognizer *gr in self.apSuspended) gr.enabled = YES;
+    [self.apSuspended removeAllObjects];
+}
+- (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    // UIControl only follows up with end/cancelTracking when this returns YES
+    // (a tap on the bare track returns NO), so only suspend for a real drag.
+    BOOL tracking = [super beginTrackingWithTouch:touch withEvent:event];
+    if (tracking) [self apSuspendAncestorGestures];
+    return tracking;
+}
+- (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    [super endTrackingWithTouch:touch withEvent:event];
+    [self apRestoreAncestorGestures];
+}
+- (void)cancelTrackingWithEvent:(UIEvent *)event {
+    [super cancelTrackingWithEvent:event];
+    [self apRestoreAncestorGestures];
+}
 @end
 
 @implementation CustomAPIViewController
@@ -1394,6 +1451,14 @@ typedef NS_ENUM(NSInteger, Tag) {
                                 push:^UIViewController * {
             return [[ApolloInterfaceSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
         }];
+    ApolloSettingsRow *duo =
+        [self hubDisclosureRowWithID:@"feat.duo" title:@"iPhone Duo" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloDuoSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    duo.visible = ^BOOL { return ApolloDuoDeviceDetected(); };
+    duo.iconSystemName = @"iphone.duo";
+    duo.iconTileColor = UIColor.systemIndigoColor;
     ApolloSettingsRow *linkPreviews = [self buildLinkPreviewsRow];
     ApolloSettingsRow *polls = [self buildPollsRow];
     ApolloSettingsRow *apolloAI = [self buildApolloAIRow];
@@ -1415,7 +1480,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Features"
                                             footer:@"Fine-tune posts, comments, media, subreddits, profile layout and the interface."
-                                              rows:@[ posts, comments, media, subreddits, profileLayout, interface_,
+                                              rows:@[ posts, comments, media, subreddits, profileLayout, interface_, duo,
                                                       linkPreviews, polls, apolloAI, palHome ]];
 }
 
@@ -2215,6 +2280,12 @@ typedef NS_ENUM(NSInteger, Tag) {
                                   onToggle:^(UISwitch *sender) { [weakSelf devvitFeedPostsSwitchToggled:sender]; }];
     devvitFeedPosts.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; };
 
+    ApolloSettingsRow *hideInteractiveForYou =
+        [ApolloSettingsRow switchRowWithID:@"gen.hideInteractiveForYou"
+                                     title:@"Hide Interactive Posts in For You"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyHomeFeedHideInteractivePosts]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf hideInteractiveForYouSwitchToggled:sender]; }];
+
     ApolloSettingsRow *restoreReadingSession =
         [ApolloSettingsRow switchRowWithID:@"media.restoreReadingSession"
                                      title:@"Restore Reading Session"
@@ -2222,8 +2293,45 @@ typedef NS_ENUM(NSInteger, Tag) {
                                   onToggle:^(UISwitch *sender) { [weakSelf restoreReadingSessionSwitchToggled:sender]; }];
 
     return [ApolloSettingsSection sectionWithTitle:@"Feed"
-                                            footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nSmoother Video Scrolling: prepares feed videos in the background and lets video posts finish drawing right after they scroll in instead of holding the frame for them. Turn off to get Apollo's original behavior back.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments.\n\nRestore Reading Session: after iOS evicts Apollo, reopen the last feed, post and reading position on the next normal launch. Turn it off to delete the saved session immediately."
-                                              rows:@[ textPostThumbnails, infoRow, feedScrubber, videoScrollSmoothing, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts, restoreReadingSession ]];
+                                            footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nSmoother Video Scrolling: prepares feed videos in the background and lets video posts finish drawing right after they scroll in instead of holding the frame for them. Turn off to get Apollo's original behavior back.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments.\n\nHide Interactive Posts in For You: removes Devvit games, interactive polls, brackets and live-score posts from For You only. It does not hide ordinary Reddit polls or affect other feeds and comments.\n\nRestore Reading Session: after iOS evicts Apollo, reopen the last feed, post and reading position on the next normal launch. Turn it off to delete the saved session immediately."
+                                              rows:@[ textPostThumbnails, infoRow, feedScrubber, videoScrollSmoothing, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts, hideInteractiveForYou, restoreReadingSession ]];
+}
+
+// All+ r/all: NSFW posts blended into r/all by rank (see ApolloAllPlusNSFW.xm /
+// ApolloAllPlusMerge.m). Grouped with Posts & Feeds since it shapes a feed.
+- (ApolloSettingsSection *)buildPostsAllPlusSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *allPlusNSFW =
+        [ApolloSettingsRow customRowWithID:@"gen.allPlusNSFW"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_Gen_AllPlusNSFW"
+                                                label:@"Show NSFW in r/all"
+                                               detail:@"Blends NSFW posts into the r/all feed."
+                                                   on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAllPlusNSFWEnabled]
+                                               action:@selector(allPlusNSFWSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *allPlusNSFWBoost =
+        [ApolloSettingsRow customRowWithID:@"gen.allPlusNSFWBoost"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf sliderCellWithIdentifier:@"Cell_Gen_AllPlusNSFWBoost"
+                                                label:@"NSFW boost"
+                                                  min:0.0
+                                                  max:2.0
+                                                 step:0.05
+                                                value:(float)[[NSUserDefaults standardUserDefaults] doubleForKey:UDKeyAllPlusNSFWBoost]
+                                              enabled:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAllPlusNSFWEnabled]
+                                               action:@selector(allPlusNSFWBoostChanged:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:@"All+"
+                                            footer:@"Shows r/all the way old Reddit did, with NSFW posts placed by the same hot ranking as everything else. Applies to the hot, best and rising sorts; top, new and controversial are left as Reddit sends them. NSFW boost moves the NSFW posts up."
+                                              rows:@[ allPlusNSFW, allPlusNSFWBoost ]];
 }
 
 - (ApolloSettingsSection *)buildPostsFloatingTabsSection {
@@ -2639,12 +2747,74 @@ typedef NS_ENUM(NSInteger, Tag) {
     };
 
     NSString *displayNavigationFooter =
-    @"True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
+    @"Spelling applies to screens as they open; reopen Apollo to update everything. True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
 
     if (IsLiquidGlass()) {
         displayNavigationFooter = [displayNavigationFooter stringByAppendingString:
             @"\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."];
     }
+    // Feed title tap and Posts tab long press open the tweak's Modern search
+    // sheet or Apollo's Classic inline popup. Read live, so no relaunch is needed.
+    ApolloSettingsRow *switcherStyle =
+        [ApolloSettingsRow valueRowWithID:@"interface.subredditSwitcher"
+                                   title:@"Subreddit Switcher"
+                                  detail:^NSString * {
+            return sSubredditSwitcherSheetEnabled ? @"Modern" : @"Classic";
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.subredditSwitcher"],
+                @"Subreddit Switcher", @[ @"Classic", @"Modern" ],
+                sSubredditSwitcherSheetEnabled ? 1 : 0, ^(NSInteger picked) {
+                    BOOL sheetEnabled = picked == 1;
+                    if (sSubredditSwitcherSheetEnabled == sheetEnabled) return;
+                    sSubredditSwitcherSheetEnabled = sheetEnabled;
+                    [NSUserDefaults.standardUserDefaults setBool:sheetEnabled
+                        forKey:UDKeySubredditSwitcherSheetEnabled];
+                    [weakSelf reloadRowWithID:@"interface.subredditSwitcher"];
+                });
+        }];
+
+    NSArray<NSString *> *spellingTitles = @[ @"American", @"British" ];
+    void (^applySpelling)(NSInteger) = ^(NSInteger picked) {
+        ApolloSpellingSetStyle(picked == 1 ? ApolloSpellingStyleBritish : ApolloSpellingStyleAmerican);
+        // Other loaded lists (the subreddit list in another tab) pick it up now too.
+        ApolloSpellingReloadLoadedTables(weakSelf.tableView);
+        // Rebuild so this screen's own labels pick up the new spelling. Cell labels skip
+        // a set whose text matches what they show, so clear them first.
+        [weakSelf performUpdateKeepingVisibleRowsInPlace:^{
+            for (UITableViewCell *cell in weakSelf.tableView.visibleCells) {
+                cell.textLabel.text = nil;
+                cell.detailTextLabel.text = nil;
+            }
+            [weakSelf rebuildForm];
+        }];
+    };
+    // Liquid Glass uses the native pull-down like the other Interface pickers; the
+    // standard build keeps the action sheet.
+    ApolloSettingsRow *spelling = IsLiquidGlass()
+        ? [ApolloSettingsRow customRowWithID:@"interface.spelling"
+                                        cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:@"ApolloSpellingMenu"];
+            if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                                      reuseIdentifier:@"ApolloSpellingMenu"];
+            NSInteger current = ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0;
+            cell.textLabel.text = @"Spelling";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.accessoryView = ApolloSettingsMenuButton(@"Spelling", spellingTitles[current],
+                                                          spellingTitles, current, applySpelling);
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        } onSelect:nil]
+        : [ApolloSettingsRow valueRowWithID:@"interface.spelling"
+                                      title:@"Spelling"
+                                     detail:^NSString * {
+            return spellingTitles[ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0];
+        }
+                                   onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.spelling"],
+                @"Spelling", spellingTitles, ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0,
+                applySpelling);
+        }];
 
     NSArray<NSString *> *trueBlackTitles = @[ @"Off", @"Dark Mode Only", @"Light Mode Only", @"Always" ];
     ApolloSettingsRow *trueBlackKeyboard =
@@ -2666,7 +2836,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
                                             footer:displayNavigationFooter
-                                              rows:@[ scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, iPadPaneLayout, scrollEdgeEffect ]];
+                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
@@ -3130,23 +3300,9 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     });
 }
 
-// Subreddits group screen: list organization, subreddit page layout, and
-// the sources used by the Search tab.
-- (ApolloSettingsSection *)buildSubredditsMainSection {
+// Shared with the Duo page while retaining the existing contextual entrance.
+- (ApolloSettingsRow *)buildDuoPanelStyleRow {
     __weak typeof(self) weakSelf = self;
-
-    ApolloSettingsRow *feedShortcuts =
-        [ApolloSettingsRow disclosureRowWithID:@"sub.feedShortcuts"
-                               title:@"Feed Shortcuts"
-                            detail:^NSString * {
-            return [NSString stringWithFormat:@"%@ · %@",
-                    [weakSelf subredditFeedIconStyleText],
-                    [weakSelf subredditFeedLayoutText]];
-        }
-                                push:^UIViewController * {
-            return ApolloSettingsRouteInstantiate(@"feed-shortcuts");
-        }];
-
     ApolloSettingsRow *panelStyle =
         [ApolloSettingsRow valueRowWithID:@"sub.panelStyle"
                                    title:@"Subreddit Panel Style"
@@ -3167,6 +3323,26 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                 });
         }];
     panelStyle.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+
+    return panelStyle;
+}
+
+- (ApolloSettingsSection *)buildSubredditsMainSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *feedShortcuts =
+        [ApolloSettingsRow disclosureRowWithID:@"sub.feedShortcuts"
+                               title:@"Feed Shortcuts"
+                            detail:^NSString * {
+            return [NSString stringWithFormat:@"%@ · %@",
+                    [weakSelf subredditFeedIconStyleText],
+                    [weakSelf subredditFeedLayoutText]];
+        }
+                                push:^UIViewController * {
+            return ApolloSettingsRouteInstantiate(@"feed-shortcuts");
+        }];
+
+    ApolloSettingsRow *panelStyle = [self buildDuoPanelStyleRow];
 
     // Pushes the dedicated Subreddit Sections screen: the FOLLOWING section
     // for followed users, drag-to-reorder for the special sections, and a
@@ -3444,7 +3620,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                       cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
             return [weakSelf textFieldCellWithIdentifier:@"Cell_Sub_RecentLimit"
                                                    label:@"Recently Visited Limit"
-                                             placeholder:@"(unlimited)"
+                                             placeholder:@"Unlimited"
                                                     text:sRecentlyVisitedSubredditsLimit
                                                      tag:TagRecentlyVisitedLimit
                                                numerical:YES]
@@ -4136,6 +4312,95 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     toggleSwitch.enabled = enabled;
     toggleSwitch.onTintColor = [self apollo_themeAccentColor];
     return cell;
+}
+
+// A single-row settings slider: [title] [slider fills the middle] [%.2f value].
+// Single row (not stacked) so it fits the settings table's default row height --
+// the table doesn't self-size, and a stacked layout gets clipped to ~44pt,
+// which cramps the slider's touch target. Tags: title 7700, slider 7701,
+// value 7702. The step is stashed on the slider's accessibilityIdentifier so
+// the handlers can snap without extra state. `enabled` greys the control+labels.
+- (UITableViewCell *)sliderCellWithIdentifier:(NSString *)identifier
+                                        label:(NSString *)label
+                                          min:(float)min
+                                          max:(float)max
+                                         step:(float)step
+                                        value:(float)value
+                                      enabled:(BOOL)enabled
+                                       action:(SEL)action {
+    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:identifier];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        UILabel *title = [[UILabel alloc] init];
+        title.tag = 7700;
+        title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        title.translatesAutoresizingMaskIntoConstraints = NO;
+        [title setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [title setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+        UISlider *slider = [[ApolloAPSlider alloc] init];
+        slider.tag = 7701;
+        slider.continuous = YES;
+        // valueChanged fires live during the drag (updates label + stored value);
+        // the thumb is snapped to the step only on release, so dragging stays
+        // smooth instead of the handler yanking the thumb mid-drag.
+        [slider addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+        [slider addTarget:self action:@selector(apolloSliderSnapOnRelease:)
+         forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+        slider.translatesAutoresizingMaskIntoConstraints = NO;
+        [slider setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+
+        UILabel *valueLabel = [[UILabel alloc] init];
+        valueLabel.tag = 7702;
+        valueLabel.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightRegular];
+        valueLabel.textColor = [UIColor secondaryLabelColor];
+        valueLabel.textAlignment = NSTextAlignmentRight;
+        valueLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [valueLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [valueLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+        [cell.contentView addSubview:title];
+        [cell.contentView addSubview:slider];
+        [cell.contentView addSubview:valueLabel];
+        UILayoutGuide *g = cell.contentView.layoutMarginsGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [title.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+            [title.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+            [slider.leadingAnchor constraintEqualToAnchor:title.trailingAnchor constant:12],
+            [slider.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+            [valueLabel.leadingAnchor constraintEqualToAnchor:slider.trailingAnchor constant:12],
+            [valueLabel.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+            [valueLabel.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+            [valueLabel.widthAnchor constraintGreaterThanOrEqualToConstant:40],  // stable width so slider doesn't jump
+            [title.topAnchor constraintGreaterThanOrEqualToAnchor:g.topAnchor],
+            [title.bottomAnchor constraintLessThanOrEqualToAnchor:g.bottomAnchor],
+        ]];
+    }
+    UILabel *title = [cell.contentView viewWithTag:7700];
+    UILabel *valueLabel = [cell.contentView viewWithTag:7702];
+    UISlider *slider = [cell.contentView viewWithTag:7701];
+    title.text = label;
+    slider.minimumValue = min;
+    slider.maximumValue = max;
+    slider.value = value;
+    slider.enabled = enabled;
+    slider.accessibilityIdentifier = [NSString stringWithFormat:@"%.4f", step];  // step, read back on change
+    valueLabel.text = [NSString stringWithFormat:@"%.2f", value];
+    valueLabel.enabled = enabled;
+    title.enabled = enabled;
+    return cell;
+}
+
+// Ease the thumb to the nearest step when the drag ends. Kept off the live
+// valueChanged path on purpose -- reassigning value mid-drag fights the finger.
+- (void)apolloSliderSnapOnRelease:(UISlider *)sender {
+    float step = sender.accessibilityIdentifier.floatValue;
+    if (step <= 0) return;
+    float snapped = roundf(sender.value / step) * step;
+    snapped = fmaxf(sender.minimumValue, fminf(sender.maximumValue, snapped));
+    [sender setValue:snapped animated:YES];
 }
 
 - (BOOL)isNotificationBackendURLValid:(NSString *)urlString {
@@ -4831,7 +5096,9 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
 - (BOOL)textField:(UITextField *)textField
 shouldChangeCharactersInRange:(NSRange)range
 replacementString:(NSString *)string {
-    if (textField.tag == TagReadPostMaxCount || textField.tag == TagTrendingLimit) {
+    if (textField.tag == TagReadPostMaxCount ||
+        textField.tag == TagTrendingLimit ||
+        textField.tag == TagRecentlyVisitedLimit) {
         NSString *updated = [textField.text stringByReplacingCharactersInRange:range
                                                                     withString:string];
         NSCharacterSet *nonDigits =
@@ -5039,27 +5306,32 @@ replacementString:(NSString *)string {
 }
 
 - (void)webJSONSwitchToggled:(UISwitch *)sender {
-    // Turning this OFF while ANY account has a stored web session leaves that
-    // account with no working transport: no OAuth key is configured (it never
-    // needed one) and cookie auth just got disabled by this flag — every
-    // request for it would hang forever with no visible error. Confirm before
-    // applying so that's a deliberate choice, not a surprise.
-    NSUInteger webSessionCount = ApolloWebSessionUsernames().count;
-    if (sender.isOn == NO && sWebJSONEnabled && webSessionCount > 0) {
-        [sender setOn:YES animated:YES]; // revert the visual toggle pending confirmation
-        NSString *who = webSessionCount == 1 ? @"An account" : [NSString stringWithFormat:@"%lu accounts", (unsigned long)webSessionCount];
-        UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"Turn Off API-Key-Free Mode?"
-                             message:[NSString stringWithFormat:
-                                 @"%@ signed in via a web session, not an API key. Turning this off will make every request for it hang. Remove or re-sign-in that account first, or turn it back on if you change your mind.", who]
-                      preferredStyle:UIAlertControllerStyleAlert];
+    // A stored web session IS that account's sign-in, so launch turns this
+    // back on while one exists (Tweak.xm %ctor). Turning it off alone never
+    // stuck (#1581), and until the relaunch every request for that account
+    // hung. Off therefore means moving those accounts to an API key first,
+    // through the same switch the account switcher offers.
+    NSArray<NSString *> *webSessionUsers = ApolloWebSessionUsernames().allObjects;
+    if (sender.isOn == NO && sWebJSONEnabled && webSessionUsers.count > 0) {
+        [sender setOn:YES animated:YES]; // stays on while a web session is left
+        if (webSessionUsers.count > 1) {
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"Turn Off API-Key-Free Mode?"
+                                 message:[NSString stringWithFormat:
+                                     @"%lu accounts sign in without an API key. Switch each one to an API key from the account switcher first.",
+                                     (unsigned long)webSessionUsers.count]
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+        }
         __weak typeof(self) weakSelf = self;
-        [alert addAction:[UIAlertAction actionWithTitle:@"Turn Off Anyway" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-            [sender setOn:NO animated:YES];
+        __weak UISwitch *weakSender = sender;
+        ApolloPresentSwitchToAPIKeyFlow(self, webSessionUsers.firstObject, ^(BOOL switched) {
+            if (!switched || ApolloWebSessionUsernames().count > 0) return;
+            [weakSender setOn:NO animated:YES];
             [weakSelf _applyWebJSONEnabled:NO];
-        }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
+        });
         return;
     }
     [self _applyWebJSONEnabled:sender.isOn];
@@ -5136,6 +5408,32 @@ replacementString:(NSString *)string {
 
 - (void)randNsfwSwitchToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyShowRandNsfw];
+}
+
+- (void)allPlusNSFWSwitchToggled:(UISwitch *)sender {
+    sAllPlusNSFWEnabled = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyAllPlusNSFWEnabled];
+    // Either way, start clean: off must stop a search already in flight from
+    // publishing or re-asking; on must not resume from whatever was buffered.
+    ApolloAllPlusInvalidate();
+    // Reload the boost slider row so it enables/disables to match the toggle.
+    [self reloadRowWithID:@"gen.allPlusNSFWBoost"];
+}
+
+- (void)allPlusNSFWBoostChanged:(UISlider *)sender {
+    float step = sender.accessibilityIdentifier.floatValue;   // stashed by sliderCellWithIdentifier:
+    if (step <= 0) step = 0.05f;
+    float snapped = roundf(sender.value / step) * step;
+    snapped = fmaxf(sender.minimumValue, fminf(sender.maximumValue, snapped));
+    // Do NOT write sender.value here -- reassigning the thumb mid-drag fights the
+    // finger. The thumb snaps on release (apolloSliderSnapOnRelease:); live we
+    // only update the label and the stored value.
+    UIView *v = sender.superview;
+    while (v && ![v isKindOfClass:[UITableViewCell class]]) v = v.superview;
+    UILabel *valueLabel = [((UITableViewCell *)v).contentView viewWithTag:7702];
+    valueLabel.text = [NSString stringWithFormat:@"%.2f", snapped];
+    sAllPlusNSFWBoost = snapped;
+    [[NSUserDefaults standardUserDefaults] setDouble:snapped forKey:UDKeyAllPlusNSFWBoost];
 }
 
 - (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {
@@ -5378,6 +5676,11 @@ replacementString:(NSString *)string {
     sDevvitFeedWidgets = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sDevvitFeedWidgets forKey:UDKeyDevvitFeedWidgets];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloDevvitFeedOwnershipChangedNotification object:nil];
+}
+
+- (void)hideInteractiveForYouSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyHomeFeedHideInteractivePosts];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloForYouFeedFilterChangedNotification object:nil];
 }
 
 - (void)liveCommentsFollowSwitchToggled:(UISwitch *)sender {
@@ -5705,7 +6008,8 @@ replacementString:(NSString *)string {
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildPostsRecentlyReadSection],
               [self buildPostsFeedSection],
-              [self buildPostsFloatingTabsSection] ];
+              [self buildPostsFloatingTabsSection],
+              [self buildPostsAllPlusSection] ];
 }
 @end
 
@@ -6234,5 +6538,49 @@ replacementString:(NSString *)string {
 - (NSString *)apollo_screenTitle { return @"Notification Backend"; }
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildNotificationBackendSection] ];
+}
+@end
+
+// A stable hardware gate keeps this page available on both Duo displays and
+// through posture changes; ordinary iPhones and iPads never index its rows.
+@implementation ApolloDuoSettingsViewController
+- (NSString *)apollo_screenTitle { return @"iPhone Duo"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    if (!ApolloDuoDeviceDetected()) return @[];
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *tabletop = [ApolloSettingsRow switchRowWithID:@"duo.tabletopVideo"
+        title:@"Tabletop Video Controls"
+        isOn:^BOOL { return sDuoTabletopVideoEnabled; }
+        onToggle:^(UISwitch *sender) {
+            sDuoTabletopVideoEnabled = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyDuoTabletopVideoEnabled];
+            [NSNotificationCenter.defaultCenter postNotificationName:ApolloDuoVideoLayoutDidChangeNotification object:nil];
+        }];
+    ApolloSettingsRow *landscape = [ApolloSettingsRow valueRowWithID:@"duo.landscapeFeed"
+        title:@"Landscape Feed Layout"
+        detail:^NSString * { return sDuoLandscapeFeedLayout == 2 ? @"Focused" : @"Original"; }
+        onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.landscapeFeed"],
+                @"Landscape Feed Layout", @[@"Original", @"Focused"], sDuoLandscapeFeedLayout == 2 ? 1 : 0,
+                ^(NSInteger picked) {
+                    NSInteger layout = picked == 1 ? 2 : 0;
+                    if (layout == sDuoLandscapeFeedLayout) return;
+                    sDuoLandscapeFeedLayout = layout;
+                    [NSUserDefaults.standardUserDefaults setInteger:layout forKey:UDKeyDuoLandscapeFeedLayout];
+                    [weakSelf reloadRowWithID:@"duo.landscapeFeed"];
+                    [NSNotificationCenter.defaultCenter postNotificationName:@"ApolloDuoFeedLayoutDidChange" object:nil];
+                });
+        }];
+    landscape.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+    ApolloSettingsSection *openDisplay = [ApolloSettingsSection sectionWithTitle:@"Open Display"
+        footer:@"Focused centers the landscape feed in a narrower column. Subreddit Panel Style controls the open display's subreddit panel. These options also remain available from their existing controls."
+        rows:@[landscape, [self buildDuoPanelStyleRow]]];
+    openDisplay.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+    return @[
+        [ApolloSettingsSection sectionWithTitle:@"Video Playback"
+            footer:@"When enabled, partly folding the open portrait display puts fullscreen video above the fold and playback controls below it. Off by default."
+            rows:@[tabletop]],
+        openDisplay
+    ];
 }
 @end

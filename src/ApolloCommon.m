@@ -17,6 +17,7 @@
 #import "ApolloAccountCredentials.h"
 #import "ApolloWebSessionStore.h"
 #import "ApolloDeviceIdentity.h"
+#import "ApolloSwiftRuntime.h"
 #include <sys/sysctl.h>
 #import "ApolloAccountCredentials.h"
 #import "ApolloWebSessionStore.h"
@@ -847,14 +848,18 @@ BOOL ApolloRouteURLThroughAppInScene(NSURL *url, UIWindowScene *scene) {
     UITabBarController *tabs = (id)ApolloMainTabBarControllerForScene(scene);
     if (![tabs isKindOfClass:UITabBarController.class]) return NO;
     if (scene && tabs.viewIfLoaded.window.windowScene != scene) return NO;
-    Ivar ivar = class_getInstanceVariable([appDelegate class], "tabBarController");
-    Ivar next = class_getInstanceVariable([appDelegate class], "apolloProProducts");
     // Verified in AppDelegate's native destructor at 0x10016cb10: ldr +
-    // objc_release, followed by apolloProProducts eight bytes later. Swift's
-    // mangled Optional encoding is deliberately not interpreted as ObjC @.
-    if (![appDelegate isMemberOfClass:objc_getClass("_TtC6Apollo11AppDelegate")] || !ivar || !next ||
-        ivar_getOffset(next) - ivar_getOffset(ivar) != sizeof(void *)) return NO;
-    void *storage = (uint8_t *)(__bridge void *)appDelegate + ivar_getOffset(ivar);
+    // objc_release, followed by apolloProProducts eight bytes later (the same
+    // order as the 1.7.4 and 1.10.99 class dumps). Swift's mangled Optional
+    // encoding is deliberately not interpreted as ObjC @. Apollo builds that
+    // still ship Firebase (iOS 14 users run 1.14.x) move the delegate onto
+    // GoogleUtilities' GUL_ subclass, which an exact class check refused (#1529).
+    void *storage = ApolloPointerIvarSlot(appDelegate, "_TtC6Apollo11AppDelegate", "tabBarController",
+                                          "apolloProProducts");
+    if (!storage) {
+        ApolloLog(@"[ApolloRouteURL] not routing: unrecognized app delegate %s", object_getClassName(appDelegate));
+        return NO;
+    }
     id previous = (__bridge_transfer id)ApolloSwiftExchangePaneTabs(storage, (__bridge const void *)tabs);
     @try {
         return ((BOOL (*)(id, SEL, id, id, id))objc_msgSend)(appDelegate, selector, application, url, @{});
@@ -1830,8 +1835,30 @@ UIViewController *ApolloMainTabBarControllerForScene(UIWindowScene *originatingS
     return ApolloTabBarControllerIvarOn(application.delegate);
 }
 
+// Nearly every Duo/Liquid Glass gate asks for the tab controller, many of them
+// per cell or per scroll frame, and the full lookup copies connectedScenes and
+// walks windows. Cache it weakly on the main thread; any scene activation or
+// key-window change drops the cache, and a controller that left its window is
+// never returned.
+static __weak UIViewController *sApolloCachedMainTabBarController;
+
 UIViewController *ApolloMainTabBarController(void) {
-    return ApolloMainTabBarControllerForScene(nil);
+    if (!NSThread.isMainThread) return ApolloMainTabBarControllerForScene(nil);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+        for (NSNotificationName name in @[UISceneDidActivateNotification, UISceneWillDeactivateNotification,
+                                          UISceneDidDisconnectNotification, UIWindowDidBecomeKeyNotification]) {
+            [center addObserverForName:name object:nil queue:nil usingBlock:^(__unused NSNotification *note) {
+                sApolloCachedMainTabBarController = nil;
+            }];
+        }
+    });
+    UIViewController *cached = sApolloCachedMainTabBarController;
+    if (cached && cached.viewIfLoaded.window) return cached;
+    cached = ApolloMainTabBarControllerForScene(nil);
+    sApolloCachedMainTabBarController = cached;
+    return cached;
 }
 
 // ApolloCommon is included by nearly every file, so it must not import the pane

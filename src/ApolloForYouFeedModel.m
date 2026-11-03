@@ -1,4 +1,5 @@
 #import "ApolloForYouFeedModel.h"
+#import "ApolloDevvitPosts.h"
 
 static NSString *const kApolloForYouFeedEndpoint = @"https://www.reddit.com/svc/shreddit/feeds/interest-home-feed";
 static NSString *const kApolloForYouTokenPrefix = @"foryou:";
@@ -118,7 +119,8 @@ double ApolloForYouFeedRateLimitReset(NSDictionary *headers) {
     return ApolloForYouHeaderNumber(headers, @"x-ratelimit-reset");
 }
 
-NSArray<NSDictionary *> *ApolloForYouFeedOrderedChildren(id infoResponse, NSArray<NSString *> *orderedIDs) {
+NSArray<NSDictionary *> *ApolloForYouFeedOrderedChildren(id infoResponse, NSArray<NSString *> *orderedIDs,
+                                                         BOOL hideInteractivePosts) {
     id listing = infoResponse;
     if ([listing isKindOfClass:[NSArray class]]) listing = [(NSArray *)listing lastObject];
     if (![listing isKindOfClass:[NSDictionary class]]) return @[];
@@ -136,6 +138,16 @@ NSArray<NSDictionary *> *ApolloForYouFeedOrderedChildren(id infoResponse, NSArra
         if (![name isKindOfClass:[NSString class]]) continue;
         // A post the user hid on Reddit stays hidden here too.
         if ([((NSDictionary *)childData)[@"hidden"] isEqual:@YES]) continue;
+        // HTML parsing rejects both shreddit-ad-post and promoted attributes.
+        // Keep the JSON boundary defensive too in case Reddit changes its
+        // server-rendered markup without changing /api/info's payload.
+        if ([((NSDictionary *)childData)[@"promoted"] boolValue] ||
+            [((NSDictionary *)childData)[@"is_promoted"] boolValue]) continue;
+        // Devvit has no dedicated classic-JSON type. Its stable payload marker
+        // is an is_self post whose old-Reddit fallback links to this post's own
+        // ID; the shared classifier deliberately rejects native polls and text
+        // posts that merely link to a different interactive thread.
+        if (hideInteractivePosts && ApolloDevvitPostDataIsInteractive(childData)) continue;
         byName[name] = child;
     }
     NSMutableArray<NSDictionary *> *ordered = [NSMutableArray arrayWithCapacity:orderedIDs.count];
@@ -144,6 +156,14 @@ NSArray<NSDictionary *> *ApolloForYouFeedOrderedChildren(id infoResponse, NSArra
         if (child) [ordered addObject:child];
     }
     return ordered;
+}
+
+BOOL ApolloForYouFeedShouldStopAfterFilteredBatches(NSUInteger consecutiveFilteredBatches) {
+    // One user-visible page normally takes one hydration. Three fully filtered
+    // batches allow sparse feeds to recover while bounding a first-page request
+    // to 75–300 inspected IDs (depending on read-ahead) instead of draining the
+    // whole 1,000-item session in a tight request loop.
+    return consecutiveFilteredBatches >= 3;
 }
 
 NSDictionary *ApolloForYouFeedListing(NSArray<NSDictionary *> *children, NSString *after) {
@@ -188,4 +208,13 @@ BOOL ApolloForYouFeedIsHomeListingPath(NSString *path) {
                                            @"controversial.json", @"top.json" ]];
     });
     return [homePaths containsObject:p.lowercaseString];
+}
+
+BOOL ApolloForYouFeedIsHomeIdentity(NSInteger postsTypeTag, NSString *controllerTitle, NSString *jumpBarTitle) {
+    if (postsTypeTag != 6) return NO;
+    return [controllerTitle isEqualToString:@"Home"] || [jumpBarTitle isEqualToString:@"Home"];
+}
+
+BOOL ApolloForYouFeedShouldApplyInitialEnable(BOOL buildRequestsEnable, BOOL alreadyApplied) {
+    return buildRequestsEnable && !alreadyApplied;
 }

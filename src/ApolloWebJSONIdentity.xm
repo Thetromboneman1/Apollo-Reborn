@@ -76,6 +76,7 @@
 #import "ApolloUserProfileCache.h"
 #import "ApolloWebSessionStore.h"
 #import "ApolloReduceRateLimiting.h"
+#import "ApolloAllPlusNSFW.h"
 
 // Minimal surface of Apollo's RedditKit classes used here. Real definitions live
 // in Headers/ObjC/{RDKClient,RDKOAuthCredential,RDKAccessToken}.h (not on the
@@ -616,24 +617,41 @@ void ApolloWebJSONSeedBearerRegistryFromDisk(void) {
     if (seeded > 0) ApolloLog(@"[WebJSON][identity] Seeded bearer registry from disk (%lu account(s))", (unsigned long)seeded);
 }
 
-BOOL ApolloWebJSONDiskAccountHasRealCredential(NSString *username) {
-    if (username.length == 0) return NO;
+// The Valet sensitive dicts persisted for `username` (case-insensitive), one per
+// matching RedditAccounts2 entry — normally one, more if the blobs hold duplicates.
+static NSArray<NSDictionary *> *ApolloWebJSONDiskSensitiveEntriesForUsername(NSString *username) {
+    if (username.length == 0) return @[];
     NSString *lowerUsername = username.lowercaseString;
     NSUserDefaults *group = [[NSUserDefaults alloc] initWithSuiteName:kApolloGroupSuite];
     id accountsObj = ApolloWebJSONUnarchive([group objectForKey:@"RedditAccounts2"]);
     NSArray *accounts = [accountsObj isKindOfClass:[NSArray class]] ? accountsObj : @[];
-    if (accounts.count == 0) return NO;
+    if (accounts.count == 0) return @[];
     NSArray<NSDictionary *> *valet = ApolloWebJSONReadValetAccountsArray(NULL) ?: @[];
 
+    NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
     for (NSUInteger i = 0; i < accounts.count && i < valet.count; i++) {
         if (![ApolloWebJSONUsernameAtIndex(accounts, i) isEqualToString:lowerUsername]) continue;
-        NSDictionary *sensitive = [valet[i] isKindOfClass:[NSDictionary class]] ? valet[i] : nil;
+        if ([valet[i] isKindOfClass:[NSDictionary class]]) [entries addObject:valet[i]];
+    }
+    return entries;
+}
+
+BOOL ApolloWebJSONDiskAccountHasRealCredential(NSString *username) {
+    for (NSDictionary *sensitive in ApolloWebJSONDiskSensitiveEntriesForUsername(username)) {
         NSString *accessToken  = [sensitive[@"accessToken"]  isKindOfClass:[NSString class]] ? sensitive[@"accessToken"]  : nil;
         NSString *refreshToken = [sensitive[@"refreshToken"] isKindOfClass:[NSString class]] ? sensitive[@"refreshToken"] : nil;
         if (refreshToken.length > 0) return YES;
         if (accessToken.length > 0 && !ApolloWebJSONBearerIsSynthetic(accessToken)) return YES;
     }
     return NO;
+}
+
+NSString *ApolloWebJSONDiskAccountRefreshToken(NSString *username) {
+    for (NSDictionary *sensitive in ApolloWebJSONDiskSensitiveEntriesForUsername(username)) {
+        NSString *refreshToken = [sensitive[@"refreshToken"] isKindOfClass:[NSString class]] ? sensitive[@"refreshToken"] : nil;
+        if (refreshToken.length > 0) return refreshToken;
+    }
+    return nil;
 }
 
 // One-shot launch repair for installs poisoned by the pre-fix cross-account
@@ -1116,12 +1134,35 @@ static BOOL ApolloWebJSONKeepSubscriptionListAfterFailedWalk(RDKUser *user, NSAr
     NSString *requestMethod = [method copy];
     NSString *requestPath = [path copy];
     NSString *username = ApolloWebJSONShouldActForClient(self) ? ApolloWebJSONClientUsername(self) : nil;
+    // API-key accounts: /api/info and /api/morechildren go by their /.json form
+    // once oauth.reddit.com refused their usual path this launch (below).
+    if (!username) requestPath = ApolloOAuthReadPathToSend(requestMethod, requestPath);
     ApolloWebJSONCheckAccountSession(username);
     // API-Key-Free account listings: 100 per page (ApolloWebJSONParametersForAccountRead).
     parameters = ApolloWebJSONParametersForAccountRead(username, requestMethod, requestPath, parameters);
     RDKClient *client = self;
     id sentParameters = parameters;
     void (^wrapped)(NSHTTPURLResponse *, id, NSError *) = ^(NSHTTPURLResponse *response, id object, NSError *error) {
+        // API-key accounts (#1608, #1615): oauth.reddit.com answers some keys'
+        // /api/info and /api/morechildren with Reddit's block page, which
+        // RedditKit reads as no answer and no error, so "more replies" puts its
+        // label back and loads nothing. The same read in its /.json form is
+        // still answered (ApolloWebJSONRoutes.h): send it once more that way,
+        // and only that answer reaches the caller.
+        if (!username) {
+            BOOL refused = NO;
+            NSString *retryPath = ApolloOAuthReadPathAfterResponse(requestMethod, requestPath, response, &refused);
+            if (retryPath) {
+                ApolloWebJSONLogRouteOutcomeOnce(requestMethod, requestPath, [NSString stringWithFormat:
+                    @"oauth.reddit.com sent this API key Reddit's block page; sending it as %@ from now on", retryPath]);
+                [client taskWithMethod:requestMethod path:retryPath parameters:sentParameters completion:completion];
+                return;
+            }
+            if (refused) {
+                ApolloWebJSONLogRouteOutcomeOnce(requestMethod, requestPath,
+                    @"oauth.reddit.com sent this API key Reddit's block page for the /.json form too");
+            }
+        }
         // A read that has another route gets sent again on it, at most once per
         // route, and only the last answer reaches the caller. Writes never get
         // here (ApolloWebJSONRouteRequestMayRetry). A bearer route's 401 is a
@@ -1183,10 +1224,10 @@ static BOOL ApolloWebJSONKeepSubscriptionListAfterFailedWalk(RDKUser *user, NSAr
     // answered is shared instead of sent again (ApolloWebJSONShareAccountRead).
     ApolloWebJSONTaskCompletion send = ApolloWebJSONShareAccountRead(username, requestMethod, requestPath, parameters, wrapped);
     if (!send) return ApolloWebJSONSharedReadPlaceholderTask();
-    if (routesTried == 0) return %orig(method, path, parameters, send);
+    if (routesTried == 0) return %orig(method, requestPath, parameters, send);
     sApolloWebJSONRoutesTriedToStamp = routesTried;
     @try {
-        return %orig(method, path, parameters, send);
+        return %orig(method, requestPath, parameters, send);
     } @finally {
         sApolloWebJSONRoutesTriedToStamp = 0;
     }
@@ -1209,9 +1250,17 @@ static BOOL ApolloWebJSONKeepSubscriptionListAfterFailedWalk(RDKUser *user, NSAr
 // expects. No-op for the modern shape — see ApolloWebJSONFixupWriteResponseObject.
 %hook RDKResponseSerializer
 - (id)responseObjectForResponse:(id)response data:(id)data error:(id *)error {
+    // All+ r/all: rewrite the raw listing JSON BEFORE the media fixup, so the
+    // blended posts flow through that fixup too and reach full parity with
+    // native ones. Running it afterwards would leave them un-fixed.
+    // nil = leave untouched.
     id serializerData = data;
+    @try {
+        NSData *rewritten = ApolloAllPlusRewriteData(response, serializerData);
+        if (rewritten) serializerData = rewritten;
+    } @catch (NSException *e) { ApolloLog(@"[AllPlus] data rewrite failed: %@", e); }
     if (sWebJSONEnabled) {
-        @try { serializerData = ApolloWebJSONFixupListingMediaResponseData(response, data); }
+        @try { serializerData = ApolloWebJSONFixupListingMediaResponseData(response, serializerData); }
         @catch (NSException *e) { ApolloLog(@"[WebJSON] listing-media fixup failed: %@", e); }
     }
     id obj = %orig(response, serializerData, error);

@@ -74,6 +74,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAICloudBridge.m \
     $(SRC_DIR)/ApolloAutoHideMetaFeeds.xm \
     $(SRC_DIR)/ApolloDevvitPosts.xm \
+    $(SRC_DIR)/ApolloDevvitPostDetection.m \
     $(SRC_DIR)/ApolloWhatsNew.xm \
     $(SRC_DIR)/ApolloWhatsNewHalloween.m \
     $(WHATS_NEW_GEN_M) \
@@ -98,6 +99,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloProfilePagination.xm \
     $(SRC_DIR)/ApolloListEmptyState.xm \
     $(SRC_DIR)/ApolloEmptyFeedNextPage.xm \
+    $(SRC_DIR)/ApolloPasscodeLockPrompt.xm \
     $(SRC_DIR)/ApolloWebTextDecoding.m \
     $(SRC_DIR)/ApolloNitterInstances.m \
     $(SRC_DIR)/ApolloMemoryDiagnostics.m \
@@ -220,6 +222,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloCommentVoteFlicker.xm \
     $(SRC_DIR)/ApolloThreeStateVoting.xm \
     $(SRC_DIR)/ApolloFeedSubredditIcons.xm \
+    $(SRC_DIR)/ApolloSubredditIconLookup.xm \
     $(SRC_DIR)/ApolloPostedCommentInsert.xm \
     $(SRC_DIR)/ApolloLoadMoreComments.xm \
     $(SRC_DIR)/ApolloCommentSubmitFailure.xm \
@@ -247,6 +250,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloCrosspostTitle.xm \
     $(SRC_DIR)/ApolloMessagesKeyboardInset.xm \
     $(SRC_DIR)/ApolloTrueBlackKeyboard.xm \
+    $(SRC_DIR)/ApolloSpelling.xm \
     $(SRC_DIR)/ApolloAutoHideTabBar.xm \
     $(SRC_DIR)/ApolloTopBarScrollPresentation.m \
     $(SRC_DIR)/ApolloCompactTabBarView.m \
@@ -400,6 +404,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloLinkCardTitleFallback.xm \
     $(SRC_DIR)/ApolloFeedTextPostThumbnails.xm \
     $(SRC_DIR)/ApolloMediaHinge.xm \
+    $(SRC_DIR)/ApolloDuoVideoLayout.xm \
     $(SRC_DIR)/ApolloTweetBuddy.xm \
 	$(SRC_DIR)/ApolloVisionOSFix.xm \
     $(SRC_DIR)/ApolloVisionOSHover.xm \
@@ -412,6 +417,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloWebJSONRoutes.m \
     $(SRC_DIR)/ApolloWebJSONRouteUpdates.m \
     $(SRC_DIR)/ApolloWebJSONIdentity.xm \
+    $(SRC_DIR)/ApolloAllPlusMerge.m \
+    $(SRC_DIR)/ApolloAllPlusNSFW.xm \
     $(SRC_DIR)/ApolloWebSessionLoginViewController.m \
     $(SRC_DIR)/ApolloWebSessionStore.m \
     $(SRC_DIR)/ApolloProfileEditorWebViewController.m \
@@ -527,6 +534,10 @@ endif
 # ApolloAppleTranslation.swift) only exists on iOS 18.0+. Weak-link it so the tweak still
 # loads on older iOS, where the Apple provider is gated off at runtime.
 ApolloReborn_LDFLAGS += -weak_framework Translation
+# Keep the public SwiftUI translation dependency optional on older iOS releases.
+# SwiftUICore is private to SwiftUI in the iOS 27.2 SDK and cannot be linked by
+# this target directly; SwiftUI resolves its own dependency at runtime.
+ApolloReborn_LDFLAGS += -weak_framework _Translation_SwiftUI
 # Xcode 27 warns that its bundled libc++ no longer supports deployment below
 # iOS 15. Keep the established iOS 14 target buildable while treating every
 # other warning as an error; runtime availability guards remain authoritative.

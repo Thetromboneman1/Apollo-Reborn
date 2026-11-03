@@ -12,6 +12,7 @@ xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror \
     -framework Foundation \
     -I "$test_repo_root/src" \
     "$test_repo_root/src/ApolloForYouFeedModel.m" \
+    "$test_repo_root/src/ApolloDevvitPostDetection.m" \
     "$test_repo_root/tests/for_you_feed_tests.m" \
     -o "$test_binary"
 

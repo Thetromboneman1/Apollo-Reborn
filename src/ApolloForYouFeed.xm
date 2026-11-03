@@ -84,6 +84,10 @@ static NSString *const kApolloFYFeed = @"for-you";
 static NSString *const kApolloFYTitle = @"For You";
 static NSString *const kApolloFYSymbol = @"sparkles";
 static NSString *const kApolloFYErrorDomain = @"ApolloForYouFeed";
+static NSString *const kApolloFYInitialEnableInfoKey = @"ApolloInitialHomeFeedForYou";
+static NSString *const kApolloFYInitialEnableAppliedKey = @"HomeFeedForYouInitialEnableApplied";
+static NSString *const kApolloFYInitialHideInteractiveInfoKey = @"ApolloInitialHomeFeedHideInteractivePosts";
+static NSString *const kApolloFYInitialHideInteractiveAppliedKey = @"HomeFeedHideInteractivePostsInitialEnableApplied";
 
 static const NSUInteger kApolloFYPageSize = 25;           // posts per page handed to Apollo
 static const NSUInteger kApolloFYHydrateBatch = 100;      // /api/info's own maximum
@@ -102,6 +106,10 @@ static NSString *const kApolloFYDesktopUA =
 
 static BOOL ApolloForYouFeedEnabled(void) {
     return [NSUserDefaults.standardUserDefaults boolForKey:UDKeyHomeFeedForYou];
+}
+
+static BOOL ApolloFYHideInteractivePosts(void) {
+    return [NSUserDefaults.standardUserDefaults boolForKey:UDKeyHomeFeedHideInteractivePosts];
 }
 
 #pragma mark - Session
@@ -126,6 +134,8 @@ static BOOL ApolloForYouFeedEnabled(void) {
 @property (nonatomic) NSUInteger furthestIndex;     // furthest page index Apollo has asked for
 @property (nonatomic) NSUInteger htmlRequests;
 @property (nonatomic) NSUInteger hydrateRequests;
+@property (nonatomic) BOOL hideInteractivePosts;
+@property (nonatomic) NSUInteger filteredBatchesInARow;
 @end
 
 @implementation ApolloFYSession
@@ -145,6 +155,7 @@ static BOOL sApolloFYSuppressRefreshArm;
 static __weak UIViewController *sApolloFYSortArmedVC;
 static CFAbsoluteTime sApolloFYSortArmedAt;
 static NSHashTable<UIViewController *> *sApolloFYHomeControllers;
+static BOOL sApolloFYFilterReloadPending;
 
 static NSError *ApolloFYError(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:kApolloFYErrorDomain code:code
@@ -262,17 +273,35 @@ static void ApolloFYHydrate(ApolloFYSession *session, RDKClient *client, void (^
     CFAbsoluteTime started = CFAbsoluteTimeGetCurrent();
 
     ApolloFYRawCompletion done = ^(id response, NSError *error) {
-        NSArray<NSDictionary *> *children = error ? @[] : ApolloForYouFeedOrderedChildren(response, batch);
+        NSArray<NSDictionary *> *unfiltered = error ? @[] : ApolloForYouFeedOrderedChildren(response, batch, NO);
+        NSArray<NSDictionary *> *children = error ? @[] : ApolloForYouFeedOrderedChildren(response, batch,
+                                                                                           session.hideInteractivePosts);
+        NSUInteger filtered = unfiltered.count >= children.count ? unfiltered.count - children.count : 0;
         dispatch_async(sApolloFYQueue, ^{
-            ApolloLog(@"[ForYou] hydrate #%lu asked=%lu got=%lu %.0fms err=%@",
+            ApolloLog(@"[ForYou] hydrate #%lu asked=%lu got=%lu filtered=%lu %.0fms err=%@",
                       (unsigned long)requestNumber, (unsigned long)batch.count, (unsigned long)children.count,
-                      (CFAbsoluteTimeGetCurrent() - started) * 1000.0, error.localizedDescription ?: @"-");
+                      (unsigned long)filtered, (CFAbsoluteTimeGetCurrent() - started) * 1000.0,
+                      error.localizedDescription ?: @"-");
             if (error) {
                 completion(error);
                 return;
             }
             [session.pendingIDs removeObjectsInRange:NSMakeRange(0, count)];
             [session.items addObjectsFromArray:children];
+            if (session.hideInteractivePosts && children.count == 0 && filtered > 0) {
+                session.filteredBatchesInARow += 1;
+                if (ApolloForYouFeedShouldStopAfterFilteredBatches(session.filteredBatchesInARow)) {
+                    // A personalized feed made entirely of the opted-out class
+                    // must finish cleanly instead of consuming every remaining
+                    // HTML and /api/info page in one first-page request.
+                    [session.pendingIDs removeAllObjects];
+                    session.htmlExhausted = YES;
+                    ApolloLog(@"[ForYou] stopped after %lu fully filtered hydration batches",
+                              (unsigned long)session.filteredBatchesInARow);
+                }
+            } else if (children.count > 0) {
+                session.filteredBatchesInARow = 0;
+            }
             completion(nil);
         });
     };
@@ -408,6 +437,7 @@ static ApolloFYSession *ApolloFYNewSession(NSString *username, NSString *cookieH
     session.pendingIDs = [NSMutableArray array];
     session.seenIDs = [NSMutableSet set];
     session.waiting = [NSMutableArray array];
+    session.hideInteractivePosts = ApolloFYHideInteractivePosts();
     // Keep the outgoing session for its in-flight pages; drop anything older.
     NSMutableDictionary *kept = [NSMutableDictionary dictionary];
     if (sApolloFYCurrent) kept[sApolloFYCurrent.identifier] = sApolloFYCurrent;
@@ -419,14 +449,48 @@ static ApolloFYSession *ApolloFYNewSession(NSString *username, NSString *cookieH
 
 #pragma mark - Sort button
 
+static UIView *ApolloFYFindJumpBar(UIView *root) {
+    if (!root) return nil;
+    if (ApolloClassJumpBar && [root isMemberOfClass:ApolloClassJumpBar]) return root;
+    for (UIView *child in root.subviews) {
+        UIView *match = ApolloFYFindJumpBar(child);
+        if (match) return match;
+    }
+    return nil;
+}
+
+static NSString *ApolloFYVisibleLabelText(UIView *root) {
+    if (!root || root.hidden || root.alpha < 0.01) return nil;
+    if ([root isKindOfClass:UILabel.class]) {
+        NSString *text = ((UILabel *)root).text;
+        if (text.length) return text;
+    }
+    for (UIView *child in root.subviews) {
+        NSString *text = ApolloFYVisibleLabelText(child);
+        if (text.length) return text;
+    }
+    return nil;
+}
+
+static NSString *ApolloFYJumpBarTitle(UIViewController *vc) {
+    // Liquid Glass hosts JumpBar in UINavigationBar instead of leaving Home in
+    // navigationItem.title. Read the visible view hierarchy rather than
+    // Swift Optional ivar storage, which is not object-layout safe.
+    UIView *jumpBar = ApolloFYFindJumpBar(vc.navigationController.navigationBar);
+    if (!jumpBar) jumpBar = ApolloFYFindJumpBar(vc.view);
+    return ApolloFYVisibleLabelText(jumpBar) ?: jumpBar.accessibilityLabel;
+}
+
 static UIViewController *ApolloFYHomeOwner(UIViewController *vc) {
     Class postsClass = ApolloClassPostsViewController;
     if (!postsClass || ![vc isKindOfClass:postsClass]) return nil;
-    // Home's PostsType tag is 6 (ApolloGalleryMenu.xm measured it); the nav
-    // title is the second lock, as there.
-    if (ApolloPostsTypeTagFromViewController(vc) != 6) return nil;
-    NSString *title = vc.navigationItem.title ?: vc.title;
-    return [title isEqualToString:@"Home"] ? vc : nil;
+    // Home's PostsType tag is 6 (ApolloGalleryMenu.xm measured it). Classic
+    // Apollo keeps the second lock in the controller title; Liquid Glass moves
+    // it into JumpBar and leaves both controller title properties empty.
+    NSInteger tag = ApolloPostsTypeTagFromViewController(vc);
+    NSString *controllerTitle = vc.navigationItem.title ?: vc.title;
+    NSString *jumpBarTitle = ApolloFYJumpBarTitle(vc);
+    return ApolloForYouFeedIsHomeIdentity(tag, controllerTitle, jumpBarTitle) ? vc : nil;
 }
 
 static char kApolloFYOriginalSortImageKey;
@@ -633,6 +697,7 @@ static void ApolloFYWrapNativeSortActions(NSArray<UIMenuElement *> *elements) {
         } else {
             ApolloFYSession *current = sApolloFYCurrent;
             BOOL reusable = current && !forceNew && [current.username isEqualToString:username] &&
+                            current.hideInteractivePosts == ApolloFYHideInteractivePosts() &&
                             CFAbsoluteTimeGetCurrent() - current.createdAt < kApolloFYSessionReuseSeconds &&
                             current.items.count > 0;
             if (reusable) {
@@ -659,6 +724,10 @@ static void ApolloFYWrapNativeSortActions(NSArray<UIMenuElement *> *elements) {
     if (!ApolloFYHomeOwner(vc)) return;
     [sApolloFYHomeControllers addObject:vc];
     ApolloFYApplySortButton(vc);
+    if (sApolloFYFilterReloadPending && ApolloForYouFeedEnabled()) {
+        sApolloFYFilterReloadPending = NO;
+        ApolloFYReload(vc);
+    }
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -689,10 +758,46 @@ static void ApolloFYWrapNativeSortActions(NSArray<UIMenuElement *> *elements) {
 %end
 
 %ctor {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL buildRequestsEnable = [[NSBundle.mainBundle objectForInfoDictionaryKey:kApolloFYInitialEnableInfoKey] boolValue];
+    BOOL alreadyApplied = [defaults boolForKey:kApolloFYInitialEnableAppliedKey];
+    if (ApolloForYouFeedShouldApplyInitialEnable(buildRequestsEnable, alreadyApplied)) {
+        [defaults setBool:YES forKey:UDKeyHomeFeedForYou];
+        [defaults setBool:YES forKey:kApolloFYInitialEnableAppliedKey];
+        ApolloLog(@"[ForYou] applied private-build initial enable");
+    }
+    BOOL buildRequestsInteractiveFilter = [[NSBundle.mainBundle objectForInfoDictionaryKey:
+                                             kApolloFYInitialHideInteractiveInfoKey] boolValue];
+    BOOL interactiveFilterApplied = [defaults boolForKey:kApolloFYInitialHideInteractiveAppliedKey];
+    if (ApolloForYouFeedShouldApplyInitialEnable(buildRequestsInteractiveFilter, interactiveFilterApplied)) {
+        [defaults setBool:YES forKey:UDKeyHomeFeedHideInteractivePosts];
+        [defaults setBool:YES forKey:kApolloFYInitialHideInteractiveAppliedKey];
+        ApolloLog(@"[ForYou] applied private-build interactive-post filter");
+    }
     sApolloFYQueue = dispatch_queue_create("com.apolloreborn.foryou", DISPATCH_QUEUE_SERIAL);
     sApolloFYSessions = [NSMutableDictionary dictionary];
     sApolloFYSignedOutUsers = [NSMutableSet set];
     sApolloFYHomeControllers = [NSHashTable weakObjectsHashTable];
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:ApolloForYouFeedFilterChangedNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(__unused NSNotification *note) {
+        dispatch_async(sApolloFYQueue, ^{
+            // Keep prior sessions in the identifier map so an in-flight token
+            // page can finish consistently, but never replay one whose filter
+            // policy no longer matches the setting.
+            sApolloFYCurrent = nil;
+        });
+        sApolloFYFilterReloadPending = YES;
+        for (UIViewController *vc in sApolloFYHomeControllers.allObjects) {
+            if (vc.viewIfLoaded.window && ApolloForYouFeedEnabled()) {
+                sApolloFYFilterReloadPending = NO;
+                ApolloFYReload(vc);
+                break;
+            }
+        }
+    }];
     %init;
 
     ApolloActionMenuSpec *spec = [ApolloActionMenuSpec new];

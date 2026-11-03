@@ -8,6 +8,7 @@
 #import <objc/message.h>
 
 #import "ApolloCommon.h"
+#import "ApolloDuoRail.h"
 #import "ApolloThemeManagerViewController.h"
 #import "PictureInPictureViewController.h"
 #import "TagFiltersViewController.h"
@@ -95,6 +96,9 @@ static void ApolloSettingsRouterEnsureRegistry(void) {
         add(@"pal-home", @"Pal Home", @"Apollo Reborn → Features → Pal Home", ^UIViewController *{
             return [[ApolloPalHomeViewController alloc] init];
         });
+        if (ApolloDuoDeviceDetected()) {
+            add(@"iphone-duo", @"iPhone Duo", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloDuoSettingsViewController class]));
+        }
         add(@"action-menus", @"Customize Action Menus", @"Apollo Reborn → Features → Interface", ApolloSettingsInsetGrouped([ApolloActionMenuSettingsViewController class]));
         // One route per menu editor (settings search indexes a screen per route,
         // so each menu's items stay searchable and open in the right editor).
