@@ -2746,6 +2746,26 @@ typedef NS_ENUM(NSInteger, Tag) {
         displayNavigationFooter = [displayNavigationFooter stringByAppendingString:
             @"\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."];
     }
+    // Feed title tap and Posts tab long press open the tweak's Modern search
+    // sheet or Apollo's Classic inline popup. Read live, so no relaunch is needed.
+    ApolloSettingsRow *switcherStyle =
+        [ApolloSettingsRow valueRowWithID:@"interface.subredditSwitcher"
+                                   title:@"Subreddit Switcher"
+                                  detail:^NSString * {
+            return sSubredditSwitcherSheetEnabled ? @"Modern" : @"Classic";
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.subredditSwitcher"],
+                @"Subreddit Switcher", @[ @"Classic", @"Modern" ],
+                sSubredditSwitcherSheetEnabled ? 1 : 0, ^(NSInteger picked) {
+                    BOOL sheetEnabled = picked == 1;
+                    if (sSubredditSwitcherSheetEnabled == sheetEnabled) return;
+                    sSubredditSwitcherSheetEnabled = sheetEnabled;
+                    [NSUserDefaults.standardUserDefaults setBool:sheetEnabled
+                        forKey:UDKeySubredditSwitcherSheetEnabled];
+                    [weakSelf reloadRowWithID:@"interface.subredditSwitcher"];
+                });
+        }];
 
     NSArray<NSString *> *trueBlackTitles = @[ @"Off", @"Dark Mode Only", @"Light Mode Only", @"Always" ];
     ApolloSettingsRow *trueBlackKeyboard =
@@ -2767,7 +2787,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
                                             footer:displayNavigationFooter
-                                              rows:@[ scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, iPadPaneLayout, scrollEdgeEffect ]];
+                                              rows:@[ scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden

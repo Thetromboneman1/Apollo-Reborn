@@ -407,6 +407,10 @@ static NSString *const UDKeyDuoSubredditPanelGlassEnabled = @"DuoSubredditPanelG
 // Opt-in tabletop video layout on a partly folded Duo. Default OFF.
 static NSString *const UDKeyDuoTabletopVideoEnabled = @"DuoTabletopVideoEnabled";
 static NSString *const ApolloDuoVideoLayoutDidChangeNotification = @"ApolloDuoVideoLayoutDidChangeNotification";
+// Subreddit quick-switcher (feed title tap, Posts tab long press): YES = the
+// tweak's Modern search sheet (default on Duo), NO = Apollo's Classic inline popup
+// (default elsewhere; it doesn't carry over a Duo unfold).
+static NSString *const UDKeySubredditSwitcherSheetEnabled = @"SubredditSwitcherSheetEnabled";
 // When ON, press-and-hold anywhere on a post info row (score, comments,
 // timestamp, 🌐 translation marker…) shows the glass-slider magnifier loupe: the
 // row is zoomed in a Liquid Glass card, sliding moves the selection pill

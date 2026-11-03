@@ -83,6 +83,7 @@ BOOL sTabBarSwipeNavigation = NO;   // opt-in (default OFF via registerDefaults,
 NSInteger sDuoLandscapeFeedLayout = 0;
 BOOL sDuoSubredditPanelGlassEnabled = NO;
 BOOL sDuoTabletopVideoEnabled = NO;
+BOOL sSubredditSwitcherSheetEnabled = NO;
 BOOL sKeepSearchBarInPlace = NO;
 ApolloSettingsIconAppearance sSettingsIconAppearance = ApolloSettingsIconAppearanceLight;
 BOOL sIconRowMagnifier = YES;   // effective default ON via registerDefaults (UDKeyIconRowMagnifier)

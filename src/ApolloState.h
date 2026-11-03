@@ -204,6 +204,8 @@ extern NSInteger sDuoLandscapeFeedLayout;
 // Standard (default NO) or Liquid Glass for the open Duo subreddit panel.
 extern BOOL sDuoSubredditPanelGlassEnabled;
 extern BOOL sDuoTabletopVideoEnabled; // opt-in, default NO
+// Modern sheet or Apollo's Classic popup for the subreddit quick-switcher.
+extern BOOL sSubredditSwitcherSheetEnabled;
 BOOL ApolloSupportsNativeTabBarScrollBehavior(void);
 #ifdef __cplusplus
 }
