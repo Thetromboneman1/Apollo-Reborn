@@ -8,11 +8,14 @@ from pathlib import Path
 import sys
 root, build = map(Path, sys.argv[1:])
 s = (root/'src/ApolloNavigationActions.xm').read_text()
+box = s[s.index('@interface ApolloNavigationActionsControllerBox'):s.index('@interface ApolloNavigationActionsScrollOwnerBox')]
+start = s.index('static BOOL ApolloActionsUsesDuoOverflow(')
+policy = s[start:s.index('\n}', start) + 2]
 helper = s[s.index('@interface ApolloDuoSystemOverflow'):s.index('static NSArray<UIBarButtonItem *> *ApolloActionsDuoNativeItems(')]
 fixture = (root/'tests/duo_system_overflow_tests.m').read_text()
 search = (root/'src/ApolloSearchNativeBar.xm').read_text()
 trailing = search[search.index('NSArray<UIBarButtonItem *> *ApolloNativeFeedSearchDuoTrailingItems('):search.index('static void NSBUpdateDuoControls(')]
-(build/'tests.m').write_text(fixture.replace('// INCLUDE_PRODUCTION_HELPERS', helper).replace('// INCLUDE_TRAILING_ITEMS_HELPER', trailing))
+(build/'tests.m').write_text(fixture.replace('// INCLUDE_PRODUCTION_CONTROLLER_BOX', box).replace('// INCLUDE_PRODUCTION_RAIL_POLICY', policy).replace('// INCLUDE_PRODUCTION_HELPERS', helper).replace('// INCLUDE_TRAILING_ITEMS_HELPER', trailing))
 PY
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror -fsanitize=address,undefined -framework Foundation "$overflow_build/tests.m" -o "$overflow_build/tests"
 "$overflow_build/tests"

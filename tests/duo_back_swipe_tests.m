@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
+#import "ApolloDuoPaneDrag.h"
 
 @protocol UIGestureRecognizerDelegate <NSObject> @end
 @class UIGestureRecognizer, UIPanGestureRecognizer, ApolloDuoSplitState;
@@ -45,11 +46,14 @@
 @end
 @interface UIPanGestureRecognizer : UIGestureRecognizer
 @property(nonatomic) NSUInteger maximumNumberOfTouches;
+@property(nonatomic) BOOL enabled;
 @property(nonatomic) BOOL cancelsTouchesInView;
-@property(nonatomic) CGPoint velocity;
+@property(nonatomic) CGPoint translation, velocity;
+- (CGPoint)translationInView:(UIView *)view;
 - (CGPoint)velocityInView:(UIView *)view;
 @end
 @implementation UIPanGestureRecognizer
+- (CGPoint)translationInView:(__unused UIView *)view { return self.translation; }
 - (CGPoint)velocityInView:(__unused UIView *)view { return self.velocity; }
 @end
 @interface UISwipeGestureRecognizer : UIGestureRecognizer
@@ -142,11 +146,6 @@ static BOOL ApolloDeviceIsDuo(void) { return duo; }
 static BOOL ApolloDuoSplitIsResizing(void) { return resizing; }
 static ApolloDuoSplitState *ApolloDuoSplitStateForNavigation(UINavigationController *nav, __unused BOOL create) { return nav.duoState; }
 // INCLUDE_PRODUCTION_SPLIT_POLICIES
-static BOOL ApolloDuoSplitRevealPostsList(UINavigationController *nav) {
-    nav.duoState.host.listVisible = YES;
-    drawerReveals++;
-    return YES;
-}
 static BOOL ApolloDuoSplitReturnFromVisitedProfile(UINavigationController *nav) {
     if (!ApolloDuoSplitCanReturnFromVisitedProfile(nav)) return NO;
     nav.duoState.profilePrefix = nil;
@@ -170,8 +169,37 @@ static BOOL ApolloDuoSplitRestoreClosedThread(UINavigationController *nav) {
 }
 static CGRect ApolloDuoSplitContentFrame(UINavigationController *nav, __unused UIView *view) { return nav.pane; }
 static BOOL UIAccessibilityIsReduceMotionEnabled(void) { return reduceMotion; }
-enum { UISwipeGestureRecognizerDirectionRight = 1, UISwipeGestureRecognizerDirectionLeft = 2, UIGestureRecognizerStatePossible = 0,
-       UIGestureRecognizerStateRecognized = 3, UIGestureRecognizerStateFailed = 5 };
+typedef NSInteger UIGestureRecognizerState;
+enum { UISwipeGestureRecognizerDirectionRight = 1, UISwipeGestureRecognizerDirectionLeft = 2, UIGestureRecognizerStateRecognized = 3 };
+enum { UIGestureRecognizerStatePossible, UIGestureRecognizerStateBegan, UIGestureRecognizerStateChanged,
+       UIGestureRecognizerStateEnded, UIGestureRecognizerStateCancelled, UIGestureRecognizerStateFailed };
+static NSString *const UIApplicationWillResignActiveNotification = @"resign";
+// Split surfaces the pane drag moves, recorded instead of animated.
+static NSUInteger threadDragsBegun, listDragsBegun;
+static CGFloat threadOffset = -1, listShown = -1;
+static BOOL threadClosed, listShownAtEnd, threadCanClose;
+static BOOL ApolloDuoSplitCanDragThreadClosed(UINavigationController *nav) {
+    return threadCanClose || (nav.duoState.feed && nav == nav.duoState.secondary
+        && nav.duoState.host.postsShowingDetail && nav.viewControllers.count == 2);
+}
+static CGFloat ApolloDuoSplitBeginThreadDrag(__unused UINavigationController *nav) { threadDragsBegun++; return 0; }
+static void ApolloDuoSplitDragThread(__unused UINavigationController *nav, CGFloat offset) { threadOffset = offset; }
+static CGFloat ApolloDuoSplitThreadDragTravel(__unused UINavigationController *nav) { return 500; }
+static void ApolloDuoSplitEndThreadDrag(UINavigationController *nav, BOOL close, __unused CGFloat offset, __unused CGFloat velocity) {
+    threadClosed = close;
+    if (close) {
+        [nav popViewControllerAnimated:!reduceMotion];
+        nav.duoState.host.postsShowingDetail = NO;
+    }
+}
+static BOOL ApolloDuoSplitBeginListDrag(__unused UINavigationController *nav) { listDragsBegun++; return YES; }
+static CGFloat ApolloDuoSplitListDragTravel(__unused UINavigationController *nav) { return 372; }
+static CGFloat ApolloDuoSplitListDragStart(__unused UINavigationController *nav) { return 0; }
+static void ApolloDuoSplitMoveListDrag(__unused UINavigationController *nav, CGFloat shown) { listShown = shown; }
+static void ApolloDuoSplitEndListDrag(__unused UINavigationController *nav, BOOL show, __unused CGFloat velocity) {
+    listShownAtEnd = show;
+    if (show) drawerReveals++;
+}
 #define ApolloLog(...) ((void)0)
 // INCLUDE_PRODUCTION_GESTURES
 static NSUInteger checks;
@@ -189,6 +217,25 @@ static UINavigationController *Navigation(void) {
     nav.view.safeAreaLayoutGuide.layoutFrame = CGRectMake(0, 80, 1100, 720);
     nav.pane = CGRectNull;
     return nav;
+}
+// Drive the installed pane recognizer through its real begin/change/end
+// delegates. A Native route is a handoff, so this fixture simulates Apollo's
+// separate native pop only after proving the custom pan stood down.
+static void BackDrag(ApolloDuoBackSwipe *owner) {
+    owner.pan.translation = CGPointMake(30, 0);
+    owner.pan.velocity = CGPointZero;
+    if (![owner gestureRecognizerShouldBegin:owner.pan]) {
+        Check(owner.route == ApolloDuoBackRouteNative, @"real page Back hands off to Apollo's native pan");
+        [owner.navigation popViewControllerAnimated:!reduceMotion];
+        return;
+    }
+    owner.pan.state = UIGestureRecognizerStateBegan;
+    [owner panned:owner.pan];
+    owner.pan.translation = CGPointMake(300, 0);
+    owner.pan.state = UIGestureRecognizerStateChanged;
+    [owner panned:owner.pan];
+    owner.pan.state = UIGestureRecognizerStateEnded;
+    [owner panned:owner.pan];
 }
 int main(void) {
     @autoreleasepool {
@@ -230,23 +277,18 @@ int main(void) {
         Check(!ApolloDuoBackSwipeCanNavigate(nav), @"outer containment cannot compete with the real pane");
         nav.duoState = nil;
         ApolloDuoInstallBackSwipe(nav); ApolloDuoInstallBackSwipe(nav);
-        Check(ApolloDuoHasBackSwipe(nav) && nav.view.gestureRecognizers.count == 3, @"recognizer installation is idempotent (back swipe + forward swipe + highlight guard)");
+        Check(ApolloDuoHasBackSwipe(nav) && nav.view.gestureRecognizers.count == 3, @"recognizer installation is idempotent (back pan + forward swipe + highlight guard)");
         ApolloDuoBackSwipe *owner = objc_getAssociatedObject(nav, &kApolloDuoBackSwipe);
-        Check(owner.swipe.direction == UISwipeGestureRecognizerDirectionRight && owner.swipe.numberOfTouchesRequired == 1,
-              @"Back uses a one-finger right swipe");
+        Check(owner.pan.maximumNumberOfTouches == 1, @"Back follows one finger");
         UITouch *touch = [UITouch new]; touch.point = CGPointMake(5, 300);
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"real delegate accepts the content-edge touch");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"real delegate accepts the content-edge touch");
         touch.point = CGPointMake(200, 300);
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"real delegate rejects interior touches");
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"real delegate rejects interior touches");
         UIScrollView *scroll = [UIScrollView new]; scroll.panGestureRecognizer = [UIPanGestureRecognizer new];
         scroll.panGestureRecognizer.view = scroll;
-        Check([owner gestureRecognizer:owner.swipe shouldRecognizeSimultaneouslyWithGestureRecognizer:scroll.panGestureRecognizer],
-              @"table scrolling does not wait for the swipe");
         UIPanGestureRecognizer *row = [UIPanGestureRecognizer new];
-        Check(![owner gestureRecognizer:owner.swipe shouldRecognizeSimultaneouslyWithGestureRecognizer:row],
-              @"a row action cannot fire alongside Back");
-        Check([owner gestureRecognizer:owner.swipe shouldBeRequiredToFailByGestureRecognizer:row]
-              && ![owner gestureRecognizer:owner.swipe shouldBeRequiredToFailByGestureRecognizer:scroll.panGestureRecognizer],
+        Check([owner gestureRecognizer:owner.pan shouldBeRequiredToFailByGestureRecognizer:row]
+              && ![owner gestureRecognizer:owner.pan shouldBeRequiredToFailByGestureRecognizer:scroll.panGestureRecognizer],
               @"edge Back has priority over row gestures without blocking table pans");
         UIPanGestureRecognizer *guard = owner.highlightGuard;
         Check(guard && [nav.view.gestureRecognizers containsObject:guard] && guard.maximumNumberOfTouches == 1
@@ -291,19 +333,17 @@ int main(void) {
         Check(![owner gestureRecognizerShouldBegin:guard], @"highlight guard stands down when Back cannot navigate");
         disabled = NO;
         Check([owner gestureRecognizer:guard shouldRecognizeSimultaneouslyWithGestureRecognizer:row]
-              && [owner gestureRecognizer:owner.swipe shouldRecognizeSimultaneouslyWithGestureRecognizer:guard],
+              && [owner gestureRecognizer:owner.pan shouldRecognizeSimultaneouslyWithGestureRecognizer:guard],
               @"highlight guard recognizes simultaneously with anything");
-        Check(![owner gestureRecognizer:owner.swipe shouldBeRequiredToFailByGestureRecognizer:guard],
+        Check(![owner gestureRecognizer:owner.pan shouldBeRequiredToFailByGestureRecognizer:guard],
               @"the swipe never waits for the highlight guard");
-        owner.swipe.state = UIGestureRecognizerStateRecognized;
-        [owner swiped:owner.swipe]; [owner swiped:owner.swipe];
-        Check(nav.pops == 1 && nav.viewControllers.count == 1 && nav.lastAnimated,
-              @"recognized swipe performs one native animated Back and stops at root");
-        Check(![owner gestureRecognizerShouldBegin:owner.swipe], @"root page has no Back gesture");
-        nav = Navigation(); reduceMotion = YES;
-        ApolloDuoInstallBackSwipe(nav); owner = objc_getAssociatedObject(nav, &kApolloDuoBackSwipe);
-        owner.swipe.state = UIGestureRecognizerStateRecognized; [owner swiped:owner.swipe];
-        Check(nav.pops == 1 && !nav.lastAnimated, @"Reduce Motion suppresses the Back animation");
+        // Folded: every pop is a real page pop, so Apollo's own interactive
+        // Back owns it and the pane drag stands down.
+        owner.pan.translation = CGPointMake(30, 2);
+        Check(ApolloDuoPaneBackIsNative(nav) && ![owner gestureRecognizerShouldBegin:owner.pan],
+              @"a page pop is left to Apollo's own Back, which follows the finger");
+        owner.pan.translation = CGPointMake(2, 30);
+        Check(![owner gestureRecognizerShouldBegin:owner.pan], @"vertical motion never starts Back");
         nav = Navigation(); nav.view.window = nil;
         Check(!ApolloDuoBackSwipeCanNavigate(nav), @"offscreen navigation cannot pop");
 
@@ -328,11 +368,34 @@ int main(void) {
         detail.viewControllers = @[detail.viewControllers.firstObject];
         Check(!ApolloDuoBackSwipeCanNavigate(detail), @"right pane placeholder cannot open menu or pop");
         ApolloDuoInstallBackSwipe(feed); owner = objc_getAssociatedObject(feed, &kApolloDuoBackSwipe);
-        owner.swipe.state = UIGestureRecognizerStateRecognized;
-        [owner swiped:owner.swipe]; [owner swiped:owner.swipe];
-        Check(drawerReveals == 1 && feed.pops == 0 && split.host.listVisible, @"root swipe reveals menu once without popping root or toggling closed");
+        owner.pan.translation = CGPointMake(30, 0);
+        Check([owner gestureRecognizerShouldBegin:owner.pan] && owner.route == ApolloDuoBackRouteDrawer,
+              @"feed root drag routes to the subreddit list");
+        owner.pan.state = UIGestureRecognizerStateBegan; [owner panned:owner.pan];
+        owner.pan.translation = CGPointMake(200, 0); owner.pan.state = UIGestureRecognizerStateChanged; [owner panned:owner.pan];
+        Check(listDragsBegun == 1 && listShown == 200 && feed.pops == 0, @"the list follows the finger without popping the root");
+        owner.pan.state = UIGestureRecognizerStateEnded; [owner panned:owner.pan];
+        Check(listShownAtEnd, @"a release past a third of the list shows it");
+        owner.pan.translation = CGPointMake(40, 0); owner.pan.state = UIGestureRecognizerStateBegan; [owner panned:owner.pan];
+        owner.route = ApolloDuoBackRouteDrawer; owner.pan.state = UIGestureRecognizerStateEnded; [owner panned:owner.pan];
+        Check(!listShownAtEnd, @"an early release slides the list back out");
+        split.host.listVisible = YES;
         Check(!ApolloDuoBackSwipeCanNavigate(feed), @"open drawer blocks underlying feed swipe");
-        split.host.listVisible = NO; split.changing = YES;
+        split.host.listVisible = NO;
+        // The thread right above the Posts backstop slides out with the finger.
+        detail.viewControllers = @[[UIViewController new], [UIViewController new]];
+        threadCanClose = YES; split.feed = feed;
+        ApolloDuoInstallBackSwipe(detail); owner = objc_getAssociatedObject(detail, &kApolloDuoBackSwipe);
+        owner.pan.translation = CGPointMake(30, 0);
+        Check([owner gestureRecognizerShouldBegin:owner.pan] && owner.route == ApolloDuoBackRouteCloseThread,
+              @"the thread above the backstop routes to the close drag, not a native pop");
+        owner.pan.state = UIGestureRecognizerStateBegan; [owner panned:owner.pan];
+        owner.pan.translation = CGPointMake(900, 0); owner.pan.state = UIGestureRecognizerStateChanged; [owner panned:owner.pan];
+        Check(threadDragsBegun == 1 && threadOffset == 500, @"the thread follows the finger, held within its pane");
+        owner.pan.state = UIGestureRecognizerStateCancelled; [owner panned:owner.pan];
+        Check(!threadClosed, @"a cancelled drag (fold, rotation) springs the thread back");
+        threadCanClose = NO; detail.viewControllers = @[detail.viewControllers.firstObject];
+        split.changing = YES;
         Check(!ApolloDuoBackSwipeCanNavigate(feed), @"column migration blocks menu swipe");
         split.changing = NO; disabled = YES;
         Check(!ApolloDuoBackSwipeCanNavigate(feed), @"navigation gesture opt-out applies to root menu");
@@ -359,20 +422,20 @@ int main(void) {
         ApolloDuoInstallBackSwipe(nav); owner = objc_getAssociatedObject(nav, &kApolloDuoBackSwipe);
         UIView *cell = [UIView new]; cell.superview = nav.view;
         touch = [UITouch new]; touch.point = CGPointMake(600, 300); touch.view = cell;
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"Disable Left Swipes: the real delegate accepts an interior touch on a row");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"Disable Left Swipes: the real delegate accepts an interior touch on a row");
         UIScrollView *gallery = [UIScrollView new]; gallery.superview = cell; gallery.scrollEnabled = YES;
         gallery.bounds = CGRectMake(0, 0, 400, 300); gallery.contentSize = CGSizeMake(1200, 300);
         UIView *page = [UIView new]; page.superview = gallery; touch.view = page;
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"a gallery on its first page has nothing to page back to");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"a gallery on its first page has nothing to page back to");
         gallery.contentOffset = CGPointMake(400, 0);
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"a gallery that can page back keeps its own swipe");
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"a gallery that can page back keeps its own swipe");
         touch.point = CGPointMake(10, 300);
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"the edge strip still goes Back over a gallery, as without the setting");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"the edge strip still goes Back over a gallery, as without the setting");
         touch.point = CGPointMake(600, 300);
         gallery.scrollEnabled = NO;
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"a scroll view that cannot scroll does not block Back");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"a scroll view that cannot scroll does not block Back");
         UISlider *slider = [UISlider new]; slider.superview = cell; touch.view = slider;
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"a slider keeps its drag");
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"a slider keeps its drag");
 
         // At a feed root the swipe would only reveal the list, so a sideways
         // scroller (Community Highlights) keeps the drag even at its start.
@@ -389,40 +452,40 @@ int main(void) {
         touch = [UITouch new]; touch.view = card; touch.point = CGPointMake(300, 300);
         Check(ApolloDuoSplitCanRevealPostsListWithSwipe(root) && ApolloDuoBackSwipeAcceptsPoint(root, touch.point),
               @"the feed root can reveal the list from this point");
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch]
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch]
               && ![owner gestureRecognizer:owner.highlightGuard shouldReceiveTouch:touch],
               @"root reveal: a carousel at its leading end keeps the swipe");
         highlights.contentOffset = CGPointMake(600, 0);
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"root reveal: a scrolled carousel keeps the swipe");
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"root reveal: a scrolled carousel keeps the swipe");
         highlights.contentOffset = CGPointZero; touch.point = CGPointMake(10, 300);
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"root reveal: the edge strip still opens the list over a carousel");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"root reveal: the edge strip still opens the list over a carousel");
         touch.point = CGPointMake(300, 300);
         highlights.contentSize = CGSizeMake(500, 200); highlights.alwaysBounceHorizontal = YES;
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch],
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch],
               @"root reveal: a carousel whose cards fit still keeps the swipe when it bounces sideways");
         highlights.alwaysBounceHorizontal = NO;
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch],
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch],
               @"root reveal: a horizontal scroll view that fits and does not bounce lets the list open");
         highlights.alwaysBounceHorizontal = YES; highlights.scrollEnabled = NO;
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch],
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch],
               @"root reveal: a scroll view with scrolling disabled lets the list open");
         highlights.scrollEnabled = YES; highlights.alwaysBounceHorizontal = NO;
         highlights.contentSize = CGSizeMake(1800, 200); touch.point = CGPointMake(10, 300);
         touch.point = CGPointMake(300, 300); touch.view = feedHeader;
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"root reveal: the rest of the feed still opens the list");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"root reveal: the rest of the feed still opens the list");
         touch.view = card; rootSplit.host.postsShowingDetail = YES;
         rootThread.viewControllers = @[[UIViewController new], [UIViewController new]];
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch],
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch],
               @"root reveal: a thread open beside the feed changes nothing, the carousel keeps the swipe");
         rootSplit.host.postsShowingDetail = NO; rootThread.viewControllers = @[[UIViewController new]];
         root.viewControllers = @[[UIViewController new], [UIViewController new]];
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"a pushed page with a carousel at its first item still goes Back");
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"a pushed page with a carousel at its first item still goes Back");
         highlights.contentSize = CGSizeMake(500, 200); highlights.alwaysBounceHorizontal = YES;
-        Check([owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch],
+        Check([owner gestureRecognizer:owner.pan shouldReceiveTouch:touch],
               @"a pushed page still goes Back over a bouncing carousel whose cards fit");
         highlights.contentSize = CGSizeMake(1800, 200); highlights.alwaysBounceHorizontal = NO;
         highlights.contentOffset = CGPointMake(600, 0);
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"a pushed page with a carousel mid-way keeps it scrolling");
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"a pushed page with a carousel mid-way keeps it scrolling");
 
         // A visited profile is the account split's one-page detail root: Back
         // leaves it the way its Back button does, with or without the setting.
@@ -435,9 +498,10 @@ int main(void) {
         account.profilePrefix = @[[UIViewController new]];
         account.secondary = profile; account.root = profile.viewControllers.firstObject;
         profile.duoState = account;
-        Check(ApolloDuoBackSwipeCanNavigate(profile), @"a visited profile's pane can swipe Back out of the profile");
+        Check(ApolloDuoBackSwipeCanNavigate(profile) && !ApolloDuoPaneBackIsNative(profile),
+              @"a visited profile's pane uses its split Back transition, not native page popping");
         ApolloDuoInstallBackSwipe(profile); owner = objc_getAssociatedObject(profile, &kApolloDuoBackSwipe);
-        owner.swipe.state = UIGestureRecognizerStateRecognized; [owner swiped:owner.swipe];
+        BackDrag(owner);
         Check(profileReturns == 1 && profile.pops == 0, @"the swipe leaves the visited profile through its Back transition");
         Check(!ApolloDuoBackSwipeCanNavigate(profile), @"once left, the profile pane has nothing to go Back to");
         // The profile's left column (header and shortcuts) belongs to the
@@ -448,7 +512,7 @@ int main(void) {
         header.duoState = account; account.primary = header;
         Check(ApolloDuoBackSwipeCanNavigate(header), @"the visited profile's left column can swipe Back out of the profile");
         ApolloDuoInstallBackSwipe(header); owner = objc_getAssociatedObject(header, &kApolloDuoBackSwipe);
-        owner.swipe.state = UIGestureRecognizerStateRecognized; [owner swiped:owner.swipe];
+        BackDrag(owner);
         Check(profileReturns == 2 && header.pops == 0, @"a left-column swipe leaves the visited profile the same way");
         Check(!ApolloDuoBackSwipeCanNavigate(header), @"after leaving, the left column swipe stands down");
         account.profilePrefix = @[[UIViewController new]]; account.tabKind = @"profile";
@@ -464,36 +528,34 @@ int main(void) {
         posts.split = [NSObject new]; posts.host = [TestDuoHost new]; posts.host.postsShowingDetail = YES;
         posts.feed = feed2; posts.secondary = thread; feed2.duoState = posts; thread.duoState = posts;
         ApolloDuoInstallBackSwipe(feed2); owner = objc_getAssociatedObject(feed2, &kApolloDuoBackSwipe);
-        owner.swipe.state = UIGestureRecognizerStateRecognized;
         NSUInteger revealsBefore = drawerReveals;
         leftSwipesDisabled = YES;
-        [owner swiped:owner.swipe];
+        BackDrag(owner);
         Check(drawerReveals == revealsBefore + 1 && thread.pops == 0 && feed2.pops == 0,
               @"Disable Left Swipes: a feed-root swipe opens the list and leaves the thread beside it open");
         posts.host.listVisible = NO;
         feed2.viewControllers = @[[UIViewController new], [UIViewController new]];
-        [owner swiped:owner.swipe];
+        BackDrag(owner);
         Check(feed2.pops == 1 && thread.pops == 0 && drawerReveals == revealsBefore + 1,
               @"Disable Left Swipes: a feed-pane swipe pops the feed's own page, not the thread beside it");
         thread.viewControllers = @[[UIViewController new], [UIViewController new], [UIViewController new]];
         ApolloDuoInstallBackSwipe(thread);
         ApolloDuoBackSwipe *threadOwner = objc_getAssociatedObject(thread, &kApolloDuoBackSwipe);
-        threadOwner.swipe.state = UIGestureRecognizerStateRecognized;
-        [threadOwner swiped:threadOwner.swipe];
+        BackDrag(threadOwner);
         Check(thread.pops == 1 && thread.viewControllers.count == 2 && feed2.pops == 1,
               @"Disable Left Swipes: a thread-pane swipe pops the page pushed over the thread");
-        [threadOwner swiped:threadOwner.swipe];
+        BackDrag(threadOwner);
         Check(thread.pops == 2 && thread.viewControllers.count == 1 && feed2.pops == 1 && drawerReveals == revealsBefore + 1,
               @"Disable Left Swipes: the next thread-pane swipe closes the thread itself");
         posts.host.postsShowingDetail = YES; thread.viewControllers = @[[UIViewController new], [UIViewController new]];
         feed2.viewControllers = @[[UIViewController new]];
         leftSwipesDisabled = NO;
-        [owner swiped:owner.swipe];
+        BackDrag(owner);
         Check(thread.pops == 2 && drawerReveals == revealsBefore + 2,
               @"with left swipes on, the feed edge keeps #1245's per-pane behavior (opens the list)");
         leftSwipesDisabled = NO;
         touch.view = cell;
-        Check(![owner gestureRecognizer:owner.swipe shouldReceiveTouch:touch], @"with left swipes on, interior touches stay with row actions");
+        Check(![owner gestureRecognizer:owner.pan shouldReceiveTouch:touch], @"with left swipes on, interior touches stay with row actions");
 
         // The forward swipe brings back the thread a close took from beside the
         // feed, on release: from the feed's trailing strip, or anywhere with
@@ -534,9 +596,9 @@ int main(void) {
             Check(![fwdOwner gestureRecognizer:fwdOwner.forwardSwipe shouldReceiveTouch:leading],
                   @"forward: the leading edge is Back's, not forward's");
             strip.point = CGPointMake(1270, 300);
-            Check(![fwdOwner gestureRecognizer:fwdOwner.swipe shouldReceiveTouch:strip],
+            Check(![fwdOwner gestureRecognizer:fwdOwner.pan shouldReceiveTouch:strip],
                   @"forward: the Back swipe does not take the trailing strip");
-            Check([fwdOwner gestureRecognizer:fwdOwner.swipe shouldReceiveTouch:leading],
+            Check([fwdOwner gestureRecognizer:fwdOwner.pan shouldReceiveTouch:leading],
                   @"forward: Back keeps its leading edge with a thread to bring back");
             Check([fwdOwner gestureRecognizer:fwdOwner.highlightGuard shouldReceiveTouch:strip],
                   @"forward: the highlight guard takes the strip too, so the row drops its highlight");
