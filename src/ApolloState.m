@@ -87,6 +87,7 @@ BOOL sSubredditSwitcherSheetEnabled = NO;
 BOOL sKeepSearchBarInPlace = NO;
 BOOL sShowFeedSearchBar = YES;
 BOOL sShowFindInCommentsBar = YES;
+BOOL sDuoRailReplyButton = YES;
 ApolloSettingsIconAppearance sSettingsIconAppearance = ApolloSettingsIconAppearanceLight;
 BOOL sIconRowMagnifier = YES;   // effective default ON via registerDefaults (UDKeyIconRowMagnifier)
 BOOL sInfoRowTapUpvote = YES;      // effective default ON via registerDefaults (UDKeyInfoRowTapUpvote)

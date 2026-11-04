@@ -376,6 +376,9 @@ static NSString *const UDKeyShowFeedSearchBar = @"ShowFeedSearchBar";
 // The same for Find in Comments on a thread; the ••• menu's Find in Comments
 // still opens a search. Default YES.
 static NSString *const UDKeyShowFindInCommentsBar = @"ShowFindInCommentsBar";
+// iPhone Duo: a Reply button in the side rail on threads, running the ••• menu's
+// own Reply (ApolloDuoSplitView.xm). Default YES.
+static NSString *const UDKeyDuoRailReplyButton = @"DuoRailReplyButton";
 // iPad only, Liquid Glass only. When ON, forces the iOS 26 floating tab bar to
 // dock at the BOTTOM (classic tab bar) instead of the top-center pill, which on
 // iPad overlaps Apollo's search bar. Temporary stopgap for issue #387 until the

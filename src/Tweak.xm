@@ -4056,6 +4056,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyKeepSearchBarInPlace: @NO,
                                     UDKeyShowFeedSearchBar: @YES,
                                     UDKeyShowFindInCommentsBar: @YES,
+                                    UDKeyDuoRailReplyButton: @YES,
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeyIPadPaneLayout: @NO,
                                     UDKeySettingsIconAppearance: @(ApolloSettingsIconAppearanceLight),
@@ -4386,6 +4387,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
     sShowFeedSearchBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowFeedSearchBar];
     sShowFindInCommentsBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowFindInCommentsBar];
+    sDuoRailReplyButton = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDuoRailReplyButton];
     sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
     // Read once here: ApolloPaneInstall.xm builds the split controllers during
     // scene connect, which happens after %ctor and never again for the process.

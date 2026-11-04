@@ -2858,9 +2858,23 @@ typedef NS_ENUM(NSInteger, Tag) {
     if (searchBarRows) {
         displayNavigationFooter = [displayNavigationFooter stringByAppendingString:@"\n\nFeed Search Bar and Find in Comments Bar: turn off to remove the search field under the title. Find in Comments stays in the thread's ••• menu. Applies to screens opened afterwards."];
     }
+
+    ApolloSettingsRow *duoRailReply =
+        [ApolloSettingsRow switchRowWithID:@"interface.duoRailReply"
+                                     title:@"Reply Button in Side Rail"
+                                      isOn:^BOOL { return sDuoRailReplyButton; }
+                                  onToggle:^(UISwitch *sender) {
+            sDuoRailReplyButton = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyDuoRailReplyButton];
+        }];
+    duoRailReply.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+
+    if (ApolloDuoUsesAdaptiveBars()) {
+        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:@"\n\nReply Button in Side Rail: on iPhone Duo, threads show Reply beside the other actions in the side rail instead of only in the ••• menu."];
+    }
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
                                             footer:displayNavigationFooter
-                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect, feedSearchBar, findInCommentsBar ]];
+                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect, feedSearchBar, findInCommentsBar, duoRailReply ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
