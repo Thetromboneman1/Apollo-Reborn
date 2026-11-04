@@ -2834,9 +2834,33 @@ typedef NS_ENUM(NSInteger, Tag) {
                 });
         }];
 
+    ApolloSettingsRow *feedSearchBar =
+        [ApolloSettingsRow switchRowWithID:@"interface.feedSearchBar"
+                                     title:@"Feed Search Bar"
+                                      isOn:^BOOL { return sShowFeedSearchBar; }
+                                  onToggle:^(UISwitch *sender) {
+            sShowFeedSearchBar = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyShowFeedSearchBar];
+        }];
+    ApolloSettingsRow *findInCommentsBar =
+        [ApolloSettingsRow switchRowWithID:@"interface.findInCommentsBar"
+                                     title:@"Find in Comments Bar"
+                                      isOn:^BOOL { return sShowFindInCommentsBar; }
+                                  onToggle:^(UISwitch *sender) {
+            sShowFindInCommentsBar = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyShowFindInCommentsBar];
+        }];
+    BOOL searchBarRows = NO;
+    if (@available(iOS 26.0, *)) searchBarRows = IsLiquidGlass();
+    feedSearchBar.visible = ^BOOL { return searchBarRows; };
+    findInCommentsBar.visible = ^BOOL { return searchBarRows; };
+
+    if (searchBarRows) {
+        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:@"\n\nFeed Search Bar and Find in Comments Bar: turn off to remove the search field under the title. Find in Comments stays in the thread's ••• menu. Applies to screens opened afterwards."];
+    }
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
                                             footer:displayNavigationFooter
-                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect ]];
+                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect, feedSearchBar, findInCommentsBar ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
