@@ -31,6 +31,7 @@ static const NSUInteger UIControlEventTouchUpInside = 64, UIControlStateNormal =
 @interface UIViewController : NSObject
 @property(strong) UIView *view;
 @property BOOL isViewLoaded;
+@property(strong) UIViewController *presentingViewController;
 @end
 @implementation UIViewController @end
 @interface UINavigationItem : NSObject
@@ -60,13 +61,15 @@ static const NSUInteger UIControlEventTouchUpInside = 64, UIControlStateNormal =
 + (UIApplication *)sharedApplication { return [self new]; }
 - (void)sendAction:(__unused SEL)a to:(__unused id)t from:(__unused id)s forEvent:(__unused id)e {}
 @end
-@interface Box : NSObject
-@property(weak) UIViewController *controller;
-@end
-@implementation Box @end
+// INCLUDE_PRODUCTION_CONTROLLER_BOX
 static char kActionsControllerKey;
-static BOOL isDuo = YES;
+static BOOL isDuo = YES, trailingRail, unfoldedPortrait, sidebar;
 static BOOL ApolloDeviceIsDuo(void) { return isDuo; }
+// Environmental boundaries: the production rail policy is extracted below.
+static BOOL ApolloActionsHasTrailingTabRail(void) { return trailingRail; }
+static BOOL ApolloDuoSplitIsUnfoldedPortrait(void) { return unfoldedPortrait; }
+static BOOL ApolloDuoSplitIsSidebarController(__unused UIViewController *controller) { return sidebar; }
+// INCLUDE_PRODUCTION_RAIL_POLICY
 static id ApolloActionsTemplateImage(id image) { return image; }
 static id ApolloNativeActionMenuCaptureMenuController(__unused UIView *source, dispatch_block_t build) { build(); return nil; }
 static UIMenu *ApolloNativeActionMenuBuildCaptured(__unused id captured) { return nil; }
@@ -89,11 +92,18 @@ int main(void) { @autoreleasepool {
     @autoreleasepool {
     UINavigationItem *item = [UINavigationItem new]; UIButton *button = [UIButton new];
     UIViewController *page = [UIViewController new]; page.view = [UIView new]; page.view.window = [NSObject new]; page.isViewLoaded = YES;
-    Box *box = [Box new]; box.controller = page;
+    ApolloNavigationActionsControllerBox *box = [ApolloNavigationActionsControllerBox new]; box.controller = page;
     objc_setAssociatedObject(item, &kActionsControllerKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIDeferredMenuElement *previous = [UIDeferredMenuElement new]; item.additionalOverflowItems = previous;
     isDuo = NO; Check(!ApolloActionsInstallSystemOverflow(item, button)); Check(item.additionalOverflowItems == previous);
-    isDuo = YES; Check(ApolloActionsInstallSystemOverflow(item, button));
+    isDuo = YES; trailingRail = YES;
+    Check(!ApolloActionsInstallSystemOverflow(item, button)); // Direct rail overflow already owns this page.
+    Check(item.additionalOverflowItems == previous); // Bypass preserves the existing provider.
+    unfoldedPortrait = YES;
+    Check(ApolloActionsInstallSystemOverflow(item, button)); // Target portrait overrides stale rail geometry.
+    ApolloActionsRemoveSystemOverflow(item);
+    unfoldedPortrait = NO; trailingRail = NO;
+    Check(ApolloActionsInstallSystemOverflow(item, button));
     provider = item.additionalOverflowItems;
     Check(ApolloActionsInstallSystemOverflow(item, button)); Check(provider == item.additionalOverflowItems);
     button.menu = [UIMenu new]; button.showsMenuAsPrimaryAction = YES;
