@@ -33,6 +33,8 @@ no playback bar and stays native.
    the layout. Close and the Reddit row stay visible the whole time.
 5. Unfold during playback and while paused. Confirm immediate native layout
    restoration without restarting, seeking, muting or unpausing the player.
+   Repeat after the tabletop transport has auto-hidden; then tap native
+   play/pause, skip, mute and scrub controls to confirm they still receive touch.
 6. Rotate to landscape/book posture and close onto the cover display. Confirm
    native layouts, then reopen portrait and partially fold again.
 7. Dismiss/reopen the viewer and page through video/photo gallery items. Photos

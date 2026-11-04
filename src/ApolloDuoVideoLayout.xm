@@ -237,6 +237,7 @@ static void DuoVideoPanelFrame(UIView *view, CGRect frame) {
 @property (nonatomic) CGRect frame;
 @property (nonatomic) CGFloat alpha;
 @property (nonatomic) BOOL hidden;
+@property (nonatomic) BOOL userInteractionEnabled;
 @property (nonatomic, strong) UIColor *background;
 @property (nonatomic) CGFloat radius;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, id> *images;
@@ -487,6 +488,7 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
     snapshot.frame = view.frame;
     snapshot.alpha = view.alpha;
     snapshot.hidden = view.hidden;
+    snapshot.userInteractionEnabled = view.userInteractionEnabled;
     snapshot.background = view.backgroundColor;
     snapshot.radius = view.layer.cornerRadius;
     if ([view isKindOfClass:UISlider.class]) {
@@ -1174,6 +1176,7 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
         }
         view.alpha = snapshot.alpha;
         view.hidden = snapshot.hidden;
+        view.userInteractionEnabled = snapshot.userInteractionEnabled;
         if (view != self.scroll && view != self.controls) DuoVideoFrame(view, snapshot.frame);
     }
     DuoVideoFrame(self.scroll, self.nativeScrollFrame);
