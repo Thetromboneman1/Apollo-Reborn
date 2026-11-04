@@ -952,6 +952,14 @@ static BOOL ApolloNativeActionMenuPerformPendingDirectAction(id actionController
     sApolloNativeDirectActionSourceView = nil;
     sApolloNativeDirectActionKind = UINT16_MAX;
 
+    // Native menu construction disables every row when this Swift flag is
+    // false. A direct action has no disabled UI to enforce it, so honor the
+    // same gate before preparing or selecting a row. Missing ivar fails closed.
+    if (!ApolloReadBoolIvar(actionController, "actionsEnabled", NO)) {
+        ApolloLog(@"[NativeActionMenu] Posts action kind %u disabled", actionKind);
+        return YES;
+    }
+
     ApolloActionMenuPrepareControllerForDirectAction(actionController);
     NSInteger row = ApolloNativeActionMenuRowForActionKind(actionController, actionKind);
     if (row == NSNotFound) {
