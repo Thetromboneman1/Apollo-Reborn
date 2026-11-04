@@ -39,6 +39,7 @@ bash "$ROOT/tests/run_allplus_slider_tests.sh"
 bash "$ROOT/tests/run_spelling_tests.sh"
 bash "$ROOT/tests/run_native_search_visibility_tests.sh"
 bash "$ROOT/tests/run_native_direct_action_gate_tests.sh"
+bash "$ROOT/tests/run_duo_thread_drag_cleanup_tests.sh"
 
 if [[ "$BUILD" == true ]]; then
   : "${THEOS:?THEOS must point to a Theos checkout for --build}"
