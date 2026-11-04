@@ -1,29 +1,36 @@
 # Duo tabletop video
 
-Run `scripts/run-in-sim.sh --glass` on the iPhone Duo and confirm
-`[DuoVideo] tabletop video hooks installed` in the `apollofix` log. Use
-Device Hub's actual Open / Partially Open / Closed and rotation controls.
-A video with Apollo's full playback bar (for example a Reddit-hosted video)
-is required; Apollo's GIF-style MP4 viewer has no playback bar and stays native.
+Run `scripts/run-in-sim.sh --glass` and, separately, `--no-glass` on the
+iPhone Duo and confirm `[DuoVideo] tabletop video hooks installed` in the
+`apollofix` log. The tile frames match; only the material changes (glass
+versus a translucent fill). Use Device Hub's actual Open / Partially Open /
+Closed and rotation controls. A video with Apollo's full playback bar (for
+example a Reddit-hosted video) is required; Apollo's GIF-style MP4 viewer has
+no playback bar and stays native.
 
-0. On Duo, open Apollo Reborn → iPhone Duo. Confirm Tabletop Video Controls
-   defaults off and partly folded playback stays native. Enable it, verify the
-   choice survives relaunch, and confirm enabling/disabling requires no restart.
-   Confirm the page stays available on the cover display. Ordinary iPhones and
-   iPads must have neither the hub entry nor the route/search results.
+0. On Duo, open Apollo Reborn → Features → iPhone Duo. Confirm Tabletop Video
+   Controls is off by default, then enable it. Confirm the Subreddit Panel
+   Style and Landscape Feed Layout controls still appear where expected.
 1. Open a video while the inner display is flat in portrait. Confirm the
    ordinary fullscreen layout, native auto-hide, seek and playback controls.
 2. Partially fold the display. Confirm the picture aspect-fits above the
    division, including a tall portrait clip. Close remains in the upper left.
-3. Confirm the lower panel has a full-width rounded timeline panel with both
-   time labels inline beside the scrubber, followed by large 15-second back /
-   play-pause / 15-second forward buttons, then icon-only mute and AirPlay
-   tiles. Rows have matching edges and 8pt gaps. AirPlay must remain visible
-   even without a receiver, and tapping it opens the system route picker. Post
-   actions stay below.
-4. Wait beyond the normal control timeout, pause/resume, seek, skip in each
-   direction, mute/unmute, and change playback speed. The panel stays visible,
-   icons reflect playback state, and time updates do not collapse the layout.
+3. Confirm the lower panel shows a glass timeline capsule first, then wide
+   rounded 15-second back, a wider play/pause, and 15-second forward. Under
+   those is a row of shorter rounded tiles: mute, Share Link, Download Video,
+   Playback Speed and AirPlay. Elapsed and remaining times sit inside the
+   capsule, on a thin track. Liquid Glass uses the glass material for the
+   capsule and the tiles; a classic build uses the same frames as translucent
+   fills. Share Link and Download Video run the same actions as the video
+   long-press menu. Playback Speed opens that menu's speed submenu. AirPlay
+   must remain tappable without a receiver, and tapping it opens the system
+   route picker. Post actions stay below.
+4. The transport hides on its own after a few seconds. A tap on the video or
+   the empty lower panel brings it back, and a tap on empty space hides it
+   again. Pause/resume, seek, skip in each direction, mute/unmute, share,
+   download, and change playback speed. The transport stays up while a control
+   is in use, including for the whole scrub, and time updates do not collapse
+   the layout. Close and the Reddit row stay visible the whole time.
 5. Unfold during playback and while paused. Confirm immediate native layout
    restoration without restarting, seeking, muting or unpausing the player.
 6. Rotate to landscape/book posture and close onto the cover display. Confirm
@@ -35,6 +42,9 @@ is required; Apollo's GIF-style MP4 viewer has no playback bar and stays native.
    an available receiver, check the native AirPlay route picker.
 9. Check flat Duo and ordinary iPhone playback for regressions. Capture the
    active Duo inner display, not the inactive cover display, for evidence.
+10. Disable Tabletop Video Controls while a viewer is open and partly folded.
+    Confirm the native viewer returns immediately. Enable it again and confirm
+    the tabletop panel returns without resetting the player.
 
 Host checks: `sh tests/run_duo_video_geometry_tests.sh`,
 `sh tests/run_duo_rail_layout_tests.sh`, and
@@ -81,14 +91,12 @@ Host checks: `sh tests/run_duo_video_geometry_tests.sh`,
   native-HID scrub from 0:22 to 0:04; flat-unfold restores native layout/colors
   while remaining paused; refolding restores the revised panel.
 
-### Duo settings / opt-in playback
+### Fork integration: Duo settings / opt-in playback
 
-- PASS in Device Hub: the new setting starts off; enabled state survives a
-  relaunch; disabling keeps partly folded video native; enabling restores the
-  tabletop layout in the same session; the page remains present on the cover
-  display. The test preference was returned to off.
-- The page groups Tabletop Video Controls, Landscape Feed Layout, and Subreddit
-  Panel Style. Existing feed/panel controls retain their keys and entrances.
-- Hub visibility, route registration, and the form are all gated on stable Duo
-  hardware capability, independent of posture. Non-Duo runtime UI inspection
-  remains unverified; no non-Duo route is registered.
+- This fork keeps its Duo-only settings page and the default-off Tabletop Video
+  Controls preference. The settings switch posts a layout-change notification
+  so open viewers update without a restart.
+- The newer upstream transport, timeline, accessory controls, and material
+  are used when the setting is enabled and the fold geometry qualifies.
+- The historical validation above predates this combined layout. Repeat the
+  physical Duo checks before treating the integrated panel as certified.
