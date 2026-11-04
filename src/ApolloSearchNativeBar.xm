@@ -995,6 +995,40 @@ static void NSBRestoreHeaderForTable(UIScrollView *sv) {
 // MARK: - Attach / policy
 
 static char kNSBDuoSearchPlacementKey;
+static char kNSBSearchVisibilitySnapshotKey;
+
+// A visibility override is independent of Duo's placement override: a retained
+// controller can change pose while its bar is off. UIKit owns the generated
+// button, so remember it weakly and return removed buttons to their old state.
+@interface NSBSearchVisibilitySnapshot : NSObject
+@property(nonatomic) BOOL allowsExternalIntegration;
+@property(nonatomic) BOOL allowsToolbarIntegration;
+@property(nonatomic, weak) UIBarButtonItem *button;
+@property(nonatomic) BOOL buttonWasHidden;
+- (void)hideButton:(UIBarButtonItem *)button;
+- (void)restoreButton;
+@end
+
+@implementation NSBSearchVisibilitySnapshot
+- (void)restoreButton {
+    if (@available(iOS 27.0, *)) {
+        UIBarButtonItem *button = self.button;
+        if (button && button.hidden != self.buttonWasHidden) button.hidden = self.buttonWasHidden;
+        self.button = nil;
+    }
+}
+- (void)hideButton:(UIBarButtonItem *)button {
+    if (@available(iOS 27.0, *)) {
+        if (self.button != button) {
+            [self restoreButton];
+            self.button = button;
+            self.buttonWasHidden = button.hidden;
+        }
+        if (button && !button.hidden) button.hidden = YES;
+    }
+}
+@end
+
 static char kNSBDuoSearchPlacementScheduledKey;
 static char kNSBDuoLeadingControlsKey;
 static char kNSBDuoTrailingControlsKey;
@@ -1100,16 +1134,29 @@ static void NSBUpdateSearchPlacement(UIViewController *vc) {
                     objc_setAssociatedObject(item, &kNSBDuoSearchPlacementKey, @(item.preferredSearchBarPlacement),
                                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 }
+                NSBSearchVisibilitySnapshot *visibility = objc_getAssociatedObject(item, &kNSBSearchVisibilitySnapshotKey);
+                if (!visibility) {
+                    visibility = [NSBSearchVisibilitySnapshot new];
+                    visibility.allowsExternalIntegration = item.searchBarPlacementAllowsExternalIntegration;
+                    visibility.allowsToolbarIntegration = item.searchBarPlacementAllowsToolbarIntegration;
+                    objc_setAssociatedObject(item, &kNSBSearchVisibilitySnapshotKey, visibility, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
                 item.searchBarPlacementAllowsExternalIntegration = NO;
                 item.searchBarPlacementAllowsToolbarIntegration = NO;
                 if (item.preferredSearchBarPlacement != UINavigationItemSearchBarPlacementIntegratedButton)
                     item.preferredSearchBarPlacement = UINavigationItemSearchBarPlacementIntegratedButton;
                 if (@available(iOS 27.0, *)) {
-                    UIBarButtonItem *button = item.searchBarPlacementBarButtonItem;
-                    if (button && !button.hidden) button.hidden = YES;
+                    [visibility hideButton:item.searchBarPlacementBarButtonItem];
                 }
                 NSBUpdateDuoControls(vc);
                 return;
+            }
+            NSBSearchVisibilitySnapshot *visibility = objc_getAssociatedObject(item, &kNSBSearchVisibilitySnapshotKey);
+            if (visibility) {
+                item.searchBarPlacementAllowsExternalIntegration = visibility.allowsExternalIntegration;
+                item.searchBarPlacementAllowsToolbarIntegration = visibility.allowsToolbarIntegration;
+                [visibility restoreButton];
+                objc_setAssociatedObject(item, &kNSBSearchVisibilitySnapshotKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
         }
         if (stacked && !original) {
