@@ -2542,6 +2542,9 @@ static void ApolloDuoPostsSetDetailPagesFromDrag(ApolloDuoSplitState *state, NSA
         // rides the drawer's spring from the finger's speed.
         if (dragOffset > 0) ApolloDuoSlideDrawer(snapshot, 0, MAX(0, travel - dragOffset), dragVelocity, YES, finished);
         else ApolloDuoSlideView(snapshot, 0, travel, 0.32, finished);
+    }
+    // A full-pane drag or failed snapshot must still retire the opaque filler.
+    if (!entering) {
         ApolloDuoRemoveThreadDragFiller(state.host.threadDragFiller, 0.32);
         state.host.threadDragFiller = nil;
     }
