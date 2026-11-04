@@ -1,6 +1,6 @@
 {
-  "git_revision": "4a0bd01eeca784322d863a673254039e884d8bb1",
-  "simulator_dylib_sha256": "cf378714a0511ea6c3e6e7c28916a7c3bc815014b86b2f1d4dd7c80cc445dc23",
+  "git_revision": "616a55ee0d7ea918ed7e1fe271938ad10d264852",
+  "simulator_dylib_sha256": "92d502a89cde3632ad0cf54f27fb96d344f80028d562a90ff8a51871709847b9",
   "account_backup_loaded": false,
   "injection": "Every cold launch explicitly SIMCTL_CHILD_DYLD_INSERT_LIBRARIES; no baked tweak load command",
   "matrix": [
@@ -11,6 +11,8 @@
       "module_init_count": 4,
       "settings_route_opened": true,
       "survived": true,
+      "survived_after_back": true,
+      "back_tap_delivered": true,
       "new_apollo_crash_reports": [],
       "smoke_passed": true
     },
@@ -21,6 +23,8 @@
       "module_init_count": 4,
       "settings_route_opened": true,
       "survived": true,
+      "survived_after_back": true,
+      "back_tap_delivered": true,
       "new_apollo_crash_reports": [],
       "smoke_passed": true
     },
@@ -31,6 +35,8 @@
       "module_init_count": 4,
       "settings_route_opened": true,
       "survived": true,
+      "survived_after_back": true,
+      "back_tap_delivered": true,
       "new_apollo_crash_reports": [],
       "smoke_passed": true
     },
@@ -41,6 +47,8 @@
       "module_init_count": 4,
       "settings_route_opened": true,
       "survived": true,
+      "survived_after_back": true,
+      "back_tap_delivered": true,
       "new_apollo_crash_reports": [],
       "smoke_passed": true
     }
@@ -49,5 +57,11 @@
     "iOS26.5": 120,
     "iOS27.0": 126
   },
-  "acceptance_limit": "Ordinary iPhone simulator, network-free and no account backup. Does not certify Duo folding, cover layout, finger-following gestures, live Reddit or notification delivery."
+  "retained_search_source_unchanged_verified": true,
+  "acceptance_limit": [
+    "Ordinary iPhone15Pro simulators; installed runtimes do not support Duo device. No fold/cover/rail/manual gesture acceptance claim.",
+    "Simulator variant excludes device-only FFmpeg/FLEX and unsupported internal-Logos hooks per Makefile. Device build/sign/install is independent evidence.",
+    "No signed-in Reddit/account/runtime network acceptance.",
+    "Retained search UIKit246 evidence uses unchanged extracted search code from earlier revision; unrelated Duo predicates are stubbed."
+  ]
 }
