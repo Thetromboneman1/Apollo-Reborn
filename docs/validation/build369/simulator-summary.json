@@ -1,0 +1,53 @@
+{
+  "git_revision": "4a0bd01eeca784322d863a673254039e884d8bb1",
+  "simulator_dylib_sha256": "cf378714a0511ea6c3e6e7c28916a7c3bc815014b86b2f1d4dd7c80cc445dc23",
+  "account_backup_loaded": false,
+  "injection": "Every cold launch explicitly SIMCTL_CHILD_DYLD_INSERT_LIBRARIES; no baked tweak load command",
+  "matrix": [
+    {
+      "runtime": "26.5",
+      "requested_mode": "modern",
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "survived": true,
+      "new_apollo_crash_reports": [],
+      "smoke_passed": true
+    },
+    {
+      "runtime": "26.5",
+      "requested_mode": "classic",
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "survived": true,
+      "new_apollo_crash_reports": [],
+      "smoke_passed": true
+    },
+    {
+      "runtime": "27.0",
+      "requested_mode": "modern",
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "survived": true,
+      "new_apollo_crash_reports": [],
+      "smoke_passed": true
+    },
+    {
+      "runtime": "27.0",
+      "requested_mode": "classic",
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "survived": true,
+      "new_apollo_crash_reports": [],
+      "smoke_passed": true
+    }
+  ],
+  "synthetic_search_UIKit_checks": {
+    "iOS26.5": 120,
+    "iOS27.0": 126
+  },
+  "acceptance_limit": "Ordinary iPhone simulator, network-free and no account backup. Does not certify Duo folding, cover layout, finger-following gestures, live Reddit or notification delivery."
+}
