@@ -12,7 +12,10 @@ import re, sys
 root, out, source_path = map(Path, sys.argv[1:])
 source = source_path.read_text()
 conversion = source[source.index('static ApolloSpellingStyle sSpellingStyle'):source.index('static void CollectTables')]
-attributed = source[source.index('// Replaces word by word'):source.index('ApolloSpellingStyle ApolloSpellingCurrentStyle')] if '// Replaces word by word' in source else ''
+if 'static char kApolloSpellingExcludedKey;' in source:
+    owner_helpers = source[source.index('static char kApolloSpellingExcludedKey;'):source.index('ApolloSpellingStyle ApolloSpellingCurrentStyle')]
+else:
+    owner_helpers = source[source.index('// Replaces word by word'):source.index('ApolloSpellingStyle ApolloSpellingCurrentStyle')] if '// Replaces word by word' in source else ''
 hooks = []
 for name in ['UILabel', 'UIButton', 'UINavigationItem', 'UIListContentConfiguration']:
     match = re.search(r'%hook '+name+r'\n(.*?)\n%end', source, re.S)
@@ -21,7 +24,7 @@ for name in ['UILabel', 'UIButton', 'UINavigationItem', 'UIListContentConfigurat
 fixture = (root/'tests/spelling_tests.mm').read_text()
 marker = '// INSERT_PRODUCTION_SPELLING'
 assert fixture.count(marker) == 1
-(out/'tests.xm').write_text(fixture.replace(marker, conversion+'\n'+attributed+'\n'+'\n'.join(hooks)+'\n%ctor { %init; }'))
+(out/'tests.xm').write_text(fixture.replace(marker, conversion+'\n'+owner_helpers+'\n'+'\n'.join(hooks)+'\n%ctor { %init; }'))
 (out/'substrate.h').write_text('''#import <objc/runtime.h>
 static inline void MSHookMessageEx(Class cls, SEL selector, IMP replacement, IMP *original) {
     Method method = class_getInstanceMethod(cls, selector);

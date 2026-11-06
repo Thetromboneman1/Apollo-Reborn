@@ -2,13 +2,16 @@
 // compile-time NSString literals. Account names, community names and other
 // runtime content must retain their exact spelling even when their value equals
 // an interface word. Trusted dynamic chrome can opt in via ApolloSpellingApply.
+// Explicit content exclusions also protect literal-looking subreddit names.
 // Attributed strings no longer carry reliable literal provenance, so their
-// generic setters are left alone; convert trusted text before building them.
+// generic setters preserve their input; convert trusted text before building them.
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import "ApolloSpelling.h"
 #import "ApolloCommon.h"
 #import "UserDefaultConstants.h"
+#import "ApolloClasses.h"
+#import "ApolloSwiftRuntime.h"
 
 static ApolloSpellingStyle sSpellingStyle = ApolloSpellingStyleAmerican;
 
@@ -189,6 +192,68 @@ void ApolloSpellingReloadLoadedTables(UIView *except) {
     ApolloLog(@"[Spelling] reloaded %lu loaded table(s) for the new style", (unsigned long)seen.count);
 }
 
+static char kApolloSpellingExcludedKey;
+// @[rewritten, original] for the last respelled set on a label or navigation item, so a later
+// opt-out can put the original back.
+static char kApolloSpellingRewriteKey;
+
+static BOOL SpellingIsExcluded(id object) {
+    return objc_getAssociatedObject(object, &kApolloSpellingExcludedKey) != nil;
+}
+
+// Puts the original back if the object still shows the respelled text from its last set.
+static void SpellingRestoreOriginal(id object) {
+    NSArray *rewrite = objc_getAssociatedObject(object, &kApolloSpellingRewriteKey);
+    if (rewrite.count != 2) return;
+    objc_setAssociatedObject(object, &kApolloSpellingRewriteKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    id rewritten = rewrite[0], original = rewrite[1];
+    NSString *rewrittenText = [rewritten isKindOfClass:NSAttributedString.class] ? [rewritten string] : rewritten;
+    if ([object isKindOfClass:UILabel.class]) {
+        UILabel *label = object;
+        if (![label.text isEqualToString:rewrittenText]) return;
+        if ([original isKindOfClass:NSAttributedString.class]) label.attributedText = original;
+        else label.text = original;
+    } else if ([object isKindOfClass:UINavigationItem.class]) {
+        UINavigationItem *item = object;
+        if ([item.title isEqualToString:rewrittenText]) item.title = original;
+    } else {
+        return;
+    }
+    ApolloLog(@"[Spelling] restored original text on %@", NSStringFromClass([object class]));
+}
+
+void ApolloSpellingSetExcluded(id object, BOOL excluded) {
+    if (!object) return;
+    objc_setAssociatedObject(object, &kApolloSpellingExcludedKey, excluded ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // A button passes its title on to its own label, so that label has to opt out too.
+    if ([object isKindOfClass:UIButton.class]) ApolloSpellingSetExcluded(((UIButton *)object).titleLabel, excluded);
+    if (excluded) SpellingRestoreOriginal(object);
+}
+
+// The style check comes first so American mode never reaches the associated-object lookup.
+static BOOL SpellingSkips(id owner) {
+    return sSpellingStyle != ApolloSpellingStyleBritish || SpellingIsExcluded(owner);
+}
+
+// Text for an owner's setter: as given when excluded, otherwise in the current style. A respelled
+// set is remembered so ApolloSpellingSetExcluded can undo it.
+// (Logos can't parse a ternary inside %orig, hence these wrappers.)
+static NSString *SpellingTextForOwner(id owner, NSString *text) {
+    // A new set replaces the previous provenance, even when its bytes match
+    // an earlier rewritten value. A later exclusion must never restore stale text.
+    objc_setAssociatedObject(owner, &kApolloSpellingRewriteKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (SpellingSkips(owner)) return text;
+    return ApolloSpellingApplyInterfaceLiteral(text);
+}
+
+// Remember after the original setter: UIKit may forward between its plain and
+// attributed setters internally. A later attributed write still clears this record.
+static void SpellingRememberRewrite(id owner, NSString *original, NSString *rewritten) {
+    if (rewritten != original && !SpellingIsExcluded(owner)) {
+        objc_setAssociatedObject(owner, &kApolloSpellingRewriteKey, @[rewritten, original], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
 ApolloSpellingStyle ApolloSpellingCurrentStyle(void) {
     return sSpellingStyle;
 }
@@ -200,15 +265,38 @@ void ApolloSpellingSetStyle(ApolloSpellingStyle style) {
 }
 
 %hook UILabel
-- (void)setText:(NSString *)text { text = ApolloSpellingApplyInterfaceLiteral(text); %orig(text); }
+- (void)setText:(NSString *)text {
+    NSString *original = text;
+    text = SpellingTextForOwner(self, text);
+    %orig(text);
+    SpellingRememberRewrite(self, original, text);
+}
+- (void)setAttributedText:(NSAttributedString *)text {
+    objc_setAssociatedObject(self, &kApolloSpellingRewriteKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    %orig(text);
+}
 %end
 
 %hook UIButton
-- (void)setTitle:(NSString *)title forState:(UIControlState)state { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title, state); }
+- (void)setTitle:(NSString *)title forState:(UIControlState)state {
+    NSString *original = title;
+    title = SpellingTextForOwner(self, title);
+    %orig(title, state);
+    SpellingRememberRewrite(self, original, title);
+}
+- (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state {
+    objc_setAssociatedObject(self, &kApolloSpellingRewriteKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    %orig(title, state);
+}
 %end
 
 %hook UINavigationItem
-- (void)setTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
+- (void)setTitle:(NSString *)title {
+    NSString *original = title;
+    title = SpellingTextForOwner(self, title);
+    %orig(title);
+    SpellingRememberRewrite(self, original, title);
+}
 - (void)setBackButtonTitle:(NSString *)title { title = ApolloSpellingApplyInterfaceLiteral(title); %orig(title); }
 %end
 
@@ -260,9 +348,72 @@ void ApolloSpellingSetStyle(ApolloSpellingStyle style) {
 - (void)setSecondaryText:(NSString *)text { text = ApolloSpellingApplyInterfaceLiteral(text); %orig(text); }
 %end
 
+// Subreddit names are Reddit content too, and the feed title is also the slug Apollo and several
+// modules (subreddit headers, Community Highlights, the switcher) read back to know which
+// subreddit is open: respelling r/ColorBlind's title to "Colourblind" made them look up the
+// wrong subreddit.
+@interface ApolloSpellingPostsController : UIViewController @end
+@interface ApolloSpellingJumpBar : UIView @end
+@interface ApolloSpellingRedditListCell : UITableViewCell @end
+
+static void SpellingExcludeLabels(UIView *view, int depth) {
+    if (depth > 4) return;
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:UILabel.class]) {
+            if (!SpellingIsExcluded(sub)) ApolloSpellingSetExcluded(sub, YES);
+        } else {
+            SpellingExcludeLabels(sub, depth + 1);
+        }
+    }
+}
+
+%group SpellingFeedTitle
+%hook ApolloSpellingPostsController
+// Every title write goes through the navigation item, so tagging it on access covers Apollo's own
+// sets; a title respelled before the first access is put back.
+- (UINavigationItem *)navigationItem {
+    UINavigationItem *item = %orig;
+    if (sSpellingStyle == ApolloSpellingStyleBritish && item && !SpellingIsExcluded(item)) {
+        ApolloSpellingSetExcluded(item, YES);
+    }
+    return item;
+}
+%end
+%end
+
+%group SpellingJumpBar
+%hook ApolloSpellingJumpBar
+// The title quick-switcher: the subreddit name, its search field and name suggestions.
+- (void)didMoveToWindow {
+    %orig;
+    UIView *jumpBar = (UIView *)self;
+    if (jumpBar.window) SpellingExcludeLabels(jumpBar, 0);
+}
+%end
+%end
+
+%group SpellingRedditList
+%hook ApolloSpellingRedditListCell
+// Subreddit, multireddit and feed names in Apollo's subreddit list. The subtitle stays rewritable:
+// it also carries Apollo's own text (multireddit descriptions opt out per set).
+- (void)didMoveToWindow {
+    %orig;
+    UIView *cell = (UIView *)self;
+    if (!cell.window) return;
+    UILabel *title = ApolloObjectIvar(cell, "redditTitleLabel");
+    if ([title isKindOfClass:UILabel.class] && !SpellingIsExcluded(title)) ApolloSpellingSetExcluded(title, YES);
+}
+%end
+%end
+
 %ctor {
     sSpellingStyle = [NSUserDefaults.standardUserDefaults integerForKey:UDKeySpellingStyle] == ApolloSpellingStyleBritish
         ? ApolloSpellingStyleBritish : ApolloSpellingStyleAmerican;
     %init;
+    if (ApolloClassPostsViewController) %init(SpellingFeedTitle, ApolloSpellingPostsController = ApolloClassPostsViewController);
+    if (ApolloClassJumpBar) %init(SpellingJumpBar, ApolloSpellingJumpBar = ApolloClassJumpBar);
+    if (ApolloClassRedditListTableViewCell) %init(SpellingRedditList, ApolloSpellingRedditListCell = ApolloClassRedditListTableViewCell);
+    ApolloLog(@"[Spelling] feed-name hooks: posts=%d jumpBar=%d redditList=%d", ApolloClassPostsViewController != Nil,
+              ApolloClassJumpBar != Nil, ApolloClassRedditListTableViewCell != Nil);
     ApolloLog(@"[Spelling] hooks installed (style %@)", sSpellingStyle == ApolloSpellingStyleBritish ? @"British" : @"American");
 }

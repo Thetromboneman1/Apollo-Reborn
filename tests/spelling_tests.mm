@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
+#define ApolloLog(...) ((void)0)
 
 typedef NS_ENUM(NSInteger, ApolloSpellingStyle) {
     ApolloSpellingStyleAmerican = 0,
@@ -16,12 +17,14 @@ typedef NSUInteger UIControlState;
 @end
 
 @interface UIButton : NSObject
+@property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, copy) NSString *storedTitle;
 @property (nonatomic, copy) NSAttributedString *storedAttributedTitle;
 - (void)setTitle:(NSString *)title forState:(UIControlState)state;
 - (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state;
 @end
 @implementation UIButton
+- (instancetype)init { if ((self = [super init])) _titleLabel = [UILabel new]; return self; }
 - (void)setTitle:(NSString *)title forState:(UIControlState)state { self.storedTitle = title; }
 - (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state { self.storedAttributedTitle = title; }
 @end
@@ -103,6 +106,37 @@ int main(void) {
         CHECK([ApolloSpellingApply(Dynamic("Customize Colors")) isEqualToString:@"Customise Colours"], "explicit trusted dynamic interface conversion remains available");
         CHECK([ApolloSpellingApply(@"r/colors u/favorite colors.com") isEqualToString:@"r/colors u/favorite colors.com"], "identifier prefixes and domains remain untouched");
         CHECK([ApolloSpellingCanonical(@"Customise Colours") isEqualToString:@"Customize Colors"], "canonical UI matching still works");
+        UILabel *excludedLabel = [UILabel new];
+        ApolloSpellingSetExcluded(excludedLabel, YES);
+        excludedLabel.text = @"Colors";
+        CHECK([excludedLabel.text isEqualToString:@"Colors"], "explicit content exclusion preserves even literal names");
+        ApolloSpellingSetExcluded(excludedLabel, NO);
+        excludedLabel.text = @"Colors";
+        CHECK([excludedLabel.text isEqualToString:@"Colours"], "a reused label resumes interface conversion after exclusion ends");
+        ApolloSpellingSetExcluded(excludedLabel, YES);
+        CHECK([excludedLabel.text isEqualToString:@"Colors"], "late label exclusion restores original literal text");
+        UINavigationItem *excludedNavigation = [UINavigationItem new];
+        excludedNavigation.title = @"ColorBlind";
+        ApolloSpellingSetExcluded(excludedNavigation, YES);
+        CHECK([excludedNavigation.title isEqualToString:@"ColorBlind"], "late navigation exclusion restores exact subreddit slug");
+        excludedNavigation.title = @"Colors";
+        CHECK([excludedNavigation.title isEqualToString:@"Colors"], "excluded navigation title stays exact on reuse");
+        UIButton *excludedButton = [UIButton new];
+        ApolloSpellingSetExcluded(excludedButton, YES);
+        [excludedButton setTitle:@"Colors" forState:0];
+        excludedButton.titleLabel.text = @"Colors";
+        CHECK([excludedButton.storedTitle isEqualToString:@"Colors"] && [excludedButton.titleLabel.text isEqualToString:@"Colors"], "button exclusion propagates to its title label");
+        UILabel *replacement = [UILabel new];
+        replacement.text = @"Colors";
+        replacement.text = Dynamic("Colours");
+        ApolloSpellingSetExcluded(replacement, YES);
+        CHECK([replacement.text isEqualToString:@"Colours"], "new dynamic text invalidates stale restore provenance even for matching bytes");
+        UILabel *attributedReplacement = [UILabel new];
+        attributedReplacement.text = @"Colors";
+        NSAttributedString *replacementContent = [[NSAttributedString alloc] initWithString:Dynamic("Colours") attributes:@{@"test": @2}];
+        attributedReplacement.attributedText = replacementContent;
+        ApolloSpellingSetExcluded(attributedReplacement, YES);
+        CHECK([attributedReplacement.attributedText isEqualToAttributedString:replacementContent] && [attributedReplacement.text isEqualToString:@"Colours"], "attributed content invalidates stale plain-text restore provenance");
         sSpellingStyle = ApolloSpellingStyleAmerican;
         label.text = @"Customize Colors";
         CHECK([label.text isEqualToString:@"Customize Colors"], "American style is unchanged");
