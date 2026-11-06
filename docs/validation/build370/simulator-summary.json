@@ -1,0 +1,88 @@
+{
+  "git_revision": "eb5430735ae0de9055056e132b8e67a06d4af8c7",
+  "simulator_dylib_sha256": "ce12e413d4865f10549a6ed52de59e638e2eadd72a00ae70785f84c1d0df113a",
+  "account_backup_loaded": false,
+  "passed": true,
+  "fresh_search_uikit_passed": true,
+  "fresh_search_source_matches": true,
+  "render_inspection": "Inspected compact previews of all four Apollo Reborn root settings renders plus modern iOS27 Interface search options. Both search switches visibly on. No signed-in content or physical interaction acceptance.",
+  "limits": [
+    "Ordinary iPhone15Pro simulators; installed runtimes do not support Duo device. No fold/cover/rail/manual gesture acceptance claim.",
+    "Simulator variant excludes device-only FFmpeg/FLEX and unsupported internal-Logos hooks per Makefile. Device build/sign/install is independent evidence.",
+    "No signed-in Reddit/account/runtime network acceptance.",
+    "Fresh UIKit search results use extracted shipping source at the recorded source head. Apollo feature bridges/header hooks are stubbed and Duo poses are synthetic; see the harness scope."
+  ],
+  "modes": [
+    {
+      "runtime": "26.5",
+      "requested_mode": "modern",
+      "launch_returncode": 0,
+      "survived": true,
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "new_apollo_crash_reports": [],
+      "survived_after_back": true,
+      "back_tap_delivered": true,
+      "smoke_passed": true
+    },
+    {
+      "runtime": "26.5",
+      "requested_mode": "classic",
+      "launch_returncode": 0,
+      "survived": true,
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "new_apollo_crash_reports": [],
+      "survived_after_back": true,
+      "back_tap_delivered": true,
+      "smoke_passed": true
+    },
+    {
+      "runtime": "27.0",
+      "requested_mode": "modern",
+      "launch_returncode": 0,
+      "survived": true,
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "new_apollo_crash_reports": [],
+      "survived_after_back": true,
+      "back_tap_delivered": true,
+      "smoke_passed": true
+    },
+    {
+      "runtime": "27.0",
+      "requested_mode": "classic",
+      "launch_returncode": 0,
+      "survived": true,
+      "mode_confirmed": true,
+      "module_init_count": 4,
+      "settings_route_opened": true,
+      "new_apollo_crash_reports": [],
+      "survived_after_back": true,
+      "back_tap_delivered": true,
+      "smoke_passed": true
+    }
+  ],
+  "uikit": {
+    "source_head": "eb5430735ae0de9055056e132b8e67a06d4af8c7",
+    "runtimes": [
+      {
+        "runtime": "26.5",
+        "assertions": 225,
+        "failures": 0,
+        "failed": []
+      },
+      {
+        "runtime": "27.0",
+        "assertions": 236,
+        "failures": 0,
+        "failed": []
+      }
+    ],
+    "scope": "Fresh extracted shipping placement, full attachment, temporary-Find cleanup and delegate callback on real UIKit. Apollo feature bridges/header hooks stubbed, Duo poses synthetic. No live account or Apollo menu action exercised.",
+    "passed": true
+  }
+}
