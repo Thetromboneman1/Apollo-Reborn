@@ -8,6 +8,9 @@ typedef NS_ENUM(NSInteger, ApolloSpellingStyle) {
     ApolloSpellingStyleBritish = 1,
 };
 typedef NSUInteger UIControlState;
+static const UIControlState UIControlStateNormal = 0;
+static const UIControlState UIControlStateHighlighted = 1;
+static const UIControlState UIControlStateDisabled = 2;
 
 @interface UILabel : NSObject
 @property (nonatomic, copy) NSString *text;
@@ -16,17 +19,50 @@ typedef NSUInteger UIControlState;
 @implementation UILabel
 @end
 
+// Model UIButton's independently stored state titles and forwarding into its
+// current title label, rather than treating a button as one string slot.
 @interface UIButton : NSObject
 @property (nonatomic, strong) UILabel *titleLabel;
-@property (nonatomic, copy) NSString *storedTitle;
-@property (nonatomic, copy) NSAttributedString *storedAttributedTitle;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *titles;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSAttributedString *> *attributedTitles;
+@property (nonatomic) UIControlState displayedState;
+@property (nonatomic, readonly) NSString *storedTitle;
+@property (nonatomic, readonly) NSAttributedString *storedAttributedTitle;
 - (void)setTitle:(NSString *)title forState:(UIControlState)state;
+- (NSString *)titleForState:(UIControlState)state;
 - (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state;
+- (NSAttributedString *)attributedTitleForState:(UIControlState)state;
+- (void)showState:(UIControlState)state;
 @end
 @implementation UIButton
-- (instancetype)init { if ((self = [super init])) _titleLabel = [UILabel new]; return self; }
-- (void)setTitle:(NSString *)title forState:(UIControlState)state { self.storedTitle = title; }
-- (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state { self.storedAttributedTitle = title; }
+- (instancetype)init {
+    if ((self = [super init])) {
+        _titleLabel = [UILabel new];
+        _titles = [NSMutableDictionary dictionary];
+        _attributedTitles = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+- (NSString *)storedTitle { return [self titleForState:UIControlStateNormal]; }
+- (NSAttributedString *)storedAttributedTitle { return [self attributedTitleForState:UIControlStateNormal]; }
+- (NSString *)titleForState:(UIControlState)state { return self.titles[@(state)]; }
+- (NSAttributedString *)attributedTitleForState:(UIControlState)state { return self.attributedTitles[@(state)]; }
+- (void)showState:(UIControlState)state {
+    self.displayedState = state;
+    NSAttributedString *attributed = [self attributedTitleForState:state];
+    if (attributed) self.titleLabel.attributedText = attributed;
+    else self.titleLabel.text = [self titleForState:state];
+}
+- (void)setTitle:(NSString *)title forState:(UIControlState)state {
+    if (title) self.titles[@(state)] = title;
+    else [self.titles removeObjectForKey:@(state)];
+    if (state == self.displayedState) [self showState:state];
+}
+- (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state {
+    if (title) self.attributedTitles[@(state)] = title;
+    else [self.attributedTitles removeObjectForKey:@(state)];
+    if (state == self.displayedState) [self showState:state];
+}
 @end
 
 @interface UINavigationItem : NSObject
@@ -137,6 +173,55 @@ int main(void) {
         attributedReplacement.attributedText = replacementContent;
         ApolloSpellingSetExcluded(attributedReplacement, YES);
         CHECK([attributedReplacement.attributedText isEqualToAttributedString:replacementContent] && [attributedReplacement.text isEqualToString:@"Colours"], "attributed content invalidates stale plain-text restore provenance");
+        UIButton *lateButton = [UIButton new];
+        [lateButton setTitle:@"Colors" forState:UIControlStateNormal];
+        [lateButton setTitle:@"Favorites" forState:UIControlStateHighlighted];
+        [lateButton setTitle:@"Gray" forState:UIControlStateDisabled];
+        [lateButton showState:UIControlStateDisabled];
+        CHECK([[lateButton titleForState:UIControlStateNormal] isEqualToString:@"Colours"] && [[lateButton titleForState:UIControlStateHighlighted] isEqualToString:@"Favourites"] && [[lateButton titleForState:UIControlStateDisabled] isEqualToString:@"Grey"], "each button state converts literal interface text");
+        ApolloSpellingSetExcluded(lateButton, YES);
+        CHECK([[lateButton titleForState:UIControlStateNormal] isEqualToString:@"Colors"], "late button exclusion restores normal-state title");
+        CHECK([[lateButton titleForState:UIControlStateHighlighted] isEqualToString:@"Favorites"], "late button exclusion restores highlighted-state title");
+        CHECK([[lateButton titleForState:UIControlStateDisabled] isEqualToString:@"Gray"] && [lateButton.titleLabel.text isEqualToString:@"Gray"], "late button exclusion restores disabled state and displayed label");
+        [lateButton setTitle:@"Colors" forState:UIControlStateNormal];
+        CHECK([[lateButton titleForState:UIControlStateNormal] isEqualToString:@"Colors"], "excluded button remains exact on subsequent state writes");
+        ApolloSpellingSetExcluded(lateButton, NO);
+        [lateButton setTitle:@"Colors" forState:UIControlStateNormal];
+        CHECK([[lateButton titleForState:UIControlStateNormal] isEqualToString:@"Colours"], "button can resume literal conversion after exclusion ends");
+
+        UIButton *stateReplacement = [UIButton new];
+        [stateReplacement setTitle:@"Colors" forState:UIControlStateNormal];
+        [stateReplacement setTitle:@"Favorites" forState:UIControlStateHighlighted];
+        [stateReplacement setTitle:@"Gray" forState:UIControlStateDisabled];
+        [stateReplacement setTitle:Dynamic("Favourites") forState:UIControlStateHighlighted];
+        ApolloSpellingSetExcluded(stateReplacement, YES);
+        CHECK([[stateReplacement titleForState:UIControlStateNormal] isEqualToString:@"Colors"] && [[stateReplacement titleForState:UIControlStateDisabled] isEqualToString:@"Gray"], "dynamic replacement invalidates only its own state");
+        CHECK([[stateReplacement titleForState:UIControlStateHighlighted] isEqualToString:@"Favourites"], "matching dynamic state title never restores stale original");
+
+        UIButton *attributedStateReplacement = [UIButton new];
+        [attributedStateReplacement setTitle:@"Colors" forState:UIControlStateNormal];
+        [attributedStateReplacement setTitle:@"Favorites" forState:UIControlStateHighlighted];
+        [attributedStateReplacement setTitle:@"Gray" forState:UIControlStateDisabled];
+        NSAttributedString *stateContent = [[NSAttributedString alloc] initWithString:Dynamic("Colours") attributes:@{@"test": @3}];
+        [attributedStateReplacement setAttributedTitle:stateContent forState:UIControlStateNormal];
+        [attributedStateReplacement setTitle:nil forState:UIControlStateDisabled];
+        ApolloSpellingSetExcluded(attributedStateReplacement, YES);
+        CHECK([[attributedStateReplacement attributedTitleForState:UIControlStateNormal] isEqualToAttributedString:stateContent] && [[attributedStateReplacement titleForState:UIControlStateNormal] isEqualToString:@"Colours"], "attributed state replacement preserves exact content and invalidates its plain undo");
+        CHECK([[attributedStateReplacement titleForState:UIControlStateHighlighted] isEqualToString:@"Favorites"], "attributed and nil replacements preserve another state's undo");
+        CHECK([attributedStateReplacement titleForState:UIControlStateDisabled] == nil, "nil plain state replacement never restores a stale title");
+
+        UIButton *nilAttributedState = [UIButton new];
+        [nilAttributedState setTitle:@"Colors" forState:UIControlStateNormal];
+        [nilAttributedState setTitle:@"Favorites" forState:UIControlStateHighlighted];
+        [nilAttributedState setAttributedTitle:nil forState:UIControlStateNormal];
+        ApolloSpellingSetExcluded(nilAttributedState, YES);
+        CHECK([[nilAttributedState titleForState:UIControlStateNormal] isEqualToString:@"Colours"] && [[nilAttributedState titleForState:UIControlStateHighlighted] isEqualToString:@"Favorites"], "nil attributed write invalidates only its state");
+
+        UIButton *changedState = [UIButton new];
+        [changedState setTitle:@"Colors" forState:UIControlStateNormal];
+        changedState.titles[@(UIControlStateNormal)] = Dynamic("Author text");
+        ApolloSpellingSetExcluded(changedState, YES);
+        CHECK([[changedState titleForState:UIControlStateNormal] isEqualToString:@"Author text"], "late exclusion checks current same-state value before restoring");
         sSpellingStyle = ApolloSpellingStyleAmerican;
         label.text = @"Customize Colors";
         CHECK([label.text isEqualToString:@"Customize Colors"], "American style is unchanged");

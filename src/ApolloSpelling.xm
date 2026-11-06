@@ -196,13 +196,51 @@ static char kApolloSpellingExcludedKey;
 // @[rewritten, original] for the last respelled set on a label or navigation item, so a later
 // opt-out can put the original back.
 static char kApolloSpellingRewriteKey;
+// Buttons store independent titles for each control state; replacing one must
+// not discard undo provenance for the others.
+static char kApolloSpellingButtonRewritesKey;
 
 static BOOL SpellingIsExcluded(id object) {
     return objc_getAssociatedObject(object, &kApolloSpellingExcludedKey) != nil;
 }
 
+static void SpellingForgetButtonRewrite(UIButton *button, UIControlState state) {
+    NSDictionary *rewrites = objc_getAssociatedObject(button, &kApolloSpellingButtonRewritesKey);
+    if (!rewrites[@(state)]) return;
+    NSMutableDictionary *remaining = [rewrites mutableCopy];
+    [remaining removeObjectForKey:@(state)];
+    objc_setAssociatedObject(button, &kApolloSpellingButtonRewritesKey,
+                             remaining.count ? [remaining copy] : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void SpellingRememberButtonRewrite(UIButton *button, UIControlState state,
+                                         NSString *original, NSString *rewritten) {
+    if (rewritten == original || SpellingIsExcluded(button)) return;
+    NSDictionary *existing = objc_getAssociatedObject(button, &kApolloSpellingButtonRewritesKey);
+    NSMutableDictionary *rewrites = existing ? [existing mutableCopy] : [NSMutableDictionary dictionary];
+    rewrites[@(state)] = @[rewritten, original];
+    objc_setAssociatedObject(button, &kApolloSpellingButtonRewritesKey, [rewrites copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void SpellingRestoreButtonTitles(UIButton *button) {
+    NSDictionary<NSNumber *, NSArray<NSString *> *> *rewrites =
+        objc_getAssociatedObject(button, &kApolloSpellingButtonRewritesKey);
+    // Clear before replaying setters, which also invalidate their state's record.
+    objc_setAssociatedObject(button, &kApolloSpellingButtonRewritesKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    for (NSNumber *state in rewrites) {
+        NSArray<NSString *> *rewrite = rewrites[state];
+        if (rewrite.count == 2 && [[button titleForState:state.unsignedIntegerValue] isEqualToString:rewrite[0]]) {
+            [button setTitle:rewrite[1] forState:state.unsignedIntegerValue];
+        }
+    }
+}
+
 // Puts the original back if the object still shows the respelled text from its last set.
 static void SpellingRestoreOriginal(id object) {
+    if ([object isKindOfClass:UIButton.class]) {
+        SpellingRestoreButtonTitles(object);
+        return;
+    }
     NSArray *rewrite = objc_getAssociatedObject(object, &kApolloSpellingRewriteKey);
     if (rewrite.count != 2) return;
     objc_setAssociatedObject(object, &kApolloSpellingRewriteKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -279,13 +317,14 @@ void ApolloSpellingSetStyle(ApolloSpellingStyle style) {
 
 %hook UIButton
 - (void)setTitle:(NSString *)title forState:(UIControlState)state {
+    SpellingForgetButtonRewrite(self, state);
     NSString *original = title;
-    title = SpellingTextForOwner(self, title);
+    if (!SpellingSkips(self)) title = ApolloSpellingApplyInterfaceLiteral(title);
     %orig(title, state);
-    SpellingRememberRewrite(self, original, title);
+    SpellingRememberButtonRewrite(self, state, original, title);
 }
 - (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state {
-    objc_setAssociatedObject(self, &kApolloSpellingRewriteKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    SpellingForgetButtonRewrite(self, state);
     %orig(title, state);
 }
 %end
