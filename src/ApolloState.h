@@ -254,6 +254,25 @@ extern BOOL sShowFeedSearchBar;
 extern BOOL sShowFindInCommentsBar;
 // UDKeyDuoRailReplyButton.
 extern BOOL sDuoRailReplyButton;
+// UDKeySearchBarMode (ApolloSearchNativeBar.xm). Stored values; keep them stable.
+typedef NS_ENUM(NSInteger, ApolloSearchBarMode) {
+    ApolloSearchBarModeOn = 0,
+    ApolloSearchBarModeHidden = 1,
+    ApolloSearchBarModeOff = 2,
+};
+extern NSInteger sSearchBarMode;
+// Registered defaults are not user choices. Until SearchBarMode is persisted,
+// retain each legacy screen's explicit On/Off choice independently.
+extern BOOL sSearchBarModeExplicit;
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ApolloLoadSearchBarPreferences(NSDictionary *persistentDomain);
+ApolloSearchBarMode ApolloSearchBarModeForComments(BOOL comments);
+void ApolloSaveSearchBarMode(NSUserDefaults *defaults, ApolloSearchBarMode mode);
+#ifdef __cplusplus
+}
+#endif
 // When ON (default), press-and-hold on a post info row shows the glass-slider
 // magnifier loupe: slide to pick an icon, release to activate it (upvote /
 // comments / posted / % upvoted / translation). See ApolloStatsRowTouch.xm.

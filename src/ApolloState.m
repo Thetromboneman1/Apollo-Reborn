@@ -1,4 +1,5 @@
 #import "ApolloState.h"
+#import "UserDefaultConstants.h"
 
 NSString *sRedditClientId = nil;
 NSString *sRedditClientSecret = nil;
@@ -88,6 +89,40 @@ BOOL sKeepSearchBarInPlace = NO;
 BOOL sShowFeedSearchBar = YES;
 BOOL sShowFindInCommentsBar = YES;
 BOOL sDuoRailReplyButton = YES;
+NSInteger sSearchBarMode = ApolloSearchBarModeOn;
+BOOL sSearchBarModeExplicit = NO;
+
+// MARK: - Search bar preference compatibility
+static ApolloSearchBarMode ApolloValidatedSearchBarMode(NSInteger mode) {
+    return mode >= ApolloSearchBarModeOn && mode <= ApolloSearchBarModeOff
+        ? (ApolloSearchBarMode)mode : ApolloSearchBarModeOn;
+}
+
+void ApolloLoadSearchBarPreferences(NSDictionary *persistentDomain) {
+    id feed = persistentDomain[UDKeyShowFeedSearchBar];
+    id comments = persistentDomain[UDKeyShowFindInCommentsBar];
+    sShowFeedSearchBar = [feed respondsToSelector:@selector(boolValue)] ? [feed boolValue] : YES;
+    sShowFindInCommentsBar = [comments respondsToSelector:@selector(boolValue)] ? [comments boolValue] : YES;
+    id mode = persistentDomain[UDKeySearchBarMode];
+    sSearchBarModeExplicit = mode != nil;
+    sSearchBarMode = ApolloValidatedSearchBarMode([mode respondsToSelector:@selector(integerValue)]
+        ? [mode integerValue] : ApolloSearchBarModeOn);
+}
+
+ApolloSearchBarMode ApolloSearchBarModeForComments(BOOL comments) {
+    if (!sSearchBarModeExplicit) {
+        BOOL show = comments ? sShowFindInCommentsBar : sShowFeedSearchBar;
+        return show ? ApolloSearchBarModeOn : ApolloSearchBarModeOff;
+    }
+    return ApolloValidatedSearchBarMode(sSearchBarMode);
+}
+
+void ApolloSaveSearchBarMode(NSUserDefaults *defaults, ApolloSearchBarMode mode) {
+    sSearchBarMode = ApolloValidatedSearchBarMode(mode);
+    [defaults setInteger:sSearchBarMode forKey:UDKeySearchBarMode];
+    sSearchBarModeExplicit = YES;
+}
+// MARK: - End search bar preference compatibility
 ApolloSettingsIconAppearance sSettingsIconAppearance = ApolloSettingsIconAppearanceLight;
 BOOL sIconRowMagnifier = YES;   // effective default ON via registerDefaults (UDKeyIconRowMagnifier)
 BOOL sInfoRowTapUpvote = YES;      // effective default ON via registerDefaults (UDKeyInfoRowTapUpvote)

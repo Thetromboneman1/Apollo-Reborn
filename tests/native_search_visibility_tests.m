@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
+#import "ApolloState.h"
 
 // UIKit doubles are confined to the host boundary. The attachment, placement
 // and temporary-Find dismissal functions below are extracted from production.
@@ -52,24 +53,38 @@ static const NSInteger UIScrollViewContentInsetAdjustmentAutomatic = 0;
 @end
 @implementation UINavigationItem @end
 @interface UIGestureRecognizer : NSObject
+@property(nonatomic) NSUInteger registrations;
 - (void)addTarget:(id)target action:(SEL)action;
 @end
 @implementation UIGestureRecognizer
-- (void)addTarget:(__unused id)target action:(__unused SEL)action {}
+- (void)addTarget:(__unused id)target action:(__unused SEL)action { self.registrations++; }
 @end
+@class UIViewController;
 @interface UIScrollView : NSObject
+@property(nonatomic, weak) UIViewController *controller;
+@property(nonatomic) CGPoint contentOffset;
+@property(nonatomic) UIEdgeInsets adjustedContentInset;
 @property(nonatomic, strong) UIGestureRecognizer *panGestureRecognizer;
 @property(nonatomic) NSInteger contentInsetAdjustmentBehavior;
 @property(nonatomic) UIEdgeInsets contentInset;
 @end
 @implementation UIScrollView @end
+@interface ApolloNativeSearchRestingState : NSObject
+@property(nonatomic) BOOL revealArmed;
+@property(nonatomic) BOOL revealInFlight;
+@end
+@implementation ApolloNativeSearchRestingState @end
 @interface UIViewController : NSObject
+@property(nonatomic, strong) UIScrollView *table;
+@property(nonatomic, strong) UIScrollView *managedTable;
+@property(nonatomic, strong) ApolloNativeSearchRestingState *resting;
+@property(nonatomic) BOOL landsOnLinkedComment;
 @property(nonatomic, strong) UINavigationItem *navigationItem;
 @property(nonatomic) BOOL comments;
 - (void)setContentScrollView:(UIScrollView *)table forEdge:(NSInteger)edge;
 @end
 @implementation UIViewController
-- (void)setContentScrollView:(__unused UIScrollView *)table forEdge:(__unused NSInteger)edge {}
+- (void)setContentScrollView:(UIScrollView *)table forEdge:(__unused NSInteger)edge { self.managedTable = table; }
 @end
 @interface UIDevice : NSObject
 @property(nonatomic) NSInteger userInterfaceIdiom;
@@ -82,7 +97,6 @@ static const NSInteger UIScrollViewContentInsetAdjustmentAutomatic = 0;
 @property(nonatomic, weak) UIViewController *feedVC;
 @end
 @implementation ApolloNativeSearchBridge @end
-static BOOL sShowFindInCommentsBar = YES, sShowFeedSearchBar = YES;
 static BOOL unfolded, rail;
 static ApolloDuoMode mode;
 static NSUInteger controlsUpdates;
@@ -97,19 +111,24 @@ static const void *kNSBAppearedKey = &appearedKey, *kNSBParkedForLandingKey = &p
 static id<UISearchBarDelegate, UISearchControllerDelegate> ApolloFindInCommentsGlassBridgeForController(__unused UIViewController *vc) { return [ApolloNativeSearchBridge new]; }
 static NSString *ApolloFindInCommentsGlassPlaceholder(void) { return @"Find in Comments"; }
 static UIColor *ApolloThemeAccentColor(void) { return nil; }
-static void ApolloHeaderStyleRegisterSearchBar(__unused UISearchBar *bar) {}
-static BOOL ApolloInboxCommentScrollLandsOnLinkedComment(__unused UIViewController *vc) { return NO; }
-static UIScrollView *NSBTableForVC(__unused UIViewController *vc) { return nil; }
+void ApolloHeaderStyleRegisterSearchBar(__unused UISearchBar *bar) {}
+static BOOL ApolloInboxCommentScrollLandsOnLinkedComment(UIViewController *vc) { return vc.landsOnLinkedComment; }
+static UIScrollView *NSBTableForVC(UIViewController *vc) { return vc.table; }
+static UIViewController *NSBFeedVCForView(UIScrollView *table) { return table.controller; }
+static ApolloNativeSearchRestingState *NSBRestingStateForVC(UIViewController *vc) { return vc.resting; }
+static BOOL NSBTraceEnabled(void) { return NO; }
 static void NSBRelativizeInset(__unused UIScrollView *table, __unused UIEdgeInsets *insets) {}
 static void ApolloPaneApplySearchPlacement(__unused UIViewController *vc) {}
-static void ApolloHeaderStyleRegisterScrollAwaySearchBar(__unused UISearchBar *bar, __unused UINavigationItem *item, __unused UIScrollView *table) {}
-#define ApolloLog(...) do {} while (0)
+void ApolloHeaderStyleRegisterScrollAwaySearchBar(__unused UISearchBar *bar, __unused UINavigationItem *item, __unused UIScrollView *table) {}
+#define ApolloLog(...) do { if (0) NSLog(__VA_ARGS__); } while (0)
 // INCLUDE_PRODUCTION_VISIBILITY_STATE
 // INCLUDE_PRODUCTION_SETTING_POLICY
 // INCLUDE_PRODUCTION_PLACEMENT
 // The host fixture executes the scheduled policy immediately; the UIKit
 // harness also exercises the shipping main-queue scheduling boundary.
 static void NSBScheduleSearchPlacement(UIViewController *vc) { NSBUpdateSearchPlacement(vc); }
+// INCLUDE_PRODUCTION_TABLE_MANAGEMENT
+// INCLUDE_PRODUCTION_REVEAL
 // INCLUDE_PRODUCTION_ATTACHMENT
 // INCLUDE_PRODUCTION_FIND_DISMISSED
 static NSUInteger checks;
@@ -124,9 +143,11 @@ static UIViewController *Controller(BOOL comments, BOOL external, BOOL toolbar, 
     vc.navigationItem.searchBarPlacementAllowsToolbarIntegration = toolbar;
     vc.navigationItem.searchBarPlacementBarButtonItem = [UIBarButtonItem new];
     vc.navigationItem.searchBarPlacementBarButtonItem.hidden = hidden;
+    vc.resting = [ApolloNativeSearchRestingState new];
     return vc;
 }
 static void Show(UIViewController *vc, BOOL show) {
+    sSearchBarModeExplicit = NO;
     if (vc.comments) sShowFindInCommentsBar = show;
     else sShowFeedSearchBar = show;
     NSBAttachNativeSearch(vc);
@@ -184,6 +205,57 @@ int main(void) { @autoreleasepool {
               @"ON during temporary Find restores exact integration flags");
       }
     }
+    // Old mixed choices survive independently, while an explicit shared mode
+    // takes priority over both old values on every controller.
+    UIViewController *feed = Controller(NO, YES, YES, NO);
+    UIViewController *thread = Controller(YES, YES, YES, NO);
+    ApolloLoadSearchBarPreferences(@{@"ShowFeedSearchBar": @NO, @"ShowFindInCommentsBar": @YES});
+    NSBAttachNativeSearch(feed); NSBAttachNativeSearch(thread);
+    Check(!feed.navigationItem.searchController && thread.navigationItem.searchController,
+          @"mixed legacy choices do not reveal the prior hidden feed bar");
+    ApolloLoadSearchBarPreferences(@{@"ShowFeedSearchBar": @YES, @"ShowFindInCommentsBar": @NO});
+    NSBAttachNativeSearch(feed); NSBAttachNativeSearch(thread);
+    Check(feed.navigationItem.searchController && !thread.navigationItem.searchController,
+          @"opposite legacy mixture preserves thread Off independently");
+    for (NSNumber *choice in @[@0, @1, @2]) {
+        ApolloLoadSearchBarPreferences(@{@"SearchBarMode": choice, @"ShowFeedSearchBar": @NO, @"ShowFindInCommentsBar": @YES});
+        UIViewController *a = Controller(NO, YES, YES, NO), *b = Controller(YES, YES, YES, NO);
+        NSBAttachNativeSearch(a); NSBAttachNativeSearch(b);
+        Check((a.navigationItem.searchController != nil) == (choice.integerValue != ApolloSearchBarModeOff) &&
+              (b.navigationItem.searchController != nil) == (choice.integerValue != ApolloSearchBarModeOff),
+              @"explicit enum consistently controls feed and thread attachment");
+        if (choice.integerValue == ApolloSearchBarModeHidden) {
+            Check(a.navigationItem.hidesSearchBarWhenScrolling && b.navigationItem.hidesSearchBarWhenScrolling,
+                  @"Hidden attaches both bars already parked");
+        }
+    }
+    ApolloLoadSearchBarPreferences(@{@"SearchBarMode": @(ApolloSearchBarModeOn)});
+    UIViewController *linked = Controller(YES, YES, YES, NO); linked.landsOnLinkedComment = YES;
+    NSBAttachNativeSearch(linked);
+    Check(linked.navigationItem.hidesSearchBarWhenScrolling && objc_getAssociatedObject(linked, kNSBParkedForLandingKey),
+          @"On still preserves linked-comment landing without a reveal jump");
+
+    // Off still manages the real table, including a table created after the
+    // controller first laid out. Repeated layouts must not add duplicate pans.
+    ApolloLoadSearchBarPreferences(@{@"SearchBarMode": @(ApolloSearchBarModeOff)});
+    UIViewController *late = Controller(NO, YES, YES, NO);
+    NSBAttachNativeSearch(late);
+    Check(late.managedTable == nil, @"Off tolerates a table not created yet");
+    late.table = [UIScrollView new]; late.table.controller = late;
+    late.table.panGestureRecognizer = [UIGestureRecognizer new];
+    late.table.contentInsetAdjustmentBehavior = 1;
+    NSBAttachNativeSearch(late); NSBAttachNativeSearch(late);
+    Check(late.managedTable == late.table && late.table.contentInsetAdjustmentBehavior == UIScrollViewContentInsetAdjustmentAutomatic,
+          @"Off retries table tracking and automatic insets once table exists");
+    Check(late.table.panGestureRecognizer.registrations == 1 && !late.navigationItem.searchController,
+          @"Off management is idempotent and keeps no search chrome");
+    ApolloLoadSearchBarPreferences(@{@"SearchBarMode": @(ApolloSearchBarModeHidden)});
+    NSBArmReveal(late.table, "test");
+    Check(!late.resting.revealArmed, @"Hidden suppresses programmatic reveal arming");
+    ApolloLoadSearchBarPreferences(@{@"SearchBarMode": @(ApolloSearchBarModeOn)});
+    NSBArmReveal(late.table, "test");
+    Check(late.resting.revealArmed, @"On retains programmatic reveal arming");
+
     // The temporary override and the live Duo pose remain independent.
     UIViewController *duo = Controller(YES, YES, NO, NO);
     UINavigationItem *item = duo.navigationItem;

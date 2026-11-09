@@ -1112,13 +1112,37 @@ void ApolloNativeFeedSearchSetDuoControls(UIViewController *vc, UIBarButtonItem 
     NSBUpdateDuoControls(vc);
 }
 
-// Settings > Display & Navigation turned this screen's search bar off
-// (UDKeyShowFeedSearchBar / UDKeyShowFindInCommentsBar, Liquid Glass only).
-static BOOL NSBSearchBarTurnedOff(UIViewController *vc) {
+// MARK: - Search Bars setting
+//
+// Settings > Interface > Display & Navigation > Search Bars (UDKeySearchBarMode)
+// covers the feed's bar and a thread's Find in Comments bar.
+//
+// Off: the screen keeps no search controller. An attached one always shows
+// something, the field under the title or, with the integrated-button
+// placement, UIKit's own Search button in the navigation bar. The table stays
+// managed, so its top inset loses the band of Apollo's hidden toolbar as it
+// does with the bar on, and the content starts right under the title. The
+// thread's ••• Find in Comments attaches the bar for that one search
+// (kNSBSearchForFindKey).
+//
+// Hidden: the bar is attached with the scroll-away policy already on, which
+// parks it collapsed, and nothing reveals it in code (NSBArmReveal, the
+// re-appearance hold and the column-move repair stand down). A pull at the top
+// brings it back, as it does after scrolling it away with the bar on.
+// Resolve legacy per-screen choices until the new mode has an explicit value.
+static ApolloSearchBarMode NSBSearchBarMode(UIViewController *vc) {
     if (@available(iOS 26.0, *)) {
-        return NSBIsNativeSearchCommentsVC(vc) ? !sShowFindInCommentsBar : !sShowFeedSearchBar;
+        return ApolloSearchBarModeForComments(NSBIsNativeSearchCommentsVC(vc));
     }
-    return NO;
+    return ApolloSearchBarModeOn;
+}
+
+static BOOL NSBSearchBarTurnedOff(UIViewController *vc) {
+    return NSBSearchBarMode(vc) == ApolloSearchBarModeOff;
+}
+
+static BOOL NSBSearchBarKeptHidden(UIViewController *vc) {
+    return NSBSearchBarMode(vc) == ApolloSearchBarModeHidden;
 }
 
 // VC -> @YES while a turned-off Find in Comments bar is attached for one search
@@ -1195,6 +1219,29 @@ static void NSBScheduleSearchPlacement(UIViewController *vc) {
     });
 }
 
+// Point UIKit's bar collapse tracking at the actual feed table and hand it the
+// table's top inset. Once per table; the Off path retries until the table exists.
+static void NSBManageFeedTable(UIViewController *vc) {
+    UIScrollView *table = NSBTableForVC(vc);
+    if (!table || objc_getAssociatedObject(table, kNSBFeedTableKey) != nil) return;
+    // Automatic detection lands on Apollo's full-screen intercepting scroll
+    // view, which never scrolls, so the bar would never collapse.
+    objc_setAssociatedObject(table, kNSBFeedTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [table.panGestureRecognizer addTarget:table action:@selector(apollo_nativeSearchPanBegan:)];
+    if (@available(iOS 15.0, *)) {
+        [vc setContentScrollView:table forEdge:NSDirectionalRectEdgeTop];
+    }
+    // Hand the top inset to UIKit so the palette can compress with the
+    // drag instead of animating a discrete collapse. Apollo's own inset
+    // writes are relativized in setContentInset: below.
+    if (table.contentInsetAdjustmentBehavior != UIScrollViewContentInsetAdjustmentAutomatic) {
+        table.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
+        UIEdgeInsets cur = table.contentInset;
+        NSBRelativizeInset(table, &cur);
+        table.contentInset = cur;
+    }
+}
+
 static void NSBAttachNativeSearch(UIViewController *vc) {
     UINavigationItem *navItem = vc.navigationItem;
     if (NSBSearchBarTurnedOff(vc) && ![objc_getAssociatedObject(vc, &kNSBSearchForFindKey) boolValue]) {
@@ -1209,6 +1256,7 @@ static void NSBAttachNativeSearch(UIViewController *vc) {
         // Restore its exact flags/button and apply the current Duo pose even
         // when this item has no controller attached.
         NSBUpdateSearchPlacement(vc);
+        NSBManageFeedTable(vc);
         return;
     }
     if (navItem.searchController != nil) {
@@ -1272,31 +1320,13 @@ static void NSBAttachNativeSearch(UIViewController *vc) {
                           ApolloInboxCommentScrollLandsOnLinkedComment(vc);
     navItem.searchController = sc;
     ApolloPaneApplySearchPlacement(vc);
-    navItem.hidesSearchBarWhenScrolling = parkForLanding;
+    navItem.hidesSearchBarWhenScrolling = parkForLanding || NSBSearchBarKeptHidden(vc);
     if (parkForLanding) {
         objc_setAssociatedObject(vc, kNSBParkedForLandingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    // Point UIKit's bar collapse tracking at the actual feed table — automatic
-    // detection lands on Apollo's full-screen intercepting scroll view, which
-    // never scrolls, so the bar would never collapse.
+    NSBManageFeedTable(vc);
     UIScrollView *table = NSBTableForVC(vc);
-    if (table) {
-        objc_setAssociatedObject(table, kNSBFeedTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [table.panGestureRecognizer addTarget:table action:@selector(apollo_nativeSearchPanBegan:)];
-        if (@available(iOS 15.0, *)) {
-            [vc setContentScrollView:table forEdge:NSDirectionalRectEdgeTop];
-        }
-        // Hand the top inset to UIKit so the palette can compress with the
-        // drag instead of animating a discrete collapse. Apollo's own inset
-        // writes are relativized in setContentInset: below.
-        if (table.contentInsetAdjustmentBehavior != UIScrollViewContentInsetAdjustmentAutomatic) {
-            table.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-            UIEdgeInsets cur = table.contentInset;
-            NSBRelativizeInset(table, &cur);
-            table.contentInset = cur;
-        }
-    }
     // Hard header style: while the bar is pinned like this (here and in the
     // other holds), UIKit draws it inside the band; keep the look it has once
     // the scroll-away policy takes over (ApolloScrollEdgeEffect.xm, #1361).
@@ -1500,6 +1530,7 @@ static void NSBApplyScrollAwayPolicy(UIViewController *vc, UIScrollView *table) 
 // attempt; the async check consumes it once the list has settled.
 static void NSBArmReveal(UIScrollView *table, const char *why) {
     if (!table || objc_getAssociatedObject(table, kNSBFeedTableKey) == nil) return;
+    if (NSBSearchBarKeptHidden(NSBFeedVCForView(table))) return;   // Hidden until the user pulls
     ApolloNativeSearchRestingState *state = NSBRestingStateForVC(NSBFeedVCForView(table));
     if (!state || state.revealInFlight) return;
     if (!state.revealArmed && NSBTraceEnabled()) {
@@ -1585,6 +1616,7 @@ static void NSBRecheckRevealAfterAnimation(UIViewController *vc, UIScrollView *t
 }
 
 static void NSBEnsureBarRevealedAtTop(UIViewController *vc, UIScrollView *table) {
+    if (NSBSearchBarKeptHidden(vc)) return;   // Also suppress an already queued reveal.
     ApolloNativeFeedSession *session = NSBSessionForVC(vc);
     if (ApolloPaneUsesUnifiedChrome(vc.viewIfLoaded)) return;
     if (!NSBHasSettledFeedGeometry(vc, table)) return;
@@ -1708,6 +1740,7 @@ void ApolloNativeFeedSearchFinishColumnMove(UIViewController *vc) {
     ApolloNativeSearchRestingState *state = NSBRestingStateForVC(vc);
     if (!state.columnMoveRevealed) return;
     state.columnMoveRevealed = NO;
+    if (NSBSearchBarKeptHidden(vc)) return;   // Search Bars: Hidden until the user pulls
     UIScrollView *table = NSBTableForVC(vc);
     UINavigationItem *navItem = vc.navigationItem;
     UISearchController *sc = navItem.searchController;
@@ -1951,7 +1984,7 @@ static void NSBViewWillDisappear(UIViewController *vc) {
     }
     UISearchController *reappearSC = navItem.searchController;
     if (reappearSC && !reappearSC.active && navItem.hidesSearchBarWhenScrolling &&
-        leftAtTop && !session.dismissWindow) {
+        leftAtTop && !session.dismissWindow && !NSBSearchBarKeptHidden(vc)) {
         navItem.hidesSearchBarWhenScrolling = NO;
         reappearState.reappearanceHold = YES;
         ApolloLog(@"[NativeSearch] re-appearance at top rest: holding the bar revealed through the transition");
@@ -2204,7 +2237,7 @@ static void *NSBCommentJumpTableForController(UIViewController *vc) {
 %end
 
 void ApolloNativeFeedSearchFindDismissed(UIViewController *vc) {
-    if (![objc_getAssociatedObject(vc, &kNSBSearchForFindKey) boolValue]) return;
+    if (!vc || ![objc_getAssociatedObject(vc, &kNSBSearchForFindKey) boolValue]) return;
     objc_setAssociatedObject(vc, &kNSBSearchForFindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     NSBAttachNativeSearch(vc);
 }

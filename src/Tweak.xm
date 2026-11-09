@@ -4061,6 +4061,7 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyShowFeedSearchBar: @YES,
                                     UDKeyShowFindInCommentsBar: @YES,
                                     UDKeyDuoRailReplyButton: @YES,
+                                    UDKeySearchBarMode: @(ApolloSearchBarModeOn),
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeyIPadPaneLayout: @NO,
                                     UDKeySettingsIconAppearance: @(ApolloSettingsIconAppearanceLight),
@@ -4389,9 +4390,10 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     }
     sTabBarHideStyle = (ApolloTabBarHideStyle)storedTabBarHideStyle;
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
-    sShowFeedSearchBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowFeedSearchBar];
-    sShowFindInCommentsBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowFindInCommentsBar];
-    sDuoRailReplyButton = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDuoRailReplyButton];
+    // Inspect persisted keys, not the registered On default: old backups may
+    // deliberately have different feed and thread choices.
+    ApolloLoadSearchBarPreferences(persistentDomain);
+    sDuoRailReplyButton = [standardDefaults boolForKey:UDKeyDuoRailReplyButton];
     sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
     // Read once here: ApolloPaneInstall.xm builds the split controllers during
     // scene connect, which happens after %ctor and never again for the process.

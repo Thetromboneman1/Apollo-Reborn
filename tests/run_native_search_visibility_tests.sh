@@ -11,17 +11,22 @@ source = (root/'src/ApolloSearchNativeBar.xm').read_text()
 state = source[source.index('static char kNSBDuoSearchPlacementKey;'):source.index('static char kNSBDuoSearchPlacementScheduledKey;')]
 start = source.index('static void NSBUpdateSearchPlacement(')
 placement = source[start:source.index('\n}', start) + 2]
-setting_start = source.index('static BOOL NSBSearchBarTurnedOff(')
+setting_start = source.index('static ApolloSearchBarMode NSBSearchBarMode(')
 setting = source[setting_start:start]
 attach_start = source.index('static void NSBAttachNativeSearch(')
 attachment = source[attach_start:source.index('\n}', attach_start) + 2]
 dismiss_start = source.index('void ApolloNativeFeedSearchFindDismissed(')
 dismissal = source[dismiss_start:source.index('\n}', dismiss_start) + 2]
+manage_start = source.index('static void NSBManageFeedTable(')
+management = source[manage_start:source.index('\n}', manage_start) + 2]
+reveal_start = source.index('static void NSBArmReveal(')
+reveal = source[reveal_start:source.index('\n}', reveal_start) + 2]
 fixture = (root/'tests/native_search_visibility_tests.m').read_text()
-for marker, production in [('VISIBILITY_STATE', state), ('SETTING_POLICY', setting), ('PLACEMENT', placement), ('ATTACHMENT', attachment), ('FIND_DISMISSED', dismissal)]:
+for marker, production in [('VISIBILITY_STATE', state), ('SETTING_POLICY', setting), ('PLACEMENT', placement), ('TABLE_MANAGEMENT', management), ('REVEAL', reveal), ('ATTACHMENT', attachment), ('FIND_DISMISSED', dismissal)]:
     fixture = fixture.replace('// INCLUDE_PRODUCTION_' + marker, production)
 (build/'tests.m').write_text(fixture)
 PY
 xcrun --sdk macosx clang -fobjc-arc -fblocks -Wall -Wextra -Werror \
-    -fsanitize=address,undefined -framework Foundation "$visibility_build/tests.m" -o "$visibility_build/tests"
+    -fsanitize=address,undefined -framework Foundation -I "$visibility_root/src" \
+    "$visibility_root/src/ApolloState.m" "$visibility_build/tests.m" -o "$visibility_build/tests"
 "$visibility_build/tests"
