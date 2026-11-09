@@ -1984,7 +1984,7 @@ static void NSBViewWillDisappear(UIViewController *vc) {
     }
     UISearchController *reappearSC = navItem.searchController;
     if (reappearSC && !reappearSC.active && navItem.hidesSearchBarWhenScrolling &&
-        leftAtTop && !session.dismissWindow && !NSBSearchBarKeptHidden(vc)) {
+        leftAtTop && !session.dismissWindow && !NSBSearchBarKeptHidden((UIViewController *)self)) {
         navItem.hidesSearchBarWhenScrolling = NO;
         reappearState.reappearanceHold = YES;
         ApolloLog(@"[NativeSearch] re-appearance at top rest: holding the bar revealed through the transition");
