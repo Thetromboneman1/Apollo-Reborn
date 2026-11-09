@@ -6589,15 +6589,15 @@ replacementString:(NSString *)string {
         }];
     ApolloSettingsRow *landscape = [ApolloSettingsRow valueRowWithID:@"duo.landscapeFeed"
         title:@"Landscape Feed Layout"
-        detail:^NSString * { return sDuoLandscapeFeedLayout == 2 ? @"Focused" : @"Original"; }
+        detail:^NSString * { return sDuoUnfoldedFeedLayout == 2 ? @"Focused" : @"Original"; }
         onSelect:^{
             ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.landscapeFeed"],
-                @"Landscape Feed Layout", @[@"Original", @"Focused"], sDuoLandscapeFeedLayout == 2 ? 1 : 0,
+                @"Landscape Feed Layout", @[@"Original", @"Focused"], sDuoUnfoldedFeedLayout == 2 ? 1 : 0,
                 ^(NSInteger picked) {
                     NSInteger layout = picked == 1 ? 2 : 0;
-                    if (layout == sDuoLandscapeFeedLayout) return;
-                    sDuoLandscapeFeedLayout = layout;
-                    [NSUserDefaults.standardUserDefaults setInteger:layout forKey:UDKeyDuoLandscapeFeedLayout];
+                    if (layout == sDuoUnfoldedFeedLayout) return;
+                    sDuoUnfoldedFeedLayout = layout;
+                    [NSUserDefaults.standardUserDefaults setInteger:layout forKey:UDKeyDuoUnfoldedFeedLayout];
                     [weakSelf reloadRowWithID:@"duo.landscapeFeed"];
                     [NSNotificationCenter.defaultCenter postNotificationName:@"ApolloDuoFeedLayoutDidChange" object:nil];
                 });
