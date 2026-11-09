@@ -18,6 +18,7 @@
 #import "ApolloClasses.h"
 #import "ApolloLiquidGlassTabGesture.h"
 #import "ApolloSubredditSwitcherSheet.h"
+#import "ApolloTabBarStyle.h"
 
 /// Helpers for the Posts and account tab long-press shortcuts in Liquid Glass.
 static char kApolloTabButtonSetupKey;
@@ -68,7 +69,8 @@ static BOOL ApolloScrubTabBarItemStateAppearance(UITabBarItemStateAppearance *st
     if (!stateAppearance) return NO;
 
     BOOL changed = NO;
-    if (stateAppearance.iconColor != nil) {
+    // Tint Tab Bar Icons owns its normal-state icon color (ApolloTabBarStyle.xm).
+    if (stateAppearance.iconColor != nil && !ApolloTabBarIconTintOwnsColor(stateAppearance.iconColor)) {
         stateAppearance.iconColor = nil;
         changed = YES;
     }

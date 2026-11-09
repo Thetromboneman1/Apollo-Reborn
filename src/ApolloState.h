@@ -132,6 +132,10 @@ extern BOOL sHideTabBarTitles;
 extern BOOL sUnreadBadgeCompactTabBar;
 extern BOOL sUnreadBadgeCompactInbox;
 extern BOOL sUnreadBadgeThemeColor;
+// Inactive tab icon tint (ApolloTabBarStyle.xm).
+extern BOOL sTintInactiveTabIcons;
+// Liquid Glass navigation bar buttons in the theme accent (ApolloNavigationActions.xm).
+extern BOOL sAccentNavigationButtons;
 #ifdef __cplusplus
 extern "C" {
 #endif

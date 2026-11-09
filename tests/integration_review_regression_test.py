@@ -18,6 +18,15 @@ assert 'objc_getClass("_UIBarBadgeView")' not in badge_source
 makefile_source = (root / "Makefile").read_text()
 assert '$(SRC_DIR)/ApolloInboxBadge.xm' not in makefile_source
 assert '$(SRC_DIR)/ApolloUnreadBadges.xm' in makefile_source
+assert '$(SRC_DIR)/ApolloInactiveTabIcons.xm' not in makefile_source
+assert '$(SRC_DIR)/ApolloTabBarStyle.xm' in makefile_source
+theme_hub_source = (root / "src/ApolloThemeManagerViewController.m").read_text()
+assert 'ApolloInactiveTabIconsRefresh' not in theme_hub_source
+assert 'kApolloTintedTabIconsKey' not in theme_hub_source
+assert theme_hub_source.count('cell.textLabel.text = @"Tint Tab Bar Icons";') == 1
+assert 'ApolloTabBarIconTintSetEnabled(sw.isOn);' in theme_hub_source
+defaults_source = (root / "src/UserDefaultConstants.h").read_text()
+assert 'UDKeyTintInactiveTabIcons = @"ApolloTintedTabIcons";' in defaults_source
 
 gone_lines = [
     line

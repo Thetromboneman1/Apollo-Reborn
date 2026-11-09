@@ -24,6 +24,7 @@
 #import "ApolloDuoPaneDrag.h"
 #import "ApolloDuoUIKitCompatibility.h"
 #import "ApolloSearchNativeBar.h"
+#import "ApolloNavigationActions.h"
 #import "ApolloFeedShortcutsAppearance.h"
 #import "ApolloFollowingSection.h"
 #import "ApolloGalleryViewController.h"
@@ -85,6 +86,18 @@ static void ApolloDuoRefreshLayoutButton(UIButton *button, UIBarButtonItem *item
 static void ApolloDuoRefreshLayoutControls(void) {
     for (id<ApolloDuoLayoutControl> control in sDuoLayoutControls.allObjects)
         [control updateFeedLayoutButton];
+}
+
+// Accent Navigation Buttons: a Duo glass control takes the theme accent while
+// the setting is on, else `neutral` (nil keeps the glass button's own color).
+static void ApolloDuoSetButtonForeground(UIButton *button, UIColor *neutral) {
+    if (!button.configuration) return;
+    UIColor *color = ApolloNavigationButtonAccentColor() ?: neutral;
+    UIColor *current = button.configuration.baseForegroundColor;
+    if (current == color || [current isEqual:color]) return;
+    UIButtonConfiguration *configuration = [button.configuration copy];
+    configuration.baseForegroundColor = color;
+    button.configuration = configuration;
 }
 
 // Each account column owns its vertical origin independently. Overview and
@@ -564,6 +577,26 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
         [self.view addSubview:self.sidebarNavigationBar];
         if (self.profileBackButton) [self.view addSubview:self.profileBackButton];
     }
+    [self applyNavigationButtonColor];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(applyNavigationButtonColor)
+                                               name:ApolloNavigationButtonColorDidChangeNotification object:nil];
+}
+// The list, split and profile controls follow Accent Navigation Buttons like
+// Apollo's own navigation buttons.
+- (void)applyNavigationButtonColor {
+    if (self.splitButton) [self updateSplitButton];
+    ApolloDuoSetButtonForeground(self.listButton, nil);
+    ApolloDuoSetButtonForeground(self.feedLayoutButton, nil);
+    ApolloDuoSetButtonForeground(self.profileBackButton, UIColor.labelColor);
+    ApolloDuoSetButtonForeground(self.accountsButton, UIColor.labelColor);
+    ApolloDuoSetButtonForeground(self.moreButton, UIColor.labelColor);
+    UIButton *buttons[] = { self.listButton, self.splitButton, self.feedLayoutButton,
+                            self.profileBackButton, self.accountsButton, self.moreButton };
+    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) ApolloNavigationActionsAccentControl(buttons[i]);
+    for (UIBarButtonItem *item in self.listNavigationBar.topItem.leftBarButtonItems) ApolloNavigationActionsAccentItem(item);
+    UIBarButtonItem *sidebar = self.sidebarNavigationBar.topItem.rightBarButtonItem;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    if (sidebar && sidebar.tintColor != accent) sidebar.tintColor = accent;
 }
 - (void)viewDidDisappear:(BOOL)animated {
     [super viewDidDisappear:animated];
@@ -659,7 +692,7 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
     // The slashed state is a rendered template rather than an SF Symbol.
     // Give both states the navigation foreground so glass does not dim the
     // available toggle merely because its image representation changed.
-    configuration.baseForegroundColor = ApolloNavigationChromeColor();
+    configuration.baseForegroundColor = ApolloNavigationButtonAccentColor() ?: ApolloNavigationChromeColor();
     self.splitButton.configuration = configuration;
     self.splitBarItem.image = symbol;
     self.splitButton.accessibilityValue = self.postsSplitEnabled ? @"On" : @"Off";
@@ -2425,6 +2458,11 @@ NSArray<UIBarButtonItem *> *ApolloDuoPageLayoutItems(UINavigationItem *item, NSA
 
 @implementation ApolloDuoPageLayoutControl
 - (void)updateFeedLayoutButton { ApolloDuoRefreshLayoutButton(nil, self.item); }
+- (void)applyNavigationButtonColor {
+    UIColor *color = ApolloNavigationButtonAccentColor() ?: ApolloNavigationChromeColor();
+    if (![self.item.tintColor isEqual:color]) self.item.tintColor = color;
+    if (![self.replyItem.tintColor isEqual:color]) self.replyItem.tintColor = color;
+}
 - (void)toggle {
     if (ApolloDuoPageShowsLayoutControl(self.controller))
         ApolloDuoToggleVisibleFeedLayout(self.controller, self.item.enabled);
@@ -2457,7 +2495,6 @@ static void ApolloDuoPageUpdateLayoutControl(UIViewController *controller) {
         control.item.title = @"Feed Layout";
         control.item.accessibilityLabel = @"Feed Layout";
         control.item.accessibilityIdentifier = kApolloDuoPageLayoutID;
-        control.item.tintColor = ApolloNavigationChromeColor();
         if (@available(iOS 26.0, *)) {
             control.item.hidesSharedBackground = NO;
             control.item.sharesBackground = NO;
@@ -2468,11 +2505,13 @@ static void ApolloDuoPageUpdateLayoutControl(UIViewController *controller) {
         control.replyItem.title = @"Reply";
         control.replyItem.accessibilityLabel = @"Reply";
         control.replyItem.accessibilityIdentifier = kApolloDuoCommentsReplyID;
-        control.replyItem.tintColor = ApolloNavigationChromeColor();
         if (@available(iOS 26.0, *)) {
             control.replyItem.hidesSharedBackground = NO;
             control.replyItem.sharesBackground = NO;
         }
+        [control applyNavigationButtonColor];
+        [NSNotificationCenter.defaultCenter addObserver:control selector:@selector(applyNavigationButtonColor)
+                                                   name:ApolloNavigationButtonColorDidChangeNotification object:nil];
         objc_setAssociatedObject(controller, &kApolloDuoPageLayoutKey, control, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (!sDuoPageLayoutOwners) sDuoPageLayoutOwners = [NSMapTable weakToWeakObjectsMapTable];
         [sDuoPageLayoutOwners setObject:control forKey:controller.navigationItem];

@@ -304,6 +304,13 @@ static NSString *const UDKeyInboxBadgeUseThemeAccent = @"InboxBadgeUseThemeAccen
 static NSString *const UDKeyUnreadBadgeCompactTabBar = @"UnreadBadgeCompactTabBar";
 static NSString *const UDKeyUnreadBadgeCompactInbox = @"UnreadBadgeCompactInbox";
 static NSString *const UDKeyUnreadBadgeThemeColor = @"UnreadBadgeThemeColor";
+// Unselected tab bar icons use a muted shade of the theme accent instead of
+// UIKit's gray. Default OFF. Theme Manager -> Options.
+static NSString *const UDKeyTintInactiveTabIcons = @"ApolloTintedTabIcons";
+// Liquid Glass only: navigation bar buttons (Back, +, Edit, sort, •••) use the
+// theme accent instead of the neutral label color; titles stay neutral.
+// Default OFF. Theme Manager -> Options. See ApolloNavigationActions.xm.
+static NSString *const UDKeyAccentNavigationButtons = @"ApolloAccentNavigationButtons";
 // When ON (default), profile pages show Reborn's detailed profile — the banner,
 // large avatar/snoovatar, display name, bio, and the Social Links band. When OFF,
 // the profile page reverts to Apollo's compact stock layout: the detailed header is

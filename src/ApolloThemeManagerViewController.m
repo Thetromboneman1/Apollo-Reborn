@@ -1,9 +1,5 @@
 #import "settings/ApolloSettingsForm.h"
 
-extern void ApolloInactiveTabIconsRefresh(void);
-
-static NSString * const kApolloTintedTabIconsKey = @"ApolloTintedTabIcons";
-
 #import "ApolloThemeManagerViewController.h"
 #import "ApolloThemeTokens.h"
 #import "ApolloThemeStore.h"
@@ -17,6 +13,9 @@ static NSString * const kApolloTintedTabIconsKey = @"ApolloTintedTabIcons";
 #import "ApolloThemeShareImage.h"
 #import "ApolloThemeQRScanViewController.h"
 #import "ApolloCommon.h"
+#import "ApolloState.h"
+#import "ApolloTabBarStyle.h"
+#import "ApolloNavigationActions.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <PhotosUI/PhotosUI.h>
 #import <LinkPresentation/LinkPresentation.h>
@@ -372,6 +371,8 @@ typedef void (^ApolloThemeFontSelectionHandler)(ApolloThemeFont font);
 //              5 Generate | 6 Preview | 7 Share | 8 Apply | 9 Delete
 //              5 Generate | 6 Preview | 7 Apply | 8 Delete
 enum { HSCurrent, HSCreate, HSBrowse, HSMyThemes, HSImported, HSOptions, HSCount };
+// The navigation-button row exists only on Liquid Glass, where buttons are neutral.
+enum { HSOptionsLightDark, HSOptionsCommentsTheme, HSOptionsTabIconTint, HSOptionsNavButtonAccent };
 enum { ESName, ESVariant, ESColors, ESAdvanced, ESFont, ESGenerate, ESPreview, ESShare, ESApply, ESDelete, ESCount };
 
 @implementation ApolloThemeManagerViewController
@@ -883,7 +884,7 @@ static NSString *SpacedThemeName(NSString *raw) {
         case HSBrowse:   return 2;
         case HSMyThemes: return MAX((NSInteger)[self myThemes].count, 1);
         case HSImported: return (NSInteger)[self importedThemes].count; // section exists only with content
-        case HSOptions:  return IsLiquidGlass() ? 2 : 3;
+        case HSOptions:  return IsLiquidGlass() ? 4 : 3;
     }
     return 0;
 }
@@ -1095,30 +1096,37 @@ static NSString *SpacedThemeName(NSString *raw) {
     }
     if (ip.section == HSOptions) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
-        if (ip.row == 0) {
+        if (ip.row == HSOptionsNavButtonAccent) {
+            cell.textLabel.text = @"Accent Navigation Buttons";
+            cell.imageView.image = [UIImage systemImageNamed:@"hand.tap"];
+            UISwitch *sw = [[UISwitch alloc] init];
+            sw.on = sAccentNavigationButtons;
+            [sw addTarget:self action:@selector(accentNavigationButtonsSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        }
+        if (ip.row == HSOptionsTabIconTint) {
+            cell.textLabel.text = @"Tint Tab Bar Icons";
+            cell.imageView.image = [UIImage systemImageNamed:@"paintbrush"];
+            UISwitch *sw = [[UISwitch alloc] init];
+            sw.on = sTintInactiveTabIcons;
+            [sw addTarget:self action:@selector(tintTabBarIconsSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        }
+        if (ip.row == HSOptionsLightDark) {
             cell.textLabel.text = @"Light/Dark Mode";
             cell.imageView.image = [UIImage systemImageNamed:@"circle.lefthalf.filled"];
-        } else if (ip.row == 1) {
+        } else {
             cell.textLabel.text = @"Comments Theme";
             cell.detailTextLabel.text = [self commentsThemeDetail];
             cell.detailTextLabel.adjustsFontSizeToFitWidth = YES;
             cell.detailTextLabel.minimumScaleFactor = 0.8;
             cell.imageView.image = [UIImage systemImageNamed:@"text.bubble"];
-        } else {
-            cell.textLabel.text = @"Tint Tab Bar Icons";
-            cell.imageView.image = [UIImage systemImageNamed:@"paintbrush"];
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-
-            UISwitch *toggle = [[UISwitch alloc] init];
-            toggle.on = [[NSUserDefaults standardUserDefaults]
-                boolForKey:kApolloTintedTabIconsKey];
-            [toggle addTarget:self
-                       action:@selector(apolloTintTabBarIconsChanged:)
-             forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = toggle;
         }
-        if (ip.row != 2)
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return cell;
     }
     if (ip.section == HSMyThemes || ip.section == HSImported) {
@@ -1418,21 +1426,20 @@ static NSString *SpacedThemeName(NSString *raw) {
         return;
     }
     if (ip.section == HSOptions) {
-        if (ip.row == 2) return;
-
-        BOOL ok = (ip.row == 0) ? ApolloThemeOpenNativeLightDarkFromHub(self)
+        if (ip.row == HSOptionsTabIconTint || ip.row == HSOptionsNavButtonAccent) return;
+        BOOL ok = (ip.row == HSOptionsLightDark) ? ApolloThemeOpenNativeLightDarkFromHub(self)
                                 : ApolloThemeOpenNativeCommentsThemeFromHub(self);
         if (!ok) [self showError:@"Apollo's settings aren't available from here. Go back and reopen Appearance."];
         return;
     }
 }
 
-- (void)apolloTintTabBarIconsChanged:(UISwitch *)sender {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    if ([defaults boolForKey:kApolloTintedTabIconsKey] == sender.isOn) return;
+- (void)tintTabBarIconsSwitchChanged:(UISwitch *)sw {
+    ApolloTabBarIconTintSetEnabled(sw.isOn);
+}
 
-    [defaults setBool:sender.isOn forKey:kApolloTintedTabIconsKey];
-    ApolloInactiveTabIconsRefresh();
+- (void)accentNavigationButtonsSwitchChanged:(UISwitch *)sw {
+    ApolloNavigationActionsSetAccentButtons(sw.isOn);
 }
 
 - (void)tableView:(UITableView *)tv accessoryButtonTappedForRowWithIndexPath:(NSIndexPath *)ip {

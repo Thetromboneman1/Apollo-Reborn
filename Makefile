@@ -241,6 +241,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloNavigationActions.xm \
     $(SRC_DIR)/ApolloNavigationTitlePresentation.xm \
     $(SRC_DIR)/ApolloTabBarTitles.xm \
+    $(SRC_DIR)/ApolloTabBarStyle.xm \
     $(SRC_DIR)/ApolloScrollEdgePopFix.xm \
     $(SRC_DIR)/ApolloInterruptibleNavTransition.xm \
     $(SRC_DIR)/ApolloSystemBackSwipeGuard.xm \
@@ -366,7 +367,6 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloThemeAISheets.m \
     $(SRC_DIR)/ApolloThemeAIOverlay.m \
     $(SRC_DIR)/ApolloThemeManagerViewController.m \
-    $(SRC_DIR)/ApolloInactiveTabIcons.xm \
     $(SRC_DIR)/ApolloThemeGalleryViewController.m \
     $(SRC_DIR)/ApolloThemeManagerIntegration.xm \
     $(SRC_DIR)/ApolloThemeIntegrations.xm \
