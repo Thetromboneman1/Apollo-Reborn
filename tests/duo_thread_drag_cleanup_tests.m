@@ -63,7 +63,7 @@ static NSTimeInterval fillerFadeDuration;
 - (void)setViewControllers:(NSArray *)pages animated:(__unused BOOL)animated { self.viewControllers = pages; }
 @end
 @interface ApolloDuoSplitHost : NSObject
-@property(nonatomic, strong) UIView *view, *threadDragFiller, *postsTransitionSnapshot, *listDismiss;
+@property(nonatomic, strong) UIView *view, *threadDragFiller, *threadDragPicture, *postsTransitionSnapshot, *listDismiss;
 @property(nonatomic) BOOL postsShowingDetail;
 @end
 @implementation ApolloDuoSplitHost @end
@@ -97,7 +97,8 @@ static CGRect ApolloDuoPostsDetailPane(__unused ApolloDuoSplitState *state) { re
 static UITableView *ApolloDuoSplitFindTable(__unused UIView *view) { return nil; }
 static ApolloDuoFeedAnchor *ApolloDuoCaptureFeedAnchor(__unused UITableView *table) { return nil; }
 static void ApolloDuoRestoreFeedAnchor(__unused UITableView *table, __unused ApolloDuoFeedAnchor *anchor) {}
-static void ApolloDuoPostsRememberClosedThread(__unused id state, __unused NSArray *pages) { rememberedThreads++; }
+static void ApolloDuoPostsRememberClosedThread(__unused id state, __unused NSArray *pages,
+                                               __unused UIView *picture, __unused CGRect pictureFrame) { rememberedThreads++; }
 static void ApolloDuoPostsSyncColumns(ApolloDuoSplitState *state) { state.host.postsShowingDetail = state.secondary.viewControllers.count > 1; }
 static void ApolloNativeFeedSearchFinishColumnMove(__unused UIViewController *vc) {}
 static void ApolloDuoMediaPrepareTableForTransition(__unused UITableView *table) {}
@@ -137,8 +138,9 @@ static void Close(CGFloat offset, BOOL snapshotAvailable, BOOL animated, BOOL mo
           @"the thread closes through the production stack/column transition");
     Check(rememberedThreads == 1, @"closing still remembers the thread for Forward");
     BOOL animate = animated && onscreen && !motion;
-    Check(snapshotRequests == (animate && offset < 500 ? 1u : 0u),
-          @"full-pane drags skip an empty snapshot; partial drags attempt one");
+    NSUInteger closedPictureRequests = onscreen && offset <= 0 ? 1u : 0u;
+    Check(snapshotRequests == closedPictureRequests + (animate && offset < 500 ? 1u : 0u),
+          @"full-pane drags skip an empty snapshot; ordinary closes also keep a picture for Forward");
     if (animate && offset > 0) Check(fillerFadeDuration == 0.32, @"drag filler fades with the closing transition regardless of snapshot success");
     else Check(fillerFadeDuration == 0, @"nonanimated and ordinary closes remove stale filler immediately");
 }

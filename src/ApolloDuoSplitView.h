@@ -29,6 +29,21 @@ BOOL ApolloDuoSplitDismissPostsList(UINavigationController *navigation);
 /// Returns from a visited profile dashboard to its retained Posts Back stack.
 BOOL ApolloDuoSplitCanReturnFromVisitedProfile(UINavigationController *navigation);
 BOOL ApolloDuoSplitReturnFromVisitedProfile(UINavigationController *navigation);
+/// Forward swipes the split owns: back into a visited profile (after a Back
+/// out of it, until the Posts pane moves on), and Account's detail pages.
+BOOL ApolloDuoSplitCanForwardInSplit(UINavigationController *navigation);
+BOOL ApolloDuoSplitForwardInSplit(UINavigationController *navigation);
+/// Cover drags, Back and forward, for navigation the split lays out itself
+/// (a visited profile, Account's detail, Back from a feed link beside a
+/// thread): a picture of what shows now and a kept picture of the destination
+/// slide with the finger; release swaps the real pages under them. NO from
+/// Begin when there is no picture (Reduce Motion, a resize since); then
+/// navigate on release.
+BOOL ApolloDuoSplitBeginBackDrag(UINavigationController *navigation);
+BOOL ApolloDuoSplitBeginForwardDrag(UINavigationController *navigation);
+CGFloat ApolloDuoSplitCoverDragTravel(UINavigationController *navigation);
+void ApolloDuoSplitMoveCoverDrag(UINavigationController *navigation, CGFloat shown);
+void ApolloDuoSplitEndCoverDrag(UINavigationController *navigation, BOOL commit, CGFloat shown, CGFloat velocity);
 /// The thread the last close (the button or a Back) took from beside the Posts
 /// feed `nav`, while it can still come back: the feed page it was closed from
 /// is on top and shows the same feed for the same account, no thread is open,
@@ -39,6 +54,12 @@ BOOL ApolloDuoSplitReturnFromVisitedProfile(UINavigationController *navigation);
 /// the normal open.
 BOOL ApolloDuoSplitCanRestoreClosedThread(UINavigationController *nav);
 BOOL ApolloDuoSplitRestoreClosedThread(UINavigationController *nav);
+/// Forward drags: the closed thread's picture slides in with the finger.
+/// NO from Begin when there is no picture to show; restore on release then.
+BOOL ApolloDuoSplitBeginRestoreDrag(UINavigationController *nav);
+CGFloat ApolloDuoSplitRestoreDragTravel(UINavigationController *nav);
+void ApolloDuoSplitMoveRestoreDrag(UINavigationController *nav, CGFloat shown);
+void ApolloDuoSplitEndRestoreDrag(UINavigationController *nav, BOOL restore, CGFloat shown, CGFloat velocity);
 /// For ApolloForwardSwipeExpiry: the feed's closed thread counted as a forward
 /// page (a token for it, nil without one) and its forget.
 id ApolloDuoSplitClosedThreadToken(UINavigationController *nav);

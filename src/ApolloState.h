@@ -198,9 +198,10 @@ extern "C" {
 // Opt-in top navigation bar movement, following the bottom tab bar's scroll
 // behavior while Hide Bars on Scroll is enabled. Default NO.
 extern BOOL sHideTopBarOnScroll;
-// Experimental Duo landscape feed layout: 0 = Original (default),
-// 2 = Focused feed; value 1 is retired. Read live by ApolloMediaHinge.
-extern NSInteger sDuoLandscapeFeedLayout;
+// Experimental opened-Duo feed layout, portrait and landscape:
+// 0 = Original (default), 2 = Focused feed; value 1 is retired.
+// Read live by ApolloMediaHinge.
+extern NSInteger sDuoUnfoldedFeedLayout;
 // Standard (default NO) or Liquid Glass for the open Duo subreddit panel.
 extern BOOL sDuoSubredditPanelGlassEnabled;
 extern BOOL sDuoTabletopVideoEnabled; // opt-in, default NO
