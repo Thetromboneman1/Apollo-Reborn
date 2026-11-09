@@ -1,4 +1,5 @@
 #import "ApolloState.h"
+#import "UserDefaultConstants.h"
 
 NSString *sRedditClientId = nil;
 NSString *sRedditClientSecret = nil;
@@ -50,6 +51,11 @@ BOOL sImgurAlbumFallbackProxies = YES;
 BOOL sShowUserAvatars = NO;
 BOOL sUseProfileAvatarTabIcon = NO;
 BOOL sHideTabBarTitles = NO;
+BOOL sUnreadBadgeCompactTabBar = NO;
+BOOL sUnreadBadgeCompactInbox = NO;
+BOOL sUnreadBadgeThemeColor = NO;
+BOOL sTintInactiveTabIcons = NO;
+BOOL sAccentNavigationButtons = NO;
 BOOL sShowDetailedProfiles = YES;   // effective default ON via registerDefaults (UDKeyShowDetailedProfiles)
 BOOL sBadgeBookEnabled = YES;       // effective default ON via registerDefaults (UDKeyBadgeBookEnabled)
 BOOL sProfileHeaderImmersive = YES; // New (immersive melt) vs Classic (flat); default ON (UDKeyProfileHeaderImmersive)
@@ -80,7 +86,7 @@ BOOL sLiquidGlassEnabled = YES; // set once by ApolloCommon +load, before Logos 
 BOOL sIPadTabBarBottom = NO;   // opt-in (default OFF via registerDefaults, UDKeyIPadTabBarBottom); iPad-gated in the module
 BOOL sIPadPaneLayout = NO;     // opt-in (default OFF via registerDefaults, UDKeyIPadPaneLayout); iPad-gated, relaunch to apply
 BOOL sTabBarSwipeNavigation = NO;   // opt-in (default OFF via registerDefaults, UDKeyTabBarSwipeNavigation); Liquid Glass only, see ApolloLiquidGlass.xm
-NSInteger sDuoLandscapeFeedLayout = 0;
+NSInteger sDuoUnfoldedFeedLayout = 0;
 BOOL sDuoSubredditPanelGlassEnabled = NO;
 BOOL sDuoTabletopVideoEnabled = NO;
 BOOL sSubredditSwitcherSheetEnabled = NO;
@@ -88,6 +94,40 @@ BOOL sKeepSearchBarInPlace = NO;
 BOOL sShowFeedSearchBar = YES;
 BOOL sShowFindInCommentsBar = YES;
 BOOL sDuoRailReplyButton = YES;
+NSInteger sSearchBarMode = ApolloSearchBarModeOn;
+BOOL sSearchBarModeExplicit = NO;
+
+// MARK: - Search bar preference compatibility
+static ApolloSearchBarMode ApolloValidatedSearchBarMode(NSInteger mode) {
+    return mode >= ApolloSearchBarModeOn && mode <= ApolloSearchBarModeOff
+        ? (ApolloSearchBarMode)mode : ApolloSearchBarModeOn;
+}
+
+void ApolloLoadSearchBarPreferences(NSDictionary *persistentDomain) {
+    id feed = persistentDomain[UDKeyShowFeedSearchBar];
+    id comments = persistentDomain[UDKeyShowFindInCommentsBar];
+    sShowFeedSearchBar = [feed respondsToSelector:@selector(boolValue)] ? [feed boolValue] : YES;
+    sShowFindInCommentsBar = [comments respondsToSelector:@selector(boolValue)] ? [comments boolValue] : YES;
+    id mode = persistentDomain[UDKeySearchBarMode];
+    sSearchBarModeExplicit = mode != nil;
+    sSearchBarMode = ApolloValidatedSearchBarMode([mode respondsToSelector:@selector(integerValue)]
+        ? [mode integerValue] : ApolloSearchBarModeOn);
+}
+
+ApolloSearchBarMode ApolloSearchBarModeForComments(BOOL comments) {
+    if (!sSearchBarModeExplicit) {
+        BOOL show = comments ? sShowFindInCommentsBar : sShowFeedSearchBar;
+        return show ? ApolloSearchBarModeOn : ApolloSearchBarModeOff;
+    }
+    return ApolloValidatedSearchBarMode(sSearchBarMode);
+}
+
+void ApolloSaveSearchBarMode(NSUserDefaults *defaults, ApolloSearchBarMode mode) {
+    sSearchBarMode = ApolloValidatedSearchBarMode(mode);
+    [defaults setInteger:sSearchBarMode forKey:UDKeySearchBarMode];
+    sSearchBarModeExplicit = YES;
+}
+// MARK: - End search bar preference compatibility
 ApolloSettingsIconAppearance sSettingsIconAppearance = ApolloSettingsIconAppearanceLight;
 BOOL sIconRowMagnifier = YES;   // effective default ON via registerDefaults (UDKeyIconRowMagnifier)
 BOOL sInfoRowTapUpvote = YES;      // effective default ON via registerDefaults (UDKeyInfoRowTapUpvote)

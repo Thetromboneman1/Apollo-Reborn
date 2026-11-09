@@ -126,6 +126,16 @@ extern BOOL sUseProfileAvatarTabIcon;
 // Hide the visible main-tab labels while retaining/restoring the underlying
 // UITabBarItem titles. Opt-in; default OFF via registerDefaults.
 extern BOOL sHideTabBarTitles;
+// Unread badge style; all opt-in, default OFF via registerDefaults
+// (UDKeyUnreadBadge*). Change them through ApolloUnreadBadgesSet* so the
+// badges on screen restyle at once.
+extern BOOL sUnreadBadgeCompactTabBar;
+extern BOOL sUnreadBadgeCompactInbox;
+extern BOOL sUnreadBadgeThemeColor;
+// Inactive tab icon tint (ApolloTabBarStyle.xm).
+extern BOOL sTintInactiveTabIcons;
+// Liquid Glass navigation bar buttons in the theme accent (ApolloNavigationActions.xm).
+extern BOOL sAccentNavigationButtons;
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -198,9 +208,10 @@ extern "C" {
 // Opt-in top navigation bar movement, following the bottom tab bar's scroll
 // behavior while Hide Bars on Scroll is enabled. Default NO.
 extern BOOL sHideTopBarOnScroll;
-// Experimental Duo landscape feed layout: 0 = Original (default),
-// 2 = Focused feed; value 1 is retired. Read live by ApolloMediaHinge.
-extern NSInteger sDuoLandscapeFeedLayout;
+// Experimental opened-Duo feed layout, portrait and landscape:
+// 0 = Original (default), 2 = Focused feed; value 1 is retired.
+// Read live by ApolloMediaHinge.
+extern NSInteger sDuoUnfoldedFeedLayout;
 // Standard (default NO) or Liquid Glass for the open Duo subreddit panel.
 extern BOOL sDuoSubredditPanelGlassEnabled;
 extern BOOL sDuoTabletopVideoEnabled; // opt-in, default NO
@@ -253,6 +264,25 @@ extern BOOL sShowFeedSearchBar;
 extern BOOL sShowFindInCommentsBar;
 // UDKeyDuoRailReplyButton.
 extern BOOL sDuoRailReplyButton;
+// UDKeySearchBarMode (ApolloSearchNativeBar.xm). Stored values; keep them stable.
+typedef NS_ENUM(NSInteger, ApolloSearchBarMode) {
+    ApolloSearchBarModeOn = 0,
+    ApolloSearchBarModeHidden = 1,
+    ApolloSearchBarModeOff = 2,
+};
+extern NSInteger sSearchBarMode;
+// Registered defaults are not user choices. Until SearchBarMode is persisted,
+// retain each legacy screen's explicit On/Off choice independently.
+extern BOOL sSearchBarModeExplicit;
+#ifdef __cplusplus
+extern "C" {
+#endif
+void ApolloLoadSearchBarPreferences(NSDictionary *persistentDomain);
+ApolloSearchBarMode ApolloSearchBarModeForComments(BOOL comments);
+void ApolloSaveSearchBarMode(NSUserDefaults *defaults, ApolloSearchBarMode mode);
+#ifdef __cplusplus
+}
+#endif
 // When ON (default), press-and-hold on a post info row shows the glass-slider
 // magnifier loupe: slide to pick an icon, release to activate it (upvote /
 // comments / posted / % upvoted / translation). See ApolloStatsRowTouch.xm.

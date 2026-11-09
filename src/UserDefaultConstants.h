@@ -292,13 +292,25 @@ static NSString *const UDKeyUseProfileAvatarTabIcon = @"UseProfileAvatarTabIcon"
 // Default OFF. See ApolloTabBarTitles.xm.
 static NSString *const UDKeyHideTabBarTitles = @"HideTabBarTitles";
 static NSString *const ApolloTabBarTitlesChangedNotification = @"ApolloTabBarTitlesChangedNotification";
-
-// Controls the Inbox tab's unread badge presentation.
-// Default YES preserves Apollo's numbered unread badge.
+// Legacy badge keys retained for absent-only preference and backup migration.
 static NSString *const UDKeyInboxBadgeShowUnreadCount = @"InboxBadgeShowUnreadCount";
-// Default NO preserves Apollo's standard red badge color.
 static NSString *const UDKeyInboxBadgeUseThemeAccent = @"InboxBadgeUseThemeAccent";
-static NSString *const ApolloInboxBadgeChangedNotification = @"ApolloInboxBadgeChangedNotification";
+// Unread badge style (Interface → Unread Badges; ApolloUnreadBadges.m). All
+// default OFF, which keeps Apollo's red numbered badges untouched.
+//   CompactTabBar: the Inbox tab's badge becomes a small dot without the count.
+//   CompactInbox:  same for the Notifications / Chat switcher at the top of the
+//                  Inbox (ApolloChatsFilter.xm), independent of the tab bar.
+//   ThemeColor:    every unread badge above uses the theme accent, not red.
+static NSString *const UDKeyUnreadBadgeCompactTabBar = @"UnreadBadgeCompactTabBar";
+static NSString *const UDKeyUnreadBadgeCompactInbox = @"UnreadBadgeCompactInbox";
+static NSString *const UDKeyUnreadBadgeThemeColor = @"UnreadBadgeThemeColor";
+// Unselected tab bar icons use a muted shade of the theme accent instead of
+// UIKit's gray. Default OFF. Theme Manager -> Options.
+static NSString *const UDKeyTintInactiveTabIcons = @"ApolloTintedTabIcons";
+// Liquid Glass only: navigation bar buttons (Back, +, Edit, sort, •••) use the
+// theme accent instead of the neutral label color; titles stay neutral.
+// Default OFF. Theme Manager -> Options. See ApolloNavigationActions.xm.
+static NSString *const UDKeyAccentNavigationButtons = @"ApolloAccentNavigationButtons";
 // When ON (default), profile pages show Reborn's detailed profile — the banner,
 // large avatar/snoovatar, display name, bio, and the Social Links band. When OFF,
 // the profile page reverts to Apollo's compact stock layout: the detailed header is
@@ -370,7 +382,8 @@ static NSString *const UDKeyTabBarCollapseSide = @"TabBarCollapseSide";
 // "search takeover" (nav slides away + fades, field docks to the top and grows). Mutually
 // exclusive with the default nav-hide mode. Liquid Glass only. Default NO. See ApolloSearchInPlace.xm.
 static NSString *const UDKeyKeepSearchBarInPlace = @"KeepSearchBarInPlace";
-// Liquid Glass, iOS 26+. Off removes the search field under a feed's title
+// Legacy per-screen choices, retained for old backups until SearchBarMode is
+// explicitly selected. Off removes the search field under a feed's title
 // (and, on iOS 27, its search button). Default YES.
 static NSString *const UDKeyShowFeedSearchBar = @"ShowFeedSearchBar";
 // The same for Find in Comments on a thread; the ••• menu's Find in Comments
@@ -379,6 +392,11 @@ static NSString *const UDKeyShowFindInCommentsBar = @"ShowFindInCommentsBar";
 // iPhone Duo: a Reply button in the side rail on threads, running the ••• menu's
 // own Reply (ApolloDuoSplitView.xm). Default YES.
 static NSString *const UDKeyDuoRailReplyButton = @"DuoRailReplyButton";
+// Liquid Glass, iOS 26+. The feed's search bar and a thread's Find in Comments
+// bar: ApolloSearchBarMode (On, Hidden until pulled down at the top, Off). Off
+// keeps no search on the screen; the thread's ••• Find in Comments still opens
+// one. Default On. See ApolloSearchNativeBar.xm.
+static NSString *const UDKeySearchBarMode = @"SearchBarMode";
 // iPad only, Liquid Glass only. When ON, forces the iOS 26 floating tab bar to
 // dock at the BOTTOM (classic tab bar) instead of the top-center pill, which on
 // iPad overlaps Apollo's search bar. Temporary stopgap for issue #387 until the
@@ -409,9 +427,15 @@ static NSString *const UDKeyLiquidGlassEnabled = @"LiquidGlassEnabled";
 // dragging to switch tabs (an either/or; needs a relaunch to apply). Opt-in;
 // default OFF via registerDefaults. See ApolloLiquidGlass.xm.
 static NSString *const UDKeyTabBarSwipeNavigation = @"TabBarSwipeNavigation";
-// Experimental large post cards on Duo's opened landscape display:
+
+// Feed column's share (0–1) of Duo's flat landscape Posts split, saved when a
+// divider drag is released. Unset or invalid means 0.5. See ApolloDuoSplitDivider.
+static NSString *const UDKeyDuoDividerFeedShare = @"DuoDividerFeedShare";
+// Experimental large post cards on Duo's opened display, portrait and
+// landscape. The stored key keeps its landscape-only name so saved choices
+// survive:
 // 0 = Original (default), 2 = Focused feed; value 1 is retired.
-static NSString *const UDKeyDuoLandscapeFeedLayout = @"DuoLandscapeFeedLayout";
+static NSString *const UDKeyDuoUnfoldedFeedLayout = @"DuoLandscapeFeedLayout";
 // Open Duo subreddit panel appearance: NO = Standard
 // (default), YES = Liquid Glass. The panel keeps the same size and navigation.
 static NSString *const UDKeyDuoSubredditPanelGlassEnabled = @"DuoSubredditPanelGlassEnabled";

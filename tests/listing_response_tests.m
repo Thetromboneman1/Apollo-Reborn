@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import "ApolloWebJSONRoutes.h"
 #define ApolloLog(...) do { if (NO) NSLog(__VA_ARGS__); } while (0)
 // PRODUCTION_HELPERS
 
@@ -13,27 +14,41 @@ static ApolloWebJSONTaskCompletion ApolloWebJSONShareAccountRead(NSString *usern
     return completion;
 }
 static id ApolloWebJSONSharedReadPlaceholderTask(void) { return nil; }
-// The API-Key-Free subscription-walk helpers (page size, cut-short-walk
-// guard) only act for web-session accounts; these clients have none.
+// The API-Key-Free page size only acts for web-session accounts; these clients
+// have none.
 static id ApolloWebJSONParametersForAccountRead(NSString *username, NSString *method, NSString *path, id parameters) {
     (void)username; (void)method; (void)path;
     return parameters;
 }
-static BOOL ApolloWebJSONRequestIsSubscriptionWalk(NSString *method, NSString *path) { (void)method; (void)path; return NO; }
-static void ApolloWebJSONNoteSubscriptionWalkFailed(NSString *username, NSHTTPURLResponse *response, NSError *error) {
-    (void)username; (void)response; (void)error;
+// The failed-subscription-refresh guard has its own test
+// (tests/run_subscription_refresh_guard_tests.sh); here a page is just delivered.
+@class RDKClient;
+static NSString *ApolloSubscriptionWalkUsername(RDKClient *client, NSString *webSessionUsername,
+                                                NSString *method, NSString *path) {
+    (void)client; (void)webSessionUsername; (void)method; (void)path;
+    return nil;
+}
+static void ApolloSubscriptionWalkDeliver(NSString *walkUsername, NSHTTPURLResponse *response, NSError *error,
+                                          void (NS_NOESCAPE ^deliver)(void)) {
+    (void)walkUsername; (void)response; (void)error;
+    deliver();
 }
 static id nextObject;
 static NSError *nextError;
 static NSHTTPURLResponse *nextResponse;
 @interface RDKClient : NSObject
 - (id)taskWithMethod:(NSString *)method path:(NSString *)path parameters:(id)parameters completion:(Completion)completion;
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completionHandler;
 @end
 @implementation RDKClient
 - (id)taskWithMethod:(NSString *)method path:(NSString *)path parameters:(id)parameters completion:(Completion)completion {
     (void)method; (void)path; (void)parameters;
     if (completion) completion(nextResponse, nextObject, nextError);
     return @"task";
+}
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completionHandler {
+    (void)request; (void)completionHandler;
+    return nil;
 }
 @end
 // These tests isolate response-shape handling. Session-state behavior is
@@ -52,6 +67,15 @@ static BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path) { (void)path; return
 static NSString *ApolloWebJSONWebSessionUsernameForClient(RDKClient *client) { (void)client; return nil; }
 static BOOL ApolloWebJSONWebBearerNeedsMint(NSString *username) { (void)username; return NO; }
 static NSString *ApolloWebJSONKeylessOAuthBearer(NSString *username) { (void)username; return nil; }
+static __thread NSUInteger sApolloWebJSONRoutesTriedForSend = 0;
+static __thread NSUInteger sApolloWebJSONRoutesTriedToStamp = 0;
+// Only presentation/diagnostic seams are inert. Routing and request markers
+// come from production source, even while these clients use API keys.
+static void ApolloWebJSONLogRouteOutcomeOnce(NSString *method, NSString *path, NSString *message) {
+    (void)method; (void)path; (void)message;
+}
+static void ApolloWebJSONShowRoutesBlockedToastOnce(void) {}
+static NSString *ApolloWebJSONRouteStatusSummary(void) { return @"test"; }
 // PRODUCTION_HOOK
 
 static void Check(BOOL condition, NSString *message) {

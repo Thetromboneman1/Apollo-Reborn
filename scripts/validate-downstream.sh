@@ -38,6 +38,8 @@ bash "$ROOT/tests/run_allplus_merge_tests.sh"
 bash "$ROOT/tests/run_allplus_slider_tests.sh"
 bash "$ROOT/tests/run_spelling_tests.sh"
 bash "$ROOT/tests/run_native_search_visibility_tests.sh"
+bash "$ROOT/tests/run_search_bar_preferences_tests.sh"
+bash "$ROOT/tests/run_unread_badge_migration_tests.sh"
 bash "$ROOT/tests/run_native_direct_action_gate_tests.sh"
 bash "$ROOT/tests/run_duo_thread_drag_cleanup_tests.sh"
 

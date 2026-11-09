@@ -23,6 +23,7 @@
 #import "InfoRowSettingsViewController.h"
 #import "ApolloWebSessionLoginViewController.h"
 #import "ApolloDirectChatWeb.h"
+#import "ApolloUnreadBadges.h"
 #import "ApolloMessageDraftStore.h"
 #import "ApolloDevvitPosts.h"        // ApolloDevvitFeedOwnershipChangedNotification
 #import "ApolloFloatingTabs.h"       // close-all / fan-out entry points for the toggles
@@ -2403,40 +2404,6 @@ typedef NS_ENUM(NSInteger, Tag) {
         return !(IsLiquidGlass() && UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad);
     };
 
-    ApolloSettingsRow *inboxUnreadCount =
-        [ApolloSettingsRow switchRowWithID:@"interface.inboxUnreadCount"
-                                     title:@"Show Unread Count"
-                                      isOn:^BOOL { return [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeShowUnreadCount]; }
-                                  onToggle:^(UISwitch *sender) {
-            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyInboxBadgeShowUnreadCount];
-            [NSNotificationCenter.defaultCenter postNotificationName:ApolloInboxBadgeChangedNotification object:nil];
-        }];
-
-    ApolloSettingsRow *inboxBadgeColor =
-        [ApolloSettingsRow valueRowWithID:@"interface.inboxBadgeColor"
-                                    title:@"Unread Badge Color"
-                                   detail:^NSString * {
-            return [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? @"Theme Accent" : @"Red";
-        }
-                                 onSelect:^{
-            __strong typeof(weakSelf) self = weakSelf;
-            if (!self) return;
-            ApolloSettingsPresentLivePicker(self, [self cellForRowID:@"interface.inboxBadgeColor"],
-                                        @"Unread Badge Color", @[@"Red", @"Theme Accent"],
-                                        [NSUserDefaults.standardUserDefaults boolForKey:UDKeyInboxBadgeUseThemeAccent] ? 1 : 0,
-                                        ^(NSInteger pickedIndex) {
-                [NSUserDefaults.standardUserDefaults setBool:(pickedIndex == 1) forKey:UDKeyInboxBadgeUseThemeAccent];
-                [NSNotificationCenter.defaultCenter postNotificationName:ApolloInboxBadgeChangedNotification object:nil];
-                // Keep the existing row in place while its sheet dismisses.
-                UITableViewCell *cell = [weakSelf cellForRowID:@"interface.inboxBadgeColor"];
-                cell.detailTextLabel.text = pickedIndex == 1 ? @"Theme Accent" : @"Red";
-                [cell setNeedsLayout];
-            });
-        }];
-    inboxBadgeColor.configure = ^(UITableViewCell *cell) {
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    };
-
     // Icon-Only already hides every tab label. Hide the narrower profile-only
     // option while it is active, then reinsert it with its remembered value.
     ApolloSettingsRow *hideUsernameTab =
@@ -2569,12 +2536,45 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
     return [ApolloSettingsSection sectionWithTitle:@"Tab Bar"
                                             footer:footer
-                                              rows:@[ profileTabAvatar, iconOnlyTabBar, inboxUnreadCount, inboxBadgeColor, hideUsernameTab,
+                                              rows:@[ profileTabAvatar, iconOnlyTabBar, hideUsernameTab,
                                                       hideBarsOnScroll, hideStyle, hideTopBarToo, tabBarScrollBehavior,
                                                       iPadTabBarBottom, tabBarSwipeNavigation,
                                                       [ApolloSettingsRow disclosureRowWithID:@"interface.settingsShortcuts" title:@"Settings Shortcuts" detail:nil push:^UIViewController *{
                                                           return [[ApolloSettingsShortcutsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
                                                       }] ]];
+}
+
+// Interface → Unread Badges: how the Inbox's unread badges look. Apollo still
+// decides what is unread; see ApolloUnreadBadges.h for where each one is drawn.
+- (ApolloSettingsSection *)buildInterfaceUnreadBadgesSection {
+    ApolloSettingsRow *compactTabBar =
+        [ApolloSettingsRow switchRowWithID:@"interface.unreadBadgeCompactTabBar"
+                                     title:@"Compact Dot on Tab Bar"
+                                      isOn:^BOOL { return sUnreadBadgeCompactTabBar; }
+                                  onToggle:^(UISwitch *sender) { ApolloUnreadBadgesSetCompactTabBar(sender.isOn); }];
+
+    // The Notifications / Chat switcher (and its Requests badge) only exists
+    // with modern Chat on, so the row would do nothing without it.
+    BOOL inboxSwitcher = ApolloModernChatShouldOpen();
+    ApolloSettingsRow *compactInbox =
+        [ApolloSettingsRow switchRowWithID:@"interface.unreadBadgeCompactInbox"
+                                     title:@"Compact Dot in Inbox"
+                                      isOn:^BOOL { return sUnreadBadgeCompactInbox; }
+                                  onToggle:^(UISwitch *sender) { ApolloUnreadBadgesSetCompactInbox(sender.isOn); }];
+    compactInbox.visible = ^BOOL { return ApolloModernChatShouldOpen(); };
+
+    ApolloSettingsRow *themeColor =
+        [ApolloSettingsRow switchRowWithID:@"interface.unreadBadgeThemeColor"
+                                     title:@"Theme Color"
+                                      isOn:^BOOL { return sUnreadBadgeThemeColor; }
+                                  onToggle:^(UISwitch *sender) { ApolloUnreadBadgesSetThemeColor(sender.isOn); }];
+
+    NSString *footer = inboxSwitcher
+        ? @"A small dot replaces the unread count on the Inbox tab, or on the Notifications and Chat tabs in the Inbox. Theme Color uses your theme's accent instead of red."
+        : @"A small dot replaces the unread count on the Inbox tab. Theme Color uses your theme's accent instead of red.";
+    return [ApolloSettingsSection sectionWithTitle:@"Unread Badges"
+                                            footer:footer
+                                              rows:@[ compactTabBar, compactInbox, themeColor ]];
 }
 
 // Interface → Menus: the ••• menus' item order and visibility live on their own
@@ -2834,29 +2834,28 @@ typedef NS_ENUM(NSInteger, Tag) {
                 });
         }];
 
-    ApolloSettingsRow *feedSearchBar =
-        [ApolloSettingsRow switchRowWithID:@"interface.feedSearchBar"
-                                     title:@"Feed Search Bar"
-                                      isOn:^BOOL { return sShowFeedSearchBar; }
-                                  onToggle:^(UISwitch *sender) {
-            sShowFeedSearchBar = sender.isOn;
-            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyShowFeedSearchBar];
+    NSArray<NSString *> *searchBarTitles = @[ @"On", @"Hidden", @"Off" ];
+    ApolloSettingsRow *searchBars =
+        [ApolloSettingsRow valueRowWithID:@"interface.searchBars"
+                                    title:@"Search Bars"
+                                   detail:^NSString * {
+            if (!sSearchBarModeExplicit && sShowFeedSearchBar != sShowFindInCommentsBar) return @"Custom";
+            return searchBarTitles[ApolloSearchBarModeForComments(NO)];
+        }
+                                 onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.searchBars"],
+                @"Search Bars", searchBarTitles, ApolloSearchBarModeForComments(NO),
+                ^(NSInteger picked) {
+                    ApolloSaveSearchBarMode(NSUserDefaults.standardUserDefaults, (ApolloSearchBarMode)picked);
+                    [weakSelf reloadRowWithID:@"interface.searchBars"];
+                });
         }];
-    ApolloSettingsRow *findInCommentsBar =
-        [ApolloSettingsRow switchRowWithID:@"interface.findInCommentsBar"
-                                     title:@"Find in Comments Bar"
-                                      isOn:^BOOL { return sShowFindInCommentsBar; }
-                                  onToggle:^(UISwitch *sender) {
-            sShowFindInCommentsBar = sender.isOn;
-            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyShowFindInCommentsBar];
-        }];
-    BOOL searchBarRows = NO;
-    if (@available(iOS 26.0, *)) searchBarRows = IsLiquidGlass();
-    feedSearchBar.visible = ^BOOL { return searchBarRows; };
-    findInCommentsBar.visible = ^BOOL { return searchBarRows; };
+    BOOL searchBarsRow = NO;
+    if (@available(iOS 26.0, *)) searchBarsRow = IsLiquidGlass();
+    searchBars.visible = ^BOOL { return searchBarsRow; };
 
-    if (searchBarRows) {
-        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:@"\n\nFeed Search Bar and Find in Comments Bar: turn off to remove the search field under the title. Find in Comments stays in the thread's ••• menu. Applies to screens opened afterwards."];
+    if (searchBarsRow) {
+        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:@"\n\nSearch Bars: the search field under a feed's title and Find in Comments on threads. Hidden keeps them out of the way until you pull down at the top of the list. Off removes them; Find in Comments stays in the thread's ••• menu. Existing per-screen choices are kept until you choose a mode here. Custom means feed and thread choices differ."];
     }
 
     ApolloSettingsRow *duoRailReply =
@@ -2874,7 +2873,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     }
     return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
                                             footer:displayNavigationFooter
-                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect, feedSearchBar, findInCommentsBar, duoRailReply ]];
+                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect, searchBars, duoRailReply ]];
 }
 
 // Display order differs from stored values; Blur is optional, while Hidden
@@ -5742,14 +5741,7 @@ replacementString:(NSString *)string {
     // Icon-Only temporarily supersedes the narrower profile-only choice.
     // Preserve its preference while hiding the redundant row, then restore
     // both when tab labels return.
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    BOOL showUnreadCount = [defaults boolForKey:UDKeyInboxBadgeShowUnreadCount];
     ApolloSetHideTabBarTitlesEnabled(sender.isOn);
-    // Rebuilding the tab bar can cause Apollo/UIKit to re-register its tab
-    // defaults. Icon-Only and Inbox badge presentation are independent, so
-    // preserve the user's badge choice across that rebuild explicitly.
-    [defaults setBool:showUnreadCount forKey:UDKeyInboxBadgeShowUnreadCount];
-    [defaults synchronize];
     [self visibilityDidChange];
 }
 
@@ -6566,6 +6558,7 @@ replacementString:(NSString *)string {
 - (NSString *)apollo_screenTitle { return @"Interface"; }
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildInterfaceTabBarSection],
+              [self buildInterfaceUnreadBadgesSection],
               [self buildInterfaceDisplayNavigationSection],
               [self buildInterfaceLiquidGlassSection],
               [self buildInterfaceMenusSection] ];
@@ -6596,15 +6589,15 @@ replacementString:(NSString *)string {
         }];
     ApolloSettingsRow *landscape = [ApolloSettingsRow valueRowWithID:@"duo.landscapeFeed"
         title:@"Landscape Feed Layout"
-        detail:^NSString * { return sDuoLandscapeFeedLayout == 2 ? @"Focused" : @"Original"; }
+        detail:^NSString * { return sDuoUnfoldedFeedLayout == 2 ? @"Focused" : @"Original"; }
         onSelect:^{
             ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.landscapeFeed"],
-                @"Landscape Feed Layout", @[@"Original", @"Focused"], sDuoLandscapeFeedLayout == 2 ? 1 : 0,
+                @"Landscape Feed Layout", @[@"Original", @"Focused"], sDuoUnfoldedFeedLayout == 2 ? 1 : 0,
                 ^(NSInteger picked) {
                     NSInteger layout = picked == 1 ? 2 : 0;
-                    if (layout == sDuoLandscapeFeedLayout) return;
-                    sDuoLandscapeFeedLayout = layout;
-                    [NSUserDefaults.standardUserDefaults setInteger:layout forKey:UDKeyDuoLandscapeFeedLayout];
+                    if (layout == sDuoUnfoldedFeedLayout) return;
+                    sDuoUnfoldedFeedLayout = layout;
+                    [NSUserDefaults.standardUserDefaults setInteger:layout forKey:UDKeyDuoUnfoldedFeedLayout];
                     [weakSelf reloadRowWithID:@"duo.landscapeFeed"];
                     [NSNotificationCenter.defaultCenter postNotificationName:@"ApolloDuoFeedLayoutDidChange" object:nil];
                 });

@@ -26,6 +26,7 @@
 #import "ApolloBarkNotifications.h"
 #import "ApolloLiquidGlassIconSelectionState.h"
 #import "ApolloState.h"
+#import "ApolloUnreadBadges.h"
 #import "ApolloDuoRail.h"
 #import "ApolloDuoCompatibility.h"
 #import "ApolloTranslation.h"
@@ -4030,8 +4031,11 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyShowUserAvatars: @NO,
                                     UDKeyUseProfileAvatarTabIcon: @NO,
                                     UDKeyHideTabBarTitles: @NO,
-                                    UDKeyInboxBadgeShowUnreadCount: @YES,
-                                    UDKeyInboxBadgeUseThemeAccent: @NO,
+                                    UDKeyUnreadBadgeCompactTabBar: @NO,
+                                    UDKeyUnreadBadgeCompactInbox: @NO,
+                                    UDKeyUnreadBadgeThemeColor: @NO,
+                                    UDKeyTintInactiveTabIcons: @NO,
+                                    UDKeyAccentNavigationButtons: @NO,
                                     UDKeyShowDetailedProfiles: @YES,
                                     UDKeyBadgeBookEnabled: @YES,
                                     UDKeyProfileHeaderImmersive: @YES,
@@ -4061,11 +4065,12 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
                                     UDKeyShowFeedSearchBar: @YES,
                                     UDKeyShowFindInCommentsBar: @YES,
                                     UDKeyDuoRailReplyButton: @YES,
+                                    UDKeySearchBarMode: @(ApolloSearchBarModeOn),
                                     UDKeyIPadTabBarBottom: @NO,
                                     UDKeyIPadPaneLayout: @NO,
                                     UDKeySettingsIconAppearance: @(ApolloSettingsIconAppearanceLight),
                                     UDKeyTabBarSwipeNavigation: @NO,
-                                    UDKeyDuoLandscapeFeedLayout: @0,
+                                    UDKeyDuoUnfoldedFeedLayout: @0,
                                     UDKeyDuoSubredditPanelGlassEnabled: @NO,
                                     UDKeyDuoTabletopVideoEnabled: @NO,
                                     UDKeySubredditSwitcherSheetEnabled: @(ApolloDeviceIsDuo()),
@@ -4339,6 +4344,12 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     sShowUserAvatars = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
     sUseProfileAvatarTabIcon = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon];
     sHideTabBarTitles = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyHideTabBarTitles];
+    ApolloUnreadBadgesMigratePreferences(standardDefaults, NSBundle.mainBundle.bundleIdentifier);
+    sUnreadBadgeCompactTabBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUnreadBadgeCompactTabBar];
+    sUnreadBadgeCompactInbox = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUnreadBadgeCompactInbox];
+    sUnreadBadgeThemeColor = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUnreadBadgeThemeColor];
+    sTintInactiveTabIcons = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTintInactiveTabIcons];
+    sAccentNavigationButtons = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAccentNavigationButtons];
     ApolloNormalizeNativeHideUsernameForIconOnlyTabBar();
     // Profile Layout exposes this master again as its Native density. The
     // registered default remains ON for new installs; an explicit OFF now
@@ -4389,9 +4400,10 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     }
     sTabBarHideStyle = (ApolloTabBarHideStyle)storedTabBarHideStyle;
     sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
-    sShowFeedSearchBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowFeedSearchBar];
-    sShowFindInCommentsBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowFindInCommentsBar];
-    sDuoRailReplyButton = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDuoRailReplyButton];
+    // Inspect persisted keys, not the registered On default: old backups may
+    // deliberately have different feed and thread choices.
+    ApolloLoadSearchBarPreferences(persistentDomain);
+    sDuoRailReplyButton = [standardDefaults boolForKey:UDKeyDuoRailReplyButton];
     sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
     // Read once here: ApolloPaneInstall.xm builds the split controllers during
     // scene connect, which happens after %ctor and never again for the process.
@@ -4402,15 +4414,15 @@ static void ApolloShowRedditRateLimitToast(NSTimeInterval seconds) {
     // sLiquidGlassEnabled was already latched in ApolloCommon +load. Do not
     // reload it here: UIKit and early hook constructors use that launch choice.
     sTabBarSwipeNavigation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation];
-    sDuoLandscapeFeedLayout = [standardDefaults integerForKey:UDKeyDuoLandscapeFeedLayout];
+    sDuoUnfoldedFeedLayout = [standardDefaults integerForKey:UDKeyDuoUnfoldedFeedLayout];
     sDuoSubredditPanelGlassEnabled = [standardDefaults boolForKey:UDKeyDuoSubredditPanelGlassEnabled];
     sDuoTabletopVideoEnabled = [standardDefaults boolForKey:UDKeyDuoTabletopVideoEnabled];
     sSubredditSwitcherSheetEnabled = [standardDefaults boolForKey:UDKeySubredditSwitcherSheetEnabled];
     // Value 1 belonged to the removed side-by-side experiment. Keep Focused
     // feed at 2 so existing selections survive this menu cleanup.
-    if (sDuoLandscapeFeedLayout != 0 && sDuoLandscapeFeedLayout != 2) {
-        sDuoLandscapeFeedLayout = 0;
-        [standardDefaults setInteger:0 forKey:UDKeyDuoLandscapeFeedLayout];
+    if (sDuoUnfoldedFeedLayout != 0 && sDuoUnfoldedFeedLayout != 2) {
+        sDuoUnfoldedFeedLayout = 0;
+        [standardDefaults setInteger:0 forKey:UDKeyDuoUnfoldedFeedLayout];
     }
     sIconRowMagnifier = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIconRowMagnifier];
     sInfoRowTapUpvote = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyInfoRowTapUpvote];

@@ -10,6 +10,7 @@
 #import "ApolloThemeTokens.h"
 #import "ApolloThemeStore.h"
 #import "ApolloThemeRuntime.h"
+#import "ApolloUnreadBadges.h"
 #import "ApolloThemeManagerViewController.h"
 #import "ApolloBoldPostTitles.h"
 #import "ApolloCommon.h"
@@ -1087,15 +1088,11 @@ static UIImage *CustomPickerSwatch(void) {
 
         // Refresh the Inbox badge after selecting a stock Apollo theme.
         [[NSNotificationCenter defaultCenter]
-            postNotificationName:ApolloInboxBadgeChangedNotification
+            postNotificationName:ApolloUnreadBadgeStyleDidChangeNotification
                           object:nil];
 
         ApolloThemePickerRestoreDuoTabMetrics();
 
-        // Refresh the Inbox badge after selecting a stock Apollo theme.
-        [[NSNotificationCenter defaultCenter]
-            postNotificationName:ApolloInboxBadgeChangedNotification
-                          object:nil];
         return;
     }
     %orig;
