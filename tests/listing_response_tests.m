@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import "ApolloWebJSONRoutes.h"
 #define ApolloLog(...) do { if (NO) NSLog(__VA_ARGS__); } while (0)
 // PRODUCTION_HELPERS
 
@@ -37,12 +38,17 @@ static NSError *nextError;
 static NSHTTPURLResponse *nextResponse;
 @interface RDKClient : NSObject
 - (id)taskWithMethod:(NSString *)method path:(NSString *)path parameters:(id)parameters completion:(Completion)completion;
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completionHandler;
 @end
 @implementation RDKClient
 - (id)taskWithMethod:(NSString *)method path:(NSString *)path parameters:(id)parameters completion:(Completion)completion {
     (void)method; (void)path; (void)parameters;
     if (completion) completion(nextResponse, nextObject, nextError);
     return @"task";
+}
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completionHandler {
+    (void)request; (void)completionHandler;
+    return nil;
 }
 @end
 // These tests isolate response-shape handling. Session-state behavior is
@@ -61,6 +67,15 @@ static BOOL ApolloWebJSONPathNeedsWebBearer(NSString *path) { (void)path; return
 static NSString *ApolloWebJSONWebSessionUsernameForClient(RDKClient *client) { (void)client; return nil; }
 static BOOL ApolloWebJSONWebBearerNeedsMint(NSString *username) { (void)username; return NO; }
 static NSString *ApolloWebJSONKeylessOAuthBearer(NSString *username) { (void)username; return nil; }
+static __thread NSUInteger sApolloWebJSONRoutesTriedForSend = 0;
+static __thread NSUInteger sApolloWebJSONRoutesTriedToStamp = 0;
+// Only presentation/diagnostic seams are inert. Routing and request markers
+// come from production source, even while these clients use API keys.
+static void ApolloWebJSONLogRouteOutcomeOnce(NSString *method, NSString *path, NSString *message) {
+    (void)method; (void)path; (void)message;
+}
+static void ApolloWebJSONShowRoutesBlockedToastOnce(void) {}
+static NSString *ApolloWebJSONRouteStatusSummary(void) { return @"test"; }
 // PRODUCTION_HOOK
 
 static void Check(BOOL condition, NSString *message) {
