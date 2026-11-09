@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 root = Path(__file__).resolve().parents[1]
-badge_source = (root / "src/ApolloInboxBadge.xm").read_text()
+badge_source = (root / "src/ApolloUnreadBadges.xm").read_text()
 preview_source = (root / "src/ApolloLinkPreviewFetcher.m").read_text()
 comment_header_source = (root / "src/ApolloCommentHeaderLayout.xm").read_text()
 classes_header = (root / "src/ApolloClasses.h").read_text()
@@ -13,7 +13,11 @@ new_video_source = (root / "src/ApolloNewVideoPost.xm").read_text()
 
 assert '#import "ApolloClasses.h"' in badge_source
 assert 'NSClassFromString(@"_UIBarBadgeView")' not in badge_source
-assert badge_source.count("ApolloClassUIBarBadgeView") >= 4
+assert 'Class glass = ApolloClassUIBarBadgeView;' in badge_source
+assert 'objc_getClass("_UIBarBadgeView")' not in badge_source
+makefile_source = (root / "Makefile").read_text()
+assert '$(SRC_DIR)/ApolloInboxBadge.xm' not in makefile_source
+assert '$(SRC_DIR)/ApolloUnreadBadges.xm' in makefile_source
 
 gone_lines = [
     line
