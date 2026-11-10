@@ -855,6 +855,10 @@ static NSString *const UDKeyLinkPreviewCardColorHex = @"LinkPreviewCardColorHex"
 // toggle (ApolloSettingsPinnedPreview); one key per screen, like
 // UDKeyInlineMediaPreviewPinned.
 static NSString *const UDKeyLinkPreviewPreviewPinned = @"LinkPreviewPreviewPinned";
+// Whether the Feed Shortcuts screen's live preview stays pinned while the rows
+// scroll beneath it (default) or scrolls away with them. Tap the card to
+// toggle (ApolloSettingsPinnedPreview); one key per screen.
+static NSString *const UDKeyFeedShortcutsPreviewPinned = @"FeedShortcutsPreviewPinned";
 static NSString *const ApolloLinkPreviewModeDidChangeNotification = @"ApolloLinkPreviewModeDidChangeNotification";
 // Posted by the Inline Media settings screen when size/alignment changes so
 // visible comments re-measure their inline media immediately.

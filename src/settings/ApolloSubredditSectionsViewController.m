@@ -8,26 +8,22 @@
 #import "ApolloThemeRuntime.h"
 #import "ApolloDuoRail.h"
 #import "UserDefaultConstants.h"
+#import "settings/ApolloSettingsPinnedPreview.h"
 
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 
-// The screen is a container (ApolloSubredditSectionsViewController) that pins
-// a live preview card above a declarative form-table child, mirroring the
-// Feed Shortcuts screen (ApolloFeedShortcutsSettingsViewController): the
-// preview stays on screen while the toggles and the drag-to-reorder rows
-// scroll beneath it, and every change animates the preview's bands and
-// sample rows into their new places — nothing reloads.
-//
-// The pin is optional: a pin glyph at the trailing end of the "Preview" line
-// shows the state, and tapping it (or the card) toggles it. The form's table
-// fills the container in both modes (so the bars have the same list beneath
-// them either way and keep the same glass). Pinned, the card's host is the
-// container's own subview at the safe-area top and the table reserves its
-// height with a top content inset. Unpinned, the card becomes real scroll
-// content — the host is the table's header view — so it scrolls away like a
-// normal header with the bars' scroll-edge treatment, touches on it scroll
-// the list, and the offset bookkeeping is UIKit's. Pinned is the default;
-// the choice is persisted (UDKeySubredditSectionsPreviewPinned).
+// The screen is a declarative form whose first section, "Preview", holds the
+// shared pinned preview (ApolloSettingsPinnedPreview.h), the same block Inline
+// Media and Rich Link Previews use: a transparent spacer row the card rests
+// on, a card hosted directly in the table that stays put (with a copy of the
+// section title) while the toggles and the drag-to-reorder rows scroll
+// beneath it, and the shared pin glyph in the card's top-right corner. Tapping
+// the card pins/unpins it; the choice is persisted per screen
+// (UDKeySubredditSectionsPreviewPinned, default pinned). Every change animates
+// the preview's bands and sample rows into their new places — nothing
+// reloads — and the spacer row springs to the new card height in the same
+// beat.
 //
 // The preview is a miniature, non-interactive rendering of the Subreddits
 // list: one band + sample row per special section in the configured order,
@@ -58,6 +54,9 @@ static const CGFloat kApolloSectionsPreviewDetailRowHeight = 48.0;
 static const CGFloat kApolloSectionsPreviewTopPadding = 10.0;
 static const CGFloat kApolloSectionsPreviewBottomPadding = 8.0;
 static const CGFloat kApolloSectionsPreviewBlockSpacing = 3.0;
+// Room the first band's rule leaves for the shared pin glyph (12pt trailing
+// inset + 22pt glyph box + 10pt gap).
+static const CGFloat kApolloSectionsPreviewPinCornerReserve = 44.0;
 
 @interface ApolloSubredditSectionsPreviewBlock : NSObject
 @property (nonatomic) ApolloSubredditSectionsPreviewBlockKind kind;
@@ -275,7 +274,10 @@ static UIImage *ApolloPreviewBundledIcon(NSString *blockKey) {
 }
 
 // One section band: the header strip in the block's divider style.
-- (UIView *)apollo_bandViewForBlock:(ApolloSubredditSectionsPreviewBlock *)block {
+// reservePinCorner: the first block sits under the shared pin glyph in the
+// card's top-right corner, so a modern band's rule stops short of it.
+- (UIView *)apollo_bandViewForBlock:(ApolloSubredditSectionsPreviewBlock *)block
+                   reservePinCorner:(BOOL)reservePinCorner {
     UIView *band = [UIView new];
     UILabel *label = [UILabel new];
     label.text = block.title;
@@ -292,7 +294,8 @@ static UIImage *ApolloPreviewBundledIcon(NSString *blockKey) {
             [label.leadingAnchor constraintEqualToAnchor:band.leadingAnchor constant:22.0],
             [label.centerYAnchor constraintEqualToAnchor:band.centerYAnchor],
             [line.leadingAnchor constraintEqualToAnchor:label.trailingAnchor constant:12.0],
-            [line.trailingAnchor constraintEqualToAnchor:band.trailingAnchor constant:-12.0],
+            [line.trailingAnchor constraintEqualToAnchor:band.trailingAnchor
+                                                constant:reservePinCorner ? -kApolloSectionsPreviewPinCornerReserve : -12.0],
             [line.centerYAnchor constraintEqualToAnchor:band.centerYAnchor],
             [line.heightAnchor constraintEqualToConstant:2.0],
         ]];
@@ -410,7 +413,7 @@ static UIImage *ApolloPreviewBundledIcon(NSString *blockKey) {
     NSMutableDictionary<NSString *, NSString *> *signaturesByKey = [NSMutableDictionary dictionaryWithCapacity:state.blocks.count];
     for (ApolloSubredditSectionsPreviewBlock *block in state.blocks) {
         UIView *view = block.kind == ApolloSubredditSectionsPreviewBlockKindBand
-            ? [self apollo_bandViewForBlock:block]
+            ? [self apollo_bandViewForBlock:block reservePinCorner:(blockViews.count == 0)]
             : [self apollo_rowViewForBlock:block];
         [blockViews addObject:view];
         viewsByKey[block.key] = view;
@@ -459,28 +462,256 @@ static UIImage *ApolloPreviewBundledIcon(NSString *blockKey) {
 
 @end
 
-#pragma mark - Preview host
+#pragma mark - Preview content (the shared host's contentView)
 
-// The pinned-area view. Unpinned it is the table's header, and touches pass
-// through it to the table (so drags on the card scroll the list); pinned it
-// is the container's subview above the table, and it absorbs them (a row
-// that has scrolled under the card must not take the tap). The container's
-// tap recognizer toggles the pin either way, since it lives on an ancestor.
-// The pin button handles its own taps in both modes.
-@interface ApolloSubredditSectionsPreviewHostView : UIView
-@property (nonatomic, weak) UIView *touchableView;
+// What the shared pinned host shows in its card: the current rendering, and
+// the keyed transition between two renderings. The card's height is the spacer
+// row's height, so a height change is the screen's job: layoutAlongside runs
+// inside the same animation (and after an immediate swap) to spring the spacer
+// row, and with it the card, to the new height.
+@interface ApolloSubredditSectionsPreviewContentView : UIView
+@property (nonatomic, copy) void (^layoutAlongside)(void);
++ (CGFloat)heightForCardWidth:(CGFloat)width;
+- (void)apollo_refreshPreviewAnimated:(BOOL)animated;
+- (void)apollo_finishPreviewTransition;
 @end
 
-@implementation ApolloSubredditSectionsPreviewHostView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (hit && self.touchableView && [hit isDescendantOfView:self.touchableView]) return hit;
-    // Pass through only as the table's header (so drags on the card scroll
-    // the list). Pinned, the view beneath is the table too, and a row that
-    // has scrolled under the card would take the tap: absorb it instead.
-    // The container's tap recognizer still receives it from the ancestor.
-    return [self.superview isKindOfClass:[UIScrollView class]] ? nil : hit;
+@interface ApolloSubredditSectionsPreviewContentView ()
+@property (nonatomic, strong) ApolloSubredditSectionsPreviewView *currentPreviewView;
+@property (nonatomic, strong) UIViewPropertyAnimator *previewAnimator;
+@property (nonatomic) NSUInteger previewTransitionGeneration;
+@property (nonatomic) BOOL previewRefreshPending;
+@property (nonatomic, strong) ApolloSubredditSectionsPreviewState *previewTransitionFromState;
+@property (nonatomic, strong) ApolloSubredditSectionsPreviewState *previewTransitionToState;
+@end
+
+@implementation ApolloSubredditSectionsPreviewContentView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = UIColor.clearColor;
+    // A growing rendering must not spill below the card mid-spring.
+    self.clipsToBounds = YES;
+    self.userInteractionEnabled = NO;
+    return self;
 }
+
+// The rendering's height does not depend on the card width (fixed-height
+// bands and rows), only on the current settings.
++ (CGFloat)heightForCardWidth:(__unused CGFloat)width {
+    return ApolloSubredditSectionsCurrentPreviewState().previewHeight;
+}
+
+- (void)apollo_layoutAlongside {
+    if (self.layoutAlongside) self.layoutAlongside();
+}
+
+- (ApolloSubredditSectionsPreviewView *)apollo_previewViewForState:(ApolloSubredditSectionsPreviewState *)state {
+    ApolloSubredditSectionsPreviewView *preview = [[ApolloSubredditSectionsPreviewView alloc] initWithFrame:CGRectZero];
+    preview.translatesAutoresizingMaskIntoConstraints = NO;
+    preview.previewState = state;
+    [preview apollo_configurePreview];
+    return preview;
+}
+
+- (void)apollo_addPreviewView:(ApolloSubredditSectionsPreviewView *)preview height:(CGFloat)height {
+    [self addSubview:preview];
+    [NSLayoutConstraint activateConstraints:@[
+        [preview.topAnchor constraintEqualToAnchor:self.topAnchor],
+        [preview.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [preview.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+        [preview.heightAnchor constraintEqualToConstant:height]
+    ]];
+}
+
+- (void)apollo_finishPreviewTransition {
+    UIViewPropertyAnimator *animator = self.previewAnimator;
+    if (!animator) return;
+    [animator stopAnimation:NO];
+    [animator finishAnimationAtPosition:UIViewAnimatingPositionEnd];
+}
+
+- (void)apollo_replacePreviewImmediately:(ApolloSubredditSectionsPreviewView *)preview
+                                   state:(ApolloSubredditSectionsPreviewState *)state {
+    [self apollo_finishPreviewTransition];
+    for (UIView *subview in self.subviews) [subview removeFromSuperview];
+    [self apollo_addPreviewView:preview height:state.previewHeight];
+    preview.alpha = 1.0;
+    self.currentPreviewView = preview;
+    [UIView performWithoutAnimation:^{
+        [self layoutIfNeeded];
+        [self apollo_layoutAlongside];
+    }];
+}
+
+// Re-render for the current settings. Animated: the new rendering is laid
+// out on top of the old one and every block is matched by key — survivors
+// slide from their old spot to their new one (a pixel-identical twin swaps in
+// silently; a restyled one cross-fades on the way), newcomers scale-fade in,
+// leavers scale-fade out — while the card's height (and the form below it)
+// springs to the new size. A refresh landing mid-animation is queued and
+// replayed once the animation completes.
+- (void)apollo_refreshPreviewAnimated:(BOOL)animated {
+    if (animated && self.previewAnimator.state == UIViewAnimatingStateActive) {
+        ApolloSubredditSectionsPreviewState *requested = ApolloSubredditSectionsCurrentPreviewState();
+        BOOL atSource = ApolloPreviewStatesEqual(requested, self.previewTransitionFromState);
+        BOOL atTarget = ApolloPreviewStatesEqual(requested, self.previewTransitionToState);
+        if (atSource || atTarget) {
+            // Reverse the running timeline, preserving its current visual position.
+            self.previewRefreshPending = NO;
+            self.previewAnimator.reversed = atSource;
+        } else {
+            // Coalesce different controls/order changes into the latest state.
+            self.previewRefreshPending = YES;
+        }
+        return;
+    }
+    [self apollo_finishPreviewTransition];
+
+    ApolloSubredditSectionsPreviewState *state = ApolloSubredditSectionsCurrentPreviewState();
+    ApolloSubredditSectionsPreviewView *incoming = [self apollo_previewViewForState:state];
+    ApolloSubredditSectionsPreviewView *outgoing = self.currentPreviewView;
+    if (!animated || UIAccessibilityIsReduceMotionEnabled() || !outgoing || !self.window) {
+        [self apollo_replacePreviewImmediately:incoming state:state];
+        return;
+    }
+
+    self.previewTransitionFromState = outgoing.previewState;
+    self.previewTransitionToState = state;
+    [self layoutIfNeeded];
+    [self apollo_addPreviewView:incoming height:state.previewHeight];
+    [self layoutIfNeeded];
+    [incoming layoutIfNeeded];
+    self.currentPreviewView = incoming;
+
+    NSDictionary<NSString *, UIView *> *oldItems = outgoing.itemViewsByKey;
+    NSDictionary<NSString *, UIView *> *newItems = incoming.itemViewsByKey;
+    NSMutableArray<UIView *> *departingItems = [NSMutableArray array]; // gone: scale-fade out in place
+    NSMutableArray<UIView *> *restyledItems = [NSMutableArray array];  // old look of a survivor: fade out in place
+    NSMutableArray<UIView *> *slidingRows = [NSMutableArray array];
+    NSMutableArray<void (^)(void)> *slideAnimations = [NSMutableArray array];
+    NSMutableArray<UIView *> *slidingIncomingRows = [NSMutableArray array];
+    for (NSString *key in newItems) {
+        UIView *newItem = newItems[key];
+        UIView *oldItem = oldItems[key];
+        if (!oldItem) {
+            newItem.alpha = 0.0;
+            newItem.transform = CGAffineTransformMakeScale(0.88, 0.88);
+            continue;
+        }
+        CGRect oldFrame = [oldItem convertRect:oldItem.bounds toView:self];
+        CGRect newFrame = [newItem convertRect:newItem.bounds toView:self];
+        newItem.transform = CGAffineTransformMakeTranslation(CGRectGetMidX(oldFrame) - CGRectGetMidX(newFrame),
+                                                              CGRectGetMidY(oldFrame) - CGRectGetMidY(newFrame));
+        BOOL sameLook = [outgoing.itemSignaturesByKey[key] isEqualToString:incoming.itemSignaturesByKey[key]];
+        if (sameLook) {
+            oldItem.alpha = 0.0; // the twin takes over from the very first frame
+        } else if ([key hasPrefix:@"row."]) {
+            // Animate each piece inside a resizing clip. This keeps names visible
+            // while icons slide sideways and descriptions slide below the row.
+            UIView *clip = [[UIView alloc] initWithFrame:oldFrame];
+            clip.clipsToBounds = YES;
+            [self addSubview:clip];
+            [slidingRows addObject:clip];
+            [slidingIncomingRows addObject:newItem];
+            [slideAnimations addObject:^{ clip.frame = newFrame; }];
+            for (NSInteger tag = 101; tag <= 105; tag++) {
+                UIView *oldPart = [oldItem viewWithTag:tag];
+                UIView *newPart = [newItem viewWithTag:tag];
+                BOOL hadPart = oldPart && !oldPart.hidden;
+                BOOL hasPart = newPart && !newPart.hidden;
+                if (!hadPart && !hasPart) continue;
+                UIView *source = hasPart ? newPart : oldPart;
+                // These are plain labels/images. Render their layers directly:
+                // snapshotViewAfterScreenUpdates:YES flushes the partially staged
+                // preview to the screen, exposing duplicate/missing rows for a frame.
+                UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
+                    initWithSize:source.bounds.size];
+                UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+                    [source.layer renderInContext:context.CGContext];
+                }];
+                UIView *snapshot = [[UIImageView alloc] initWithImage:image];
+                CGRect start = hadPart ? [oldPart convertRect:oldPart.bounds toView:oldItem]
+                                       : [newPart convertRect:newPart.bounds toView:newItem];
+                CGRect end = hasPart ? [newPart convertRect:newPart.bounds toView:newItem] : start;
+                if (!hadPart) {
+                    if (tag == 101) start.origin.x = -CGRectGetWidth(start);
+                    else start.origin.y = CGRectGetHeight(oldFrame);
+                }
+                if (!hasPart) {
+                    if (tag == 101) end.origin.x = -CGRectGetWidth(end);
+                    else end.origin.y = CGRectGetHeight(newFrame);
+                }
+                snapshot.frame = start;
+                [clip addSubview:snapshot];
+                [slideAnimations addObject:^{ snapshot.frame = end; }];
+            }
+            oldItem.alpha = 0.0;
+            // Hidden arranged subviews collapse in UIStackView. Keep the real
+            // row in layout while its clipped snapshot supplies the visuals.
+            newItem.alpha = 0.0;
+        } else {
+            newItem.alpha = 0.0;
+            [restyledItems addObject:oldItem];
+        }
+    }
+    for (NSString *key in oldItems) {
+        if (!newItems[key]) [departingItems addObject:oldItems[key]];
+    }
+
+    NSUInteger generation = ++self.previewTransitionGeneration;
+    UISpringTimingParameters *timing = [[UISpringTimingParameters alloc] initWithDampingRatio:0.88];
+    UIViewPropertyAnimator *animator = [[UIViewPropertyAnimator alloc] initWithDuration:0.34
+                                                                      timingParameters:timing];
+    __weak typeof(self) weakSelf = self;
+    __weak UIViewPropertyAnimator *weakAnimator = animator;
+    [animator addAnimations:^{
+        for (UIView *item in newItems.allValues) {
+            if (![slidingIncomingRows containsObject:item]) item.alpha = 1.0;
+            item.transform = CGAffineTransformIdentity;
+        }
+        for (UIView *item in departingItems) {
+            item.alpha = 0.0;
+            item.transform = CGAffineTransformMakeScale(0.88, 0.88);
+        }
+        for (void (^slide)(void) in slideAnimations) slide();
+        for (UIView *item in restyledItems) item.alpha = 0.0;
+        [weakSelf apollo_layoutAlongside];
+    }];
+    [animator addCompletion:^(UIViewAnimatingPosition finalPosition) {
+        for (UIView *row in slidingIncomingRows) row.alpha = 1.0;
+        for (UIView *clip in slidingRows) [clip removeFromSuperview];
+        if (finalPosition == UIViewAnimatingPositionStart) {
+            [incoming removeFromSuperview];
+            for (UIView *item in oldItems.allValues) {
+                item.alpha = 1.0;
+                item.transform = CGAffineTransformIdentity;
+            }
+            weakSelf.currentPreviewView = outgoing;
+            [UIView performWithoutAnimation:^{
+                [weakSelf layoutIfNeeded];
+                [weakSelf apollo_layoutAlongside];
+            }];
+        } else {
+            [outgoing removeFromSuperview];
+            incoming.alpha = 1.0;
+        }
+        if (weakSelf.previewTransitionGeneration == generation &&
+            weakSelf.previewAnimator == weakAnimator) {
+            weakSelf.previewAnimator = nil;
+        }
+        if (weakSelf.previewRefreshPending) {
+            weakSelf.previewRefreshPending = NO;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf apollo_refreshPreviewAnimated:YES];
+            });
+        }
+    }];
+    self.previewAnimator = animator;
+    [animator startAnimation];
+}
+
 @end
 
 // Native reorder chrome is disabled: the redesign's snapshot gesture below
@@ -493,10 +724,13 @@ static UIImage *ApolloPreviewBundledIcon(NSString *blockKey) {
 }
 @end
 
-#pragma mark - The form (child)
+#pragma mark - The screen
 
-@interface ApolloSubredditSectionsFormViewController : ApolloSettingsFormViewController <UIGestureRecognizerDelegate>
-@property (nonatomic, weak) ApolloSubredditSectionsViewController *previewContainer;
+@interface ApolloSubredditSectionsViewController () <UIGestureRecognizerDelegate>
+@property (nonatomic, strong) ApolloPinnedPreviewHost *previewHost;
+// Card width the spacer row was last measured for (0 = only the table's own
+// section inset was available), from the shared layout pass.
+@property (nonatomic) CGFloat previewCardWidth;
 @property (nonatomic, strong) UILongPressGestureRecognizer *accountReorderGesture;
 @property (nonatomic, strong, nullable) UIView *accountReorderWrapper;
 @property (nonatomic, strong, nullable) UIView *accountReorderBackground;
@@ -519,78 +753,107 @@ static UIImage *ApolloPreviewBundledIcon(NSString *blockKey) {
 @property (nonatomic, strong, nullable) UISelectionFeedbackGenerator *accountReorderFeedback;
 @end
 
-@interface ApolloSubredditSectionsViewController () <UIGestureRecognizerDelegate>
-@property (nonatomic) UITableViewStyle tableStyle;
-@property (nonatomic, strong) ApolloSubredditSectionsFormViewController *formViewController;
-@property (nonatomic, strong) UIView *previewHost;
-@property (nonatomic, strong) UILabel *previewTitleLabel;
-// The pin control, styled and behaving like the Inline Media preview's:
-// a 13pt pin.fill / pin glyph (accent when pinned, tertiary when not) with
-// a transparent button over it, a selection haptic, a spring bounce, and a
-// brief "Pinned" / "Unpinned" caption that fades in beside it.
-@property (nonatomic, strong) UIButton *pinButton;
-@property (nonatomic, strong) UIImageView *pinIcon;
-@property (nonatomic, strong) UILabel *pinCaption;
-@property (nonatomic, strong) UISelectionFeedbackGenerator *pinFeedback;
-@property (nonatomic) NSUInteger pinCaptionToken;
-@property (nonatomic, strong) UIView *previewCardView;
-@property (nonatomic, strong) UIView *scrollBoundaryView;
-// Pinned only: an opaque strip in the page colour between the container's
-// top and the pinned host. The table runs under the bars in both modes, so
-// without it rows scrolling up past the card would surface above it, under
-// the transparent bar.
-@property (nonatomic, strong) UIView *pinnedCoverView;
-@property (nonatomic, strong) NSLayoutConstraint *previewContentHeightConstraint;
-@property (nonatomic, strong) NSLayoutConstraint *previewCardTrailingConstraint;
-@property (nonatomic, strong) NSLayoutConstraint *scrollBoundaryTrailingConstraint;
-@property (nonatomic) CGFloat previewTrailingRailReserve;
-@property (nonatomic, strong) NSLayoutConstraint *previewCardLeadingConstraint;
-// The host's constraints for wherever it is mounted right now (rebuilt on
-// every remount — moving a view drops its cross-hierarchy constraints).
-@property (nonatomic, copy) NSArray<NSLayoutConstraint *> *hostMountConstraints;
-// The saved choice (what the glyph shows) vs. where the host actually is:
-// the preview only sticks when the preference says so AND there is room
-// for it — never in compact height, never when it would leave less than
-// kApolloSubredditSectionsMinListViewport of list beneath it.
-@property (nonatomic) BOOL previewPinPreference;
-@property (nonatomic) BOOL previewPinned;
-@property (nonatomic) CGSize previewEvaluatedSize;
-// Set while a pin/unpin animation is driving the host's transform.
-@property (nonatomic) BOOL previewModeTransitioning;
-@property (nonatomic) BOOL previewInsetSettled;
-@property (nonatomic, strong) ApolloSubredditSectionsPreviewView *currentPreviewView;
-@property (nonatomic, strong) UIViewPropertyAnimator *previewAnimator;
-@property (nonatomic) NSUInteger previewTransitionGeneration;
-@property (nonatomic) BOOL previewRefreshPending;
-@property (nonatomic, strong) ApolloSubredditSectionsPreviewState *previewTransitionFromState;
-@property (nonatomic, strong) ApolloSubredditSectionsPreviewState *previewTransitionToState;
-- (void)apollo_refreshPreviewAnimated:(BOOL)animated;
-- (void)apollo_formDidScroll:(UIScrollView *)scrollView;
-@end
-
-static const CGFloat kApolloSubredditSectionsMinListViewport = 200.0;
-
 static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
     id stored = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeySubredditSectionsPreviewPinned];
     return stored ? [stored boolValue] : YES;
 }
 
-@implementation ApolloSubredditSectionsFormViewController
+@implementation ApolloSubredditSectionsViewController
 
 - (void)apollo_applyThemeToCell:(UITableViewCell *)cell {
+    // The spacer row must stay invisible whatever the theme pass does to cells.
+    if ([cell isKindOfClass:[ApolloPinnedPreviewSpacerCell class]]) {
+        ApolloPinnedPreviewClearSpacerCell(cell);
+        return;
+    }
     [super apollo_applyThemeToCell:cell];
     if ([cell isKindOfClass:ApolloSectionOrderCell.class]) {
         cell.editingAccessoryView.tintColor = UIColor.tertiaryLabelColor;
     }
 }
 
+- (instancetype)init {
+    return [self initWithStyle:UITableViewStyleInsetGrouped];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self applyThemeToPreviewHost];
+}
+
 - (void)viewWillDisappear:(BOOL)animated {
     [self finishAccountReorderCancelled:YES];
+    [self.previewContentView apollo_finishPreviewTransition];
     [super viewWillDisappear:animated];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    BOOL appearanceChanged = !previousTraitCollection ||
+        [self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:previousTraitCollection];
+    BOOL contentSizeChanged = !previousTraitCollection ||
+        ![self.traitCollection.preferredContentSizeCategory
+            isEqualToString:previousTraitCollection.preferredContentSizeCategory];
+    if (!appearanceChanged && !contentSizeChanged) return;
+    // The rendering resolves its theme colours when it is built.
+    [self applyThemeToPreviewHost];
+}
+
+- (void)viewWillTransitionToSize:(CGSize)size
+       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    __weak typeof(self) weakSelf = self;
+    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
+        [weakSelf.previewContentView apollo_refreshPreviewAnimated:NO];
+    }];
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.title = @"Subreddit List Sections";
+
+    // The pinned preview: shared layout pass on the table (the subclass adds no
+    // ivars, so isa-swizzling the existing table view is safe) + the host as a
+    // direct subview of it, never a cell, so it survives every reload.
+    if (![self.tableView isKindOfClass:[ApolloPinnedPreviewTableView class]]) {
+        object_setClass(self.tableView, [ApolloPinnedPreviewTableView class]);
+    }
+    ApolloPinnedPreviewHost *host = [[ApolloPinnedPreviewHost alloc] initWithFrame:CGRectZero];
+    ApolloSubredditSectionsPreviewContentView *content =
+        [[ApolloSubredditSectionsPreviewContentView alloc] initWithFrame:CGRectZero];
+    host.contentView = content;
+    __weak typeof(self) weakSelf = self;
+    content.layoutAlongside = ^{
+        // Re-read the spacer row's height block (the card follows the row
+        // rect on the table's next layout pass, inside the same animation).
+        UITableView *table = weakSelf.tableView;
+        if (!table.window) return;
+        [table performBatchUpdates:nil completion:nil];
+        [table layoutIfNeeded];
+    };
+    host.spacerIndexPath = ^NSIndexPath * {
+        return [weakSelf indexPathForRowID:@"sections.preview"];
+    };
+    host.cardWidthDidChange = ^(CGFloat width) {
+        [weakSelf previewCardWidthDidChange:width];
+    };
+    host.pinned = ApolloSubredditSectionsPreviewPinnedPreference();
+    host.pinDidChange = ^(BOOL pinned) {
+        [[NSUserDefaults standardUserDefaults] setBool:pinned forKey:UDKeySubredditSectionsPreviewPinned];
+        ApolloLog(@"[SubredditSections] preview %@", pinned ? @"pinned" : @"unpinned");
+        // Slide the block into (or out of) its pinned spot instead of snapping:
+        // the table's layout pass computes the new frames inside the animation.
+        UITableView *table = weakSelf.tableView;
+        [table setNeedsLayout];
+        [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.9 initialSpringVelocity:0
+                            options:UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{ [table layoutIfNeeded]; }
+                         completion:nil];
+    };
+    self.previewHost = host;
+    ApolloPinnedPreviewAttachHost(self.tableView, host);
+    [self applyThemeToPreviewHost];
+
     // Match the account-switcher redesign’s snapshot reorder interaction.
     self.tableView.estimatedRowHeight = 0.0;
     self.tableView.estimatedSectionHeaderHeight = 0.0;
@@ -607,6 +870,29 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     __weak typeof(self) weakSelf = self;
 
+    // --- Preview (the spacer row the pinned card sits on) ---
+    // Escape hatch (custom row): a transparent placeholder — the pinned host
+    // draws the card on top of (or, once scrolled, instead of) this slot. Its
+    // height is the rendering's height for the current settings.
+    ApolloSettingsRow *preview =
+        [ApolloSettingsRow customRowWithID:@"sections.preview"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            ApolloPinnedPreviewSpacerCell *cell =
+                [[ApolloPinnedPreviewSpacerCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            ApolloPinnedPreviewClearSpacerCell(cell);
+            cell.isAccessibilityElement = NO;
+            return cell;
+        }
+                                  onSelect:nil];
+    preview.height = ^CGFloat {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return 0.0;
+        return [ApolloSubredditSectionsPreviewContentView
+            heightForCardWidth:[strongSelf previewCardWidthForTable:strongSelf.tableView]];
+    };
+    ApolloSettingsSection *previewSection =
+        [ApolloSettingsSection sectionWithTitle:@"Preview" footer:nil rows:@[ preview ]];
+
     // --- Options: every toggle the preview demonstrates, together ---
     ApolloSettingsRow *showIcons =
         [ApolloSettingsRow switchRowWithID:@"sections.showIcons" title:@"Show Subreddit Icons"
@@ -616,7 +902,7 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
             } onToggle:^(UISwitch *sender) {
                 [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyShowSubredditIconsInSubredditList];
                 [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSubredditListIconsChangedNotification object:nil];
-                [weakSelf.previewContainer apollo_refreshPreviewAnimated:YES];
+                [weakSelf apollo_refreshPreviewAnimated:YES];
             }];
     ApolloSettingsRow *separateFollowing =
         [ApolloSettingsRow switchRowWithID:@"sections.separateFollowing"
@@ -661,7 +947,7 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
                                          footer:nil
                                            rows:orderRows];
 
-    return @[ optionsSection, orderSection ];
+    return @[ previewSection, optionsSection, orderSection ];
 }
 
 - (ApolloSettingsRow *)orderRowForToken:(NSString *)token {
@@ -690,19 +976,68 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
     return row;
 }
 
-// The pinned preview owns the top of the screen; keep the first section's
-// header gap the same modest size the Feed Shortcuts screen uses so the form
-// starts right under the card rather than a full inset-grouped top margin
-// lower.
-- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
-    if (section != 0) return UITableViewAutomaticDimension;
-    UIFont *font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote
-                           compatibleWithTraitCollection:self.traitCollection];
-    return ceil(font.lineHeight) + 20.0;
+#pragma mark Pinned preview plumbing
+
+- (ApolloSubredditSectionsPreviewContentView *)previewContentView {
+    return (ApolloSubredditSectionsPreviewContentView *)self.previewHost.contentView;
 }
 
-- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
-    [self.previewContainer apollo_formDidScroll:scrollView];
+- (void)apollo_refreshPreviewAnimated:(BOOL)animated {
+    [self.previewContentView apollo_refreshPreviewAnimated:animated];
+}
+
+// Card chrome follows the same theme walk as before (the Subreddits list's own
+// background, so the miniature reads as that list; section corner radius;
+// table background for the stuck backdrop; accent for the pin glyph), and the
+// rendering is rebuilt for the theme's ink.
+- (void)applyThemeToPreviewHost {
+    ApolloPinnedPreviewHost *host = self.previewHost;
+    if (!host) return;
+    host.card.backgroundColor = ApolloThemeSubredditListBackgroundColor()
+        ?: [self apollo_themeCellBackgroundColor];
+    host.card.layer.cornerRadius = ApolloPinnedPreviewSectionCornerRadius(self.tableView);
+    UIColor *tableBackground = self.tableView.backgroundColor;
+    UIColor *resolved = [tableBackground resolvedColorWithTraitCollection:self.tableView.traitCollection];
+    if (!resolved || CGColorGetAlpha(resolved.CGColor) < 0.99) {
+        tableBackground = [UIColor systemGroupedBackgroundColor];
+    }
+    host.backdropColor = tableBackground;
+    host.accentColor = [self apollo_themeAccentColor];
+    [self.previewContentView apollo_refreshPreviewAnimated:NO];
+}
+
+- (void)apollo_applyTheme {
+    [super apollo_applyTheme];
+    [self applyThemeToPreviewHost];
+}
+
+// Width the spacer row's height is derived from: the measured cell width once
+// the layout pass has seen a real cell, else the table's reported section inset.
+- (CGFloat)previewCardWidthForTable:(UITableView *)tableView {
+    if (self.previewCardWidth > 0) return self.previewCardWidth;
+    UIEdgeInsets inset = ApolloPinnedPreviewSectionContentInset(tableView);
+    CGFloat width = CGRectGetWidth(tableView.bounds) - inset.left - inset.right;
+    if (width <= 0.0) width = CGRectGetWidth(UIScreen.mainScreen.bounds) - inset.left - inset.right;
+    return MAX(0.0, width);
+}
+
+- (void)previewCardWidthDidChange:(CGFloat)width {
+    if (width <= 0 || fabs(width - self.previewCardWidth) <= 0.5) return;
+    CGFloat oldHeight = [ApolloSubredditSectionsPreviewContentView
+        heightForCardWidth:[self previewCardWidthForTable:self.tableView]];
+    self.previewCardWidth = width;
+    CGFloat newHeight = [ApolloSubredditSectionsPreviewContentView heightForCardWidth:width];
+    ApolloLog(@"[SubredditSections] card width %.1f → spacer row %.1f → %.1f", width, oldHeight, newHeight);
+    if (fabs(newHeight - oldHeight) <= 0.5) return;
+    [UIView performWithoutAnimation:^{
+        [self reloadRowWithID:@"sections.preview"];
+    }];
+}
+
+// Non-scrolling view the lifted order row floats in while it is dragged (it
+// must not ride the table's content offset while the edge auto-scroll runs).
+- (UIView *)apollo_reorderOverlayView {
+    return self.navigationController.view ?: self.view;
 }
 
 #pragma mark Toggles
@@ -710,14 +1045,14 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
 - (void)separateFollowedUsersToggled:(UISwitch *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeySeparateFollowedUsers];
     [self visibilityDidChange]; // the Following order row appears/disappears
-    [self.previewContainer apollo_refreshPreviewAnimated:YES];
+    [self apollo_refreshPreviewAnimated:YES];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSubredditSectionsChangedNotification object:nil];
 }
 
 - (void)hideMultiredditDescriptionsToggled:(UISwitch *)sender {
     sHideMultiredditDescriptions = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sHideMultiredditDescriptions forKey:UDKeyHideMultiredditDescriptions];
-    [self.previewContainer apollo_refreshPreviewAnimated:YES];
+    [self apollo_refreshPreviewAnimated:YES];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloHideMultiredditDescriptionsChangedNotification object:nil];
 }
 
@@ -726,14 +1061,14 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
     sSubredditListEnhancements = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sSubredditListEnhancements forKey:UDKeySubredditListEnhancements];
     if (sSubredditListEnhancements != wasOn) [self visibilityDidChange]; // the Modern Dividers row
-    [self.previewContainer apollo_refreshPreviewAnimated:YES];
+    [self apollo_refreshPreviewAnimated:YES];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloModernSubredditDividersChangedNotification object:nil];
 }
 
 - (void)modernDividersToggled:(UISwitch *)sender {
     sModernSubredditDividers = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:sModernSubredditDividers forKey:UDKeyModernSubredditDividers];
-    [self.previewContainer apollo_refreshPreviewAnimated:YES];
+    [self apollo_refreshPreviewAnimated:YES];
     [[NSNotificationCenter defaultCenter] postNotificationName:ApolloModernSubredditDividersChangedNotification object:nil];
 }
 
@@ -791,13 +1126,18 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
     [self noteRowMovedFromIndexPath:fromIndexPath toIndexPath:toIndexPath];
 
     // Keep the preview synchronized with each animated position change.
-    [self.previewContainer apollo_refreshPreviewAnimated:YES];
+    [self apollo_refreshPreviewAnimated:YES];
 }
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
     if (gestureRecognizer != self.accountReorderGesture || !self.tableView.isEditing ||
         self.accountReorderActive || self.accountReorderLanding) return NO;
     CGPoint point = [gestureRecognizer locationInView:self.tableView];
+    // A stuck card covers the rows scrolled beneath it: a press on the card
+    // is the card's, never a lift of the order row hidden under it.
+    ApolloPinnedPreviewHost *previewHost = self.previewHost;
+    if (previewHost && !previewHost.hidden && previewHost.superview == self.tableView &&
+        CGRectContainsPoint(previewHost.frame, point)) return NO;
     NSIndexPath *indexPath = [self.tableView indexPathForRowAtPoint:point];
     UITableViewCell *cell = indexPath ? [self.tableView cellForRowAtIndexPath:indexPath] : nil;
     if (!cell || ![self indexPathIsOrderRow:indexPath]) return NO;
@@ -856,15 +1196,16 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
 // navigation/tab bars. The lifted row stays attached to the finger in the host.
 - (void)scrollAccountReorderAtEdge {
     if (!self.accountReorderActive || self.accountReorderFinishPending) return;
-    UIView *host = self.previewContainer.view;
+    UIView *host = [self apollo_reorderOverlayView];
     UITableView *table = self.tableView;
-    CGRect viewport = CGRectIntersection([table convertRect:table.bounds toView:host],
-                                        host.safeAreaLayoutGuide.layoutFrame);
+    // The table runs under the bars; its own safe area is the visible list.
+    CGRect viewport = [table convertRect:UIEdgeInsetsInsetRect(table.bounds, table.safeAreaInsets)
+                                  toView:host];
     CGFloat top = CGRectGetMinY(viewport);
     CGFloat bottom = CGRectGetMaxY(viewport);
-    if (self.previewContainer.previewPinned) {
-        CGRect preview = [self.previewContainer.previewHost
-            convertRect:self.previewContainer.previewHost.bounds toView:host];
+    ApolloPinnedPreviewHost *previewHost = self.previewHost;
+    if (previewHost.stuck && !previewHost.hidden) {
+        CGRect preview = [previewHost convertRect:previewHost.bounds toView:host];
         top = MAX(top, CGRectGetMaxY(preview));
     }
     CGFloat edge = MIN(48.0, MAX(0.0, (bottom - top) / 3.0));
@@ -896,7 +1237,7 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
     if (cancelled) {
         sApolloSubredditSectionsPreviewDraftOrder = nil;
         [self rebuildForm];
-        [self.previewContainer apollo_refreshPreviewAnimated:YES];
+        [self apollo_refreshPreviewAnimated:YES];
         destination = self.accountReorderOriginalRow;
         self.accountReorderCurrentRow = destination;
         [self updateAccountReorderSnapshotCorners];
@@ -919,7 +1260,7 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
     UITableViewCell *landingCell = [self.tableView cellForRowAtIndexPath:destinationPath];
     CGRect tableFrame = landingCell ? [landingCell convertRect:landingCell.bounds toView:self.tableView]
         : [self.tableView rectForRowAtIndexPath:destinationPath];
-    CGRect destinationFrame = [self.tableView convertRect:tableFrame toView:self.previewContainer.view];
+    CGRect destinationFrame = [self.tableView convertRect:tableFrame toView:[self apollo_reorderOverlayView]];
     UIView *wrapper = self.accountReorderWrapper;
     UITableViewCell *destinationCell = [self.tableView cellForRowAtIndexPath:destinationPath];
     UITableViewCell *draggedCell = self.accountReorderCell;
@@ -951,7 +1292,7 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
 - (void)evaluateAccountReorderDestination {
     if (!self.accountReorderActive || self.accountReorderTransitioning) return;
     UIView *wrapper = self.accountReorderWrapper;
-    CGRect dragFrame = [self.previewContainer.view convertRect:wrapper.frame toView:self.tableView];
+    CGRect dragFrame = [[self apollo_reorderOverlayView] convertRect:wrapper.frame toView:self.tableView];
     NSInteger current = self.accountReorderCurrentRow;
     NSInteger destination = current;
     NSInteger last = (NSInteger)[self visibleOrderTokens].count - 1;
@@ -1017,7 +1358,7 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
             UIView *snapshot = [cell snapshotViewAfterScreenUpdates:NO];
             if (!snapshot) return;
 
-            CGRect frame = [cell convertRect:cell.bounds toView:self.previewContainer.view];
+            CGRect frame = [cell convertRect:cell.bounds toView:[self apollo_reorderOverlayView]];
             UIView *wrapper = [[UIView alloc] initWithFrame:frame];
             wrapper.backgroundColor = UIColor.clearColor;
             wrapper.layer.shadowColor = UIColor.blackColor.CGColor;
@@ -1066,9 +1407,9 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
             snapshot.frame = wrapper.bounds;
             snapshot.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
             [wrapper addSubview:snapshot];
-            [self.previewContainer.view addSubview:wrapper];
+            [[self apollo_reorderOverlayView] addSubview:wrapper];
 
-            CGPoint viewPoint = [gestureRecognizer locationInView:self.previewContainer.view];
+            CGPoint viewPoint = [gestureRecognizer locationInView:[self apollo_reorderOverlayView]];
             self.accountReorderWrapper = wrapper;
             self.accountReorderBackground = background;
             self.accountReorderSnapshot = snapshot;
@@ -1096,7 +1437,7 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
         }
         case UIGestureRecognizerStateChanged: {
             if (!self.accountReorderActive) return;
-            CGPoint viewPoint = [gestureRecognizer locationInView:self.previewContainer.view];
+            CGPoint viewPoint = [gestureRecognizer locationInView:[self apollo_reorderOverlayView]];
             CGFloat delta = viewPoint.y - self.accountReorderLatestPoint.y;
             if (fabs(delta) > 0.1) self.accountReorderDirection = delta > 0 ? 1 : -1;
             self.accountReorderLatestPoint = viewPoint;
@@ -1139,786 +1480,6 @@ static BOOL ApolloSubredditSectionsPreviewPinnedPreference(void) {
     cell.hidden = self.accountReorderActive && [self indexPathIsOrderRow:indexPath]
         && indexPath.row == self.accountReorderCurrentRow;
     return cell;
-}
-
-@end
-
-#pragma mark - The container (pinned preview + form)
-
-@implementation ApolloSubredditSectionsViewController
-
-- (instancetype)init {
-    return [self initWithStyle:UITableViewStyleInsetGrouped];
-}
-
-- (instancetype)initWithStyle:(UITableViewStyle)style {
-    self = [super initWithNibName:nil bundle:nil];
-    if (!self) return nil;
-    _tableStyle = style;
-    return self;
-}
-
-- (void)loadView {
-    self.view = [UIView new];
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"Subreddit List Sections";
-    BOOL liquidGlass = IsLiquidGlass();
-
-    ApolloSubredditSectionsPreviewHostView *previewHost = [ApolloSubredditSectionsPreviewHostView new];
-    previewHost.translatesAutoresizingMaskIntoConstraints = NO;
-    previewHost.layoutMargins = UIEdgeInsetsMake(0.0, 20.0, 0.0, 20.0);
-    self.previewHost = previewHost;
-
-    UILabel *titleLabel = [UILabel new];
-    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    if (liquidGlass) {
-        titleLabel.text = @"Preview";
-        // Match the semibold inset-grouped section titles beneath the preview.
-        UIFont *titleFont = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
-        titleLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody]
-            scaledFontForFont:titleFont];
-    } else {
-        titleLabel.text = @"PREVIEW";
-        titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
-    }
-    titleLabel.adjustsFontForContentSizeCategory = YES;
-    ApolloSettingsApplySectionHeaderTypography(titleLabel);
-    titleLabel.isAccessibilityElement = YES;
-    titleLabel.accessibilityTraits = UIAccessibilityTraitHeader;
-    self.previewTitleLabel = titleLabel;
-    [previewHost addSubview:titleLabel];
-
-    // The pin: state glyph at the trailing end of the title line (the card's
-    // own corner is busy with the first band's rule), a transparent button
-    // over it, and the caption that flashes beside it. The card is a tap
-    // target too, via the container's recognizer.
-    UIImageView *pinIcon = [[UIImageView alloc] init];
-    pinIcon.translatesAutoresizingMaskIntoConstraints = NO;
-    pinIcon.contentMode = UIViewContentModeCenter;
-    pinIcon.userInteractionEnabled = NO;
-    self.pinIcon = pinIcon;
-    [previewHost addSubview:pinIcon];
-
-    UILabel *pinCaption = [[UILabel alloc] init];
-    pinCaption.translatesAutoresizingMaskIntoConstraints = NO;
-    pinCaption.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold];
-    pinCaption.textColor = UIColor.secondaryLabelColor;
-    pinCaption.textAlignment = NSTextAlignmentRight;
-    pinCaption.alpha = 0.0;
-    pinCaption.userInteractionEnabled = NO;
-    self.pinCaption = pinCaption;
-    [previewHost addSubview:pinCaption];
-
-    UIButton *pinButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    pinButton.translatesAutoresizingMaskIntoConstraints = NO;
-    pinButton.backgroundColor = UIColor.clearColor;
-    [pinButton addTarget:self action:@selector(apollo_togglePreviewPinned) forControlEvents:UIControlEventTouchUpInside];
-    self.pinButton = pinButton;
-    previewHost.touchableView = pinButton;
-    [previewHost addSubview:pinButton];
-    self.pinFeedback = [[UISelectionFeedbackGenerator alloc] init];
-
-    UIView *previewCard = [UIView new];
-    previewCard.translatesAutoresizingMaskIntoConstraints = NO;
-    previewCard.userInteractionEnabled = NO;
-    previewCard.clipsToBounds = YES;
-    previewCard.layer.cornerRadius = liquidGlass ? 20.0 : 10.0;
-    previewCard.layer.cornerCurve = kCACornerCurveContinuous;
-    self.previewCardView = previewCard;
-    [previewHost addSubview:previewCard];
-
-    // Hairline along the host's bottom edge that fades in once the form has
-    // scrolled beneath the pinned card, so it reads as a fixed shelf rather
-    // than a row. Lives inside the host so it travels with it.
-    UIView *scrollBoundary = [UIView new];
-    scrollBoundary.translatesAutoresizingMaskIntoConstraints = NO;
-    scrollBoundary.userInteractionEnabled = NO;
-    scrollBoundary.alpha = 0.0;
-    self.scrollBoundaryView = scrollBoundary;
-    [previewHost addSubview:scrollBoundary];
-
-    ApolloSubredditSectionsFormViewController *form =
-        [[ApolloSubredditSectionsFormViewController alloc] initWithStyle:self.tableStyle];
-    form.previewContainer = self;
-    self.formViewController = form;
-    [self addChildViewController:form];
-    form.view.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:form.view];
-    [form didMoveToParentViewController:self];
-    // Both bars track this table in both modes. Left to automatic
-    // detection, the nav bar only finds a list beneath it while the preview
-    // is unpinned (the table extends under the bar then), so its glass pills
-    // rendered darker pinned and lighter unpinned — every toggle changed the
-    // bar's colour. Tracking the table always gives the bar the same look it
-    // has on every other settings screen, in both modes.
-    if (@available(iOS 15.0, *)) {
-        [self setContentScrollView:form.tableView forEdge:NSDirectionalRectEdgeAll];
-    }
-
-    UIView *pinnedCover = [UIView new];
-    pinnedCover.translatesAutoresizingMaskIntoConstraints = NO;
-    pinnedCover.userInteractionEnabled = NO;
-    self.pinnedCoverView = pinnedCover;
-    [self.view addSubview:pinnedCover];
-    NSLayoutConstraint *pinIconTrailing =
-        [pinIcon.trailingAnchor constraintEqualToAnchor:previewCard.trailingAnchor constant:-12.0];
-    self.previewCardLeadingConstraint = [previewCard.leadingAnchor constraintEqualToAnchor:previewHost.leadingAnchor constant:20.0];
-    NSLayoutConstraint *previewCardTrailing =
-        [previewCard.trailingAnchor constraintEqualToAnchor:previewHost.trailingAnchor constant:-20.0];
-    NSLayoutConstraint *scrollBoundaryTrailing =
-        [scrollBoundary.trailingAnchor constraintEqualToAnchor:previewHost.trailingAnchor];
-    self.previewCardTrailingConstraint = previewCardTrailing;
-    self.scrollBoundaryTrailingConstraint = scrollBoundaryTrailing;
-    [NSLayoutConstraint activateConstraints:@[
-        [pinnedCover.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [pinnedCover.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [pinnedCover.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [pinnedCover.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-    ]];
-
-    NSLayoutConstraint *contentHeight =
-        [previewCard.heightAnchor constraintEqualToConstant:1.0];
-    self.previewContentHeightConstraint = contentHeight;
-    [NSLayoutConstraint activateConstraints:@[
-        [titleLabel.topAnchor constraintEqualToAnchor:previewHost.topAnchor constant:15.0],
-        [titleLabel.leadingAnchor constraintEqualToAnchor:previewCard.leadingAnchor constant:16.0],
-        [titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:pinCaption.leadingAnchor constant:-8.0],
-
-        [pinIcon.centerYAnchor constraintEqualToAnchor:titleLabel.centerYAnchor],
-        pinIconTrailing,
-        [pinIcon.widthAnchor constraintEqualToConstant:22.0],
-        [pinIcon.heightAnchor constraintEqualToConstant:22.0],
-        [pinCaption.trailingAnchor constraintEqualToAnchor:pinIcon.leadingAnchor constant:-6.0],
-        [pinCaption.centerYAnchor constraintEqualToAnchor:pinIcon.centerYAnchor],
-        [pinButton.centerXAnchor constraintEqualToAnchor:pinIcon.centerXAnchor],
-        [pinButton.centerYAnchor constraintEqualToAnchor:pinIcon.centerYAnchor],
-        [pinButton.widthAnchor constraintEqualToConstant:44.0],
-        [pinButton.heightAnchor constraintEqualToConstant:44.0],
-
-        [previewCard.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:7.0],
-        self.previewCardLeadingConstraint,
-        previewCardTrailing,
-        [previewCard.bottomAnchor constraintEqualToAnchor:previewHost.bottomAnchor constant:-2.0],
-        contentHeight,
-
-        [scrollBoundary.leadingAnchor constraintEqualToAnchor:previewHost.leadingAnchor],
-        scrollBoundaryTrailing,
-        [scrollBoundary.bottomAnchor constraintEqualToAnchor:previewHost.bottomAnchor],
-        [scrollBoundary.heightAnchor constraintEqualToConstant:1.0 / UIScreen.mainScreen.scale],
-
-        [form.view.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [form.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [form.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [form.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
-    ]];
-
-    // Tapping the card toggles the pin. The recognizer lives on the container
-    // so it sees the tap in both modes (pinned: the touch lands on the host;
-    // unpinned: the host is touch-transparent and the touch lands on the
-    // table beneath) — the delegate limits it to the card's bounds.
-    UITapGestureRecognizer *cardTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(apollo_previewCardTapped:)];
-    cardTap.cancelsTouchesInView = NO;
-    cardTap.delegate = self;
-    [self.view addGestureRecognizer:cardTap];
-
-    self.previewPinPreference = ApolloSubredditSectionsPreviewPinnedPreference();
-    self.previewPinned = self.previewPinPreference; // room is checked at first layout
-    if (self.previewPinned) [self apollo_mountHostInContainer];
-    else [self apollo_mountHostAsHeader];
-    pinnedCover.hidden = !self.previewPinned;
-    [self apollo_updatePinIcon];
-
-    [self apollo_applyPreviewTheme];
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self apollo_applyPreviewTheme];
-    [self apollo_refreshPreviewAnimated:NO];
-    [self apollo_formDidScroll:self.formViewController.tableView];
-}
-
-- (void)viewWillDisappear:(BOOL)animated {
-    [self apollo_finishPreviewTransition];
-    [super viewWillDisappear:animated];
-}
-
-- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
-    [super traitCollectionDidChange:previousTraitCollection];
-    BOOL appearanceChanged = !previousTraitCollection ||
-        [self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:previousTraitCollection];
-    BOOL contentSizeChanged = !previousTraitCollection ||
-        ![self.traitCollection.preferredContentSizeCategory
-            isEqualToString:previousTraitCollection.preferredContentSizeCategory];
-    if (!appearanceChanged && !contentSizeChanged) return;
-
-    [self apollo_applyPreviewTheme];
-    [self apollo_refreshPreviewAnimated:NO];
-}
-
-- (void)viewWillTransitionToSize:(CGSize)size
-       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
-    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
-    __weak typeof(self) weakSelf = self;
-    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
-        [weakSelf apollo_refreshPreviewAnimated:NO];
-    }];
-}
-
-- (void)apollo_applyPreviewTheme {
-    UIColor *backgroundColor = ApolloThemePageBackgroundColor()
-        ?: UIColor.systemGroupedBackgroundColor;
-    self.view.backgroundColor = backgroundColor;
-    self.previewHost.backgroundColor = backgroundColor;
-    self.pinnedCoverView.backgroundColor = backgroundColor;
-    self.previewCardView.backgroundColor = ApolloThemeSubredditListBackgroundColor()
-        ?: UIColor.secondarySystemGroupedBackgroundColor;
-    self.previewTitleLabel.textColor =
-        ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryLabel)
-        ?: UIColor.secondaryLabelColor;
-    // This heading lives outside the form table, so table reloads do not
-    // refresh it. Reapply the effective text size and native theme palette
-    // on appearance and Dynamic Type changes, before preview measurement.
-    ApolloSettingsApplySectionHeaderTypography(self.previewTitleLabel);
-    self.scrollBoundaryView.backgroundColor = ApolloThemeSeparatorColor()
-        ?: self.formViewController.tableView.separatorColor
-        ?: UIColor.separatorColor;
-    self.view.tintColor = ApolloThemeAccentColor() ?: self.view.tintColor;
-    [self apollo_updatePinIcon];
-}
-
-#pragma mark Pinning
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
-    CGPoint point = [touch locationInView:self.previewCardView];
-    return [self.previewCardView pointInside:point withEvent:nil];
-}
-
-- (void)apollo_previewCardTapped:(UITapGestureRecognizer *)recognizer {
-    if (recognizer.state != UIGestureRecognizerStateEnded) return;
-    [self apollo_togglePreviewPinned];
-}
-
-- (void)apollo_togglePreviewPinned {
-    if (self.previewModeTransitioning) return;
-    BOOL pinned = !self.previewPinPreference;
-    self.previewPinPreference = pinned;
-    [[NSUserDefaults standardUserDefaults] setBool:pinned forKey:UDKeySubredditSectionsPreviewPinned];
-    ApolloLog(@"[SubredditSections] preview %@", pinned ? @"pinned" : @"unpinned");
-    [self.pinFeedback selectionChanged];
-    BOOL desired = pinned && [self apollo_previewCanStick];
-    if (desired != self.previewPinned) {
-        [self apollo_setPreviewPinned:desired animated:YES];
-    } else {
-        [self apollo_updatePinIcon];
-    }
-
-    // Bounce the glyph so the tap reads as a state change.
-    self.pinIcon.transform = CGAffineTransformMakeScale(1.3, 1.3);
-    [UIView animateWithDuration:0.45 delay:0 usingSpringWithDamping:0.5 initialSpringVelocity:0
-                        options:UIViewAnimationOptionBeginFromCurrentState
-                     animations:^{ self.pinIcon.transform = CGAffineTransformIdentity; }
-                     completion:nil];
-
-    // Brief caption next to the glyph, replaced (not stacked) by a quick re-tap.
-    NSUInteger token = ++self.pinCaptionToken;
-    self.pinCaption.text = pinned ? @"Pinned" : @"Unpinned";
-    [self.previewHost layoutIfNeeded];
-    [UIView animateWithDuration:0.15 animations:^{ self.pinCaption.alpha = 1.0; }];
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        typeof(self) strongSelf = weakSelf;
-        if (!strongSelf || strongSelf.pinCaptionToken != token) return;
-        [UIView animateWithDuration:0.3 animations:^{ strongSelf.pinCaption.alpha = 0.0; }];
-    });
-}
-
-- (BOOL)apollo_previewCanStick {
-    if (self.traitCollection.verticalSizeClass == UIUserInterfaceSizeClassCompact) return NO;
-    CGFloat hostHeight = [self apollo_hostFittingHeightForWidth:CGRectGetWidth(self.view.bounds)];
-    CGFloat listRoom = CGRectGetHeight(self.view.bounds) - self.view.safeAreaInsets.top
-        - self.view.safeAreaInsets.bottom - hostHeight;
-    return listRoom >= kApolloSubredditSectionsMinListViewport;
-}
-
-// Re-check whether the saved choice can be honoured at the current size
-// (rotation, first layout) and move the host without ceremony if not.
-- (void)apollo_reevaluatePinMountAnimated:(BOOL)animated {
-    if (self.previewModeTransitioning) return;
-    BOOL desired = self.previewPinPreference && [self apollo_previewCanStick];
-    if (desired != self.previewPinned) [self apollo_setPreviewPinned:desired animated:animated];
-}
-
-- (void)apollo_updatePinIcon {
-    BOOL pinned = self.previewPinPreference;
-    UIImageSymbolConfiguration *config =
-        [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightSemibold];
-    self.pinIcon.image = [UIImage systemImageNamed:(pinned ? @"pin.fill" : @"pin") withConfiguration:config];
-    self.pinIcon.tintColor = pinned
-        ? (ApolloThemeAccentColor() ?: self.view.tintColor ?: UIColor.systemBlueColor)
-        : UIColor.tertiaryLabelColor;
-    self.pinButton.accessibilityLabel = pinned ? @"Unpin preview" : @"Pin preview";
-}
-
-// Keep the table's slot for the card in step with the card's height after a
-// refresh. Pinned: the slot is the top content inset, and the rows under the
-// card follow its bottom edge (the card is always on screen). Unpinned: the
-// slot is the header view itself; rows follow it while it is on screen, and
-// stay put once it has scrolled away — a growing card nobody can see must
-// not shove the toggles around under a finger.
-- (void)apollo_syncPreviewSlot {
-    UITableView *tableView = self.formViewController.tableView;
-    UIView *host = self.previewHost;
-    CGFloat width = CGRectGetWidth(tableView.bounds);
-    if (width <= 0.0) return;
-    CGFloat height = [self apollo_hostFittingHeightForWidth:width];
-    if (self.previewPinned) {
-        UIEdgeInsets inset = tableView.contentInset;
-        if (fabs(inset.top - height) < 0.5) return;
-        CGFloat delta = height - inset.top;
-        inset.top = height;
-        tableView.contentInset = inset;
-        CGPoint offset = tableView.contentOffset;
-        offset.y -= delta;
-        tableView.contentOffset = offset;
-        return;
-    }
-    if (tableView.tableHeaderView != host) return;
-    CGFloat oldHeight = CGRectGetHeight(host.frame);
-    if (fabs(height - oldHeight) < 0.5 && fabs(width - CGRectGetWidth(host.frame)) < 0.5) return;
-    CGFloat delta = height - oldHeight;
-    CGPoint offset = tableView.contentOffset;
-    BOOL hostOnScreen = offset.y < oldHeight;
-    host.frame = CGRectMake(0.0, 0.0, width, height);
-    tableView.tableHeaderView = host;
-    if (!hostOnScreen) {
-        offset.y += delta;
-        tableView.contentOffset = offset;
-    }
-}
-
-// The host's own height: title line + card + paddings, from its constraints.
-- (CGFloat)apollo_hostFittingHeightForWidth:(CGFloat)width {
-    CGSize size = [self.previewHost systemLayoutSizeFittingSize:CGSizeMake(width, UILayoutFittingCompressedSize.height)
-                                  withHorizontalFittingPriority:UILayoutPriorityRequired
-                                        verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
-    // Pixel-rounded, not ceil'd: the pinned layout gets the same fractional
-    // height from these constraints, and a whole-point header would shift
-    // every row by the difference at each hand-over.
-    CGFloat scale = UIScreen.mainScreen.scale ?: 3.0;
-    return round(size.height * scale) / scale;
-}
-
-// The card's slot is first set up from viewWillAppear, before the safe area
-// has resolved. Land the table at the true resting offset once the first
-// layout has settled.
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    UITableView *tableView = self.formViewController.tableView;
-    if (CGRectIsEmpty(tableView.bounds) || self.view.safeAreaInsets.top <= 0.0) return;
-
-    // The Duo rail overlays the trailing side of the page instead of reducing
-    // the table's bounds. Measure the real rail frame and reserve that width
-    // inside the preview only, keeping its card, pin, and boundary clear of
-    // the system controls in both pinned and scrolling-header modes.
-    CGFloat leadingInset = self.view.safeAreaInsets.left;
-    if (fabs(self.previewCardLeadingConstraint.constant - (20.0 + leadingInset)) > 0.5) {
-        self.previewCardLeadingConstraint.constant = 20.0 + leadingInset;
-        [self.previewHost setNeedsLayout];
-        [self apollo_syncPreviewSlot];
-    }
-    CGFloat railReserve = 0.0;
-    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
-    UITabBar *tabBar = [tabs isKindOfClass:UITabBarController.class] ? tabs.tabBar : nil;
-    if (tabBar.window && !tabBar.hidden && CGRectGetWidth(tabBar.bounds) < 100.0 &&
-        CGRectGetHeight(tabBar.bounds) > CGRectGetWidth(tabBar.bounds)) {
-        CGRect railFrame = [tabBar convertRect:tabBar.bounds toView:self.view];
-        if (CGRectGetMidX(railFrame) > CGRectGetMidX(self.view.bounds)) {
-            railReserve = MAX(0.0, CGRectGetWidth(self.view.bounds) - CGRectGetMinX(railFrame));
-        }
-    }
-    if (fabs(railReserve - self.previewTrailingRailReserve) > 0.5) {
-        self.previewTrailingRailReserve = railReserve;
-        self.previewCardTrailingConstraint.constant = -(20.0 + railReserve);
-        self.scrollBoundaryTrailingConstraint.constant = -railReserve;
-        [self.previewHost setNeedsLayout];
-        [self apollo_syncPreviewSlot];
-    }
-
-    CGSize size = self.view.bounds.size;
-    if (!CGSizeEqualToSize(size, self.previewEvaluatedSize)) {
-        self.previewEvaluatedSize = size;
-        [self apollo_reevaluatePinMountAnimated:NO];
-    }
-    if (self.previewInsetSettled) return;
-    self.previewInsetSettled = YES;
-    [self apollo_syncPreviewSlot];
-    tableView.contentOffset = CGPointMake(0.0, -tableView.adjustedContentInset.top);
-}
-
-// A stand-in header of the host's size, so the rows keep their place while
-// the host itself is off animating as the container's subview.
-static UIView *ApolloSubredditSectionsSpacerHeader(CGFloat width, CGFloat height) {
-    UIView *spacer = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, width, height)];
-    spacer.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    spacer.userInteractionEnabled = NO;
-    return spacer;
-}
-
-// Pinned: the host is the container's own subview, above the form, at the
-// safe-area top.
-- (void)apollo_mountHostInContainer {
-    UIView *host = self.previewHost;
-    UITableView *tableView = self.formViewController.tableView;
-    [NSLayoutConstraint deactivateConstraints:self.hostMountConstraints ?: @[]];
-    if (tableView.tableHeaderView == host) tableView.tableHeaderView = nil;
-    [host removeFromSuperview];
-    host.transform = CGAffineTransformIdentity;
-    host.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:host];
-    self.hostMountConstraints = @[
-        [host.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-        [host.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [host.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-    ];
-    [NSLayoutConstraint activateConstraints:self.hostMountConstraints];
-}
-
-// Unpinned: the host is the table's header view — real content, so it
-// scrolls as content, the bars' scroll-edge treatment applies to it, and
-// touches on it scroll the list. (A subview parked in the top inset does not
-// count as content for that treatment; a Liquid Glass bar leaves it crisp.)
-- (void)apollo_mountHostAsHeader {
-    UIView *host = self.previewHost;
-    UITableView *tableView = self.formViewController.tableView;
-    [NSLayoutConstraint deactivateConstraints:self.hostMountConstraints ?: @[]];
-    self.hostMountConstraints = @[];
-    [host removeFromSuperview];
-    host.transform = CGAffineTransformIdentity;
-    host.translatesAutoresizingMaskIntoConstraints = YES;
-    host.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    CGFloat width = CGRectGetWidth(tableView.bounds);
-    if (width <= 0.0) width = CGRectGetWidth(self.view.bounds);
-    host.frame = CGRectMake(0.0, 0.0, width, [self apollo_hostFittingHeightForWidth:width]);
-    tableView.tableHeaderView = host;
-}
-
-- (void)apollo_setPreviewPinned:(BOOL)pinned animated:(BOOL)animated {
-    [self apollo_finishPreviewTransition];
-    UITableView *tableView = self.formViewController.tableView;
-    UIView *host = self.previewHost;
-    self.previewPinned = pinned;
-    self.previewModeTransitioning = YES;
-    [self apollo_updatePinIcon];
-    self.pinnedCoverView.hidden = !pinned;
-    BOOL animate = animated && !UIAccessibilityIsReduceMotionEnabled();
-
-    // The host animates as the container's subview in both directions.
-    // Pinning takes it from the table at its current spot and slides it
-    // down into place over the rows. Unpinning keeps it exactly where it is
-    // — it is the thing that was just tapped — and brings the list down to
-    // meet it (a spacer header holds its place in the content meanwhile),
-    // then hands it to the table once its content spot lines up. A
-    // reference row is checked after each swap and put back where it was,
-    // so the list never jumps (the swap itself is content-neutral; this
-    // absorbs rounding).
-    [self.view layoutIfNeeded];
-    CGFloat width = CGRectGetWidth(tableView.bounds);
-    CGFloat hostHeight = CGRectGetHeight(host.bounds);
-    CGFloat pinnedY = self.view.safeAreaInsets.top;
-    NSIndexPath *anchorPath = tableView.indexPathsForVisibleRows.firstObject;
-    CGFloat anchorY = anchorPath
-        ? CGRectGetMinY([tableView convertRect:[tableView rectForRowAtIndexPath:anchorPath] toView:self.view])
-        : 0.0;
-
-    // The slot moves between the top inset (pinned) and a header of the
-    // same height (unpinned); content positions are unchanged by the swap.
-    CGAffineTransform start = CGAffineTransformIdentity;
-    UIEdgeInsets inset = tableView.contentInset;
-    if (pinned) {
-        CGRect hostInContainer = [host.superview convertRect:host.frame toView:self.view];
-        start = CGAffineTransformMakeTranslation(0.0, CGRectGetMinY(hostInContainer) - pinnedY);
-        [self apollo_mountHostInContainer]; // takes the host out of the header slot
-        inset.top = hostHeight;
-    } else {
-        tableView.tableHeaderView = ApolloSubredditSectionsSpacerHeader(width, hostHeight);
-        inset.top = 0.0;
-    }
-    tableView.contentInset = inset;
-    [self.view layoutIfNeeded];
-    if (anchorPath) {
-        CGFloat newY = CGRectGetMinY([tableView convertRect:[tableView rectForRowAtIndexPath:anchorPath] toView:self.view]);
-        CGPoint offset = tableView.contentOffset;
-        offset.y += newY - anchorY;
-        offset.y = MAX(offset.y, -tableView.adjustedContentInset.top);
-        tableView.contentOffset = offset;
-    }
-    host.transform = start;
-
-    CGFloat restingOffset = -tableView.adjustedContentInset.top;
-    BOOL scrolled = tableView.contentOffset.y > restingOffset + 0.5;
-    CGFloat boundaryAlpha = pinned && scrolled ? 1.0 : 0.0;
-    __weak typeof(self) weakSelf = self;
-    void (^finish)(void) = ^{
-        typeof(self) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        if (!strongSelf.previewPinned) [strongSelf apollo_mountHostAsHeader];
-        strongSelf.previewModeTransitioning = NO;
-        [strongSelf apollo_formDidScroll:tableView];
-    };
-    if (!animate) {
-        host.transform = CGAffineTransformIdentity;
-        if (!pinned && scrolled) tableView.contentOffset = CGPointMake(0.0, restingOffset);
-        self.scrollBoundaryView.alpha = boundaryAlpha;
-        finish();
-        return;
-    }
-    [UIView animateWithDuration:0.35
-                          delay:0.0
-         usingSpringWithDamping:0.9
-          initialSpringVelocity:0.0
-                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
-                     animations:^{
-        if (pinned) {
-            host.transform = CGAffineTransformIdentity;
-        } else if (scrolled) {
-            tableView.contentOffset = CGPointMake(0.0, restingOffset);
-        }
-        weakSelf.scrollBoundaryView.alpha = boundaryAlpha;
-    } completion:^(__unused BOOL finished) {
-        finish();
-    }];
-}
-
-- (void)apollo_formDidScroll:(UIScrollView *)scrollView {
-    if (scrollView != self.formViewController.tableView) return;
-    if (self.previewModeTransitioning) return;
-    if (!self.previewPinned) {
-        if (self.scrollBoundaryView.alpha != 0.0) self.scrollBoundaryView.alpha = 0.0;
-        return;
-    }
-    CGFloat restingOffset = -scrollView.adjustedContentInset.top;
-    CGFloat targetAlpha = scrollView.contentOffset.y > restingOffset + 0.5 ? 1.0 : 0.0;
-    if (fabs(self.scrollBoundaryView.alpha - targetAlpha) < 0.01) return;
-    [UIView animateWithDuration:0.15
-                          delay:0.0
-                        options:UIViewAnimationOptionBeginFromCurrentState |
-                                UIViewAnimationOptionAllowUserInteraction
-                     animations:^{
-        self.scrollBoundaryView.alpha = targetAlpha;
-    } completion:nil];
-}
-
-- (ApolloSubredditSectionsPreviewView *)apollo_previewViewForState:(ApolloSubredditSectionsPreviewState *)state {
-    ApolloSubredditSectionsPreviewView *preview = [[ApolloSubredditSectionsPreviewView alloc] initWithFrame:CGRectZero];
-    preview.translatesAutoresizingMaskIntoConstraints = NO;
-    preview.previewState = state;
-    [preview apollo_configurePreview];
-    return preview;
-}
-
-- (void)apollo_addPreviewView:(ApolloSubredditSectionsPreviewView *)preview height:(CGFloat)height {
-    [self.previewCardView addSubview:preview];
-    [NSLayoutConstraint activateConstraints:@[
-        [preview.topAnchor constraintEqualToAnchor:self.previewCardView.topAnchor],
-        [preview.leadingAnchor constraintEqualToAnchor:self.previewCardView.leadingAnchor],
-        [preview.trailingAnchor constraintEqualToAnchor:self.previewCardView.trailingAnchor],
-        [preview.heightAnchor constraintEqualToConstant:height]
-    ]];
-}
-
-- (void)apollo_finishPreviewTransition {
-    UIViewPropertyAnimator *animator = self.previewAnimator;
-    if (!animator) return;
-    [animator stopAnimation:NO];
-    [animator finishAnimationAtPosition:UIViewAnimatingPositionEnd];
-}
-
-- (void)apollo_replacePreviewImmediately:(ApolloSubredditSectionsPreviewView *)preview
-                                   state:(ApolloSubredditSectionsPreviewState *)state {
-    [self apollo_finishPreviewTransition];
-    for (UIView *subview in self.previewCardView.subviews) [subview removeFromSuperview];
-    [self apollo_addPreviewView:preview height:state.previewHeight];
-    preview.alpha = 1.0;
-    self.currentPreviewView = preview;
-    self.previewContentHeightConstraint.constant = state.previewHeight;
-    [UIView performWithoutAnimation:^{
-        [self.view layoutIfNeeded];
-        [self apollo_syncPreviewSlot];
-    }];
-}
-
-// Re-render for the current settings. Animated: the new rendering is laid
-// out on top of the old one and every block is matched by key — survivors
-// slide from their old spot to their new one (a pixel-identical twin swaps in
-// silently; a restyled one cross-fades on the way), newcomers scale-fade in,
-// leavers scale-fade out — while the card's height (and the form below it)
-// springs to the new size. A refresh landing mid-animation is queued and
-// replayed once the animation completes.
-- (void)apollo_refreshPreviewAnimated:(BOOL)animated {
-    if (animated && self.previewAnimator.state == UIViewAnimatingStateActive) {
-        ApolloSubredditSectionsPreviewState *requested = ApolloSubredditSectionsCurrentPreviewState();
-        BOOL atSource = ApolloPreviewStatesEqual(requested, self.previewTransitionFromState);
-        BOOL atTarget = ApolloPreviewStatesEqual(requested, self.previewTransitionToState);
-        if (atSource || atTarget) {
-            // Reverse the running timeline, preserving its current visual position.
-            self.previewRefreshPending = NO;
-            self.previewAnimator.reversed = atSource;
-        } else {
-            // Coalesce different controls/order changes into the latest state.
-            self.previewRefreshPending = YES;
-        }
-        return;
-    }
-    [self apollo_finishPreviewTransition];
-
-    ApolloSubredditSectionsPreviewState *state = ApolloSubredditSectionsCurrentPreviewState();
-    ApolloSubredditSectionsPreviewView *incoming = [self apollo_previewViewForState:state];
-    ApolloSubredditSectionsPreviewView *outgoing = self.currentPreviewView;
-    if (!animated || UIAccessibilityIsReduceMotionEnabled() || !outgoing) {
-        [self apollo_replacePreviewImmediately:incoming state:state];
-        return;
-    }
-
-    self.previewTransitionFromState = outgoing.previewState;
-    self.previewTransitionToState = state;
-    [self.view layoutIfNeeded];
-    [self apollo_addPreviewView:incoming height:state.previewHeight];
-    [self.previewCardView layoutIfNeeded];
-    [incoming layoutIfNeeded];
-    self.previewContentHeightConstraint.constant = state.previewHeight;
-    self.currentPreviewView = incoming;
-
-    NSDictionary<NSString *, UIView *> *oldItems = outgoing.itemViewsByKey;
-    NSDictionary<NSString *, UIView *> *newItems = incoming.itemViewsByKey;
-    NSMutableArray<UIView *> *departingItems = [NSMutableArray array]; // gone: scale-fade out in place
-    NSMutableArray<UIView *> *restyledItems = [NSMutableArray array];  // old look of a survivor: fade out in place
-    NSMutableArray<UIView *> *slidingRows = [NSMutableArray array];
-    NSMutableArray<void (^)(void)> *slideAnimations = [NSMutableArray array];
-    NSMutableArray<UIView *> *slidingIncomingRows = [NSMutableArray array];
-    for (NSString *key in newItems) {
-        UIView *newItem = newItems[key];
-        UIView *oldItem = oldItems[key];
-        if (!oldItem) {
-            newItem.alpha = 0.0;
-            newItem.transform = CGAffineTransformMakeScale(0.88, 0.88);
-            continue;
-        }
-        CGRect oldFrame = [oldItem convertRect:oldItem.bounds toView:self.previewCardView];
-        CGRect newFrame = [newItem convertRect:newItem.bounds toView:self.previewCardView];
-        newItem.transform = CGAffineTransformMakeTranslation(CGRectGetMidX(oldFrame) - CGRectGetMidX(newFrame),
-                                                              CGRectGetMidY(oldFrame) - CGRectGetMidY(newFrame));
-        BOOL sameLook = [outgoing.itemSignaturesByKey[key] isEqualToString:incoming.itemSignaturesByKey[key]];
-        if (sameLook) {
-            oldItem.alpha = 0.0; // the twin takes over from the very first frame
-        } else if ([key hasPrefix:@"row."]) {
-            // Animate each piece inside a resizing clip. This keeps names visible
-            // while icons slide sideways and descriptions slide below the row.
-            UIView *clip = [[UIView alloc] initWithFrame:oldFrame];
-            clip.clipsToBounds = YES;
-            [self.previewCardView addSubview:clip];
-            [slidingRows addObject:clip];
-            [slidingIncomingRows addObject:newItem];
-            [slideAnimations addObject:^{ clip.frame = newFrame; }];
-            for (NSInteger tag = 101; tag <= 105; tag++) {
-                UIView *oldPart = [oldItem viewWithTag:tag];
-                UIView *newPart = [newItem viewWithTag:tag];
-                BOOL hadPart = oldPart && !oldPart.hidden;
-                BOOL hasPart = newPart && !newPart.hidden;
-                if (!hadPart && !hasPart) continue;
-                UIView *source = hasPart ? newPart : oldPart;
-                // These are plain labels/images. Render their layers directly:
-                // snapshotViewAfterScreenUpdates:YES flushes the partially staged
-                // preview to the screen, exposing duplicate/missing rows for a frame.
-                UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
-                    initWithSize:source.bounds.size];
-                UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-                    [source.layer renderInContext:context.CGContext];
-                }];
-                UIView *snapshot = [[UIImageView alloc] initWithImage:image];
-                CGRect start = hadPart ? [oldPart convertRect:oldPart.bounds toView:oldItem]
-                                       : [newPart convertRect:newPart.bounds toView:newItem];
-                CGRect end = hasPart ? [newPart convertRect:newPart.bounds toView:newItem] : start;
-                if (!hadPart) {
-                    if (tag == 101) start.origin.x = -CGRectGetWidth(start);
-                    else start.origin.y = CGRectGetHeight(oldFrame);
-                }
-                if (!hasPart) {
-                    if (tag == 101) end.origin.x = -CGRectGetWidth(end);
-                    else end.origin.y = CGRectGetHeight(newFrame);
-                }
-                snapshot.frame = start;
-                [clip addSubview:snapshot];
-                [slideAnimations addObject:^{ snapshot.frame = end; }];
-            }
-            oldItem.alpha = 0.0;
-            // Hidden arranged subviews collapse in UIStackView. Keep the real
-            // row in layout while its clipped snapshot supplies the visuals.
-            newItem.alpha = 0.0;
-        } else {
-            newItem.alpha = 0.0;
-            [restyledItems addObject:oldItem];
-        }
-    }
-    for (NSString *key in oldItems) {
-        if (!newItems[key]) [departingItems addObject:oldItems[key]];
-    }
-
-    NSUInteger generation = ++self.previewTransitionGeneration;
-    UISpringTimingParameters *timing = [[UISpringTimingParameters alloc] initWithDampingRatio:0.88];
-    UIViewPropertyAnimator *animator = [[UIViewPropertyAnimator alloc] initWithDuration:0.34
-                                                                      timingParameters:timing];
-    __weak typeof(self) weakSelf = self;
-    __weak UIViewPropertyAnimator *weakAnimator = animator;
-    [animator addAnimations:^{
-        for (UIView *item in newItems.allValues) {
-            if (![slidingIncomingRows containsObject:item]) item.alpha = 1.0;
-            item.transform = CGAffineTransformIdentity;
-        }
-        for (UIView *item in departingItems) {
-            item.alpha = 0.0;
-            item.transform = CGAffineTransformMakeScale(0.88, 0.88);
-        }
-        for (void (^slide)(void) in slideAnimations) slide();
-        for (UIView *item in restyledItems) item.alpha = 0.0;
-        [weakSelf.view layoutIfNeeded];
-        [weakSelf apollo_syncPreviewSlot];
-    }];
-    [animator addCompletion:^(__unused UIViewAnimatingPosition finalPosition) {
-        for (UIView *row in slidingIncomingRows) row.alpha = 1.0;
-        for (UIView *clip in slidingRows) [clip removeFromSuperview];
-        if (finalPosition == UIViewAnimatingPositionStart) {
-            [incoming removeFromSuperview];
-            for (UIView *item in oldItems.allValues) {
-                item.alpha = 1.0;
-                item.transform = CGAffineTransformIdentity;
-            }
-            weakSelf.currentPreviewView = outgoing;
-            weakSelf.previewContentHeightConstraint.constant = outgoing.previewState.previewHeight;
-            [UIView performWithoutAnimation:^{
-                [weakSelf.view layoutIfNeeded];
-                [weakSelf apollo_syncPreviewSlot];
-            }];
-        } else {
-            [outgoing removeFromSuperview];
-            incoming.alpha = 1.0;
-        }
-        if (weakSelf.previewTransitionGeneration == generation &&
-            weakSelf.previewAnimator == weakAnimator) {
-            weakSelf.previewAnimator = nil;
-        }
-        if (weakSelf.previewRefreshPending) {
-            weakSelf.previewRefreshPending = NO;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf apollo_refreshPreviewAnimated:YES];
-            });
-        }
-    }];
-    self.previewAnimator = animator;
-    [animator startAnimation];
 }
 
 @end

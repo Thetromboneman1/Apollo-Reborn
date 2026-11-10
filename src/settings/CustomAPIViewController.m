@@ -79,6 +79,7 @@
 #import "settings/ApolloOpenInAppViewController.h"
 #import "settings/SavedCategoriesViewController.h"
 #import "settings/ApolloSubredditLayoutViewController.h"
+#import "settings/ApolloSettingsPinnedPreview.h"
 #import "settings/ApolloSubredditSectionsViewController.h"
 #import "ApolloActionMenuLayout.h"
 #import "settings/ApolloActionMenuSettingsViewController.h"
@@ -5740,257 +5741,46 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
 }
 @end
 
-@interface ApolloFeedShortcutsFormViewController : CustomAPIViewController
-@property (nonatomic, weak) ApolloFeedShortcutsSettingsViewController *previewContainer;
-@end
+#pragma mark - Feed Shortcuts (pinned preview + form)
 
-@interface ApolloFeedShortcutsSettingsViewController ()
-@property (nonatomic) UITableViewStyle tableStyle;
-@property (nonatomic, strong) ApolloFeedShortcutsFormViewController *formViewController;
-@property (nonatomic, strong) UIView *previewHost;
-@property (nonatomic, strong) UILabel *previewTitleLabel;
-@property (nonatomic, strong) UIView *previewCardView;
-@property (nonatomic, strong) UIView *scrollBoundaryView;
-@property (nonatomic, strong) NSLayoutConstraint *previewContentHeightConstraint;
-@property (nonatomic, strong) NSLayoutConstraint *previewHostTrailingConstraint;
+// What the shared pinned host shows in the Feed Shortcuts card: the current
+// rendering and the transition between two renderings (items slide/scale-fade
+// when only visibility changed; a layout or icon-style change cross-fades).
+// The card's height is the spacer row's height, so a height change is the
+// screen's job: layoutAlongside runs inside the same animation (and after an
+// immediate swap) to spring the spacer row, and with it the card.
+@interface ApolloFeedShortcutsPreviewContentView : UIView
+@property (nonatomic, weak) UITableView *hostTableView;
+@property (nonatomic, copy) ApolloFeedShortcutsPreviewState *(^stateProvider)(void);
+@property (nonatomic, copy) void (^layoutAlongside)(void);
 @property (nonatomic, strong) ApolloFeedShortcutsPreviewView *currentPreviewView;
 @property (nonatomic, strong) UIViewPropertyAnimator *previewAnimator;
 @property (nonatomic) NSUInteger previewTransitionGeneration;
 @property (nonatomic) BOOL previewRefreshPending;
 - (void)apollo_refreshPreviewAnimated:(BOOL)animated;
-- (void)apollo_formDidScroll:(UIScrollView *)scrollView;
+- (void)apollo_finishPreviewTransition;
 @end
 
-@implementation ApolloFeedShortcutsFormViewController
-- (NSString *)apollo_screenTitle { return @"Feed Shortcuts"; }
-- (NSArray<ApolloSettingsSection *> *)buildForm {
-    return @[ [self buildFeedShortcutsVisibilitySection],
-              [self buildFeedShortcutsControlsSection] ];
-}
+@implementation ApolloFeedShortcutsPreviewContentView
 
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self reloadRowWithID:@"sub.showPopularShortcut"];
-    [self reloadRowWithID:@"sub.showAllShortcut"];
-    [self reloadRowWithID:@"sub.showModeratorShortcut"];
-}
-
-- (void)apollo_refreshFeedShortcutsPreviewAnimated:(BOOL)animated {
-    [self.previewContainer apollo_refreshPreviewAnimated:animated];
-}
-
-- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
-    [self.previewContainer apollo_formDidScroll:scrollView];
-}
-
-- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
-    if (section != 0) return UITableViewAutomaticDimension;
-    UIFont *font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote
-                           compatibleWithTraitCollection:self.traitCollection];
-    return ceil(font.lineHeight) + 20.0;
-}
-@end
-
-@implementation ApolloFeedShortcutsSettingsViewController
-
-- (instancetype)init {
-    return [self initWithStyle:UITableViewStyleInsetGrouped];
-}
-
-- (instancetype)initWithStyle:(UITableViewStyle)style {
-    self = [super initWithNibName:nil bundle:nil];
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
     if (!self) return nil;
-    _tableStyle = style;
+    self.backgroundColor = UIColor.clearColor;
+    // A growing rendering must not spill below the card mid-spring.
+    self.clipsToBounds = YES;
+    self.userInteractionEnabled = NO;
     return self;
 }
 
-- (void)loadView {
-    self.view = [UIView new];
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"Feed Shortcuts";
-    BOOL liquidGlass = IsLiquidGlass();
-
-    UIView *previewHost = [UIView new];
-    previewHost.translatesAutoresizingMaskIntoConstraints = NO;
-    previewHost.layoutMargins = UIEdgeInsetsMake(0.0, 20.0, 0.0, 20.0);
-    self.previewHost = previewHost;
-    [self.view addSubview:previewHost];
-
-    UILabel *titleLabel = [UILabel new];
-    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    if (liquidGlass) {
-        titleLabel.text = @"Preview";
-        // Match the semibold inset-grouped section titles beneath the preview.
-        UIFont *titleFont = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
-        titleLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody]
-            scaledFontForFont:titleFont];
-    } else {
-        titleLabel.text = @"PREVIEW";
-        titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
-    }
-    titleLabel.adjustsFontForContentSizeCategory = YES;
-    ApolloSettingsApplySectionHeaderTypography(titleLabel);
-    titleLabel.isAccessibilityElement = YES;
-    titleLabel.accessibilityTraits = UIAccessibilityTraitHeader;
-    self.previewTitleLabel = titleLabel;
-    [previewHost addSubview:titleLabel];
-
-    UIView *previewCard = [UIView new];
-    previewCard.translatesAutoresizingMaskIntoConstraints = NO;
-    previewCard.userInteractionEnabled = NO;
-    previewCard.clipsToBounds = YES;
-    previewCard.layer.cornerRadius = liquidGlass ? 20.0 : 10.0;
-    previewCard.layer.cornerCurve = kCACornerCurveContinuous;
-    self.previewCardView = previewCard;
-    [previewHost addSubview:previewCard];
-
-    UIView *scrollBoundary = [UIView new];
-    scrollBoundary.translatesAutoresizingMaskIntoConstraints = NO;
-    scrollBoundary.userInteractionEnabled = NO;
-    scrollBoundary.alpha = 0.0;
-    self.scrollBoundaryView = scrollBoundary;
-
-    ApolloFeedShortcutsFormViewController *form =
-        [[ApolloFeedShortcutsFormViewController alloc] initWithStyle:self.tableStyle];
-    form.previewContainer = self;
-    self.formViewController = form;
-    [self addChildViewController:form];
-    form.view.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:form.view];
-    [form didMoveToParentViewController:self];
-    [self.view bringSubviewToFront:previewHost];
-    [self.view addSubview:scrollBoundary];
-
-    NSLayoutConstraint *contentHeight =
-        [previewCard.heightAnchor constraintEqualToConstant:1.0];
-    self.previewContentHeightConstraint = contentHeight;
-    NSLayoutConstraint *previewTrailing =
-        [previewHost.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor];
-    self.previewHostTrailingConstraint = previewTrailing;
-    [NSLayoutConstraint activateConstraints:@[
-        [previewHost.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-        [previewHost.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor],
-        previewTrailing,
-
-        [titleLabel.topAnchor constraintEqualToAnchor:previewHost.topAnchor constant:15.0],
-        [titleLabel.leadingAnchor constraintEqualToAnchor:previewHost.layoutMarginsGuide.leadingAnchor constant:16.0],
-        [titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:previewHost.layoutMarginsGuide.trailingAnchor constant:-16.0],
-
-        [previewCard.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:7.0],
-        [previewCard.leadingAnchor constraintEqualToAnchor:previewHost.leadingAnchor constant:20.0],
-        [previewCard.trailingAnchor constraintEqualToAnchor:previewHost.trailingAnchor constant:-20.0],
-        [previewCard.bottomAnchor constraintEqualToAnchor:previewHost.bottomAnchor constant:-2.0],
-        contentHeight,
-
-        [scrollBoundary.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [scrollBoundary.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [scrollBoundary.topAnchor constraintEqualToAnchor:previewHost.bottomAnchor],
-        [scrollBoundary.heightAnchor constraintEqualToConstant:1.0 / UIScreen.mainScreen.scale],
-
-        [form.view.topAnchor constraintEqualToAnchor:previewHost.bottomAnchor],
-        [form.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [form.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [form.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
-    ]];
-
-    [self apollo_applyPreviewTheme];
-}
-
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    UITabBarController *tabs = self.tabBarController;
-    UITabBar *tabBar = tabs.tabBar;
-    CGFloat trailingInset = 0.0;
-    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone
-        && tabs.isViewLoaded && tabBar.window && !tabBar.hidden) {
-        CGRect railFrame = [self.view convertRect:tabBar.bounds fromView:tabBar];
-        if (CGRectGetWidth(railFrame) < 100.0
-            && CGRectGetHeight(railFrame) > 400.0
-            && CGRectGetMidX(railFrame) > CGRectGetMidX(self.view.bounds)) {
-            trailingInset = MAX(0.0, CGRectGetWidth(self.view.bounds) - CGRectGetMinX(railFrame));
-        }
-    }
-    CGFloat wantedConstant = -trailingInset;
-    if (fabs(self.previewHostTrailingConstraint.constant - wantedConstant) > 0.5) {
-        self.previewHostTrailingConstraint.constant = wantedConstant;
-    }
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self apollo_applyPreviewTheme];
-    [self apollo_refreshPreviewAnimated:NO];
-    [self apollo_formDidScroll:self.formViewController.tableView];
-}
-
-- (void)viewWillDisappear:(BOOL)animated {
-    [self apollo_finishPreviewTransition];
-    [super viewWillDisappear:animated];
-}
-
-- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
-    [super traitCollectionDidChange:previousTraitCollection];
-    BOOL appearanceChanged = !previousTraitCollection ||
-        [self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:previousTraitCollection];
-    BOOL contentSizeChanged = !previousTraitCollection ||
-        ![self.traitCollection.preferredContentSizeCategory
-            isEqualToString:previousTraitCollection.preferredContentSizeCategory];
-    if (!appearanceChanged && !contentSizeChanged) return;
-
-    [self apollo_applyPreviewTheme];
-    [self apollo_refreshPreviewAnimated:NO];
-}
-
-- (void)viewWillTransitionToSize:(CGSize)size
-       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
-    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
-    __weak typeof(self) weakSelf = self;
-    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
-        [weakSelf apollo_refreshPreviewAnimated:NO];
-    }];
-}
-
-- (void)apollo_applyPreviewTheme {
-    UIColor *backgroundColor = ApolloThemePageBackgroundColor()
-        ?: UIColor.systemGroupedBackgroundColor;
-    self.view.backgroundColor = backgroundColor;
-    self.previewHost.backgroundColor = backgroundColor;
-    self.previewCardView.backgroundColor = ApolloThemeCardBackgroundColor()
-        ?: UIColor.secondarySystemGroupedBackgroundColor;
-    self.previewTitleLabel.textColor =
-        ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryLabel)
-        ?: UIColor.secondaryLabelColor;
-    // This heading lives outside the form table, so table reloads do not
-    // refresh it. Reapply the effective text size and native theme palette
-    // on appearance and Dynamic Type changes, before preview measurement.
-    ApolloSettingsApplySectionHeaderTypography(self.previewTitleLabel);
-    self.scrollBoundaryView.backgroundColor = ApolloThemeSeparatorColor()
-        ?: self.formViewController.tableView.separatorColor
-        ?: UIColor.separatorColor;
-    self.view.tintColor = ApolloThemeAccentColor() ?: self.view.tintColor;
-}
-
-- (void)apollo_formDidScroll:(UIScrollView *)scrollView {
-    if (scrollView != self.formViewController.tableView) return;
-    CGFloat restingOffset = -scrollView.adjustedContentInset.top;
-    CGFloat targetAlpha = scrollView.contentOffset.y > restingOffset + 0.5 ? 1.0 : 0.0;
-    if (fabs(self.scrollBoundaryView.alpha - targetAlpha) < 0.01) return;
-    [UIView animateWithDuration:0.15
-                          delay:0.0
-                        options:UIViewAnimationOptionBeginFromCurrentState |
-                                UIViewAnimationOptionAllowUserInteraction
-                     animations:^{
-        self.scrollBoundaryView.alpha = targetAlpha;
-    } completion:nil];
+- (void)apollo_layoutAlongside {
+    if (self.layoutAlongside) self.layoutAlongside();
 }
 
 - (ApolloFeedShortcutsPreviewView *)apollo_previewViewForState:(ApolloFeedShortcutsPreviewState *)state {
     ApolloFeedShortcutsPreviewView *preview = [[ApolloFeedShortcutsPreviewView alloc] initWithFrame:CGRectZero];
     preview.translatesAutoresizingMaskIntoConstraints = NO;
-    preview.hostTableView = self.formViewController.tableView;
+    preview.hostTableView = self.hostTableView;
     preview.previewState = state;
     [preview apollo_configurePreview];
     return preview;
@@ -5998,11 +5788,11 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
 
 - (void)apollo_addPreviewView:(ApolloFeedShortcutsPreviewView *)preview
                        height:(CGFloat)height {
-    [self.previewCardView addSubview:preview];
+    [self addSubview:preview];
     [NSLayoutConstraint activateConstraints:@[
-        [preview.topAnchor constraintEqualToAnchor:self.previewCardView.topAnchor],
-        [preview.leadingAnchor constraintEqualToAnchor:self.previewCardView.leadingAnchor],
-        [preview.trailingAnchor constraintEqualToAnchor:self.previewCardView.trailingAnchor],
+        [preview.topAnchor constraintEqualToAnchor:self.topAnchor],
+        [preview.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [preview.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
         [preview.heightAnchor constraintEqualToConstant:height]
     ]];
 }
@@ -6017,13 +5807,13 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
 - (void)apollo_replacePreviewImmediately:(ApolloFeedShortcutsPreviewView *)preview
                                    state:(ApolloFeedShortcutsPreviewState *)state {
     [self apollo_finishPreviewTransition];
-    for (UIView *subview in self.previewCardView.subviews) [subview removeFromSuperview];
+    for (UIView *subview in self.subviews) [subview removeFromSuperview];
     [self apollo_addPreviewView:preview height:state.previewHeight];
     preview.alpha = 1.0;
     self.currentPreviewView = preview;
-    self.previewContentHeightConstraint.constant = state.previewHeight;
     [UIView performWithoutAnimation:^{
-        [self.view layoutIfNeeded];
+        [self layoutIfNeeded];
+        [self apollo_layoutAlongside];
     }];
 }
 
@@ -6034,26 +5824,19 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
     }
     [self apollo_finishPreviewTransition];
 
-    CGFloat availableWidth = CGRectGetWidth(self.previewCardView.bounds);
-    if (availableWidth <= 0.0) {
-        CGFloat containerWidth = CGRectGetWidth(self.view.bounds);
-        if (containerWidth <= 0.0) containerWidth = CGRectGetWidth(UIScreen.mainScreen.bounds);
-        availableWidth = MAX(0.0, containerWidth - 40.0);
-    }
-    ApolloFeedShortcutsPreviewState *state =
-        ApolloFeedShortcutsCurrentPreviewState(self.traitCollection, availableWidth);
+    ApolloFeedShortcutsPreviewState *state = self.stateProvider ? self.stateProvider() : nil;
+    if (!state) return;
     ApolloFeedShortcutsPreviewView *incoming = [self apollo_previewViewForState:state];
     ApolloFeedShortcutsPreviewView *outgoing = self.currentPreviewView;
-    if (!animated || UIAccessibilityIsReduceMotionEnabled() || !outgoing) {
+    if (!animated || UIAccessibilityIsReduceMotionEnabled() || !outgoing || !self.window) {
         [self apollo_replacePreviewImmediately:incoming state:state];
         return;
     }
 
-    [self.view layoutIfNeeded];
+    [self layoutIfNeeded];
     [self apollo_addPreviewView:incoming height:state.previewHeight];
-    [self.previewCardView layoutIfNeeded];
+    [self layoutIfNeeded];
     [incoming layoutIfNeeded];
-    self.previewContentHeightConstraint.constant = state.previewHeight;
     self.currentPreviewView = incoming;
 
     BOOL animatesItems = outgoing.previewState.layout == state.layout &&
@@ -6066,8 +5849,8 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
             UIView *newItem = newItems[index];
             UIView *oldItem = oldItems[index];
             if (oldItem) {
-                CGRect oldFrame = [oldItem convertRect:oldItem.bounds toView:self.previewCardView];
-                CGRect newFrame = [newItem convertRect:newItem.bounds toView:self.previewCardView];
+                CGRect oldFrame = [oldItem convertRect:oldItem.bounds toView:self];
+                CGRect newFrame = [newItem convertRect:newItem.bounds toView:self];
                 newItem.transform = CGAffineTransformMakeTranslation(CGRectGetMidX(oldFrame) - CGRectGetMidX(newFrame),
                                                                       CGRectGetMidY(oldFrame) - CGRectGetMidY(newFrame));
                 oldItem.alpha = 0.0;
@@ -6106,7 +5889,7 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
             incoming.alpha = 1.0;
             outgoing.alpha = 0.0;
         }
-        [weakSelf.view layoutIfNeeded];
+        [weakSelf apollo_layoutAlongside];
     }];
     [animator addCompletion:^(__unused UIViewAnimatingPosition finalPosition) {
         [outgoing removeFromSuperview];
@@ -6124,6 +5907,195 @@ static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
     }];
     self.previewAnimator = animator;
     [animator startAnimation];
+}
+
+@end
+
+@interface ApolloFeedShortcutsSettingsViewController ()
+@property (nonatomic, strong) ApolloPinnedPreviewHost *previewHost;
+// Card width the spacer row was last measured for (0 = only the table's own
+// section inset was available), from the shared layout pass.
+@property (nonatomic) CGFloat previewCardWidth;
+@end
+
+@implementation ApolloFeedShortcutsSettingsViewController
+- (NSString *)apollo_screenTitle { return @"Feed Shortcuts"; }
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+
+    // The pinned preview: shared layout pass on the table (the subclass adds no
+    // ivars, so isa-swizzling the existing table view is safe) + the host as a
+    // direct subview of it, never a cell, so it survives every reload.
+    if (![self.tableView isKindOfClass:[ApolloPinnedPreviewTableView class]]) {
+        object_setClass(self.tableView, [ApolloPinnedPreviewTableView class]);
+    }
+    ApolloPinnedPreviewHost *host = [[ApolloPinnedPreviewHost alloc] initWithFrame:CGRectZero];
+    ApolloFeedShortcutsPreviewContentView *content =
+        [[ApolloFeedShortcutsPreviewContentView alloc] initWithFrame:CGRectZero];
+    content.hostTableView = self.tableView;
+    __weak typeof(self) weakSelf = self;
+    content.stateProvider = ^ApolloFeedShortcutsPreviewState * {
+        return [weakSelf apollo_currentFeedShortcutsPreviewState];
+    };
+    content.layoutAlongside = ^{
+        // Re-read the spacer row's height block (the card follows the row
+        // rect on the table's next layout pass, inside the same animation).
+        UITableView *table = weakSelf.tableView;
+        if (!table.window) return;
+        [table performBatchUpdates:nil completion:nil];
+        [table layoutIfNeeded];
+    };
+    host.contentView = content;
+    host.spacerIndexPath = ^NSIndexPath * {
+        return [weakSelf indexPathForRowID:@"feedShortcuts.preview"];
+    };
+    host.cardWidthDidChange = ^(CGFloat width) {
+        [weakSelf previewCardWidthDidChange:width];
+    };
+    host.pinned = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedShortcutsPreviewPinned];
+    host.pinDidChange = ^(BOOL pinned) {
+        [[NSUserDefaults standardUserDefaults] setBool:pinned forKey:UDKeyFeedShortcutsPreviewPinned];
+        ApolloLog(@"[FeedShortcuts] preview %@", pinned ? @"pinned" : @"unpinned");
+        // Slide the block into (or out of) its pinned spot instead of snapping:
+        // the table's layout pass computes the new frames inside the animation.
+        UITableView *table = weakSelf.tableView;
+        [table setNeedsLayout];
+        [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.9 initialSpringVelocity:0
+                            options:UIViewAnimationOptionBeginFromCurrentState
+                         animations:^{ [table layoutIfNeeded]; }
+                         completion:nil];
+    };
+    self.previewHost = host;
+    ApolloPinnedPreviewAttachHost(self.tableView, host);
+    [self applyThemeToPreviewHost];
+}
+
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    __weak typeof(self) weakSelf = self;
+    // Escape hatch (custom row): a transparent placeholder — the pinned host
+    // draws the card on top of (or, once scrolled, instead of) this slot. Its
+    // height is the rendering's height for the current settings and traits.
+    ApolloSettingsRow *preview =
+        [ApolloSettingsRow customRowWithID:@"feedShortcuts.preview"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            ApolloPinnedPreviewSpacerCell *cell =
+                [[ApolloPinnedPreviewSpacerCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            ApolloPinnedPreviewClearSpacerCell(cell);
+            cell.isAccessibilityElement = NO;
+            return cell;
+        }
+                                  onSelect:nil];
+    preview.height = ^CGFloat {
+        return [weakSelf apollo_currentFeedShortcutsPreviewState].previewHeight;
+    };
+    return @[ [ApolloSettingsSection sectionWithTitle:@"Preview" footer:nil rows:@[ preview ]],
+              [self buildFeedShortcutsVisibilitySection],
+              [self buildFeedShortcutsControlsSection] ];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self reloadRowWithID:@"sub.showPopularShortcut"];
+    [self reloadRowWithID:@"sub.showAllShortcut"];
+    [self reloadRowWithID:@"sub.showModeratorShortcut"];
+    [self applyThemeToPreviewHost];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [self.previewContentView apollo_finishPreviewTransition];
+    [super viewWillDisappear:animated];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    BOOL appearanceChanged = !previousTraitCollection ||
+        [self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:previousTraitCollection];
+    BOOL contentSizeChanged = !previousTraitCollection ||
+        ![self.traitCollection.preferredContentSizeCategory
+            isEqualToString:previousTraitCollection.preferredContentSizeCategory];
+    if (!appearanceChanged && !contentSizeChanged) return;
+    [self applyThemeToPreviewHost];
+}
+
+- (void)viewWillTransitionToSize:(CGSize)size
+       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    __weak typeof(self) weakSelf = self;
+    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
+        [weakSelf.previewContentView apollo_refreshPreviewAnimated:NO];
+    }];
+}
+
+- (void)apollo_refreshFeedShortcutsPreviewAnimated:(BOOL)animated {
+    [self.previewContentView apollo_refreshPreviewAnimated:animated];
+}
+
+#pragma mark Pinned preview plumbing
+
+- (ApolloFeedShortcutsPreviewContentView *)previewContentView {
+    return (ApolloFeedShortcutsPreviewContentView *)self.previewHost.contentView;
+}
+
+- (ApolloFeedShortcutsPreviewState *)apollo_currentFeedShortcutsPreviewState {
+    return ApolloFeedShortcutsCurrentPreviewState(self.traitCollection,
+                                                  [self previewCardWidthForTable:self.tableView]);
+}
+
+// Card chrome follows the same theme walk as before (card colour, section
+// corner radius, table background for the stuck backdrop, accent for the pin
+// glyph), and the rendering is rebuilt for the theme's ink.
+- (void)applyThemeToPreviewHost {
+    ApolloPinnedPreviewHost *host = self.previewHost;
+    if (!host) return;
+    host.card.backgroundColor = ApolloThemeCardBackgroundColor() ?: [self apollo_themeCellBackgroundColor];
+    host.card.layer.cornerRadius = ApolloPinnedPreviewSectionCornerRadius(self.tableView);
+    UIColor *tableBackground = self.tableView.backgroundColor;
+    UIColor *resolved = [tableBackground resolvedColorWithTraitCollection:self.tableView.traitCollection];
+    if (!resolved || CGColorGetAlpha(resolved.CGColor) < 0.99) {
+        tableBackground = [UIColor systemGroupedBackgroundColor];
+    }
+    host.backdropColor = tableBackground;
+    host.accentColor = [self apollo_themeAccentColor];
+    [self.previewContentView apollo_refreshPreviewAnimated:NO];
+}
+
+- (void)apollo_applyTheme {
+    [super apollo_applyTheme];
+    [self applyThemeToPreviewHost];
+}
+
+// The spacer row must stay invisible whatever the theme pass does to cells.
+- (void)apollo_applyThemeToCell:(UITableViewCell *)cell {
+    if ([cell isKindOfClass:[ApolloPinnedPreviewSpacerCell class]]) {
+        ApolloPinnedPreviewClearSpacerCell(cell);
+        return;
+    }
+    [super apollo_applyThemeToCell:cell];
+}
+
+// Width the rendering is laid out for: the measured cell width once the
+// layout pass has seen a real cell, else the table's reported section inset.
+- (CGFloat)previewCardWidthForTable:(UITableView *)tableView {
+    if (self.previewCardWidth > 0) return self.previewCardWidth;
+    UIEdgeInsets inset = ApolloPinnedPreviewSectionContentInset(tableView);
+    CGFloat width = CGRectGetWidth(tableView.bounds) - inset.left - inset.right;
+    if (width <= 0.0) width = CGRectGetWidth(UIScreen.mainScreen.bounds) - inset.left - inset.right;
+    return MAX(0.0, width);
+}
+
+- (void)previewCardWidthDidChange:(CGFloat)width {
+    if (width <= 0 || fabs(width - self.previewCardWidth) <= 0.5) return;
+    CGFloat oldHeight = [self apollo_currentFeedShortcutsPreviewState].previewHeight;
+    self.previewCardWidth = width;
+    CGFloat newHeight = [self apollo_currentFeedShortcutsPreviewState].previewHeight;
+    ApolloLog(@"[FeedShortcuts] card width %.1f → spacer row %.1f → %.1f", width, oldHeight, newHeight);
+    // The compact four-up fonts depend on the width.
+    [self.previewContentView apollo_refreshPreviewAnimated:NO];
+    if (fabs(newHeight - oldHeight) <= 0.5) return;
+    [UIView performWithoutAnimation:^{
+        [self reloadRowWithID:@"feedShortcuts.preview"];
+    }];
 }
 
 @end
