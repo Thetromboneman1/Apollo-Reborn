@@ -83,6 +83,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloLogRedaction.m \
     $(SRC_DIR)/ApolloSessionState.m \
+    $(SRC_DIR)/ApolloSavedSignInCheck.m \
     $(SRC_DIR)/ApolloSessionRestoration.xm \
     $(SRC_DIR)/ApolloLogRedaction.m \
     $(SRC_DIR)/ApolloInlineImageMetadata.m \
