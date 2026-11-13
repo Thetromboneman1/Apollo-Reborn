@@ -83,6 +83,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloLogRedaction.m \
     $(SRC_DIR)/ApolloSessionState.m \
+    $(SRC_DIR)/ApolloSavedSignInCheck.m \
     $(SRC_DIR)/ApolloSessionRestoration.xm \
     $(SRC_DIR)/ApolloLogRedaction.m \
     $(SRC_DIR)/ApolloInlineImageMetadata.m \
@@ -334,7 +335,6 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloVideoHoldSpeed.xm \
     $(SRC_DIR)/ApolloYouTubePlayback.m \
     $(SRC_DIR)/ApolloYouTubeCaptions.xm \
-    $(SRC_DIR)/ApolloYouTubeEmbedOrigin.xm \
     $(SRC_DIR)/ApolloPictureInPicture.xm \
     $(SRC_DIR)/ApolloScrollToTop.xm \
     $(SRC_DIR)/ApolloInboxCommentScroll.xm \
