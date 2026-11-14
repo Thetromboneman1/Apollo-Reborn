@@ -219,7 +219,7 @@ Testing: with FLEX debugging enabled, Settings → Privacy → Crash Reports gai
 
 Host-side tests live in `tests/` and run in CI through `scripts/validate-downstream.sh` (Repository Validation workflow): the upstream-sync, release-input, update-manifest, Pal Home and other harnesses. Run `scripts/validate-downstream.sh` before pushing; add `--build` on a Mac with Theos to include the package build. Tweak behaviour inside Apollo still needs manual validation in the simulator or on a device.
 
-Before pushing a branch, run `python3 scripts/documentation_health.py --write` and commit any `README.md` / `docs/` changes: the Documentation health check fails on stale generated docs in pull requests and only self-heals on `main`.
+Before pushing a branch, run `python3 scripts/documentation_health.py --write` and commit any `README.md` / `docs/` changes. Documentation health self-heals stale docs on push, but that bot commit is made with `GITHUB_TOKEN` and `[skip ci]`, so it leaves the PR head with no checks until you push again.
 
 ## RE Notes
 

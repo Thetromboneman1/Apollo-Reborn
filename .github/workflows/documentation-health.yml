@@ -1,12 +1,12 @@
 name: Documentation health
 
 on:
-  # Self-heal only on the default branch. A self-heal commit on a PR branch is
-  # pushed with GITHUB_TOKEN, which never triggers workflows, so the PR head
-  # was left with no checks at all. PR branches now fail with the fix command.
+  # Branch-only self-heal (fleet documentation contract). A self-heal commit is
+  # pushed with GITHUB_TOKEN, which does not trigger workflows, so regenerate
+  # docs before pushing to keep PR heads checked (see AGENTS.md).
   push:
     branches:
-      - main
+      - "**"
   pull_request:
 
 # Read-only by default; only the push job below may commit, and only the
