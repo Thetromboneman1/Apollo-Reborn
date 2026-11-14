@@ -14,8 +14,6 @@
 #import "ApolloImmersiveHeaderBackground.h"
 #import "ApolloSwiftRuntime.h"
 #import "ApolloThemeRuntime.h"
-#import "ApolloState.h"
-#import "UserDefaultConstants.h"
 
 @interface SMScrollView : UIScrollView
 - (void)scaleToFit;
@@ -200,7 +198,6 @@ static UIImage *DuoVideoSymbol(NSString *name, ApolloDuoVideoSymbolRole role) {
 
 static char kDuoVideoCoordinator, kDuoVideoOwner, kDuoVideoFrame, kDuoVideoChromeHook, kDuoVideoPlate, kDuoVideoAlpha;
 static void *kDuoVideoVisibility = &kDuoVideoVisibility;
-static NSHashTable *sDuoVideoCoordinators;
 
 // A real interface, not @class: the Logos preprocessor drops forward declarations.
 @interface ApolloDuoVideoCoordinator : NSObject
@@ -237,13 +234,17 @@ static void DuoVideoPanelFrame(UIView *view, CGRect frame) {
 @property (nonatomic) CGRect frame;
 @property (nonatomic) CGFloat alpha;
 @property (nonatomic) BOOL hidden;
-@property (nonatomic) BOOL userInteractionEnabled;
+@property (nonatomic) BOOL interactionEnabled;
 @property (nonatomic, strong) UIColor *background;
 @property (nonatomic) CGFloat radius;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, id> *images;
 @property (nonatomic, strong) UIColor *minimumTrackTint;
 @property (nonatomic, strong) UIColor *maximumTrackTint;
 @property (nonatomic, strong) UIColor *thumbTint;
+@property (nonatomic, strong) UIImage *minimumTrackImage;
+@property (nonatomic, strong) UIImage *maximumTrackImage;
+@property (nonatomic, strong) UIImage *thumbImage;
+@property (nonatomic, strong) UIImage *thumbHighlightedImage;
 @property (nonatomic, strong) UIColor *textColor;
 @property (nonatomic, strong) UIFont *font;
 @property (nonatomic) NSTextAlignment alignment;
@@ -424,20 +425,23 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
 }
 // The native play/pause and mute artwork follows the controls' own state
 // ivars, so the symbol is chosen from them rather than from Apollo's image.
+// AlwaysOriginal white artwork keeps the panel white without writing tintColor
+// onto Apollo's buttons (restore must leave their native tint alone).
 - (UIImage *)symbolForButton:(UIButton *)button {
     UIView *controls = self.controls;
     if (!controls) return nil;
-    if (button == DuoVideoView(controls, "back15Button")) return DuoVideoSymbol(@"gobackward.15", ApolloDuoVideoSymbolSkip);
-    if (button == DuoVideoView(controls, "forward15Button")) return DuoVideoSymbol(@"goforward.15", ApolloDuoVideoSymbolSkip);
-    if (button == DuoVideoView(controls, "playPauseButton")) {
+    UIImage *symbol = nil;
+    if (button == DuoVideoView(controls, "back15Button")) symbol = DuoVideoSymbol(@"gobackward.15", ApolloDuoVideoSymbolSkip);
+    else if (button == DuoVideoView(controls, "forward15Button")) symbol = DuoVideoSymbol(@"goforward.15", ApolloDuoVideoSymbolSkip);
+    else if (button == DuoVideoView(controls, "playPauseButton")) {
         BOOL paused = ApolloReadBoolIvar(controls, "isPaused", YES);
-        return DuoVideoSymbol(paused ? @"play.fill" : @"pause.fill", ApolloDuoVideoSymbolPlay);
-    }
-    if (button == DuoVideoView(controls, "muteUnmuteButton")) {
+        symbol = DuoVideoSymbol(paused ? @"play.fill" : @"pause.fill", ApolloDuoVideoSymbolPlay);
+    } else if (button == DuoVideoView(controls, "muteUnmuteButton")) {
         BOOL muted = ApolloReadBoolIvar(controls, "isMuted", YES);
-        return DuoVideoSymbol(muted ? @"speaker.slash.fill" : @"speaker.wave.2.fill", ApolloDuoVideoSymbolAccessory);
+        symbol = DuoVideoSymbol(muted ? @"speaker.slash.fill" : @"speaker.wave.2.fill", ApolloDuoVideoSymbolAccessory);
     }
-    return nil;
+    if (!symbol) return nil;
+    return [symbol imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
 }
 // Apollo may write the image before or after flipping its state ivar.
 // Re-apply the remembered native images once the current change settles.
@@ -488,7 +492,7 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
     snapshot.frame = view.frame;
     snapshot.alpha = view.alpha;
     snapshot.hidden = view.hidden;
-    snapshot.userInteractionEnabled = view.userInteractionEnabled;
+    snapshot.interactionEnabled = view.userInteractionEnabled;
     snapshot.background = view.backgroundColor;
     snapshot.radius = view.layer.cornerRadius;
     if ([view isKindOfClass:UISlider.class]) {
@@ -496,6 +500,12 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
         snapshot.minimumTrackTint = slider.minimumTrackTintColor;
         snapshot.maximumTrackTint = slider.maximumTrackTintColor;
         snapshot.thumbTint = slider.thumbTintColor;
+        // Capture Apollo's track/thumb artwork before applyTimelineTrack replaces
+        // it (nil is a valid native state and must restore as nil).
+        snapshot.minimumTrackImage = [slider minimumTrackImageForState:UIControlStateNormal];
+        snapshot.maximumTrackImage = [slider maximumTrackImageForState:UIControlStateNormal];
+        snapshot.thumbImage = [slider thumbImageForState:UIControlStateNormal];
+        snapshot.thumbHighlightedImage = [slider thumbImageForState:UIControlStateHighlighted];
     }
     if ([view isKindOfClass:UILabel.class]) {
         UILabel *label = (UILabel *)view;
@@ -862,7 +872,6 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
     UIButton *sound = (id)DuoVideoView(self.controls, "muteUnmuteButton");
     [self remember:sound visible:NO];
     sound.backgroundColor = UIColor.clearColor;
-    sound.tintColor = UIColor.whiteColor;
     [self hookChromeControl:sound scrubber:NO];
     [self pairControl:sound plate:self.soundTile];
     if ([sound isKindOfClass:UIButton.class] && !DuoVideoOwner(sound)) {
@@ -956,7 +965,6 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
         [self remember:button visible:NO];
         button.backgroundColor = UIColor.clearColor;
         button.layer.cornerRadius = 0;
-        button.tintColor = UIColor.whiteColor;
         [self hookChromeControl:button scrubber:NO];
         [self pairControl:button plate:self.playbackPlates[i]];
         CGRect frame = layout.playback[i];
@@ -1026,14 +1034,6 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
 }
 - (void)update {
     if (self.applying) return;
-    if (!sDuoTabletopVideoEnabled) {
-        [self restore];
-        if (self.hinge) {
-            [self.viewer.viewIfLoaded removeInteraction:self.hinge];
-            self.hinge = nil;
-        }
-        return;
-    }
     UIViewController *viewer = self.viewer;
     UIView *view = viewer.viewIfLoaded;
     [self observeHinge];
@@ -1109,6 +1109,7 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
 }
 - (void)restore {
     if (!self.active) return;
+    BOOL chromeWasHidden = !self.chromeVisible;
     self.applying = YES;
     self.active = NO;
     self.chromeGeneration++;
@@ -1163,10 +1164,10 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
             slider.minimumTrackTintColor = snapshot.minimumTrackTint;
             slider.maximumTrackTintColor = snapshot.maximumTrackTint;
             slider.thumbTintColor = snapshot.thumbTint;
-            [slider setMinimumTrackImage:nil forState:UIControlStateNormal];
-            [slider setMaximumTrackImage:nil forState:UIControlStateNormal];
-            [slider setThumbImage:nil forState:UIControlStateNormal];
-            [slider setThumbImage:nil forState:UIControlStateHighlighted];
+            [slider setMinimumTrackImage:snapshot.minimumTrackImage forState:UIControlStateNormal];
+            [slider setMaximumTrackImage:snapshot.maximumTrackImage forState:UIControlStateNormal];
+            [slider setThumbImage:snapshot.thumbImage forState:UIControlStateNormal];
+            [slider setThumbImage:snapshot.thumbHighlightedImage forState:UIControlStateHighlighted];
         }
         if ([view isKindOfClass:UILabel.class]) {
             UILabel *label = (UILabel *)view;
@@ -1176,7 +1177,7 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
         }
         view.alpha = snapshot.alpha;
         view.hidden = snapshot.hidden;
-        view.userInteractionEnabled = snapshot.userInteractionEnabled;
+        view.userInteractionEnabled = snapshot.interactionEnabled;
         if (view != self.scroll && view != self.controls) DuoVideoFrame(view, snapshot.frame);
     }
     DuoVideoFrame(self.scroll, self.nativeScrollFrame);
@@ -1190,7 +1191,7 @@ static UIMenuElement *DuoVideoMenuElement(UIMenu *menu, NSString *key) {
     self.controls = nil;
     self.applying = NO;
     [self.viewer.view setNeedsLayout];
-    ApolloLog(@"[DuoVideo] tabletop exited; native viewer restored");
+    ApolloLog(@"[DuoVideo] tabletop exited; native viewer restored (chromeWasHidden=%d)", chromeWasHidden);
 }
 - (void)dealloc {
     for (UIView *view in _visibleViews) {
@@ -1205,7 +1206,6 @@ static ApolloDuoVideoCoordinator *DuoVideoCoordinator(UIViewController *viewer, 
     if (!owner && create) {
         owner = [ApolloDuoVideoCoordinator new];
         owner.viewer = viewer;
-        [sDuoVideoCoordinators addObject:owner];
         objc_setAssociatedObject(viewer, &kDuoVideoCoordinator, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return owner;
@@ -1393,32 +1393,8 @@ static void DuoVideoAlphaOverride(UIView *view, CGFloat *alpha, BOOL *hidden) {
 }
 %end
 
-// Apollo's Smart Rotation Lock offers "Tap to Rotate Video" from CoreMotion.
-// On Duo, folding and tabletop postures read as a sideways device, so the
-// offer keeps appearing over the video. Keep the button hidden on Duo only.
-%hook _TtC6Apollo22RotationOfferingButton
-- (void)setHidden:(BOOL)hidden {
-    %orig(YES);
-}
-- (void)setAlpha:(CGFloat)alpha {
-    %orig(0);
-}
-- (void)didMoveToWindow {
-    %orig;
-    UIView *view = (UIView *)self;
-    view.hidden = YES;
-    view.userInteractionEnabled = NO;
-    view.isAccessibilityElement = NO;
-}
-%end
-
 %ctor {
     if (!ApolloDeviceIsDuo()) return;
-    sDuoVideoCoordinators = [NSHashTable weakObjectsHashTable];
-    [NSNotificationCenter.defaultCenter addObserverForName:ApolloDuoVideoLayoutDidChangeNotification
-        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
-            for (ApolloDuoVideoCoordinator *owner in sDuoVideoCoordinators.allObjects) [owner schedule];
-        }];
     %init;
     ApolloLog(@"[DuoVideo] tabletop video hooks installed");
 }
