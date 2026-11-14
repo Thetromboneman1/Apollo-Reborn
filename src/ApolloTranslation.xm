@@ -3801,19 +3801,8 @@ static BOOL ApolloTextIsShortForLanguageGuess(NSString *text) {
     return words > 0 && words <= kMaxWords;
 }
 
-// Accents folded away and any run of 3+ of one character counted as two.
-// Already case/whitespace-normalized input.
-static NSString *ApolloFoldSpellingNoiseForCompare(NSString *normalized) {
-    static NSRegularExpression *repeatedCharacterRun;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        repeatedCharacterRun = [NSRegularExpression regularExpressionWithPattern:@"(.)\\1{2,}" options:0 error:NULL];
-    });
-    NSString *folded = [normalized stringByFoldingWithOptions:NSDiacriticInsensitiveSearch locale:nil];
-    return [repeatedCharacterRun stringByReplacingMatchesInString:folded options:0
-                                                            range:NSMakeRange(0, folded.length)
-                                                     withTemplate:@"$1$1"];
-}
+// ApolloFoldSpellingNoiseForCompare is defined once, above
+// ApolloTranslatedTextDiffersFromSource (identical to upstream's copy).
 
 // YES when the reply is the request re-spelled: a stretched word a letter
 // longer or shorter, or accents dropped or added. Only meaningful when Google
