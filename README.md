@@ -401,7 +401,7 @@ See [repository maintenance](docs/repository-maintenance.md) before syncing.
 
 ## Current repository state
 
-![apollo-reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
+![Apollo-Reborn system architecture](docs/architecture/apollo-reborn-system-architecture.png)
 
 - **Default branch:** `main`
 - **Implementation fingerprint:** `d79e70e21765a350`
