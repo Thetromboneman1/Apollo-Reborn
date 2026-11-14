@@ -31,7 +31,11 @@ def command(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def graph_node(number: int) -> dict[str, object]:
+def graph_node(
+    number: int,
+    association: str = "MEMBER",
+    review_decision: str = "APPROVED",
+) -> dict[str, object]:
     return {
         "number": number,
         "title": f"PR {number}",
@@ -42,11 +46,12 @@ def graph_node(number: int) -> dict[str, object]:
         "headRefOid": f"{number:040x}",
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
-        "reviewDecision": "APPROVED",
+        "reviewDecision": review_decision,
         "additions": 1,
         "deletions": 0,
         "changedFiles": 1,
         "author": {"login": "tester"},
+        "authorAssociation": association,
         "headRepository": {"nameWithOwner": "tester/repo"},
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
     }
@@ -170,6 +175,92 @@ class SnapshotTests(unittest.TestCase):
                 BATCH, "fetch_pull_request_status", return_value=merged
             ):
                 with self.assertRaisesRegex(RuntimeError, "manual upstream-main review is required"):
+                    BATCH.command_snapshot(args)
+
+
+    def snapshot_args(self, root: Path, policy: dict[str, object], trust_all: bool = False) -> object:
+        exclusions = root / "exclusions.json"
+        exclusions.write_text(json.dumps(policy), encoding="utf-8")
+        return type(
+            "Args",
+            (),
+            {
+                "upstream_repository": "owner/repo",
+                "downstream_sha": "a" * 40,
+                "upstream_main_sha": "b" * 40,
+                "exclusions": exclusions,
+                "output": root / "snapshot.json",
+                "trust_all": trust_all,
+            },
+        )()
+
+    def test_snapshot_holds_unreviewed_outside_contributors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.snapshot_args(
+                root,
+                {
+                    "schema_version": 1,
+                    "upstream_repository": "owner/repo",
+                    "pull_requests": [],
+                    "allowed_pull_requests": [{"number": 1603, "reason": "reviewed head"}],
+                },
+            )
+            prs = [
+                BATCH.PullRequest.from_dict(graph_node(1600, "MEMBER", "REVIEW_REQUIRED")),
+                BATCH.PullRequest.from_dict(graph_node(1601, "CONTRIBUTOR", "APPROVED")),
+                BATCH.PullRequest.from_dict(graph_node(1602, "FIRST_TIME_CONTRIBUTOR", "REVIEW_REQUIRED")),
+                BATCH.PullRequest.from_dict(graph_node(1603, "NONE", "")),
+                BATCH.PullRequest.from_dict(graph_node(1604, "CONTRIBUTOR", "CHANGES_REQUESTED")),
+            ]
+            with mock.patch.object(BATCH, "fetch_open_prs", return_value=prs):
+                self.assertEqual(0, BATCH.command_snapshot(args))
+            snapshot = json.loads((root / "snapshot.json").read_text(encoding="utf-8"))
+            self.assertEqual([1600, 1601, 1603], [record["number"] for record in snapshot["pull_requests"]])
+            self.assertEqual([1602, 1604], [record["number"] for record in snapshot["held_pull_requests"]])
+
+    def test_held_pull_requests_change_the_fingerprint(self) -> None:
+        prs = [BATCH.PullRequest.from_dict(graph_node(1600))]
+        plain = BATCH.snapshot_fingerprint("a" * 40, "b" * 40, prs, [])
+        self.assertEqual(plain, BATCH.snapshot_fingerprint("a" * 40, "b" * 40, prs, [], []))
+        held = BATCH.snapshot_fingerprint(
+            "a" * 40, "b" * 40, prs, [], [{"number": 1602, "head_sha": "c" * 40}]
+        )
+        moved = BATCH.snapshot_fingerprint(
+            "a" * 40, "b" * 40, prs, [], [{"number": 1602, "head_sha": "d" * 40}]
+        )
+        self.assertNotEqual(plain, held)
+        self.assertNotEqual(held, moved)
+
+    def test_trust_all_imports_outside_contributors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.snapshot_args(
+                root,
+                {"schema_version": 1, "upstream_repository": "owner/repo", "pull_requests": []},
+                trust_all=True,
+            )
+            prs = [BATCH.PullRequest.from_dict(graph_node(1602, "NONE", "REVIEW_REQUIRED"))]
+            with mock.patch.object(BATCH, "fetch_open_prs", return_value=prs):
+                self.assertEqual(0, BATCH.command_snapshot(args))
+            snapshot = json.loads((root / "snapshot.json").read_text(encoding="utf-8"))
+            self.assertEqual([1602], [record["number"] for record in snapshot["pull_requests"]])
+            self.assertEqual([], snapshot["held_pull_requests"])
+
+    def test_pull_request_cannot_be_both_excluded_and_allowlisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self.snapshot_args(
+                root,
+                {
+                    "schema_version": 1,
+                    "upstream_repository": "owner/repo",
+                    "pull_requests": [{"number": 1592, "reason": "excluded"}],
+                    "allowed_pull_requests": [{"number": 1592, "reason": "allowed"}],
+                },
+            )
+            with mock.patch.object(BATCH, "fetch_open_prs", return_value=[]):
+                with self.assertRaisesRegex(RuntimeError, "both excluded and allowlisted"):
                     BATCH.command_snapshot(args)
 
 
