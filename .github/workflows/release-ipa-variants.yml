@@ -8,6 +8,11 @@ on:
         required: true
         type: string
         default: 'https://downloads.apolloreborn.app/apollobase.ipa'
+      apollo_ipa_sha256:
+        description: 'SHA-256 of that IPA (required unless it is the pinned default in distribution/base-ipa.sha256)'
+        required: false
+        type: string
+        default: ''
       prerelease:
         description: 'Mark GitHub release as prerelease'
         required: false
@@ -36,6 +41,8 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: write
+      id-token: write       # sign build provenance (Sigstore)
+      attestations: write   # store provenance with the repository
 
     steps:
       - name: Checkout repository
@@ -119,7 +126,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/cyan-venv"
           "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install \
-            "https://github.com/asdfzxcvbn/pyzule-rw/archive/refs/tags/v1.4.4.zip"
+            "https://github.com/asdfzxcvbn/pyzule-rw/archive/04a40f2aa65ec9cb36127f74d52ae4ef71377c50.zip" # v1.4.4
           echo "$RUNNER_TEMP/cyan-venv/bin" >> "$GITHUB_PATH"
           # Fail loudly here if cyan isn't runnable, rather than later in the build.
           "$RUNNER_TEMP/cyan-venv/bin/cyan" --help >/dev/null
@@ -135,8 +142,12 @@ jobs:
           xcodegen --version
 
       - name: Download Apollo IPA
+        env:
+          APOLLO_IPA_URL: ${{ inputs.apollo_ipa_url }}
+          APOLLO_IPA_SHA256: ${{ inputs.apollo_ipa_sha256 }}
         run: |
-          curl -L --fail --retry 3 "${{ github.event.inputs.apollo_ipa_url }}" -o Apollo.ipa
+          curl -L --fail --retry 3 "$APOLLO_IPA_URL" -o Apollo.ipa
+          bash ./scripts/verify-base-ipa.sh Apollo.ipa "$APOLLO_IPA_URL" "$APOLLO_IPA_SHA256"
           unzip -t Apollo.ipa >/dev/null
 
       - name: Collect metadata
@@ -192,6 +203,23 @@ jobs:
           echo "symbols_zip=${SYMBOLS_ZIP}" >> "$GITHUB_OUTPUT"
           echo "Debug symbols: ${SYMBOLS_ZIP} ($(wc -c < "${SYMBOLS_ZIP}") bytes)"
 
+      - name: Write release checksums
+        id: checksums
+        run: |
+          SUMS="dist/Apollo-Reborn-${{ steps.meta.outputs.tweak_version }}-SHA256SUMS.txt"
+          shasum -a 256 dist/out/*.ipa packages/*.deb "${{ steps.symbols.outputs.symbols_zip }}" \
+            | sed -E 's#  .*/#  #' > "$SUMS"
+          cat "$SUMS"
+          echo "sums=${SUMS}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/out/*.ipa
+            packages/*.deb
+            ${{ steps.symbols.outputs.symbols_zip }}
+
       - name: Generate release notes
         run: python3 ./scripts/generate_release_notes.py > RELEASE_NOTES.md
         env:
@@ -210,6 +238,7 @@ jobs:
             dist/out/*.ipa
             packages/*.deb
             ${{ steps.symbols.outputs.symbols_zip }}
+            ${{ steps.checksums.outputs.sums }}
 
       - name: Summarize release outputs
         run: |
