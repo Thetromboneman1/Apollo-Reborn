@@ -83,6 +83,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloCommon.m \
     $(SRC_DIR)/ApolloLogRedaction.m \
     $(SRC_DIR)/ApolloSessionState.m \
+    $(SRC_DIR)/ApolloSavedSignInCheck.m \
     $(SRC_DIR)/ApolloSessionRestoration.xm \
     $(SRC_DIR)/ApolloLogRedaction.m \
     $(SRC_DIR)/ApolloInlineImageMetadata.m \
@@ -238,6 +239,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloURLOpenCommentSort.xm \
     $(SRC_DIR)/ApolloLiquidGlassTabGesture.m \
     $(SRC_DIR)/ApolloLiquidGlass.xm \
+    $(SRC_DIR)/ApolloFrameRate.m \
     $(SRC_DIR)/ApolloNavigationActions.xm \
     $(SRC_DIR)/ApolloNavigationTitlePresentation.xm \
     $(SRC_DIR)/ApolloTabBarTitles.xm \

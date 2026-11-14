@@ -43,9 +43,12 @@
 // resets. ApolloWebJSON then holds the account (ApolloWebJSONOptionalReadBackoff)
 // and a toast says to try again in a few minutes, but a list whose first page
 // failed stayed on "Pull down to try again" until the user did. A first page
-// that fails while that hold is on now says it will load once the limit resets,
-// and the list reloads itself (through its own pull to refresh action) when
-// the hold ends, or as soon as the app is back in the foreground after that.
+// that fails while Reddit holds the account that sent it now says it will load
+// once the limit resets, and the list reloads itself (through its own pull to
+// refresh action) when that account's hold ends, or as soon as the app is back
+// in the foreground after that. Each list waits on its own request's account,
+// and switching to another account ends the wait. Like the outcome, the wait
+// follows whichever first page Apollo shows: the one that arrives last.
 
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
@@ -54,6 +57,7 @@
 #import "ApolloThemeRuntime.h"
 #import "ApolloWebJSON.h"
 #import "ApolloWebSessionStore.h"
+#import "ApolloAccountCredentials.h"
 
 @interface RDKPagination : NSObject
 @property (copy, nonatomic) NSString *after;
@@ -89,20 +93,129 @@ typedef struct {
     SEL refreshSelector;
 } ApolloListSlot;
 
+// One first page of one list. A new first page (load, pull to refresh, sort)
+// replaces the list's state, so a state also identifies the request it was
+// made for.
 @interface ApolloListLoadState : NSObject
 @property (nonatomic) ApolloListKind kind;
 @property (nonatomic) ApolloListOutcome outcome;
 @property (nonatomic, copy) NSString *username;
 @property (nonatomic) BOOL timeFiltered;
-// The first page failed while Reddit was rate-limiting the account; the list
-// reloads itself once the limit resets (see the header).
+// The API-Key-Free account that sent this first page, lowercased; nil for an
+// API-key account.
+@property (nonatomic, copy) NSString *account;
+// The first page failed while Reddit was rate-limiting `account`; the list
+// reloads itself once that account's limit resets (see the header).
 @property (nonatomic) BOOL waitingForRateLimit;
-@property (nonatomic, weak) UIViewController *controller;
+@property (nonatomic, weak) id adapter;
+@property (nonatomic, weak) id controller;
 @property (nonatomic) SEL refreshSelector;
 @end
 
 @implementation ApolloListLoadState
 @end
+
+#pragma mark - Rate-limit decisions
+
+// Foundation-only, so tests/run_list_rate_limit_tests.sh runs this block as is
+// (from the ApolloListKind enum to the end marker below).
+
+// How long after an account's hold ends its waiting lists reload. The hold
+// ends by this device's clock; a reload that reached Reddit just before its own
+// window turned over would be refused, and a refusal right before a reset holds
+// for a whole new window.
+static NSTimeInterval const kApolloListRateLimitRetryMargin = 5.0;
+
+// What Reddit's hold on the account that sent this list's first page has left;
+// 0 when none is running, and always for an API-key account.
+static NSTimeInterval ApolloListStateHold(ApolloListLoadState *state) {
+    return state.account.length > 0 ? ApolloWebJSONOptionalReadBackoff(state.account) : 0;
+}
+
+// Records how a first page of the list whose state this is ended. Apollo shows
+// whichever first page arrives last, so its outcome goes on the list's current
+// state even if a newer first page has started since, and the wait follows it:
+// a late page that brought posts clears it, a late failure on an empty list
+// sets it. A first page that failed while Reddit held the list's account, on a
+// list with nothing in it yet, waits for the hold to end; a list that still
+// shows posts keeps them and isn't reloaded under the reader.
+static void ApolloListRecordOutcome(ApolloListLoadState *state, ApolloListOutcome outcome, BOOL listEmpty) {
+    if (!state) return;
+    state.outcome = outcome;
+    state.waitingForRateLimit = outcome == ApolloListOutcomeFailed && listEmpty && ApolloListStateHold(state) > 0;
+}
+
+typedef NS_ENUM(NSInteger, ApolloListRetryAction) {
+    ApolloListRetryActionNone = 0, // not waiting on a rate limit
+    ApolloListRetryActionWait,     // its account's hold is still running
+    ApolloListRetryActionLater,    // the hold is over, but the app isn't active
+    ApolloListRetryActionReload,
+    ApolloListRetryActionDiscard,  // another account is active now
+};
+
+// What a pass does with one list, judged by the account that sent its first
+// page and that account's own hold. `activeAccount` is the lowercased username
+// of the account active now, of either kind (nil when none is signed in). After
+// a switch the list's request belongs to an account that's no longer active, so
+// it stops waiting rather than reload as someone else.
+static ApolloListRetryAction ApolloListRetryActionFor(ApolloListLoadState *state, NSString *activeAccount, BOOL appActive) {
+    if (!state.waitingForRateLimit || state.outcome != ApolloListOutcomeFailed) return ApolloListRetryActionNone;
+    if (activeAccount.length == 0 || ![state.account isEqualToString:activeAccount]) return ApolloListRetryActionDiscard;
+    if (ApolloListStateHold(state) > 0) return ApolloListRetryActionWait;
+    return appActive ? ApolloListRetryActionReload : ApolloListRetryActionLater;
+}
+
+// Sorts the lists a pass found into `reload` and `discard`, and returns how
+// long until the next pass is due: the earliest hold still running among the
+// lists that wait, plus the margin. -1 when none waits on a hold.
+static NSTimeInterval ApolloListPlanRetry(NSArray<ApolloListLoadState *> *states, NSString *activeAccount, BOOL appActive,
+                                          NSMutableArray<ApolloListLoadState *> *reload,
+                                          NSMutableArray<ApolloListLoadState *> *discard) {
+    NSTimeInterval next = -1;
+    for (ApolloListLoadState *state in states) {
+        switch (ApolloListRetryActionFor(state, activeAccount, appActive)) {
+            case ApolloListRetryActionWait: {
+                NSTimeInterval due = ApolloListStateHold(state) + kApolloListRateLimitRetryMargin;
+                if (next < 0 || due < next) next = due;
+                break;
+            }
+            case ApolloListRetryActionReload: [reload addObject:state]; break;
+            case ApolloListRetryActionDiscard: [discard addObject:state]; break;
+            case ApolloListRetryActionLater:
+            case ApolloListRetryActionNone: break;
+        }
+    }
+    return next;
+}
+
+// Defined below this block (the tests define their own): wall-clock time now,
+// a wall-clock dispatch_after on main, and the pass itself.
+static NSTimeInterval ApolloListWallClockNow(void);
+static void ApolloListAfterWallClock(NSTimeInterval delay, dispatch_block_t block);
+static void ApolloListRetryRateLimitedLists(void);
+
+// Wall-clock time the earliest pending pass is due; 0 when none is.
+static NSTimeInterval sListRateLimitRetryAt;
+
+// Schedules a pass `delay` seconds from now unless one is already due no later
+// (that pass plans the next one from the holds as they are then). A list that
+// starts waiting on a shorter hold, such as another account's after a switch,
+// moves the next pass earlier instead of waiting behind a longer one. A pass
+// that fires after an earlier one has run finds nothing left or plans again.
+// Wall-clock time, so a device that sleeps through the reset reloads as soon
+// as the app runs again. Main thread.
+static void ApolloListScheduleRateLimitRetry(NSTimeInterval delay) {
+    delay = MAX(delay, 0.0);
+    NSTimeInterval at = ApolloListWallClockNow() + delay;
+    if (sListRateLimitRetryAt > 0 && sListRateLimitRetryAt <= at + 1.0) return;
+    sListRateLimitRetryAt = at;
+    ApolloListAfterWallClock(delay, ^{
+        if (sListRateLimitRetryAt == at) sListRateLimitRetryAt = 0;
+        ApolloListRetryRateLimitedLists();
+    });
+}
+
+// End of the rate-limit decisions.
 
 static ApolloListSlot sListSlots[4];
 static NSUInteger sListSlotCount;
@@ -255,65 +368,73 @@ static void ApolloListApply(id adapter) {
 
 #pragma mark - Reload once Reddit's rate limit resets
 
-// How long after the hold ends a waiting list reloads. The hold ends by this
-// device's clock; a reload that reached Reddit just before its own window
-// turned over would be refused, and a refusal right before a reset holds for
-// a whole new window.
-static NSTimeInterval const kApolloListRateLimitRetryMargin = 5.0;
-static BOOL sListRateLimitRetryScheduled;
-
-static void ApolloListRetryRateLimitedLists(void);
-
-// The active account's remaining hold, 0 when there is none (always for an
-// API-key account).
-static NSTimeInterval ApolloListRateLimitHold(void) {
-    return ApolloWebJSONOptionalReadBackoff(ApolloActiveWebSessionUsername());
+static NSTimeInterval ApolloListWallClockNow(void) {
+    return [[NSDate date] timeIntervalSince1970];
 }
 
-// One pending pass at a time; a pass that finds the hold extended schedules
-// the next. Wall-clock time, so a device that sleeps through the reset reloads
-// as soon as the app runs again. Main thread.
-static void ApolloListScheduleRateLimitRetry(void) {
-    if (sListRateLimitRetryScheduled) return;
-    sListRateLimitRetryScheduled = YES;
-    NSTimeInterval delay = MAX(ApolloListRateLimitHold(), 0.0) + kApolloListRateLimitRetryMargin;
-    dispatch_after(dispatch_walltime(NULL, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        sListRateLimitRetryScheduled = NO;
-        ApolloListRetryRateLimitedLists();
-    });
+static void ApolloListAfterWallClock(NSTimeInterval delay, dispatch_block_t block) {
+    dispatch_after(dispatch_walltime(NULL, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), block);
 }
 
-// Reloads every list still waiting on the rate limit, once it has ended and
-// the app is in the foreground (UIApplicationDidBecomeActiveNotification runs
-// this again). Lists off screen reload too: each is one request right after a
-// reset, and the alternative is the user finding it still failed when they go
-// back to it. Main thread.
+// The lowercased username of the account active now, of either kind. Reads
+// AccountManager's live selection: on its account-change notification that has
+// already moved, while the defaults copy ApolloActiveWebSessionUsername() reads
+// is written afterwards.
+static NSString *ApolloListActiveAccount(void) {
+    NSString *username = nil;
+    NSString *persisted = ApolloActiveWebSessionUsername().lowercaseString;
+    if (ApolloResolveLiveActiveAccountIdentity(&username) == ApolloPersistedAccountIdentitySignedIn && username.length > 0) {
+        if (![username.lowercaseString isEqualToString:persisted ?: @""]) {
+            ApolloLog(@"[ListEmptyState] Active account is u/%@ (the saved selection still says u/%@)", username, persisted ?: @"-");
+        }
+        return username.lowercaseString;
+    }
+    return persisted;
+}
+
+// Runs on each scheduled pass, on UIApplicationDidBecomeActiveNotification and
+// after an account switch. Every waiting list is judged by its own account's
+// hold (ApolloListPlanRetry): it reloads once that hold has ended and the app
+// is active, keeps waiting while it runs, and stops waiting once another
+// account is active (it shows "Pull down to try again" instead). Lists off
+// screen reload too: each is one request right after a reset, and the
+// alternative is the user finding it still failed when they go back to it.
+// Main thread.
 static void ApolloListRetryRateLimitedLists(void) {
-    NSMutableArray<ApolloListLoadState *> *waiting = [NSMutableArray array];
+    NSMutableArray<ApolloListLoadState *> *states = [NSMutableArray array];
     for (UIViewController *controller in sListControllers.allObjects) {
         for (NSUInteger i = 0; i < sListSlotCount; i++) {
             ApolloListSlot slot = sListSlots[i];
             if (![controller isKindOfClass:slot.controllerClass]) continue;
             ApolloListLoadState *state = ApolloListStateFor(object_getIvar(controller, slot.adapterIvar));
-            if (state.waitingForRateLimit && state.outcome == ApolloListOutcomeFailed) [waiting addObject:state];
+            if (state.waitingForRateLimit) [states addObject:state];
         }
     }
-    if (waiting.count == 0) return;
-    NSTimeInterval hold = ApolloListRateLimitHold();
-    if (hold > 0) {
-        ApolloLog(@"[ListEmptyState] Reddit's rate limit still holds for %.0fs; %lu list(s) keep waiting",
-                  hold, (unsigned long)waiting.count);
-        ApolloListScheduleRateLimitRetry();
-        return;
-    }
-    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
-    for (ApolloListLoadState *state in waiting) {
+    if (states.count == 0) return;
+    NSString *activeAccount = ApolloListActiveAccount();
+    BOOL appActive = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    NSMutableArray<ApolloListLoadState *> *reload = [NSMutableArray array];
+    NSMutableArray<ApolloListLoadState *> *discard = [NSMutableArray array];
+    NSTimeInterval next = ApolloListPlanRetry(states, activeAccount, appActive, reload, discard);
+    for (ApolloListLoadState *state in discard) {
         state.waitingForRateLimit = NO;
-        UIViewController *controller = state.controller;
+        ApolloLog(@"[ListEmptyState] u/%@ is no longer the active account; its failed list stops waiting for the rate limit",
+                  state.account);
+        ApolloListApply(state.adapter);
+    }
+    if (next >= 0) {
+        ApolloLog(@"[ListEmptyState] Reddit's rate limit still holds; checking again in %.0fs", next);
+        ApolloListScheduleRateLimitRetry(next);
+    }
+    for (ApolloListLoadState *state in reload) {
+        state.waitingForRateLimit = NO;
+        // Nothing reloads under the reader: a list that has posts again keeps them.
+        if (!ApolloListInstalledSpinner(state.adapter)) continue;
+        id controller = state.controller;
         SEL refresh = state.refreshSelector;
         if (!controller || !refresh || ![controller respondsToSelector:refresh]) continue;
-        ApolloLog(@"[ListEmptyState] Reddit's rate limit has reset; reloading %@ (%@)",
-                  NSStringFromClass(controller.class), NSStringFromSelector(refresh));
+        ApolloLog(@"[ListEmptyState] Reddit's rate limit on u/%@ has reset; reloading %@ (%@)", state.account,
+                  NSStringFromClass([controller class]), NSStringFromSelector(refresh));
         ((void (*)(id, SEL, id))objc_msgSend)(controller, refresh, nil);
     }
 }
@@ -324,13 +445,14 @@ static void ApolloListRetryRateLimitedLists(void) {
 static void ApolloListFinishFirstPage(id adapter, NSString *path, ApolloListOutcome outcome, NSError *error) {
     ApolloListLoadState *state = ApolloListStateFor(adapter);
     if (!state || outcome == ApolloListOutcomeNone) return;
+    NSTimeInterval hold = ApolloListStateHold(state);
     ApolloLog(@"[ListEmptyState] First page of %@ %@; %@%@", path,
               outcome == ApolloListOutcomeFailed ? [NSString stringWithFormat:@"failed (%@ %ld)", error.domain, (long)error.code] : @"was empty",
               ApolloListStateShowsMessage(state) ? @"showing a message instead of the loading spinner"
                                                  : @"asking the list for Apollo's empty state",
-              state.waitingForRateLimit ? [NSString stringWithFormat:@"; reloading when Reddit's rate limit resets in %.0fs",
-                                                                     ApolloListRateLimitHold()] : @"");
-    if (state.waitingForRateLimit) ApolloListScheduleRateLimitRetry();
+              state.waitingForRateLimit ? [NSString stringWithFormat:@"; reloading when Reddit's rate limit on u/%@ resets in %.0fs",
+                                                                     state.account, hold] : @"");
+    if (state.waitingForRateLimit) ApolloListScheduleRateLimitRetry(hold + kApolloListRateLimitRetryMargin);
     if (outcome == ApolloListOutcomeFailed) ApolloListEndRefreshing(adapter);
     ApolloListApply(adapter);
     // Posts: let Apollo pick its own empty state ("No submitted posts", a
@@ -339,16 +461,14 @@ static void ApolloListFinishFirstPage(id adapter, NSString *path, ApolloListOutc
     if (state.kind == ApolloListKindPosts) ApolloListReevaluateEmptyView(adapter);
 }
 
-// Records how the list's first page ended. One that failed while Reddit was
-// rate-limiting the account, on a list with nothing in it yet (the loading
-// spinner is still its empty view), waits for the limit to reset; a list that
-// still shows posts keeps them and isn't reloaded under the reader.
-static void ApolloListRecordOutcome(id adapter, ApolloListOutcome outcome) {
-    ApolloListLoadState *state = ApolloListStateFor(adapter);
-    if (!state) return;
-    state.outcome = outcome;
-    state.waitingForRateLimit = outcome == ApolloListOutcomeFailed && ApolloListInstalledSpinner(adapter) != nil &&
-                                ApolloListRateLimitHold() > 0;
+// The API-Key-Free account sending a first page, lowercased, or nil for an
+// API-key account: the requesting client's own user, or the active account
+// when RedditKit hasn't set that user yet (early in launch).
+static NSString *ApolloListRequestAccount(id client) {
+    id user = [client respondsToSelector:@selector(currentUser)] ? ((id (*)(id, SEL))objc_msgSend)(client, @selector(currentUser)) : nil;
+    NSString *username = [user respondsToSelector:@selector(username)] ? ((id (*)(id, SEL))objc_msgSend)(user, @selector(username)) : nil;
+    if (![username isKindOfClass:NSString.class] || username.length == 0) username = ApolloListActiveAccount();
+    return username.length > 0 && ApolloWebSessionFor(username) ? username.lowercaseString : nil;
 }
 
 // "user/<name>/comments.json" -> "<name>".
@@ -412,6 +532,8 @@ static void ApolloListRegisterController(UIViewController *controller) {
 
     ApolloListLoadState *state = [ApolloListLoadState new];
     state.kind = kind;
+    state.account = ApolloListRequestAccount(self);
+    state.adapter = adapter;
     state.controller = controller;
     state.refreshSelector = slot.refreshSelector;
     if (kind == ApolloListKindUserComments) {
@@ -436,7 +558,7 @@ static void ApolloListRegisterController(UIViewController *controller) {
             completion(items, nextPagination, error);
             dispatch_async(dispatch_get_main_queue(), ^{
                 id strongAdapter = weakAdapter;
-                ApolloListRecordOutcome(strongAdapter, outcome);
+                ApolloListRecordOutcome(ApolloListStateFor(strongAdapter), outcome, ApolloListInstalledSpinner(strongAdapter) != nil);
                 ApolloListFinishFirstPage(strongAdapter, path, outcome, error);
             });
             return;
@@ -444,7 +566,7 @@ static void ApolloListRegisterController(UIViewController *controller) {
         // Record the outcome before Apollo handles the page: ListAdapter can
         // re-install its spinner synchronously inside that call.
         id strongAdapter = weakAdapter;
-        ApolloListRecordOutcome(strongAdapter, outcome);
+        ApolloListRecordOutcome(ApolloListStateFor(strongAdapter), outcome, ApolloListInstalledSpinner(strongAdapter) != nil);
         completion(items, nextPagination, error);
         ApolloListFinishFirstPage(strongAdapter, path, outcome, error);
     };
@@ -536,5 +658,16 @@ static BOOL ApolloListAddSlot(Class controllerClass, const char *adapterName, co
                                                   usingBlock:^(__unused NSNotification *note) {
         ApolloListRetryRateLimitedLists();
     }];
+    // After an account switch, lists still waiting on the previous account's
+    // limit stop waiting right away. Apollo posts these while it switches, so
+    // the pass runs once it has.
+    for (NSString *name in @[ @"com.christianselig.RedditCurrentAccountChanged", @"com.christianselig.RedditAccountChanged" ]) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:name
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            dispatch_async(dispatch_get_main_queue(), ^{ ApolloListRetryRateLimitedLists(); });
+        }];
+    }
     ApolloLog(@"[ListEmptyState] Comments, Posts and Friends empty state hooks installed (reload after a rate limit)");
 }
