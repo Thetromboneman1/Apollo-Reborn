@@ -71,27 +71,42 @@ jobs:
   build:
     name: Build IPA
     runs-on: macos-15
+    timeout-minutes: 60
     permissions:
       contents: write
+    # Dispatch inputs reach shell only through these variables, never as
+    # ${{ }} text spliced into a script.
+    env:
+      IN_INJECT_TWEAK: ${{ inputs.inject_tweak }}
+      IN_NO_EXTENSIONS: ${{ inputs.no_extensions }}
+      IN_LIQUID_GLASS: ${{ inputs.liquid_glass }}
+      IN_LIQUID_GLASS_ICONS: ${{ inputs.liquid_glass_icons }}
+      IN_URL_SCHEMES: ${{ inputs.url_schemes }}
+      IN_REMOVE_CODE_SIGNATURE: ${{ inputs.remove_code_signature }}
+      IN_OUTPUT_NAME: ${{ inputs.output_name }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Validate inputs
         run: |
-          if [ "${{ github.event.inputs.liquid_glass }}" == "true" ] && [ "${{ github.event.inputs.liquid_glass_icons }}" == "true" ]; then
+          if [ "${IN_LIQUID_GLASS}" == "true" ] && [ "${IN_LIQUID_GLASS_ICONS}" == "true" ]; then
             echo "Error: 'liquid_glass' and 'liquid_glass_icons' are mutually exclusive."
             exit 1
           fi
-          if [ "${{ github.event.inputs.no_extensions }}" == "true" ] && [ "${{ github.event.inputs.inject_tweak }}" != "true" ]; then
+          if [ "${IN_NO_EXTENSIONS}" == "true" ] && [ "${IN_INJECT_TWEAK}" != "true" ]; then
             echo "Error: 'no_extensions' only applies when 'inject_tweak' is enabled."
             exit 1
           fi
 
       - name: Install build dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
         run: brew install ldid dpkg make
 
       - name: Add GNU make to PATH
@@ -99,8 +114,9 @@ jobs:
 
       - name: Setup Theos
         if: inputs.inject_tweak
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           repository: theos/theos
           ref: 9bc73406cf80b711ef4d02c15ff1dedc4478a275 # master @ 2026-04-09
           path: theos
@@ -170,9 +186,11 @@ jobs:
 
       - name: Inject tweak
         if: inputs.inject_tweak
+        env:
+          DEB_PATH: ${{ steps.locate_deb.outputs.deb_path }}
         run: |
-          DEB="${{ steps.locate_deb.outputs.deb_path }}"
-          if [ "${{ github.event.inputs.no_extensions }}" == "true" ]; then
+          DEB="$DEB_PATH"
+          if [ "${IN_NO_EXTENSIONS}" == "true" ]; then
             echo "Injecting tweak (no extensions) with cyan..."
             cyan -i Apollo.ipa -f "$DEB" -o injected.ipa -e
             python3 scripts/register-backup-document.py injected.ipa
@@ -216,19 +234,23 @@ jobs:
       - name: Build output filename
         id: outname
         run: |
-          BASE="${{ github.event.inputs.output_name }}"
+          BASE="${IN_OUTPUT_NAME}"
           [ -z "$BASE" ] && BASE="Apollo-Reborn"
+          if [[ ! "$BASE" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error title=Invalid output_name::Use letters, digits, '.', '_' or '-' only."
+            exit 1
+          fi
           SUFFIX=""
-          if [ "${{ github.event.inputs.no_extensions }}" == "true" ]; then
+          if [ "${IN_NO_EXTENSIONS}" == "true" ]; then
             SUFFIX="${SUFFIX}-NoExt"
           fi
-          if [ "${{ github.event.inputs.liquid_glass }}" == "true" ]; then
+          if [ "${IN_LIQUID_GLASS}" == "true" ]; then
             SUFFIX="${SUFFIX}-LiquidGlass"
           fi
-          if [ "${{ github.event.inputs.liquid_glass_icons }}" == "true" ]; then
+          if [ "${IN_LIQUID_GLASS_ICONS}" == "true" ]; then
             SUFFIX="${SUFFIX}-LiquidGlassIcons"
           fi
-          if [ -n "${{ github.event.inputs.url_schemes }}" ] && [ "${{ github.event.inputs.url_schemes }}" != "dystopia,redreader" ]; then
+          if [ -n "${IN_URL_SCHEMES}" ] && [ "${IN_URL_SCHEMES}" != "dystopia,redreader" ]; then
             SUFFIX="${SUFFIX}-URLSchemes"
           fi
           OUTPUT_IPA="${BASE}${SUFFIX}.ipa"
@@ -237,37 +259,38 @@ jobs:
 
       - name: Apply patches
         id: patch
+        env:
+          OUTPUT_IPA: ${{ steps.outname.outputs.output_ipa }}
         run: |
-          OUTPUT_IPA="${{ steps.outname.outputs.output_ipa }}"
           NEEDS_PATCH="false"
-          CMD_ARGS="Apollo.ipa -o ${OUTPUT_IPA}"
-          if [ "${{ github.event.inputs.liquid_glass }}" == "true" ]; then
-            CMD_ARGS="${CMD_ARGS} --liquid-glass"
+          PATCH_ARGS=(Apollo.ipa -o "$OUTPUT_IPA")
+          if [ "${IN_LIQUID_GLASS}" == "true" ]; then
+            PATCH_ARGS+=(--liquid-glass)
             NEEDS_PATCH="true"
           fi
-          if [ "${{ github.event.inputs.liquid_glass_icons }}" == "true" ]; then
-            CMD_ARGS="${CMD_ARGS} --liquid-glass-icons"
+          if [ "${IN_LIQUID_GLASS_ICONS}" == "true" ]; then
+            PATCH_ARGS+=(--liquid-glass-icons)
             NEEDS_PATCH="true"
           fi
-          if [ -n "${{ github.event.inputs.url_schemes }}" ]; then
-            CMD_ARGS="${CMD_ARGS} --url-schemes '${{ github.event.inputs.url_schemes }}'"
+          if [ -n "${IN_URL_SCHEMES}" ]; then
+            PATCH_ARGS+=(--url-schemes "${IN_URL_SCHEMES}")
             NEEDS_PATCH="true"
           fi
-          if [ "${{ github.event.inputs.remove_code_signature }}" == "true" ]; then
-            CMD_ARGS="${CMD_ARGS} --remove-code-signature"
+          if [ "${IN_REMOVE_CODE_SIGNATURE}" == "true" ]; then
+            PATCH_ARGS+=(--remove-code-signature)
             NEEDS_PATCH="true"
           fi
           # Package the passive manual fallback and the separately labelled,
           # opt-in legacy automatic opener whenever extensions are retained.
-          if [ "${{ github.event.inputs.no_extensions }}" != "true" ]; then
-            CMD_ARGS="${CMD_ARGS} --fix-safari-extension"
+          if [ "${IN_NO_EXTENSIONS}" != "true" ]; then
+            PATCH_ARGS+=(--fix-safari-extension)
             NEEDS_PATCH="true"
           fi
 
           if [ "$NEEDS_PATCH" == "true" ]; then
-            echo "Running: ./patch.sh ${CMD_ARGS}"
+            echo "Running: ./patch.sh ${PATCH_ARGS[*]}"
             chmod +x ./patch.sh
-            eval "./patch.sh ${CMD_ARGS}"
+            ./patch.sh "${PATCH_ARGS[@]}"
           else
             # No patch options selected: the (possibly injected) IPA is the output.
             echo "No patch options selected; using IPA as-is."
@@ -284,9 +307,10 @@ jobs:
 
       - name: Validate output IPA
         if: inputs.inject_tweak
+        env:
+          IPA: ${{ steps.patch.outputs.output_ipa }}
         run: |
-          IPA="${{ steps.patch.outputs.output_ipa }}"
-          if [ "${{ github.event.inputs.no_extensions }}" == "true" ]; then
+          if [ "${IN_NO_EXTENSIONS}" == "true" ]; then
             if unzip -Z1 "$IPA" | grep -Eq '^Payload/[^/]+\.app/PlugIns/[^/]+\.appex/'; then
               echo "Error: no-extensions output contains app extensions:" >&2
               unzip -Z1 "$IPA" | grep -E '^Payload/[^/]+\.app/PlugIns/[^/]+\.appex/' >&2

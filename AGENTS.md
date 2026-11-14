@@ -34,7 +34,7 @@ The iOS 27.1 SDK declares `SupportedTargets.iphoneos.MinimumDeploymentTarget = 1
 For the private iOS 27 device-update workflow, use the matching SDK installed in the selected Xcode and set both its SDK root and the iOS 15 floor explicitly. Build 365 was verified with Xcode 27.2 using:
 
 ```sh
-THEOS=/Users/corn/theos \
+THEOS="$HOME/theos" \
 THEOS_PLATFORM_SDK_ROOT=/Applications/Xcode.app/Contents/Developer \
 make -j2 package FINALPACKAGE=1 APOLLO_DEVICE_SDK=27.2 APOLLO_DEVICE_DEPLOY=15.0
 ```
@@ -217,7 +217,9 @@ Testing: with FLEX debugging enabled, Settings → Privacy → Crash Reports gai
 
 ## Testing
 
-No automated test suite, must be validated manually.
+Host-side tests live in `tests/` and run in CI through `scripts/validate-downstream.sh` (Repository Validation workflow): the upstream-sync, release-input, update-manifest, Pal Home and other harnesses. Run `scripts/validate-downstream.sh` before pushing; add `--build` on a Mac with Theos to include the package build. Tweak behaviour inside Apollo still needs manual validation in the simulator or on a device.
+
+Before pushing a branch, run `python3 scripts/documentation_health.py --write` and commit any `README.md` / `docs/` changes: the Documentation health check fails on stale generated docs in pull requests and only self-heals on `main`.
 
 ## RE Notes
 
@@ -289,7 +291,7 @@ Once you have `hopperAddr`:
 
 ### Symbolicating User Crash Reports With Release dSYMs
 
-Release IPAs are built with `FINALPACKAGE=1`, so the shipped tweak dylib is optimized and stripped. Public release IPAs always come from the `Apollo-Reborn/Apollo-Reborn` release workflow:
+Release IPAs are built with `FINALPACKAGE=1`, so the shipped tweak dylib is optimized and stripped. Public upstream release IPAs come from the `Apollo-Reborn/Apollo-Reborn` release workflow below; builds of this fork come from `Thetromboneman1/Apollo-Reborn`'s own **Build and release IPA variants** workflow, so use `--repo Thetromboneman1/Apollo-Reborn` in the commands below for a fork build:
 
 ```text
 https://github.com/Apollo-Reborn/Apollo-Reborn/actions/workflows/release-ipa-variants.yml
