@@ -99,7 +99,9 @@ static int ApolloDuoRailModeForTabs(UITabBarController *tabs) {
         return ApolloDuoModePhone;
     }
     UIWindow *window = tabs.view.window ?: ApolloDeviceAppWindow();
-    return ApolloDuoModeFromWindow(window, ApolloDuoRailDualDisplays() ? 1 : 0);
+    if (!window) return ApolloDuoModePhone;
+    CGSize size = ApolloDuoLayoutSize(window.bounds.size);
+    return ApolloDuoModeFromBounds(ApolloDuoRailDualDisplays() ? 1 : 0, size.width, size.height);
 }
 
 static int ApolloDuoRailCurrentMode(void) {
@@ -144,8 +146,11 @@ BOOL ApolloDuoUsesAdaptiveBars(void) {
 }
 
 BOOL ApolloDuoAllowsTabBarScrollHiding(void) {
+    // Scroll hiding needs the bottom tab bar: the opened portrait display, or
+    // a short pane under a Picture in Picture, which keeps the bottom bar too.
     return !ApolloDuoUsesAdaptiveBars() ||
-        (!ApolloDuoSplitIsResizing() && ApolloDuoSplitIsUnfoldedPortrait());
+        (!ApolloDuoSplitIsResizing()
+            && (ApolloDuoSplitIsUnfoldedPortrait() || ApolloDuoSplitIsShortPane()));
 }
 
 BOOL ApolloDuoRailHasVisibleSideBar(void) {
@@ -233,8 +238,11 @@ CGFloat ApolloDuoRailFeedContentWidth(UITableView *table) {
     if (![tabs isKindOfClass:UITabBarController.class]) return 0.0;
     // During a display resize the bar may be detached and the table may
     // still carry its old bounds. Neither is a valid measurement fallback.
-    CGFloat transitionWidth = ApolloDuoSplitTransitionContentWidth(table,
-        (CGFloat)ApolloDuoRailWidthClosed + 12.0);
+    // A short pane (another window stacked above or below Apollo on the opened
+    // display) is landscape-shaped but keeps the bottom tab bar, so it must not
+    // reserve the trailing rail: that clipped feed media 84pt short of the edge.
+    CGFloat railInset = ApolloDuoSplitIsShortPane() ? 0.0 : (CGFloat)ApolloDuoRailWidthClosed + 12.0;
+    CGFloat transitionWidth = ApolloDuoSplitTransitionContentWidth(table, railInset);
     if (transitionWidth > 0.0) return transitionWidth;
     if (ApolloDuoSplitIsUnfoldedPortrait()) return 0.0;
     if (ApolloDuoRailModeForTabs(tabs) != ApolloDuoModeClosed
@@ -326,19 +334,78 @@ static UIView *ApolloDuoCoverFindJumpButton(UIViewController *comments) {
     return best;
 }
 
+// Apollo's push/pop animator sets the leaving page's final (off-screen) frame
+// as Back starts; only the presentation layer moves.
+static BOOL ApolloDuoJumpButtonPageIsSliding(UIViewController *comments) {
+    UIView *page = comments.viewIfLoaded;
+    UIWindow *window = page.window;
+    if (!page || !window) return NO;
+    CGRect onScreen = [page convertRect:page.bounds toView:nil];
+    if (CGRectGetMinX(onScreen) >= CGRectGetMaxX(window.bounds) - 0.5 || CGRectGetMaxX(onScreen) <= CGRectGetMinX(window.bounds) + 0.5) {
+        return YES;
+    }
+    for (UIView *view = page; view && view != window; view = view.superview) {
+        if (fabs(view.transform.tx) > 0.5 || fabs(view.layer.sublayerTransform.m41) > 0.5) return YES;
+    }
+    UINavigationController *navigation = comments.navigationController;
+    UIView *navigationView = navigation.viewIfLoaded;
+    if (!navigationView || fabs([page convertPoint:CGPointZero toView:navigationView].x) <= 0.5) return NO;
+    if (navigation.transitionCoordinator) return YES;
+    for (UIView *view = page; view && view != navigationView; view = view.superview) {
+        if (view.layer.animationKeys.count > 0) return YES;
+    }
+    return NO;
+}
+
+static char kApolloDuoJumpButtonRestingXKey;
+
+static void ApolloDuoJumpButtonRememberRestingX(UIView *button, CGFloat x, CGFloat containerWidth) {
+    objc_setAssociatedObject(button, &kApolloDuoJumpButtonRestingXKey,
+                             [NSValue valueWithCGPoint:CGPointMake(x, containerWidth)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// Mid-slide, the off-screen frame makes Apollo and the clamps below place the
+// button at the leading edge. Keep its resting x so it rides with the page.
+static BOOL ApolloDuoJumpButtonHoldDuringSlide(UIViewController *comments, UIView *button, BOOL coverChrome) {
+    UIView *container = button.superview;
+    if (!ApolloDuoJumpButtonPageIsSliding(comments)) return NO;
+    NSValue *resting = objc_getAssociatedObject(button, &kApolloDuoJumpButtonRestingXKey);
+    CGPoint rest = resting ? resting.CGPointValue : CGPointZero; // x, container width
+    if (!ApolloDuoJumpButtonKeepsRestingX(YES, resting != nil, rest.y, CGRectGetWidth(container.bounds))) return YES;
+    CGRect frame = button.frame;
+    BOOL moved = NO;
+    if (fabs(frame.origin.x - rest.x) > 0.5) {
+        ApolloLog(@"[DuoRail] jump button held at x=%.1f during a slide (was %.1f)", rest.x, frame.origin.x);
+        frame.origin.x = rest.x;
+        moved = YES;
+    }
+    if (coverChrome) {
+        CGFloat limitY = CGRectGetMaxY(container.bounds) - (CGFloat)ApolloDuoCoverPillBottom;
+        if (CGRectGetMaxY(frame) > limitY + 0.5) {
+            frame.origin.y -= (CGRectGetMaxY(frame) - limitY);
+            moved = YES;
+        }
+    }
+    if (moved) button.frame = frame;
+    return YES;
+}
+
 void ApolloDuoCoverAdjustJumpButton(UIViewController *comments) {
-    if (!comments || !comments.isViewLoaded
-        || !ApolloDuoCoverClassLooksLikeComments(comments.class)) return;
+    if (!comments || !ApolloDuoCoverClassLooksLikeComments(comments.class)) return;
+    if (!comments.isViewLoaded) return;
+    UIView *button = ApolloDuoCoverFindJumpButton(comments);
+    if (![button isKindOfClass:[UIView class]] || !button.superview) return;
     BOOL coverChrome = ApolloDuoCoverChromeIsActive();
+    if (ApolloDuoJumpButtonHoldDuringSlide(comments, button, coverChrome)) return;
+    UIView *container = button.superview;
     BOOL trailingRail = ApolloDuoRailHasVisibleSideBar();
     NSString *position = [NSUserDefaults.standardUserDefaults stringForKey:@"CommentJumpButtonPosition"];
     int kind = ApolloDuoJumpButtonPositionKind(position.UTF8String);
-    if (!comments.isViewLoaded) return;
-    if (!coverChrome && !trailingRail && CGRectIsNull(ApolloDuoSplitContentFrame(comments, comments.view))) return;
+    if (!coverChrome && !trailingRail && CGRectIsNull(ApolloDuoSplitContentFrame(comments, comments.view))) {
+        ApolloDuoJumpButtonRememberRestingX(button, CGRectGetMinX(button.frame), CGRectGetWidth(container.bounds));
+        return;
+    }
 
-    UIView *button = ApolloDuoCoverFindJumpButton(comments);
-    if (![button isKindOfClass:[UIView class]] || !button.superview) return;
-    UIView *container = button.superview;
     CGRect frame = button.frame;
     BOOL moved = NO;
     CGRect railFrame = CGRectNull;
@@ -376,6 +443,7 @@ void ApolloDuoCoverAdjustJumpButton(UIViewController *comments) {
     }
     if (!coverChrome && !trailingRail) {
         if (moved) button.frame = frame;
+        ApolloDuoJumpButtonRememberRestingX(button, frame.origin.x, CGRectGetWidth(container.bounds));
         return;
     }
     // The button is a child of ASTableView. Its frame is in *content*
@@ -412,6 +480,7 @@ void ApolloDuoCoverAdjustJumpButton(UIViewController *comments) {
         moved = YES;
     }
     if (moved) button.frame = frame;
+    ApolloDuoJumpButtonRememberRestingX(button, frame.origin.x, CGRectGetWidth(container.bounds));
 }
 
 void ApolloDuoRailAdjustHideReadButton(UIViewController *posts) {
