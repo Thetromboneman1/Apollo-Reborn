@@ -32,6 +32,10 @@ CGRect ApolloDuoActiveHorizontalDivision(UIView *view);
 /// Refresh the cached window mode without changing UIKit's tab bar.
 void ApolloDuoRailSync(void);
 
+/// Moves Apollo's tab bar pan back beside the Liquid Lens after the Duo moves
+/// its bars. Defined in ApolloLiquidGlass.xm.
+void ApolloTabBarSwipeScheduleLensCheck(UITabBarController *tabBarController);
+
 /// Mark Apollo's Texture feed tables before a navigation push measures them.
 void ApolloDuoRailPrepareFeedContent(UIViewController *controller);
 CGFloat ApolloDuoRailFeedContentWidth(UITableView *table);

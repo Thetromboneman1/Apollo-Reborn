@@ -29,6 +29,10 @@ static char kApolloDuoFeedGeometryKey;
 static NSHashTable<UITableView *> *sApolloDuoFeedTables;
 // Resolved once in %ctor (cold path), not per measurement.
 static Class sApolloDuoCommentsViewControllerClass;
+// Focused media in a short pane: a share of the pane's height, never smaller
+// than a readable preview.
+static const CGFloat kApolloDuoShortPaneMediaShare = 0.5;
+static const CGFloat kApolloDuoShortPaneMinimumMedia = 160.0;
 
 // Published once per geometry/settings change on the main thread. Texture
 // measures nodes on background threads, which must never read UIKit geometry.
@@ -233,6 +237,22 @@ static BOOL ApolloDuoMediaUpdateViewport(UITableView *table) {
             if (!landscape) columnWidth = 560.0;
             centerOffset = ApolloDuoFeedCenterOffset(table, window, owner);
         }
+    } else if (window && ApolloDuoSplitIsShortPane()) {
+        // A pane under a Picture in Picture keeps the display's width but not
+        // its height, so native media alone overflows it. Original caps a
+        // preview at the pane, as landscape does; Focused shrinks it further
+        // so the title, media and info row read together in one pane.
+        CGFloat paneHeight = floor(CGRectGetHeight(window.bounds));
+        if (isfinite(paneHeight) && paneHeight >= 100.0) {
+            height = paneHeight;
+            if (sDuoUnfoldedFeedLayout == 2) {
+                layout = sDuoUnfoldedFeedLayout;
+                height = MAX(kApolloDuoShortPaneMinimumMedia, floor(paneHeight * kApolloDuoShortPaneMediaShare));
+                UIScreen *screen = window.windowScene.screen ?: window.screen;
+                if (CGRectGetHeight(screen.bounds) > CGRectGetWidth(screen.bounds)) columnWidth = 560.0;
+                centerOffset = ApolloDuoFeedCenterOffset(table, window, owner);
+            }
+        }
     }
     BOOL stacked = owner.navigationController != nil;
     BOOL changed = !previous || fabs(previous.height - height) > 0.5
@@ -300,7 +320,7 @@ static void ApolloDuoMediaRefreshAfterGeometryChange(UITableView *table) {
 }
 
 void ApolloDuoMediaPrepareTableForTransition(UITableView *table) {
-    if (!NSThread.isMainThread || !table.window || !ApolloDuoSplitIsUnfolded()
+    if (!NSThread.isMainThread || !table.window || !ApolloDuoSplitShowsFeedLayout()
         || ![table respondsToSelector:NSSelectorFromString(@"tableNode")]) return;
     ApolloDuoMediaUpdateViewport(table);
     // The column transition captures its endpoints in this turn. Waiting for

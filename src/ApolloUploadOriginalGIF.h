@@ -9,9 +9,12 @@
 // a one-image JPEG CGImageDestination. A GIF comes out as a JPEG of its first
 // frame. The rebindings here (Apollo's own image only) spot that chain running on
 // an animated GIF picked in a comment/reply composer and keep a copy of the
-// original file, keyed by the JPEG Apollo produced. The upload hooks in
-// ApolloImageUploadHost.xm look the JPEG up and upload the GIF in its place.
-// Post and chat picks keep Apollo's still.
+// original file, keyed by the JPEG Apollo produced and the composer it was
+// picked in. The upload hooks in ApolloImageUploadHost.xm look the JPEG up and
+// upload the GIF in its place. When picks with different content made the same
+// JPEG (GIFs sharing a first frame, or a still of it), the upload can't be tied
+// to one of them, so those uploads keep Apollo's still. Post and chat picks keep
+// Apollo's still.
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,8 +26,14 @@ void ApolloUploadOriginalGIFInstallRebindings(const struct mach_header *header, 
 /// The original GIF behind an upload body Apollo flattened to a JPEG, or nil.
 NSData *ApolloUploadOriginalGIFDataForBody(NSData *body);
 
-/// Same for a file-backed upload: a temporary .gif file URL, or nil.
+/// Same for a file-backed upload: a temporary .gif file URL, or nil. The caller
+/// owns the file: pass it to ApolloUploadOriginalGIFReleaseFile once the upload
+/// that sends it has finished (or been cancelled), or right away if it isn't sent.
 NSURL *ApolloUploadOriginalGIFFileForBodyFile(NSURL *fileURL);
+
+/// Deletes a kept copy handed out by ApolloUploadOriginalGIFFileForBodyFile.
+/// Ignores anything outside the store's own folder.
+void ApolloUploadOriginalGIFReleaseFile(NSURL *gifFile);
 
 /// YES when the bytes start with a GIF signature ("GIF87a" / "GIF89a").
 BOOL ApolloUploadDataIsGIF(NSData *data);

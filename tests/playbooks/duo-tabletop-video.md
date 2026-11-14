@@ -8,9 +8,9 @@ Closed and rotation controls. A video with Apollo's full playback bar (for
 example a Reddit-hosted video) is required; Apollo's GIF-style MP4 viewer has
 no playback bar and stays native.
 
-0. On Duo, open Apollo Reborn → Features → iPhone Duo. Confirm Tabletop Video
-   Controls is off by default, then enable it. Confirm the Subreddit Panel
-   Style and Landscape Feed Layout controls still appear where expected.
+0. On Duo, confirm Apollo Reborn → Features has no iPhone Duo settings page
+   and settings search has no iphone-duo route. Tabletop layout is always on
+   for partly folded portrait playback; there is no preference to enable.
 1. Open a video while the inner display is flat in portrait. Confirm the
    ordinary fullscreen layout, native auto-hide, seek and playback controls.
 2. Partially fold the display. Confirm the picture aspect-fits above the
@@ -33,8 +33,6 @@ no playback bar and stays native.
    the layout. Close and the Reddit row stay visible the whole time.
 5. Unfold during playback and while paused. Confirm immediate native layout
    restoration without restarting, seeking, muting or unpausing the player.
-   Repeat after the tabletop transport has auto-hidden; then tap native
-   play/pause, skip, mute and scrub controls to confirm they still receive touch.
 6. Rotate to landscape/book posture and close onto the cover display. Confirm
    native layouts, then reopen portrait and partially fold again.
 7. Dismiss/reopen the viewer and page through video/photo gallery items. Photos
@@ -44,9 +42,6 @@ no playback bar and stays native.
    an available receiver, check the native AirPlay route picker.
 9. Check flat Duo and ordinary iPhone playback for regressions. Capture the
    active Duo inner display, not the inactive cover display, for evidence.
-10. Disable Tabletop Video Controls while a viewer is open and partly folded.
-    Confirm the native viewer returns immediately. Enable it again and confirm
-    the tabletop panel returns without resetting the player.
 
 Host checks: `sh tests/run_duo_video_geometry_tests.sh`,
 `sh tests/run_duo_rail_layout_tests.sh`, and
@@ -93,12 +88,21 @@ Host checks: `sh tests/run_duo_video_geometry_tests.sh`,
   native-HID scrub from 0:22 to 0:04; flat-unfold restores native layout/colors
   while remaining paused; refolding restores the revised panel.
 
-### Fork integration: Duo settings / opt-in playback
+### Duo settings / opt-in playback
 
-- This fork keeps its Duo-only settings page and the default-off Tabletop Video
-  Controls preference. The settings switch posts a layout-change notification
-  so open viewers update without a restart.
-- The newer upstream transport, timeline, accessory controls, and material
-  are used when the setting is enabled and the fold geometry qualifies.
-- The historical validation above predates this combined layout. Repeat the
-  physical Duo checks before treating the integrated panel as certified.
+- Historical: the 2026-10-29 validation covered an opt-in Tabletop Video
+  Controls toggle on a Duo-only settings page that also mirrored Landscape
+  Feed Layout and Subreddit Panel Style.
+- Current: tabletop is standard behavior whenever the fold geometry
+  qualifies. The Duo settings page, preference key, and layout-change
+  notification are gone. Subreddit Panel Style stays under Subreddits; Landscape
+  Feed Layout stays as the in-feed control.
+
+### Review revision (PR #1591)
+
+- Fold a video into tabletop, let the transport auto-hide for four seconds,
+  then unfold without tapping. Confirm play, seek, mute and skip accept taps
+  and that the slider/button artwork looks native. Repeat with chrome still
+  visible at unfold.
+- Smart Rotation Lock's "Tap to Rotate" offer is unchanged by this PR; the Duo
+  misfire is tracked separately.
