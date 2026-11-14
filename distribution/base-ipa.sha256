@@ -1,0 +1,4 @@
+# SHA-256 and URL of the Apollo base IPA every CI build injects into.
+# Recorded 2026-11-14 (Last-Modified Sun, 24 May 2026, 107926682 bytes).
+# When upstream replaces the file: review it, then update this line in its own PR.
+9526010ba4c52a5d1ad608f2c0262cefcb0d0740e8a960362642cbaec8b62f40  https://downloads.apolloreborn.app/apollobase.ipa

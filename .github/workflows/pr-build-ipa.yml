@@ -29,6 +29,7 @@ on:
       - 'Makefile'                            # build config
       - 'control'                             # package metadata + version
       - 'distribution/config.json'            # app build/version metadata
+      - 'distribution/base-ipa.sha256'        # pinned base IPA digest
       - '.github/workflows/pr-build-ipa.yml'  # this pipeline
       - '.github/workflows/pr-build-ipa-comment.yml' # trusted reporting gate
       - 'tests/pr_ipa_authorization_test.py'   # authorization regressions
@@ -178,7 +179,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/cyan-venv"
           "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install \
-            "https://github.com/asdfzxcvbn/pyzule-rw/archive/refs/tags/v1.4.4.zip"
+            "https://github.com/asdfzxcvbn/pyzule-rw/archive/04a40f2aa65ec9cb36127f74d52ae4ef71377c50.zip" # v1.4.4
           echo "$RUNNER_TEMP/cyan-venv/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cyan-venv/bin/cyan" --help >/dev/null
           echo "cyan installed: $RUNNER_TEMP/cyan-venv/bin/cyan"
@@ -203,6 +204,7 @@ jobs:
       - name: Download Apollo IPA
         run: |
           curl -L --fail --retry 3 "$APOLLO_IPA_URL" -o Apollo.ipa
+          bash ./scripts/verify-base-ipa.sh Apollo.ipa "$APOLLO_IPA_URL"
           unzip -t Apollo.ipa >/dev/null
 
       - name: Build IPA variants

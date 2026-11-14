@@ -17,6 +17,11 @@ on:
         required: true
         type: string
         default: 'https://downloads.apolloreborn.app/apollobase.ipa'
+      apollo_ipa_sha256:
+        description: 'SHA-256 of that IPA (required unless it is the pinned default in distribution/base-ipa.sha256)'
+        required: false
+        type: string
+        default: ''
       inject_tweak:
         description: 'Build and inject the Apollo-Reborn tweak'
         required: false
@@ -137,7 +142,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/cyan-venv"
           "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/cyan-venv/bin/python" -m pip install \
-            "https://github.com/asdfzxcvbn/pyzule-rw/archive/refs/tags/v1.4.4.zip"
+            "https://github.com/asdfzxcvbn/pyzule-rw/archive/04a40f2aa65ec9cb36127f74d52ae4ef71377c50.zip" # v1.4.4
           echo "$RUNNER_TEMP/cyan-venv/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/cyan-venv/bin/cyan" --help >/dev/null
           echo "cyan installed: $RUNNER_TEMP/cyan-venv/bin/cyan"
@@ -151,8 +156,15 @@ jobs:
           xcodegen --version
 
       - name: Download Apollo IPA
+        env:
+          APOLLO_IPA_URL: ${{ inputs.apollo_ipa_url }}
+          APOLLO_IPA_SHA256: ${{ inputs.apollo_ipa_sha256 }}
+          # Manual test builds may use an unpinned IPA (with a warning);
+          # release and PR builds may not.
+          ALLOW_UNPINNED_BASE_IPA: '1'
         run: |
-          curl -L --fail --retry 3 "${{ github.event.inputs.apollo_ipa_url }}" -o Apollo.ipa
+          curl -L --fail --retry 3 "$APOLLO_IPA_URL" -o Apollo.ipa
+          bash ./scripts/verify-base-ipa.sh Apollo.ipa "$APOLLO_IPA_URL" "$APOLLO_IPA_SHA256"
           unzip -t Apollo.ipa >/dev/null
           echo "Apollo.ipa size: $(wc -c < Apollo.ipa) bytes"
 

@@ -25,13 +25,15 @@ bash -n \
   "$ROOT/scripts/push-validated-docs.sh" \
   "$ROOT/scripts/publish-upstream-sync-review.sh" \
   "$ROOT/scripts/build_release_variants.sh" \
-  "$ROOT/scripts/validate_release_variants.sh"
+  "$ROOT/scripts/validate_release_variants.sh" \
+  "$ROOT/scripts/verify-base-ipa.sh"
 
 bash "$ROOT/tests/upstream_sync_publish_test.sh"
 bash "$ROOT/tests/push_validated_docs_test.sh"
 python3 "$ROOT/tests/upstream_pr_batch_test.py"
 python3 "$ROOT/tests/upstream_batch_preservation_test.py"
 python3 "$ROOT/tests/pr_ipa_authorization_test.py"
+bash "$ROOT/tests/verify_base_ipa_test.sh"
 python3 "$ROOT/tests/integration_review_regression_test.py"
 bash "$ROOT/tests/run_allplus_feed_tests.sh"
 bash "$ROOT/tests/run_allplus_merge_tests.sh"
