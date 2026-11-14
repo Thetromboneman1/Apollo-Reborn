@@ -42,6 +42,7 @@ query($owner: String!, $name: String!, $cursor: String) {
         deletions
         changedFiles
         author { login }
+        authorAssociation
         headRepository { nameWithOwner }
         commits(last: 1) {
           nodes {
@@ -75,6 +76,8 @@ class PullRequest:
     additions: int
     deletions: int
     changed_files: int
+    # Last so snapshots and callers written before the trust gate still load.
+    author_association: str = "NONE"
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "PullRequest":
@@ -96,6 +99,9 @@ class PullRequest:
             author=(author or {}).get("login", "unknown")
             if isinstance(author, dict)
             else str(value.get("author", "unknown")),
+            author_association=str(
+                value.get("authorAssociation", value.get("author_association", "NONE")) or "NONE"
+            ),
             mergeable=str(value.get("mergeable") or "UNKNOWN"),
             merge_state=str(value.get("mergeStateStatus", value.get("merge_state", "UNKNOWN")) or "UNKNOWN"),
             review_decision=str(value.get("reviewDecision", value.get("review_decision", "NONE")) or "NONE"),
@@ -116,6 +122,7 @@ class PullRequest:
             "head_sha": self.head_sha,
             "head_repository": self.head_repository,
             "author": self.author,
+            "author_association": self.author_association,
             "mergeable": self.mergeable,
             "merge_state": self.merge_state,
             "review_decision": self.review_decision,
@@ -172,6 +179,7 @@ def snapshot_fingerprint(
     upstream_main_sha: str,
     prs: list[PullRequest],
     excluded_prs: list[dict[str, Any]] | None = None,
+    held_prs: list[dict[str, Any]] | None = None,
 ) -> str:
     payload = {
         "downstream_sha": downstream_sha,
@@ -182,6 +190,13 @@ def snapshot_fingerprint(
             for record in sorted(excluded_prs or [], key=lambda item: int(item["number"]))
         ],
     }
+    if held_prs:
+        # Only present when the trust gate held something back, so fingerprints of
+        # snapshots that predate the gate (and of all-trusted snapshots) are unchanged.
+        payload["held_pull_requests"] = [
+            [record["number"], record.get("head_sha", "")]
+            for record in sorted(held_prs, key=lambda item: int(item["number"]))
+        ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -236,6 +251,42 @@ def load_exclusions(path: Path | None, upstream_repository: str) -> dict[int, st
     return exclusions
 
 
+# Upstream authors GitHub reports as having a role on the upstream repository.
+# CONTRIBUTOR (merged before), FIRST_TIME_CONTRIBUTOR, FIRST_TIMER and NONE are
+# outside contributors whose heads are never imported without review.
+TRUSTED_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+
+def load_allowlist(path: Path | None, upstream_repository: str) -> dict[int, str]:
+    """Upstream PR numbers the fork owner has reviewed and allows by number."""
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("upstream_repository") != upstream_repository:
+        raise RuntimeError(f"upstream PR policy in {path} targets a different repository")
+    allowed: dict[int, str] = {}
+    for record in payload.get("allowed_pull_requests", []):
+        number = int(record["number"])
+        reason = str(record.get("reason") or "").strip()
+        if number <= 0 or not reason:
+            raise RuntimeError(f"invalid upstream PR allowlist entry in {path}: {record!r}")
+        if number in allowed:
+            raise RuntimeError(f"duplicate upstream PR allowlist entry {number} in {path}")
+        allowed[number] = reason
+    return allowed
+
+
+def trust_reason(pr: PullRequest, allowed: dict[int, str]) -> str | None:
+    """Why this upstream head may be imported unreviewed, or None to hold it."""
+    if pr.number in allowed:
+        return "allowlisted by the fork owner"
+    if pr.author_association in TRUSTED_AUTHOR_ASSOCIATIONS:
+        return f"author is an upstream {pr.author_association.lower()}"
+    if pr.review_decision == "APPROVED":
+        return "approved by an upstream reviewer"
+    return None
+
+
 def fetch_pull_request_status(owner: str, name: str, number: int) -> dict[str, Any]:
     result = run(["gh", "api", f"repos/{owner}/{name}/pulls/{number}"])
     payload = json.loads(result.stdout)
@@ -255,8 +306,28 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def command_snapshot(args: argparse.Namespace) -> int:
     owner, name = args.upstream_repository.split("/", 1)
     exclusions = load_exclusions(args.exclusions, args.upstream_repository)
+    allowed = load_allowlist(args.exclusions, args.upstream_repository)
+    overlap = sorted(set(exclusions) & set(allowed))
+    if overlap:
+        raise RuntimeError(f"upstream PRs are both excluded and allowlisted: {overlap}")
     all_open_prs = fetch_open_prs(owner, name)
-    prs = [pr for pr in all_open_prs if pr.number not in exclusions]
+    candidates = [pr for pr in all_open_prs if pr.number not in exclusions]
+    prs: list[PullRequest] = []
+    held_prs: list[dict[str, Any]] = []
+    for pr in candidates:
+        if getattr(args, "trust_all", False) or trust_reason(pr, allowed):
+            prs.append(pr)
+        else:
+            held_prs.append(
+                {
+                    "number": pr.number,
+                    "head_sha": pr.head_sha,
+                    "author_association": pr.author_association,
+                    "review_decision": pr.review_decision,
+                    "reason": "outside contributor without an approving upstream review; "
+                    "add it to allowed_pull_requests after reviewing the exact head",
+                }
+            )
     excluded_prs: list[dict[str, Any]] = []
     for number, reason in sorted(exclusions.items()):
         status = fetch_pull_request_status(owner, name, number)
@@ -266,7 +337,9 @@ def command_snapshot(args: argparse.Namespace) -> int:
                 f"excluded upstream PR {number} was merged; manual upstream-main review is required"
             )
         excluded_prs.append(status)
-    fingerprint = snapshot_fingerprint(args.downstream_sha, args.upstream_main_sha, prs, excluded_prs)
+    fingerprint = snapshot_fingerprint(
+        args.downstream_sha, args.upstream_main_sha, prs, excluded_prs, held_prs
+    )
     payload = {
         "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -276,11 +349,13 @@ def command_snapshot(args: argparse.Namespace) -> int:
         "fingerprint": fingerprint,
         "pull_requests": [pr.as_dict() for pr in prs],
         "excluded_pull_requests": excluded_prs,
+        "held_pull_requests": held_prs,
     }
     write_json(args.output, payload)
     print(
         f"snapshotted {len(prs)} selected open upstream pull requests; "
-        f"excluded {len(excluded_prs)} by policy ({fingerprint[:12]})"
+        f"excluded {len(excluded_prs)} by policy; held {len(held_prs)} for review "
+        f"({fingerprint[:12]})"
     )
     return 0
 
@@ -455,6 +530,8 @@ def render_summary(manifest: dict[str, Any]) -> str:
         f"- Upstream main result: **{manifest['upstream_main_result']['status']}**",
         f"- Open PRs inventoried: **{manifest['total']}**",
         f"- PRs excluded by fork policy: **{len(manifest.get('excluded_pull_requests', []))}**",
+        f"- PRs held for owner review (untrusted author, no upstream approval): "
+        f"**{len(manifest.get('held_pull_requests', []))}**",
         f"- Exact heads present after assembly: **{manifest['included_count']}/{manifest['total']}**",
         f"- Complete: **{'yes' if manifest['complete'] else 'no'}**",
         "",
@@ -478,6 +555,18 @@ def render_summary(manifest: dict[str, Any]) -> str:
                 *[
                     f"- `upstream PR {record['number']}`: {markdown_escape(record['reason'])}"
                     for record in manifest["excluded_pull_requests"]
+                ],
+            ]
+        )
+    if manifest.get("held_pull_requests"):
+        lines.extend(
+            [
+                "",
+                "Held upstream pull requests are not imported until reviewed and allowlisted:",
+                "",
+                *[
+                    f"- `upstream PR {record['number']}` at `{str(record.get('head_sha', ''))[:12]}`"
+                    for record in manifest["held_pull_requests"]
                 ],
             ]
         )
@@ -794,6 +883,11 @@ def parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--downstream-sha", required=True)
     snapshot.add_argument("--upstream-main-sha", required=True)
     snapshot.add_argument("--exclusions", type=Path)
+    snapshot.add_argument(
+        "--trust-all",
+        action="store_true",
+        help="import every non-excluded open PR, including outside contributors (manual runs only)",
+    )
     snapshot.add_argument("--output", type=Path, required=True)
     snapshot.set_defaults(func=command_snapshot)
 

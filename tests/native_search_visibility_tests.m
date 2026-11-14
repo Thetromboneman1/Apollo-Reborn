@@ -103,6 +103,9 @@ static NSUInteger controlsUpdates;
 static BOOL ApolloDuoSplitIsUnfolded(void) { return unfolded; }
 static ApolloDuoMode ApolloDuoCurrentMode(void) { return mode; }
 static BOOL ApolloDuoRailHasVisibleSideBar(void) { return rail; }
+// NSBUpdateSearchPlacement also stacks for a detected Duo device (#1705);
+// the fixture models a phone, so the capability is never detected here.
+static BOOL ApolloDuoDeviceDetected(void) { return NO; }
 static BOOL NSBIsNativeSearchCommentsVC(UIViewController *vc) { return vc.comments; }
 static void NSBUpdateDuoControls(__unused UIViewController *vc) { controlsUpdates++; }
 static char bridgeKey, nativeBarKey, appearedKey, parkedKey, feedTableKey;

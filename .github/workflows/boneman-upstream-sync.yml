@@ -8,7 +8,12 @@ on:
       auto_merge:
         description: Merge the complete validated fork integration PR into main
         required: true
-        default: true
+        default: false
+        type: boolean
+      trust_all:
+        description: Also import outside contributors' unreviewed PRs (never auto-merged)
+        required: false
+        default: false
         type: boolean
 
 permissions:
@@ -22,6 +27,10 @@ env:
   UPSTREAM_REPOSITORY: Apollo-Reborn/Apollo-Reborn
   DOWNSTREAM_BRANCH: main
   REPOSITORY_DEFAULT_BRANCH: main
+  # Outside contributors' upstream heads are held for review unless an upstream
+  # maintainer authored or approved them, or they are allowlisted by number in
+  # .github/upstream-pr-exclusions.json (scripts/upstream_pr_batch.py).
+  TRUST_ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.trust_all && 'true' || 'false' }}
 
 jobs:
   prepare:
@@ -54,7 +63,9 @@ jobs:
           ref: main
           fetch-depth: 0
           submodules: false
-          token: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
+          # Untrusted upstream heads are merged in this workspace, so the sync
+          # credential is not left in .git/config; the push step supplies it.
+          persist-credentials: false
 
       - name: Freeze trusted batch tooling
         id: tooling
@@ -83,6 +94,11 @@ jobs:
           GH_TOKEN: ${{ secrets.BONEMAN_UPSTREAM_SYNC_TOKEN }}
         run: |
           set -euo pipefail
+          trust_args=()
+          if [[ "$TRUST_ALL" == true ]]; then
+            echo "::warning title=Trust gate bypassed::This manual run imports outside contributors' unreviewed heads; it will not auto-merge."
+            trust_args=(--trust-all)
+          fi
           downstream_sha=$(git rev-parse origin/main)
           upstream_main_sha=$(git rev-parse upstream/main)
           stable=false
@@ -94,6 +110,7 @@ jobs:
               --downstream-sha "$downstream_sha" \
               --upstream-main-sha "$upstream_main_sha" \
               --exclusions .github/upstream-pr-exclusions.json \
+              "${trust_args[@]}" \
               --output snapshot.json
             python3 "$RUNNER_TEMP/upstream_pr_batch.py" assemble \
               --repository . \
@@ -105,6 +122,7 @@ jobs:
               --downstream-sha "$downstream_sha" \
               --upstream-main-sha "$upstream_main_sha" \
               --exclusions .github/upstream-pr-exclusions.json \
+              "${trust_args[@]}" \
               --output snapshot-after.json
             if python3 "$RUNNER_TEMP/upstream_pr_batch.py" compare \
               --before snapshot.json \
@@ -159,7 +177,10 @@ jobs:
             } >> batch-summary.md
           fi
           if [[ "$changed" == true ]]; then
-            git push --set-upstream origin "$branch"
+            authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+            echo "::add-mask::${authorization}"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${authorization}" \
+              push --set-upstream origin "$branch"
           fi
           cat batch-summary.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -323,7 +344,7 @@ jobs:
           VALIDATED_HEAD: ${{ steps.publish-docs.outputs.head || steps.docs.outputs.head }}
           VALIDATION_RESULT: ${{ needs.prepare.outputs.changed == 'true' && needs.validate.result || 'success' }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          AUTO_MERGE: ${{ github.event_name == 'schedule' || inputs.auto_merge }}
+          AUTO_MERGE: ${{ env.TRUST_ALL != 'true' && (github.event_name == 'schedule' || inputs.auto_merge) }}
         run: trusted/scripts/publish-upstream-pr-batch.sh
 
       - name: Preserve the full report in the job summary
