@@ -1266,24 +1266,6 @@ static void ApolloLogPostBodySkipOnce(RDKLink *link, NSString *reason) {
 
 static NSString *ApolloStripInlineMediaTokens(NSString *text);
 
-// Spelling noise a provider adds to text it had nothing to translate: accents
-// dropped or added (Google hands "Dončić" back as "Doncic" from Slovenian,
-// "Bogdanovic" as "Bogdanović" from Maltese) and a stretched word coming back
-// a letter longer or shorter ("LUKA" + 25 A's returned with 26, from Tagalog,
-// #1665). Accents fold away and any run of 3+ of one character counts as two,
-// so neither reads as a translation. Already case/whitespace-normalized input.
-static NSString *ApolloFoldSpellingNoiseForCompare(NSString *normalized) {
-    static NSRegularExpression *repeatedCharacterRun;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        repeatedCharacterRun = [NSRegularExpression regularExpressionWithPattern:@"(.)\\1{2,}" options:0 error:NULL];
-    });
-    NSString *folded = [normalized stringByFoldingWithOptions:NSDiacriticInsensitiveSearch locale:nil];
-    return [repeatedCharacterRun stringByReplacingMatchesInString:folded options:0
-                                                            range:NSMakeRange(0, folded.length)
-                                                     withTemplate:@"$1$1"];
-}
-
 // NO when the "translation" is the original handed back: the provider saw the
 // target language, or a name / emoji / slang word with nothing to translate.
 // Inline media-id tokens (![gif](giphy|…)) never reach the provider, so they
@@ -1292,8 +1274,7 @@ static NSString *ApolloFoldSpellingNoiseForCompare(NSString *normalized) {
 static BOOL ApolloTranslatedTextDiffersFromSource(NSString *sourceText, NSString *translatedText) {
     NSString *sourceNorm = ApolloNormalizeTextForCompare(ApolloStripInlineMediaTokens(sourceText ?: @""));
     NSString *translatedNorm = ApolloNormalizeTextForCompare(ApolloStripInlineMediaTokens(translatedText ?: @""));
-    if (sourceNorm.length == 0 || translatedNorm.length == 0 || [sourceNorm isEqualToString:translatedNorm]) return NO;
-    return ![ApolloFoldSpellingNoiseForCompare(sourceNorm) isEqualToString:ApolloFoldSpellingNoiseForCompare(translatedNorm)];
+    return sourceNorm.length > 0 && translatedNorm.length > 0 && ![sourceNorm isEqualToString:translatedNorm];
 }
 
 // YES when the cached reply for `cacheKey` is just `sourceText` handed back. The
@@ -3801,8 +3782,19 @@ static BOOL ApolloTextIsShortForLanguageGuess(NSString *text) {
     return words > 0 && words <= kMaxWords;
 }
 
-// ApolloFoldSpellingNoiseForCompare is defined once, above
-// ApolloTranslatedTextDiffersFromSource (identical to upstream's copy).
+// Accents folded away and any run of 3+ of one character counted as two.
+// Already case/whitespace-normalized input.
+static NSString *ApolloFoldSpellingNoiseForCompare(NSString *normalized) {
+    static NSRegularExpression *repeatedCharacterRun;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        repeatedCharacterRun = [NSRegularExpression regularExpressionWithPattern:@"(.)\\1{2,}" options:0 error:NULL];
+    });
+    NSString *folded = [normalized stringByFoldingWithOptions:NSDiacriticInsensitiveSearch locale:nil];
+    return [repeatedCharacterRun stringByReplacingMatchesInString:folded options:0
+                                                            range:NSMakeRange(0, folded.length)
+                                                     withTemplate:@"$1$1"];
+}
 
 // YES when the reply is the request re-spelled: a stretched word a letter
 // longer or shorter, or accents dropped or added. Only meaningful when Google
