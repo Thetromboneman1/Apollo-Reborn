@@ -503,9 +503,10 @@ def write_repository_state(root: Path) -> None:
     lines += [
         "## Update policy",
         "",
-        "The documentation-health workflow runs for every push and pull request. On",
-        "push it regenerates deterministic documentation and commits drift; on pull",
-        "requests it fails when generated documentation or rendered diagrams are stale.",
+        "The documentation-health workflow runs for pushes to main and for every pull",
+        "request. On main it regenerates deterministic documentation and commits drift;",
+        "on pull requests it fails when generated documentation or rendered diagrams are",
+        "stale.",
         "",
     ]
     path = root / "docs/REPOSITORY_STATE.md"
@@ -633,7 +634,7 @@ WORKFLOW = '''name: Documentation health
 on:
   push:
     branches:
-      - "**"
+      - main
   pull_request:
 
 permissions:

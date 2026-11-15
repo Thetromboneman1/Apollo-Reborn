@@ -1,6 +1,6 @@
 # Repository State
 
-Updated: 2026-11-14
+Updated: 2026-11-15
 
 This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
@@ -35,6 +35,7 @@ the documentation record advances with implementation changes.
 
 ## Update policy
 
-The documentation-health workflow runs for every push and pull request. On
-push it regenerates deterministic documentation and commits drift; on pull
-requests it fails when generated documentation or rendered diagrams are stale.
+The documentation-health workflow runs for pushes to main and for every pull
+request. On main it regenerates deterministic documentation and commits drift;
+on pull requests it fails when generated documentation or rendered diagrams are
+stale.
