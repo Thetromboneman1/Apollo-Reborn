@@ -7,8 +7,8 @@ the documentation record advances with implementation changes.
 
 - Repository: `Thetromboneman1/Apollo-Reborn`
 - Default branch: `main`
-- Implementation fingerprint: `2777c4f4afca9667`
-- Maintained documents: 67
+- Implementation fingerprint: `1f2600cabaf16938`
+- Maintained documents: 71
 - Architecture assets: 5
 
 ## Detected architecture
@@ -35,6 +35,7 @@ the documentation record advances with implementation changes.
 
 ## Update policy
 
-The documentation-health workflow runs for every push and pull request. On
-push it regenerates deterministic documentation and commits drift; on pull
-requests it fails when generated documentation or rendered diagrams are stale.
+The documentation-health workflow runs for pushes to main and for every pull
+request. On main it regenerates deterministic documentation and commits drift;
+on pull requests it fails when generated documentation or rendered diagrams are
+stale.

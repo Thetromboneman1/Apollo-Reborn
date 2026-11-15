@@ -1,9 +1,11 @@
 name: Documentation health
 
 on:
+  # Self-heal only on main. On PR branches its [skip ci] commit became the
+  # PR head and left it with no checks; PRs get the read-only check instead.
   push:
     branches:
-      - "**"
+      - main
   pull_request:
 
 # Read-only by default. Only the push job below may commit, and only
@@ -43,8 +45,8 @@ jobs:
             exit 1
           fi
 
-  # Same check name on push. Its commit uses GITHUB_TOKEN, which does not
-  # trigger workflows, so regenerate before pushing to keep PR heads checked.
+  # Same check name on push to main. Its commit uses GITHUB_TOKEN, which does
+  # not trigger workflows, so it must never land on a PR branch.
   self-heal:
     name: documentation-health
     if: github.event_name == 'push'
