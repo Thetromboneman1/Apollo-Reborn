@@ -197,6 +197,9 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloPhotoPostComposerScrollFix.xm \
     $(SRC_DIR)/ApolloMarkdownToolbarGif.xm \
     $(SRC_DIR)/ApolloComposerToolbarTint.xm \
+    $(SRC_DIR)/ApolloComposerGlassToolbar.xm \
+    $(SRC_DIR)/ApolloComposerLayout.xm \
+    $(SRC_DIR)/ApolloPostComposerStyle.xm \
     $(SRC_DIR)/ApolloMarkdownBodyCleanup.xm \
     $(SRC_DIR)/ApolloGiphyClient.m \
     $(SRC_DIR)/GiphyPickerViewController.m \
@@ -312,6 +315,8 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloActionMenu.xm \
     $(SRC_DIR)/ApolloActionMenuLayout.m \
     $(SRC_DIR)/ApolloHostedVideo.m \
+    $(SRC_DIR)/ApolloRedditVideoPlaylist.m \
+    $(SRC_DIR)/ApolloRedditVideoPlaylistProtocol.xm \
     $(SRC_DIR)/ApolloRedgifsTokenRefresh.m \
     $(SRC_DIR)/ApolloSportsClipResolver.m \
     $(SRC_DIR)/ApolloSportsClips.xm \
