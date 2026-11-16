@@ -117,8 +117,10 @@ BOOL ApolloOfflineShouldServe(ApolloOfflineUseMode mode, BOOL networkAvailable, 
     return NO;
 }
 
-const NSTimeInterval ApolloOfflineAutoRefreshMaxAge = 6 * 60 * 60;
-const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval = 30 * 60;
+const NSTimeInterval ApolloOfflineAutoRefreshMaxAge = 60 * 60;
+const double ApolloOfflineAutoRefreshReadFraction = 0.5;
+const NSTimeInterval ApolloOfflineAutoRefreshMinAge = 10 * 60;
+const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval = 15 * 60;
 
 BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState s) {
     if (!s.enabled || !s.hasLibrary) return NO;
@@ -126,8 +128,10 @@ BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState s) {
     // Serving means the user is browsing the batch (Always mode, or no
     // connection): replacing it under them would change what they're reading.
     if (s.serving || s.downloading) return NO;
-    if (s.libraryAge < ApolloOfflineAutoRefreshMaxAge) return NO;
-    return s.sinceLastAttempt >= ApolloOfflineAutoRefreshRetryInterval;
+    if (s.sinceLastAttempt < ApolloOfflineAutoRefreshRetryInterval) return NO;
+    if (s.libraryAge >= ApolloOfflineAutoRefreshMaxAge) return YES;
+    // Most of it has been read: top it up now rather than waiting out the hour.
+    return s.libraryAge >= ApolloOfflineAutoRefreshMinAge && s.readFraction >= ApolloOfflineAutoRefreshReadFraction;
 }
 
 NSData *ApolloOfflineListingRemovingPosts(NSData *listing, NSSet<NSString *> *postIDs, NSUInteger *removed) {
@@ -360,6 +364,19 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
 - (unsigned long long)totalBytes { [_lock lock]; unsigned long long v = _totalBytes; [_lock unlock]; return v; }
 - (NSDate *)downloadedAt { [_lock lock]; NSDate *v = _downloadedAt; [_lock unlock]; return v; }
 - (NSArray<NSString *> *)feedTitles { [_lock lock]; NSArray *v = _feedTitles; [_lock unlock]; return v; }
+
+- (NSArray<NSString *> *)savedPostIDs {
+    [_lock lock];
+    NSArray<NSString *> *cursorKeys = _cursors.allKeys;
+    [_lock unlock];
+    NSMutableSet<NSString *> *ids = [NSMutableSet set];
+    for (NSString *key in cursorKeys) {
+        // "feed:<feed>|t3_<id>"
+        NSRange marker = [key rangeOfString:@"|t3_"];
+        if (marker.location != NSNotFound) [ids addObject:[key substringFromIndex:NSMaxRange(marker)]];
+    }
+    return ids.allObjects;
+}
 
 - (BOOL)hasEntryForKey:(NSString *)key {
     if (key.length == 0) return NO;

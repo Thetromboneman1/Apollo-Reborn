@@ -228,6 +228,8 @@ static void TestDownloaderWholeFeed(void) {
     CHECK([library hasEntryForKey:Key(@"https://www.reddit.com/new.json?after=t3_a3")], "page two via after");
     CHECK([library hasEntryForKey:Key(@"https://oauth.reddit.com/r/x/comments/b3/slug")], "comments");
     CHECK([library hasEntryForKey:Key(@"https://i.redd.it/b2.jpg")], "image by stem");
+    NSArray *saved = [library.savedPostIDs sortedArrayUsingSelector:@selector(compare:)];
+    CHECK([saved isEqualToArray:(@[ @"a1", @"a2", @"a3", @"b1", @"b2", @"b3" ])], "saved post ids: %s", saved.description.UTF8String);
     NSDictionary *last = [NSJSONSerialization JSONObjectWithData:[library dataForKey:@"feed:home|t3_a3" contentType:nil] options:0 error:nil];
     CHECK(last[@"data"][@"after"] == [NSNull null] && [last[@"data"][@"children"] count] == 3, "last page ends the feed");
 
@@ -283,7 +285,7 @@ static void TestRemovingReadPosts(void) {
 
 static void TestAutoRefreshPolicy(void) {
     ApolloOfflineAutoRefreshState s = {
-        .enabled = YES, .hasLibrary = YES, .libraryAge = 7 * 3600, .networkAvailable = YES, .onWiFi = YES,
+        .enabled = YES, .hasLibrary = YES, .libraryAge = 61 * 60, .readFraction = 0, .networkAvailable = YES, .onWiFi = YES,
         .lowPowerMode = NO, .serving = NO, .downloading = NO, .sinceLastAttempt = 3600,
     };
     CHECK(ApolloOfflineShouldAutoRefresh(s), "stale batch on Wi-Fi refreshes");
@@ -297,10 +299,14 @@ static void TestAutoRefreshPolicy(void) {
     CHECK(!ApolloOfflineShouldAutoRefresh(t), "never in Low Power Mode");
     t = s; t.serving = YES;
     CHECK(!ApolloOfflineShouldAutoRefresh(t), "not while the batch is being browsed");
-    t = s; t.libraryAge = 3 * 3600;
-    CHECK(!ApolloOfflineShouldAutoRefresh(t), "fresh batch kept");
-    t = s; t.sinceLastAttempt = 60;
-    CHECK(!ApolloOfflineShouldAutoRefresh(t), "a failed try isn't retried right away");
+    t = s; t.libraryAge = 30 * 60;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "half-hour-old, mostly unread batch kept");
+    t.readFraction = 0.6;
+    CHECK(ApolloOfflineShouldAutoRefresh(t), "mostly read batch topped up before the hour");
+    t.libraryAge = 5 * 60;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "but not one that was just downloaded");
+    t = s; t.sinceLastAttempt = 10 * 60;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "a failed try waits 15 minutes");
 }
 
 static void TestDownloaderSkipsReadPosts(void) {

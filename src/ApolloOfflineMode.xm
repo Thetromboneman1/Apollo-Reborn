@@ -265,15 +265,18 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
     [self recompute];
 
     // Keep Fresh checks: on launch, whenever Apollo comes back to the front,
-    // when the connection or Low Power Mode changes, and every 10 minutes
-    // while Apollo is open (a timer only fires while the app runs).
+    // when the connection or Low Power Mode changes, when posts get read (so a
+    // mostly-read batch tops up right away), and every 5 minutes while Apollo
+    // is open (a timer only fires while the app runs).
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     __weak typeof(self) weakSelf = self;
     [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
                     usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"app active"]; }];
     [center addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
                     usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"power state"]; }];
-    _keepFreshTimer = [NSTimer scheduledTimerWithTimeInterval:10 * 60 repeats:YES block:^(__unused NSTimer *timer) {
+    [center addObserverForName:ApolloPostReadStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+                    usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"post read"]; }];
+    _keepFreshTimer = [NSTimer scheduledTimerWithTimeInterval:5 * 60 repeats:YES block:^(__unused NSTimer *timer) {
         [weakSelf considerKeepFresh:@"timer"];
     }];
     _keepFreshTimer.tolerance = 60;
@@ -298,11 +301,20 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
 
 - (void)considerKeepFresh:(NSString *)reason {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    if (_downloading || !_onWiFi) return; // cheap early outs before reading the read history
     ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
+    NSArray<NSString *> *saved = library.savedPostIDs;
+    double readFraction = 0;
+    if (saved.count > 0) {
+        NSMutableSet<NSString *> *readSaved = [NSMutableSet setWithArray:saved];
+        [readSaved intersectSet:ApolloOfflineReadPostIDs()];
+        readFraction = (double)readSaved.count / saved.count;
+    }
     ApolloOfflineAutoRefreshState state = {
         .enabled = [NSUserDefaults.standardUserDefaults boolForKey:UDKeyOfflineAutoRefresh],
         .hasLibrary = library.hasContent,
         .libraryAge = library.downloadedAt ? -library.downloadedAt.timeIntervalSinceNow : DBL_MAX,
+        .readFraction = readFraction,
         .networkAvailable = _networkAvailable,
         .onWiFi = _onWiFi,
         .lowPowerMode = NSProcessInfo.processInfo.lowPowerModeEnabled,
@@ -312,7 +324,8 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
     };
     if (!ApolloOfflineShouldAutoRefresh(state)) return;
     _lastAutoAttempt = CFAbsoluteTimeGetCurrent();
-    ApolloLog(@"[Offline] Keep Fresh: batch is %.1f h old on Wi-Fi (%@); refreshing", state.libraryAge / 3600, reason);
+    ApolloLog(@"[Offline] Keep Fresh: batch is %.0f min old, %.0f%% read, on Wi-Fi (%@); refreshing",
+              state.libraryAge / 60, readFraction * 100, reason);
     [self startDownloadAutomatically:YES completion:nil];
 }
 

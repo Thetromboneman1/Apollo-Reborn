@@ -759,8 +759,8 @@ static NSString *const UDKeyOfflineIncludeComments = @"OfflineIncludeComments";
 static NSString *const UDKeyOfflineIncludeImages = @"OfflineIncludeImages";
 // Data limit for one download, in megabytes (default 100).
 static NSString *const UDKeyOfflineBudgetMB = @"OfflineBudgetMB";
-// Keep Fresh: re-download the batch on its own while Apollo is open on Wi-Fi
-// and the batch is over 6 hours old (default on; only after a first download).
+// Keep Fresh: re-download the batch on its own while Apollo is open on Wi-Fi,
+// hourly or once half of it is read (default on; only after a first download).
 static NSString *const UDKeyOfflineAutoRefresh = @"OfflineAutoRefresh";
 // Leave posts the user has already read out of downloads (default on).
 static NSString *const UDKeyOfflineSkipRead = @"OfflineSkipRead";

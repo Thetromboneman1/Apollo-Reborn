@@ -73,6 +73,7 @@ typedef struct {
     BOOL enabled;                   // the user's setting
     BOOL hasLibrary;                // only after a first manual download (an opt-in)
     NSTimeInterval libraryAge;      // seconds since the last batch
+    double readFraction;            // share of the batch's posts already read (0...1)
     BOOL networkAvailable;
     BOOL onWiFi;                    // never on cellular
     BOOL lowPowerMode;
@@ -81,8 +82,13 @@ typedef struct {
     NSTimeInterval sinceLastAttempt; // seconds since the last automatic try
 } ApolloOfflineAutoRefreshState;
 
-extern const NSTimeInterval ApolloOfflineAutoRefreshMaxAge;       // 6 hours
-extern const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval; // 30 minutes
+// Refresh when the batch is this old...
+extern const NSTimeInterval ApolloOfflineAutoRefreshMaxAge;        // 1 hour
+// ...or sooner, once this share of it has been read (TikTok-style top-up)...
+extern const double ApolloOfflineAutoRefreshReadFraction;          // 0.5
+// ...but never for a batch younger than this.
+extern const NSTimeInterval ApolloOfflineAutoRefreshMinAge;        // 10 minutes
+extern const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval; // 15 minutes
 
 BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
 
@@ -114,6 +120,9 @@ BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
 // is the rest of that post's page, or the next saved page when it was last.
 - (BOOL)hasEntryForKey:(NSString *)key;
 - (nullable NSData *)dataForKey:(NSString *)key contentType:(NSString * _Nullable * _Nullable)contentType;
+
+// Bare ids ("abc123") of every post saved in feed pages.
+@property (nonatomic, readonly) NSArray<NSString *> *savedPostIDs;
 
 // Re-reads the index from disk (after a download commits).
 - (void)reload;

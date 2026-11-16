@@ -121,8 +121,8 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                     "anything. Anything you didn't download loads from the internet as usual.\n\n%@", now];
         }
         case ApolloOfflineSectionAutomatic:
-            return @"When Apollo is open on Wi-Fi and your offline posts are more than 6 hours old, it quietly "
-                    "downloads a fresh batch while you browse. Never on cellular or in Low Power Mode, and only "
+            return @"While Apollo is open on Wi-Fi, your offline posts top themselves up: a fresh batch every hour, "
+                    "or sooner once you've read half of them. Never on cellular or in Low Power Mode, and only "
                     "after you've downloaded once yourself.";
         case ApolloOfflineSectionFeeds:
             return @"Offline, each feed shows the posts that were downloaded, whatever sort you pick.";
