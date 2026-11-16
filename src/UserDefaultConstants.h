@@ -746,6 +746,19 @@ static NSString *const UDKeyPollsEnabled = @"PollsEnabled";
 // Horizontal alignment of poll option text (ApolloPollOptionAlignment).
 // Default Center (0).
 static NSString *const UDKeyPollOptionAlignment = @"PollOptionAlignment";
+// Offline Mode (ApolloOfflineMode.xm, settings/ApolloOfflineModeSettingsViewController).
+// When the saved batch answers requests: ApolloOfflineUseMode, default
+// Automatic (0) = only while the device has no connection.
+static NSString *const UDKeyOfflineUseMode = @"OfflineUseMode";
+// What the next download fetches. Home defaults on, Popular off; extra
+// subreddits are an array of names without "r/".
+static NSString *const UDKeyOfflineIncludeHome = @"OfflineIncludeHome";
+static NSString *const UDKeyOfflineIncludePopular = @"OfflineIncludePopular";
+static NSString *const UDKeyOfflineSubreddits = @"OfflineSubreddits";
+static NSString *const UDKeyOfflineIncludeComments = @"OfflineIncludeComments";
+static NSString *const UDKeyOfflineIncludeImages = @"OfflineIncludeImages";
+// Data limit for one download, in megabytes (default 100).
+static NSString *const UDKeyOfflineBudgetMB = @"OfflineBudgetMB";
 // Legacy NSUserDefaults location of the harvested "name=value; ..." Cookie
 // header. The cookie is now stored in the keychain (ApolloWebJSON.m); this key
 // is retained only so ApolloWebJSONLoadPersistedCredentials can migrate an older

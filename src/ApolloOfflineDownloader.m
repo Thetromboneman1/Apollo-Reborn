@@ -1,0 +1,387 @@
+#import "ApolloOfflineDownloader.h"
+#import "ApolloOfflineLibrary.h"
+
+// Foundation-only (host-tested). Every piece of run state lives on _queue;
+// fetch completions hop back onto it before touching anything.
+
+NSErrorDomain const ApolloOfflineErrorDomain = @"ApolloOfflineErrorDomain";
+
+@implementation ApolloOfflineFeedSource
++ (instancetype)sourceWithPath:(NSString *)path title:(NSString *)title {
+    ApolloOfflineFeedSource *source = [self new];
+    source->_path = [path copy];
+    source->_title = [title copy];
+    return source;
+}
+@end
+
+@implementation ApolloOfflineDownloadOptions
+- (instancetype)init {
+    if ((self = [super init])) {
+        _sources = @[];
+        _byteBudget = 100ull * 1024 * 1024;
+        _includeComments = YES;
+        _includeImages = YES;
+        _pageSize = 50;
+        _maxPostsPerFeed = 300;
+        _maxImageWidth = 1080;
+        _maxImageBytes = 12ull * 1024 * 1024;
+        _apiSpacing = 0.75;
+    }
+    return self;
+}
+@end
+
+// A fetched listing page waiting for the next page to decide whether it ends the feed.
+@interface ApolloOfflinePendingPage : NSObject
+@property (nonatomic, copy) NSString *key;
+@property (nonatomic, strong) NSData *data;
+@property (nonatomic) NSUInteger childCount;
+@property (nonatomic) NSUInteger kept;
+@property (nonatomic, copy) NSArray<NSString *> *keptNames;
+@end
+@implementation ApolloOfflinePendingPage
+@end
+
+static NSDictionary *ApolloOfflineDictValue(id value) {
+    return [value isKindOfClass:[NSDictionary class]] ? value : nil;
+}
+
+static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NSError *error) {
+    if (error || data.length == 0) return NO;
+    return response == nil || (response.statusCode >= 200 && response.statusCode < 300);
+}
+
+@implementation ApolloOfflineDownloader {
+    NSURL *_directory;
+    ApolloOfflineFetcher _fetcher;
+    ApolloOfflineRequestBuilder _requestBuilder;
+    dispatch_queue_t _queue;
+
+    // Run state (on _queue).
+    ApolloOfflineDownloadOptions *_options;
+    ApolloOfflineProgress _progress;
+    ApolloOfflineCompletion _completion;
+    ApolloOfflineLibraryWriter *_writer;
+    BOOL _cancelled;
+    NSError *_lastError;
+    CFAbsoluteTime _lastAPICall;
+
+    NSUInteger _feedIndex;
+    unsigned long long _feedBudgetEnd;
+    NSUInteger _keptInFeed;
+    NSString *_after;
+    ApolloOfflinePendingPage *_pending;
+    NSArray<NSDictionary *> *_pagePosts;
+    NSString *_pageKey;
+    NSData *_pageData;
+    NSString *_nextAfter;
+}
+
+- (instancetype)initWithLibraryDirectory:(NSURL *)directory fetcher:(ApolloOfflineFetcher)fetcher requestBuilder:(ApolloOfflineRequestBuilder)requestBuilder {
+    if ((self = [super init])) {
+        _directory = directory;
+        _fetcher = [fetcher copy];
+        _requestBuilder = [requestBuilder copy];
+        _queue = dispatch_queue_create("app.apolloreborn.offline-download", DISPATCH_QUEUE_SERIAL);
+    }
+    return self;
+}
+
+- (void)startWithOptions:(ApolloOfflineDownloadOptions *)options progress:(ApolloOfflineProgress)progress completion:(ApolloOfflineCompletion)completion {
+    dispatch_async(_queue, ^{
+        if (self->_running) return;
+        NSError *error = nil;
+        ApolloOfflineLibraryWriter *writer = [[ApolloOfflineLibraryWriter alloc] initWithLibraryDirectory:self->_directory error:&error];
+        if (!writer) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, 0, 0, error); });
+            return;
+        }
+        self->_running = YES;
+        self->_options = options;
+        self->_progress = [progress copy];
+        self->_completion = [completion copy];
+        self->_writer = writer;
+        self->_cancelled = NO;
+        self->_lastError = nil;
+        self->_lastAPICall = 0;
+        self->_feedIndex = 0;
+        [self startFeed];
+    });
+}
+
+- (void)cancel {
+    dispatch_async(_queue, ^{ self->_cancelled = YES; });
+}
+
+// MARK: - Reporting
+
+- (void)report:(NSString *)status {
+    ApolloOfflineProgress progress = _progress;
+    if (!progress) return;
+    unsigned long long bytes = _writer.bytesWritten;
+    NSUInteger posts = _writer.postCount + _keptInFeed;
+    dispatch_async(dispatch_get_main_queue(), ^{ progress(bytes, posts, status); });
+}
+
+- (void)finishWithCommit:(BOOL)commit error:(NSError *)error {
+    ApolloOfflineCompletion completion = _completion;
+    NSUInteger posts = _writer.postCount;
+    unsigned long long bytes = _writer.bytesWritten;
+    BOOL committed = NO;
+    NSError *finalError = error;
+    if (commit) {
+        NSError *commitError = nil;
+        committed = [_writer commit:&commitError];
+        if (!committed) {
+            NSMutableDictionary *info = [@{ NSLocalizedDescriptionKey: @"Couldn't save the offline library." } mutableCopy];
+            if (commitError) info[NSUnderlyingErrorKey] = commitError;
+            finalError = [NSError errorWithDomain:ApolloOfflineErrorDomain code:ApolloOfflineErrorStorage userInfo:info];
+        }
+    } else {
+        [_writer discard];
+    }
+    _writer = nil;
+    _progress = nil;
+    _completion = nil;
+    _pending = nil;
+    _pagePosts = nil;
+    _pageData = nil;
+    _running = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (completion) completion(committed, committed ? posts : 0, committed ? bytes : 0, finalError);
+    });
+}
+
+- (BOOL)stopIfCancelled {
+    if (!_cancelled) return NO;
+    [self finishWithCommit:NO error:[NSError errorWithDomain:ApolloOfflineErrorDomain code:ApolloOfflineErrorCancelled
+                                                    userInfo:@{ NSLocalizedDescriptionKey: @"Download cancelled." }]];
+    return YES;
+}
+
+// MARK: - Transport
+
+// Reddit API reads are spaced out; CDN image fetches are not.
+- (void)fetchAPI:(NSString *)path query:(NSArray<NSURLQueryItem *> *)query completion:(void (^)(NSURLRequest *request, NSData *data, NSHTTPURLResponse *response, NSError *error))completion {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    NSTimeInterval wait = MAX(0, _options.apiSpacing - (now - _lastAPICall));
+    _lastAPICall = now + wait;
+    NSURLRequest *request = _requestBuilder(path, query);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), _queue, ^{
+        self->_fetcher(request, ^(NSData *data, NSHTTPURLResponse *response, NSError *error) {
+            dispatch_async(self->_queue, ^{ completion(request, data, response, error); });
+        });
+    });
+}
+
+// MARK: - Feeds
+
+- (void)startFeed {
+    if ([self stopIfCancelled]) return;
+    NSArray<ApolloOfflineFeedSource *> *sources = _options.sources;
+    if (_feedIndex >= sources.count) {
+        if (_writer.postCount == 0) {
+            NSMutableDictionary *info = [@{
+                NSLocalizedDescriptionKey: @"Nothing could be downloaded. Check your connection and that you're signed in, then try again.",
+            } mutableCopy];
+            if (_lastError) info[NSUnderlyingErrorKey] = _lastError;
+            [self finishWithCommit:NO error:[NSError errorWithDomain:ApolloOfflineErrorDomain code:ApolloOfflineErrorNothingDownloaded userInfo:info]];
+        } else {
+            [self finishWithCommit:YES error:nil];
+        }
+        return;
+    }
+    // Each feed gets an equal share of what's left, so a later feed still
+    // gets its turn when an earlier one runs out of posts early.
+    unsigned long long used = _writer.bytesWritten;
+    unsigned long long left = _options.byteBudget > used ? _options.byteBudget - used : 0;
+    _feedBudgetEnd = used + left / (sources.count - _feedIndex);
+    _keptInFeed = 0;
+    _after = nil;
+    _pending = nil;
+    [self fetchPage];
+}
+
+- (void)finishFeed {
+    ApolloOfflineFeedSource *source = _options.sources[_feedIndex];
+    [_writer noteFeedTitle:source.title posts:_keptInFeed];
+    _keptInFeed = 0;
+    _feedIndex++;
+    [self startFeed];
+}
+
+- (void)fetchPage {
+    if ([self stopIfCancelled]) return;
+    ApolloOfflineFeedSource *source = _options.sources[_feedIndex];
+    NSMutableArray<NSURLQueryItem *> *query = [NSMutableArray arrayWithObjects:
+        [NSURLQueryItem queryItemWithName:@"limit" value:[NSString stringWithFormat:@"%lu", (unsigned long)_options.pageSize]],
+        [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"], nil];
+    if (_after.length > 0) [query addObject:[NSURLQueryItem queryItemWithName:@"after" value:_after]];
+    [self report:[NSString stringWithFormat:@"Loading %@…", source.title]];
+
+    [self fetchAPI:source.path query:query completion:^(NSURLRequest *request, NSData *data, NSHTTPURLResponse *response, NSError *error) {
+        if ([self stopIfCancelled]) return;
+        NSDictionary *root = ApolloOfflineIsSuccess(response, data, error)
+            ? ApolloOfflineDictValue([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]) : nil;
+        NSDictionary *listing = ApolloOfflineDictValue(root[@"data"]);
+        NSArray *children = [listing[@"children"] isKindOfClass:[NSArray class]] ? listing[@"children"] : nil;
+        NSString *key = ApolloOfflineKeyForURL(request.URL);
+        if (!children || !key) {
+            self->_lastError = error ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Reddit answered %ld for %@.", (long)response.statusCode, source.title],
+            }];
+            self->_pagePosts = @[];
+            [self completePageKeeping:0 endFeed:YES];
+            return;
+        }
+        NSMutableArray<NSDictionary *> *posts = [NSMutableArray array];
+        for (id child in children) {
+            NSDictionary *post = ApolloOfflineDictValue(ApolloOfflineDictValue(child)[@"data"]);
+            if ([ApolloOfflineDictValue(child)[@"kind"] isEqual:@"t3"] && post) [posts addObject:post];
+        }
+        self->_pageKey = key;
+        self->_pageData = data;
+        self->_pagePosts = posts;
+        id after = listing[@"after"];
+        self->_nextAfter = [after isKindOfClass:[NSString class]] ? after : nil;
+        [self processPostAtIndex:0];
+    }];
+}
+
+// MARK: - Posts
+
+- (BOOL)budgetSpent {
+    return _writer.bytesWritten >= _feedBudgetEnd || _keptInFeed >= _options.maxPostsPerFeed;
+}
+
+- (void)processPostAtIndex:(NSUInteger)index {
+    if ([self stopIfCancelled]) return;
+    if (index >= _pagePosts.count) {
+        [self completePageKeeping:index endFeed:NO];
+        return;
+    }
+    if ([self budgetSpent]) {
+        [self completePageKeeping:index endFeed:YES];
+        return;
+    }
+    NSDictionary *post = _pagePosts[index];
+    void (^next)(void) = ^{
+        self->_keptInFeed++;
+        [self report:[NSString stringWithFormat:@"Saved %lu posts", (unsigned long)(self->_writer.postCount + self->_keptInFeed)]];
+        [self processPostAtIndex:index + 1];
+    };
+    [self saveCommentsForPost:post then:^{
+        [self saveImagesForPost:post then:next];
+    }];
+}
+
+- (void)saveCommentsForPost:(NSDictionary *)post then:(void (^)(void))then {
+    NSString *postID = [post[@"id"] isKindOfClass:[NSString class]] ? post[@"id"] : nil;
+    if (!_options.includeComments || postID.length == 0) {
+        then();
+        return;
+    }
+    NSString *path = [@"/comments/" stringByAppendingString:postID];
+    NSArray *query = @[
+        [NSURLQueryItem queryItemWithName:@"limit" value:@"100"],
+        [NSURLQueryItem queryItemWithName:@"depth" value:@"6"],
+        [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"],
+    ];
+    [self fetchAPI:path query:query completion:^(NSURLRequest *request, NSData *data, NSHTTPURLResponse *response, NSError *error) {
+        NSString *key = ApolloOfflineKeyForURL(request.URL);
+        id root = ApolloOfflineIsSuccess(response, data, error) ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        // Apollo indexes the comments response as an array; never store anything else.
+        if (key && [root isKindOfClass:[NSArray class]]) {
+            [self->_writer storeData:data contentType:@"application/json; charset=UTF-8" forKey:key];
+        } else if (error) {
+            self->_lastError = error;
+        }
+        then();
+    }];
+}
+
+- (void)saveImagesForPost:(NSDictionary *)post then:(void (^)(void))then {
+    if (!_options.includeImages) {
+        then();
+        return;
+    }
+    NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+    for (NSURL *url in ApolloOfflineImageURLsForPost(post, _options.maxImageWidth)) {
+        NSString *key = ApolloOfflineKeyForURL(url);
+        if (key && ![_writer hasKey:key]) [urls addObject:url];
+    }
+    if (urls.count == 0) {
+        then();
+        return;
+    }
+    dispatch_group_t group = dispatch_group_create();
+    unsigned long long maxBytes = _options.maxImageBytes;
+    for (NSURL *url in urls) {
+        dispatch_group_enter(group);
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+        request.timeoutInterval = 30;
+        _fetcher(request, ^(NSData *data, NSHTTPURLResponse *response, NSError *error) {
+            dispatch_async(self->_queue, ^{
+                NSString *key = ApolloOfflineKeyForURL(url);
+                if (key && ApolloOfflineIsSuccess(response, data, error) && data.length <= maxBytes && self->_writer) {
+                    NSString *type = response.MIMEType.length > 0 ? response.MIMEType : @"image/jpeg";
+                    if ([type hasPrefix:@"image/"]) {
+                        [self->_writer storeData:data contentType:type forKey:key];
+                    }
+                }
+                dispatch_group_leave(group);
+            });
+        });
+    }
+    dispatch_group_notify(group, _queue, then);
+}
+
+// MARK: - Pages
+
+- (void)flushPending:(BOOL)endHere {
+    ApolloOfflinePendingPage *page = _pending;
+    _pending = nil;
+    if (!page || page.kept == 0) return;
+    NSData *data = page.data;
+    if (endHere || page.kept < page.childCount) {
+        data = ApolloOfflineTruncatedListing(page.data, page.kept, YES) ?: page.data;
+    }
+    [_writer storeFeedPage:data forKey:page.key postNames:page.keptNames];
+}
+
+// `kept` counts posts of _pagePosts. A page is held back until the next one
+// shows whether it was the feed's last, so the final page can say so.
+- (void)completePageKeeping:(NSUInteger)kept endFeed:(BOOL)endFeed {
+    if (kept == 0) {
+        [self flushPending:YES];
+        [self finishFeed];
+        return;
+    }
+    [self flushPending:NO];
+    ApolloOfflinePendingPage *page = [ApolloOfflinePendingPage new];
+    page.key = _pageKey;
+    page.data = _pageData;
+    // Feed listings only return t3 children, so post counts and listing
+    // child counts line up for truncation.
+    page.childCount = _pagePosts.count;
+    page.kept = kept;
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSDictionary *post in [_pagePosts subarrayWithRange:NSMakeRange(0, kept)]) {
+        if ([post[@"name"] isKindOfClass:[NSString class]]) [names addObject:post[@"name"]];
+    }
+    page.keptNames = names;
+    _pending = page;
+    _pagePosts = nil;
+    _pageData = nil;
+
+    if (endFeed || kept < page.childCount || _nextAfter.length == 0 || [self budgetSpent]) {
+        [self flushPending:YES];
+        [self finishFeed];
+        return;
+    }
+    _after = _nextAfter;
+    [self fetchPage];
+}
+
+@end

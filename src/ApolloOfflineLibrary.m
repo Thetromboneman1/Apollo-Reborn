@@ -1,0 +1,495 @@
+#import "ApolloOfflineLibrary.h"
+
+// Foundation-only on purpose: tests/run_offline_library_tests.sh builds this
+// file for macOS. No UIKit, no ApolloLog.
+
+static NSString *const kApolloOfflineIndexName = @"index.json";
+static const NSInteger kApolloOfflineIndexVersion = 1;
+
+// MARK: - Keys
+
+static NSSet<NSString *> *ApolloOfflineSortNames(void) {
+    static NSSet *sorts;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sorts = [NSSet setWithArray:@[ @"hot", @"new", @"top", @"rising", @"controversial", @"best", @"gilded" ]];
+    });
+    return sorts;
+}
+
+// Path components with ".json" removed from the last one, lowercased, empties dropped.
+static NSArray<NSString *> *ApolloOfflinePathComponents(NSString *path) {
+    NSMutableArray<NSString *> *components = [NSMutableArray array];
+    for (NSString *raw in [path componentsSeparatedByString:@"/"]) {
+        if (raw.length == 0) continue;
+        [components addObject:raw.lowercaseString];
+    }
+    NSString *last = components.lastObject;
+    if ([last hasSuffix:@".json"]) {
+        NSString *trimmed = [last substringToIndex:last.length - 5];
+        [components removeLastObject];
+        if (trimmed.length > 0) [components addObject:trimmed];
+    }
+    return components;
+}
+
+NSString *ApolloOfflineFeedKeyForPath(NSString *path) {
+    NSArray<NSString *> *c = ApolloOfflinePathComponents(path ?: @"");
+    NSSet *sorts = ApolloOfflineSortNames();
+    if (c.count == 0) return @"home";
+    if (c.count == 1 && [sorts containsObject:c[0]]) return @"home";
+    if ([c[0] isEqualToString:@"r"] && c.count >= 2) {
+        if (c.count == 2 || (c.count == 3 && [sorts containsObject:c[2]])) {
+            return [@"r/" stringByAppendingString:c[1]];
+        }
+        return nil;
+    }
+    if (([c[0] isEqualToString:@"user"] || [c[0] isEqualToString:@"u"]) && c.count >= 4 && [c[2] isEqualToString:@"m"]) {
+        if (c.count == 4 || (c.count == 5 && [sorts containsObject:c[4]])) {
+            return [NSString stringWithFormat:@"m/%@/%@", c[1], c[3]];
+        }
+    }
+    return nil;
+}
+
+BOOL ApolloOfflineURLIsRedditAPI(NSURL *url) {
+    NSString *host = url.host.lowercaseString;
+    if (!host) return NO;
+    return [host isEqualToString:@"oauth.reddit.com"] || [host isEqualToString:@"www.reddit.com"] ||
+           [host isEqualToString:@"reddit.com"] || [host isEqualToString:@"old.reddit.com"];
+}
+
+static NSString *ApolloOfflineQueryValue(NSURL *url, NSString *name) {
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    for (NSURLQueryItem *item in components.queryItems) {
+        if ([item.name isEqualToString:name]) return item.value;
+    }
+    return nil;
+}
+
+static NSString *ApolloOfflineFileStem(NSURL *url) {
+    NSString *stem = url.lastPathComponent.stringByDeletingPathExtension;
+    return stem.length > 0 ? stem : nil;
+}
+
+NSString *ApolloOfflineKeyForURL(NSURL *url) {
+    if (!url) return nil;
+    NSString *scheme = url.scheme.lowercaseString;
+    if (![scheme isEqualToString:@"https"] && ![scheme isEqualToString:@"http"]) return nil;
+    NSString *host = url.host.lowercaseString;
+    if (host.length == 0) return nil;
+
+    if (ApolloOfflineURLIsRedditAPI(url)) {
+        NSArray<NSString *> *c = ApolloOfflinePathComponents(url.path ?: @"");
+        NSUInteger commentsIndex = [c indexOfObject:@"comments"];
+        // /comments/<id>[/slug] or /r/<sub>/comments/<id>[/slug] (not /r/<sub>/comments
+        // alone, which is the subreddit's comment stream).
+        BOOL commentsAtRoot = commentsIndex == 0;
+        BOOL commentsInSub = commentsIndex == 2 && [c[0] isEqualToString:@"r"];
+        if ((commentsAtRoot || commentsInSub) && commentsIndex + 1 < c.count) {
+            return [@"comments:" stringByAppendingString:c[commentsIndex + 1]];
+        }
+        NSString *feed = ApolloOfflineFeedKeyForPath(url.path ?: @"");
+        if (!feed) return nil;
+        NSString *after = ApolloOfflineQueryValue(url, @"after") ?: @"";
+        return [NSString stringWithFormat:@"feed:%@|%@", feed, after.lowercaseString];
+    }
+
+    if ([host isEqualToString:@"i.redd.it"] || [host isEqualToString:@"preview.redd.it"]) {
+        NSString *stem = ApolloOfflineFileStem(url);
+        return stem ? [@"reddimg:" stringByAppendingString:stem] : nil;
+    }
+    if ([host isEqualToString:@"external-preview.redd.it"]) {
+        NSString *stem = ApolloOfflineFileStem(url);
+        return stem ? [@"extimg:" stringByAppendingString:stem] : nil;
+    }
+    NSString *path = url.path.length > 0 ? url.path : @"/";
+    return [NSString stringWithFormat:@"url:%@%@", host, path];
+}
+
+BOOL ApolloOfflineShouldServe(ApolloOfflineUseMode mode, BOOL networkAvailable, BOOL hasLibrary, BOOL downloading) {
+    if (!hasLibrary || downloading) return NO;
+    switch (mode) {
+        case ApolloOfflineUseModeAlways: return YES;
+        case ApolloOfflineUseModeAutomatic: return !networkAvailable;
+        case ApolloOfflineUseModeNever: return NO;
+    }
+    return NO;
+}
+
+// MARK: - Post media
+
+static NSString *ApolloOfflineString(id value) {
+    return [value isKindOfClass:[NSString class]] ? value : nil;
+}
+
+static NSDictionary *ApolloOfflineDict(id value) {
+    return [value isKindOfClass:[NSDictionary class]] ? value : nil;
+}
+
+static NSArray *ApolloOfflineArray(id value) {
+    return [value isKindOfClass:[NSArray class]] ? value : nil;
+}
+
+static NSURL *ApolloOfflineMediaURL(NSString *string) {
+    if (string.length == 0) return nil;
+    // raw_json=1 responses are already unescaped; older shapes aren't.
+    NSString *unescaped = [string stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    if (![unescaped hasPrefix:@"https://"] && ![unescaped hasPrefix:@"http://"]) return nil;
+    return [NSURL URLWithString:unescaped];
+}
+
+// Largest {url|u, width|x} entry no wider than maxWidth; else the fallback.
+static NSString *ApolloOfflinePickResolution(NSArray *resolutions, NSString *urlKey, NSString *widthKey,
+                                             NSInteger maxWidth, NSString *fallback) {
+    NSString *best = nil;
+    NSInteger bestWidth = -1;
+    for (id entry in resolutions) {
+        NSDictionary *resolution = ApolloOfflineDict(entry);
+        NSString *url = ApolloOfflineString(resolution[urlKey]);
+        NSInteger width = [resolution[widthKey] respondsToSelector:@selector(integerValue)] ? [resolution[widthKey] integerValue] : 0;
+        if (url.length == 0 || width > maxWidth) continue;
+        if (width > bestWidth) {
+            best = url;
+            bestWidth = width;
+        }
+    }
+    return best ?: fallback;
+}
+
+static BOOL ApolloOfflineIsDirectImage(NSURL *url) {
+    NSString *host = url.host.lowercaseString;
+    if (![host isEqualToString:@"i.redd.it"] && ![host isEqualToString:@"i.imgur.com"]) return NO;
+    NSString *ext = url.pathExtension.lowercaseString;
+    return [@[ @"jpg", @"jpeg", @"png", @"webp", @"gif" ] containsObject:ext];
+}
+
+static void ApolloOfflineCollectImages(NSDictionary *post, NSInteger maxWidth, NSMutableArray<NSURL *> *urls,
+                                       NSMutableSet<NSString *> *keys, NSUInteger depth) {
+    void (^add)(NSString *) = ^(NSString *string) {
+        NSURL *url = ApolloOfflineMediaURL(string);
+        NSString *key = url ? ApolloOfflineKeyForURL(url) : nil;
+        if (!key || [keys containsObject:key]) return;
+        [keys addObject:key];
+        [urls addObject:url];
+    };
+
+    // Gallery: media_metadata keyed by id, ordered by gallery_data.items.
+    NSDictionary *metadata = ApolloOfflineDict(post[@"media_metadata"]);
+    if (metadata.count > 0) {
+        NSMutableArray<NSString *> *order = [NSMutableArray array];
+        for (id item in ApolloOfflineArray(ApolloOfflineDict(post[@"gallery_data"])[@"items"])) {
+            NSString *mediaID = ApolloOfflineString(ApolloOfflineDict(item)[@"media_id"]);
+            if (mediaID) [order addObject:mediaID];
+        }
+        if (order.count == 0) {
+            [order addObjectsFromArray:[metadata.allKeys sortedArrayUsingSelector:@selector(compare:)]];
+        }
+        for (NSString *mediaID in order) {
+            NSDictionary *media = ApolloOfflineDict(metadata[mediaID]);
+            if (![ApolloOfflineString(media[@"status"]) isEqualToString:@"valid"]) continue;
+            NSString *source = ApolloOfflineString(ApolloOfflineDict(media[@"s"])[@"u"]);
+            add(ApolloOfflinePickResolution(ApolloOfflineArray(media[@"p"]), @"u", @"x", maxWidth, source));
+        }
+    }
+
+    // Link/image preview.
+    NSDictionary *image = ApolloOfflineDict(ApolloOfflineArray(ApolloOfflineDict(post[@"preview"])[@"images"]).firstObject);
+    if (image) {
+        NSString *source = ApolloOfflineString(ApolloOfflineDict(image[@"source"])[@"url"]);
+        add(ApolloOfflinePickResolution(ApolloOfflineArray(image[@"resolutions"]), @"url", @"width", maxWidth, source));
+    }
+
+    // Direct image link (dedupes against the preview for i.redd.it: same stem).
+    NSString *link = ApolloOfflineString(post[@"url_overridden_by_dest"]) ?: ApolloOfflineString(post[@"url"]);
+    NSURL *linkURL = ApolloOfflineMediaURL(link);
+    if (linkURL && ApolloOfflineIsDirectImage(linkURL)) add(linkURL.absoluteString);
+
+    add(ApolloOfflineString(post[@"thumbnail"]));
+
+    if (depth == 0) {
+        NSDictionary *parent = ApolloOfflineDict(ApolloOfflineArray(post[@"crosspost_parent_list"]).firstObject);
+        if (parent) ApolloOfflineCollectImages(parent, maxWidth, urls, keys, depth + 1);
+    }
+}
+
+NSArray<NSURL *> *ApolloOfflineImageURLsForPost(NSDictionary *post, NSInteger maxWidth) {
+    NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+    if (![post isKindOfClass:[NSDictionary class]]) return urls;
+    ApolloOfflineCollectImages(post, maxWidth, urls, [NSMutableSet set], 0);
+    return urls;
+}
+
+NSData *ApolloOfflineTruncatedListing(NSData *listing, NSUInteger keep, BOOL endHere) {
+    if (listing.length == 0) return nil;
+    id root = [NSJSONSerialization JSONObjectWithData:listing options:NSJSONReadingMutableContainers error:nil];
+    NSMutableDictionary *object = [root isKindOfClass:[NSMutableDictionary class]] ? root : nil;
+    NSMutableDictionary *data = [object[@"data"] isKindOfClass:[NSMutableDictionary class]] ? object[@"data"] : nil;
+    NSMutableArray *children = [data[@"children"] isKindOfClass:[NSMutableArray class]] ? data[@"children"] : nil;
+    if (!children) return nil;
+    if (children.count > keep) {
+        [children removeObjectsInRange:NSMakeRange(keep, children.count - keep)];
+    }
+    data[@"dist"] = @(children.count);
+    if (endHere) data[@"after"] = [NSNull null];
+    return [NSJSONSerialization dataWithJSONObject:object options:0 error:nil];
+}
+
+// MARK: - Library
+
+static NSDictionary *ApolloOfflineReadIndex(NSURL *directory) {
+    NSData *data = [NSData dataWithContentsOfURL:[directory URLByAppendingPathComponent:kApolloOfflineIndexName]];
+    if (!data) return nil;
+    NSDictionary *index = ApolloOfflineDict([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]);
+    if ([index[@"version"] integerValue] != kApolloOfflineIndexVersion) return nil;
+    return index;
+}
+
+static NSString *ApolloOfflineFeedOfKey(NSString *key) {
+    if (![key hasPrefix:@"feed:"]) return nil;
+    NSRange bar = [key rangeOfString:@"|"];
+    return bar.location == NSNotFound ? nil : [key substringWithRange:NSMakeRange(5, bar.location - 5)];
+}
+
+@implementation ApolloOfflineLibrary {
+    NSLock *_lock;
+    NSDictionary<NSString *, NSDictionary *> *_entries;
+    // "feed:<feed>|<post fullname>" -> @[ page key, @(position in page) ]
+    NSDictionary<NSString *, NSArray *> *_cursors;
+    NSUInteger _postCount;
+    unsigned long long _totalBytes;
+    NSDate *_downloadedAt;
+    NSArray<NSString *> *_feedTitles;
+}
+
++ (NSURL *)defaultDirectory {
+    NSURL *support = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory
+                                                          inDomains:NSUserDomainMask].firstObject;
+    return [[support URLByAppendingPathComponent:@"ApolloReborn" isDirectory:YES]
+            URLByAppendingPathComponent:@"OfflineLibrary" isDirectory:YES];
+}
+
++ (instancetype)sharedLibrary {
+    static ApolloOfflineLibrary *library;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        library = [[ApolloOfflineLibrary alloc] initWithDirectory:[self defaultDirectory]];
+    });
+    return library;
+}
+
+- (instancetype)initWithDirectory:(NSURL *)directory {
+    if ((self = [super init])) {
+        _directory = directory;
+        _lock = [NSLock new];
+        [self reload];
+    }
+    return self;
+}
+
+- (void)reload {
+    NSDictionary *index = ApolloOfflineReadIndex(_directory);
+    NSDictionary *entries = ApolloOfflineDict(index[@"entries"]) ?: @{};
+    NSNumber *downloaded = [index[@"downloadedAt"] isKindOfClass:[NSNumber class]] ? index[@"downloadedAt"] : nil;
+    NSMutableArray<NSString *> *titles = [NSMutableArray array];
+    for (id title in ApolloOfflineArray(index[@"feeds"])) {
+        if ([title isKindOfClass:[NSString class]]) [titles addObject:title];
+    }
+    NSMutableDictionary<NSString *, NSArray *> *cursors = [NSMutableDictionary dictionary];
+    [entries enumerateKeysAndObjectsUsingBlock:^(NSString *key, id entry, __unused BOOL *stop) {
+        NSString *feed = ApolloOfflineFeedOfKey(key);
+        NSArray *names = ApolloOfflineArray(ApolloOfflineDict(entry)[@"names"]);
+        if (!feed || names.count == 0) return;
+        [names enumerateObjectsUsingBlock:^(id name, NSUInteger position, __unused BOOL *innerStop) {
+            if (![name isKindOfClass:[NSString class]]) return;
+            cursors[[NSString stringWithFormat:@"feed:%@|%@", feed, [name lowercaseString]]] = @[ key, @(position) ];
+        }];
+    }];
+    [_lock lock];
+    _entries = entries;
+    _cursors = cursors;
+    _postCount = [index[@"posts"] unsignedIntegerValue];
+    _totalBytes = [index[@"bytes"] unsignedLongLongValue];
+    _downloadedAt = downloaded ? [NSDate dateWithTimeIntervalSince1970:downloaded.doubleValue] : nil;
+    _feedTitles = titles;
+    [_lock unlock];
+}
+
+- (BOOL)hasContent {
+    [_lock lock];
+    BOOL has = _entries.count > 0;
+    [_lock unlock];
+    return has;
+}
+
+- (NSUInteger)postCount { [_lock lock]; NSUInteger v = _postCount; [_lock unlock]; return v; }
+- (unsigned long long)totalBytes { [_lock lock]; unsigned long long v = _totalBytes; [_lock unlock]; return v; }
+- (NSDate *)downloadedAt { [_lock lock]; NSDate *v = _downloadedAt; [_lock unlock]; return v; }
+- (NSArray<NSString *> *)feedTitles { [_lock lock]; NSArray *v = _feedTitles; [_lock unlock]; return v; }
+
+- (BOOL)hasEntryForKey:(NSString *)key {
+    if (key.length == 0) return NO;
+    [_lock lock];
+    BOOL has = _entries[key] != nil || _cursors[key] != nil;
+    [_lock unlock];
+    return has;
+}
+
+- (NSData *)storedDataForKey:(NSString *)key contentType:(NSString **)contentType {
+    [_lock lock];
+    NSDictionary *entry = ApolloOfflineDict(_entries[key]);
+    [_lock unlock];
+    NSString *file = ApolloOfflineString(entry[@"file"]);
+    if (file.length == 0 || [file containsString:@"/"]) return nil;
+    if (contentType) *contentType = ApolloOfflineString(entry[@"type"]);
+    return [NSData dataWithContentsOfURL:[_directory URLByAppendingPathComponent:file]];
+}
+
+- (NSData *)dataForKey:(NSString *)key contentType:(NSString **)contentType {
+    if (key.length == 0) return nil;
+    NSData *stored = [self storedDataForKey:key contentType:contentType];
+    if (stored) return stored;
+
+    // A cursor in the middle of a saved page: the posts after it, keeping the
+    // page's own `after` so the chain continues into the next saved page.
+    [_lock lock];
+    NSArray *cursor = _cursors[key];
+    [_lock unlock];
+    if (cursor.count != 2) return nil;
+    NSData *page = [self storedDataForKey:cursor[0] contentType:contentType];
+    id root = page ? [NSJSONSerialization JSONObjectWithData:page options:NSJSONReadingMutableContainers error:nil] : nil;
+    NSMutableDictionary *listing = [root isKindOfClass:[NSMutableDictionary class]] ? root : nil;
+    NSMutableDictionary *data = [listing[@"data"] isKindOfClass:[NSMutableDictionary class]] ? listing[@"data"] : nil;
+    NSMutableArray *children = [data[@"children"] isKindOfClass:[NSMutableArray class]] ? data[@"children"] : nil;
+    if (!children) return nil;
+    NSUInteger start = [cursor[1] unsignedIntegerValue] + 1;
+    if (start >= children.count) {
+        NSString *after = ApolloOfflineString(data[@"after"]);
+        NSString *feed = ApolloOfflineFeedOfKey(key);
+        if (after.length > 0 && feed) {
+            NSString *next = [NSString stringWithFormat:@"feed:%@|%@", feed, after.lowercaseString];
+            if (![next isEqualToString:key]) {
+                NSData *nextPage = [self storedDataForKey:next contentType:contentType];
+                if (nextPage) return nextPage;
+            }
+        }
+        [children removeAllObjects];
+        data[@"after"] = [NSNull null];
+    } else {
+        [children removeObjectsInRange:NSMakeRange(0, start)];
+    }
+    data[@"dist"] = @(children.count);
+    if (contentType) *contentType = @"application/json; charset=UTF-8";
+    return [NSJSONSerialization dataWithJSONObject:listing options:0 error:nil];
+}
+
+- (BOOL)removeAll:(NSError **)error {
+    BOOL ok = YES;
+    if ([NSFileManager.defaultManager fileExistsAtPath:_directory.path]) {
+        ok = [NSFileManager.defaultManager removeItemAtURL:_directory error:error];
+    }
+    [self reload];
+    return ok;
+}
+
+@end
+
+// MARK: - Writer
+
+@implementation ApolloOfflineLibraryWriter {
+    NSURL *_libraryDirectory;
+    NSURL *_stagingDirectory;
+    NSMutableDictionary<NSString *, NSDictionary *> *_entries;
+    NSMutableArray<NSString *> *_feedTitles;
+    NSUInteger _nextFile;
+    BOOL _finished;
+}
+
+- (instancetype)initWithLibraryDirectory:(NSURL *)directory error:(NSError **)error {
+    if ((self = [super init])) {
+        _libraryDirectory = directory;
+        NSURL *parent = directory.URLByDeletingLastPathComponent;
+        _stagingDirectory = [parent URLByAppendingPathComponent:
+            [directory.lastPathComponent stringByAppendingString:@".staging"] isDirectory:YES];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm removeItemAtURL:_stagingDirectory error:nil];
+        if (![fm createDirectoryAtURL:_stagingDirectory withIntermediateDirectories:YES attributes:nil error:error]) {
+            return nil;
+        }
+        _entries = [NSMutableDictionary dictionary];
+        _feedTitles = [NSMutableArray array];
+    }
+    return self;
+}
+
+- (BOOL)hasKey:(NSString *)key {
+    return _entries[key] != nil;
+}
+
+- (BOOL)storeData:(NSData *)data contentType:(NSString *)contentType forKey:(NSString *)key {
+    if (_finished || data.length == 0 || key.length == 0) return NO;
+    NSString *file = [NSString stringWithFormat:@"e%lu", (unsigned long)++_nextFile];
+    if (![data writeToURL:[_stagingDirectory URLByAppendingPathComponent:file] atomically:NO]) return NO;
+    NSDictionary *previous = _entries[key];
+    if (previous) {
+        _bytesWritten -= [previous[@"bytes"] unsignedLongLongValue];
+        [NSFileManager.defaultManager removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:previous[@"file"]] error:nil];
+    }
+    _entries[key] = @{ @"file": file, @"type": contentType ?: @"application/octet-stream", @"bytes": @(data.length) };
+    _bytesWritten += data.length;
+    return YES;
+}
+
+- (BOOL)storeFeedPage:(NSData *)data forKey:(NSString *)key postNames:(NSArray<NSString *> *)names {
+    if (![self storeData:data contentType:@"application/json; charset=UTF-8" forKey:key]) return NO;
+    if (names.count > 0) {
+        NSMutableDictionary *entry = [_entries[key] mutableCopy];
+        entry[@"names"] = [names copy];
+        _entries[key] = entry;
+    }
+    return YES;
+}
+
+- (void)noteFeedTitle:(NSString *)title posts:(NSUInteger)posts {
+    if (posts == 0) return;
+    [_feedTitles addObject:title];
+    _postCount += posts;
+}
+
+- (BOOL)commit:(NSError **)error {
+    if (_finished) return NO;
+    _finished = YES;
+    NSDictionary *index = @{
+        @"version": @(kApolloOfflineIndexVersion),
+        @"downloadedAt": @((long long)NSDate.date.timeIntervalSince1970),
+        @"posts": @(_postCount),
+        @"bytes": @(_bytesWritten),
+        @"feeds": _feedTitles,
+        @"entries": _entries,
+    };
+    NSData *json = [NSJSONSerialization dataWithJSONObject:index options:0 error:error];
+    if (!json || ![json writeToURL:[_stagingDirectory URLByAppendingPathComponent:kApolloOfflineIndexName] options:NSDataWritingAtomic error:error]) {
+        [self discard];
+        return NO;
+    }
+    NSURL *staged = _stagingDirectory;
+    [staged setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL ok;
+    if ([fm fileExistsAtPath:_libraryDirectory.path]) {
+        ok = [fm replaceItemAtURL:_libraryDirectory withItemAtURL:staged backupItemName:nil
+                          options:0 resultingItemURL:nil error:error];
+    } else {
+        ok = [fm moveItemAtURL:staged toURL:_libraryDirectory error:error];
+    }
+    if (!ok) [fm removeItemAtURL:staged error:nil];
+    [_libraryDirectory setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
+    return ok;
+}
+
+- (void)discard {
+    _finished = YES;
+    [NSFileManager.defaultManager removeItemAtURL:_stagingDirectory error:nil];
+}
+
+@end

@@ -4,6 +4,7 @@
 #import "ApolloSiriSettingsViewController.h"
 #import "palhome/ApolloPalHomeViewController.h"
 #import "settings/ApolloPalHomeSettingsViewController.h"
+#import "settings/ApolloOfflineModeSettingsViewController.h"
 
 #import <objc/message.h>
 
@@ -92,6 +93,7 @@ static void ApolloSettingsRouterEnsureRegistry(void) {
         add(@"settings-shortcuts", @"Settings Shortcuts", @"Apollo Reborn → Interface → Tab Bar", ApolloSettingsInsetGrouped([ApolloSettingsShortcutsViewController class]));
         add(@"interface", @"Interface", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloInterfaceSettingsViewController class]));
         add(@"pal-home-settings", @"Pal Home", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloPalHomeSettingsViewController class]));
+        add(@"offline-mode", @"Offline Mode", @"Apollo Reborn → Features", ApolloSettingsInsetGrouped([ApolloOfflineModeSettingsViewController class]));
         // Pal Home itself (deep link apollo://reborn/settings/pal-home, the widget).
         add(@"pal-home", @"Pal Home", @"Apollo Reborn → Features → Pal Home", ^UIViewController *{
             return [[ApolloPalHomeViewController alloc] init];

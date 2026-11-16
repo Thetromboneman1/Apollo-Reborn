@@ -317,6 +317,9 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloHostedVideo.m \
     $(SRC_DIR)/ApolloRedditVideoPlaylist.m \
     $(SRC_DIR)/ApolloRedditVideoPlaylistProtocol.xm \
+    $(SRC_DIR)/ApolloOfflineLibrary.m \
+    $(SRC_DIR)/ApolloOfflineDownloader.m \
+    $(SRC_DIR)/ApolloOfflineMode.xm \
     $(SRC_DIR)/ApolloRedgifsTokenRefresh.m \
     $(SRC_DIR)/ApolloSportsClipResolver.m \
     $(SRC_DIR)/ApolloSportsClips.xm \
@@ -437,6 +440,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloPollVoting.xm \
     $(SRC_DIR)/ApolloPollCompose.xm \
     $(SRC_DIR)/settings/ApolloPollSettingsViewController.m \
+    $(SRC_DIR)/settings/ApolloOfflineModeSettingsViewController.m \
     $(SRC_DIR)/settings/ApolloPalHomeSettingsViewController.m \
     $(SRC_DIR)/ApolloSimDebugTap.xm \
     $(SRC_DIR)/ApolloManualSignInViewController.m \
