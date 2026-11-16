@@ -6,6 +6,7 @@
 typedef NS_ENUM(NSInteger, ApolloOfflineSection) {
     ApolloOfflineSectionLibrary = 0,
     ApolloOfflineSectionUse,
+    ApolloOfflineSectionAutomatic,
     ApolloOfflineSectionFeeds,
     ApolloOfflineSectionContent,
 };
@@ -25,6 +26,7 @@ typedef NS_ENUM(NSInteger, ApolloOfflineFeedRow) {
 typedef NS_ENUM(NSInteger, ApolloOfflineContentRow) {
     ApolloOfflineContentRowComments = 0,
     ApolloOfflineContentRowImages,
+    ApolloOfflineContentRowSkipRead,
     ApolloOfflineContentRowBudget,
 };
 
@@ -79,7 +81,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
 #pragma mark - Structure
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 4;
+    return 5;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -88,6 +90,8 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         BOOL canDelete = [ApolloOfflineLibrary sharedLibrary].hasContent && !self.controller.downloading;
         return canDelete ? 3 : 2;
     }
+    if (section == ApolloOfflineSectionAutomatic) return 1;
+    if (section == ApolloOfflineSectionContent) return 4;
     return 3;
 }
 
@@ -95,6 +99,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
     switch (section) {
         case ApolloOfflineSectionLibrary: return @"Offline Library";
         case ApolloOfflineSectionUse: return @"Use Offline Library";
+        case ApolloOfflineSectionAutomatic: return @"Automatic";
         case ApolloOfflineSectionFeeds: return @"Feeds to Download";
         case ApolloOfflineSectionContent: return @"Download Options";
     }
@@ -115,10 +120,15 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                     "Always shows it even online, which helps on plane Wi-Fi that's connected but doesn't load "
                     "anything. Anything you didn't download loads from the internet as usual.\n\n%@", now];
         }
+        case ApolloOfflineSectionAutomatic:
+            return @"When Apollo is open on Wi-Fi and your offline posts are more than 6 hours old, it quietly "
+                    "downloads a fresh batch while you browse. Never on cellular or in Low Power Mode, and only "
+                    "after you've downloaded once yourself.";
         case ApolloOfflineSectionFeeds:
             return @"Offline, each feed shows the posts that were downloaded, whatever sort you pick.";
         case ApolloOfflineSectionContent:
-            return @"The download stops once it reaches the data limit. Images are saved at your screen's size.";
+            return @"Skipping read posts means a new batch is all posts you haven't seen. The download stops once "
+                    "it reaches the data limit. Images are saved at your screen's size.";
     }
     return nil;
 }
@@ -159,7 +169,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                 UITableViewCell *cell;
                 if (controller.downloading) {
                     cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
-                    cell.textLabel.text = @"Cancel Download";
+                    cell.textLabel.text = controller.downloadingAutomatically ? @"Cancel Automatic Refresh" : @"Cancel Download";
                     cell.detailTextLabel.text = controller.progressText;
                     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
                     UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
@@ -181,6 +191,8 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
             cell.accessoryType = (NSInteger)controller.useMode == indexPath.row ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
             return cell;
         }
+        case ApolloOfflineSectionAutomatic:
+            return [self switchCellWithTitle:@"Keep Fresh on Wi-Fi" key:UDKeyOfflineAutoRefresh];
         case ApolloOfflineSectionFeeds: {
             if (indexPath.row == ApolloOfflineFeedRowHome) return [self switchCellWithTitle:@"Home" key:UDKeyOfflineIncludeHome];
             if (indexPath.row == ApolloOfflineFeedRowPopular) return [self switchCellWithTitle:@"Popular" key:UDKeyOfflineIncludePopular];
@@ -193,6 +205,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         case ApolloOfflineSectionContent: {
             if (indexPath.row == ApolloOfflineContentRowComments) return [self switchCellWithTitle:@"Comments" key:UDKeyOfflineIncludeComments];
             if (indexPath.row == ApolloOfflineContentRowImages) return [self switchCellWithTitle:@"Images" key:UDKeyOfflineIncludeImages];
+            if (indexPath.row == ApolloOfflineContentRowSkipRead) return [self switchCellWithTitle:@"Skip Posts I've Read" key:UDKeyOfflineSkipRead];
             UITableViewCell *cell = [self valueCellWithTitle:@"Data Limit"
                                                       detail:ApolloOfflineBudgetText((NSInteger)(controller.budgetBytes / (1000 * 1000)))];
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;

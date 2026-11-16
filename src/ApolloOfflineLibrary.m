@@ -117,6 +117,40 @@ BOOL ApolloOfflineShouldServe(ApolloOfflineUseMode mode, BOOL networkAvailable, 
     return NO;
 }
 
+const NSTimeInterval ApolloOfflineAutoRefreshMaxAge = 6 * 60 * 60;
+const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval = 30 * 60;
+
+BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState s) {
+    if (!s.enabled || !s.hasLibrary) return NO;
+    if (!s.networkAvailable || !s.onWiFi || s.lowPowerMode) return NO;
+    // Serving means the user is browsing the batch (Always mode, or no
+    // connection): replacing it under them would change what they're reading.
+    if (s.serving || s.downloading) return NO;
+    if (s.libraryAge < ApolloOfflineAutoRefreshMaxAge) return NO;
+    return s.sinceLastAttempt >= ApolloOfflineAutoRefreshRetryInterval;
+}
+
+NSData *ApolloOfflineListingRemovingPosts(NSData *listing, NSSet<NSString *> *postIDs, NSUInteger *removed) {
+    if (removed) *removed = 0;
+    if (listing.length == 0) return nil;
+    id root = [NSJSONSerialization JSONObjectWithData:listing options:NSJSONReadingMutableContainers error:nil];
+    NSMutableDictionary *object = [root isKindOfClass:[NSMutableDictionary class]] ? root : nil;
+    NSMutableDictionary *data = [object[@"data"] isKindOfClass:[NSMutableDictionary class]] ? object[@"data"] : nil;
+    NSMutableArray *children = [data[@"children"] isKindOfClass:[NSMutableArray class]] ? data[@"children"] : nil;
+    if (!children) return nil;
+    if (postIDs.count == 0) return listing;
+    NSIndexSet *drop = [children indexesOfObjectsPassingTest:^BOOL(id child, __unused NSUInteger index, __unused BOOL *stop) {
+        NSDictionary *post = [child isKindOfClass:[NSDictionary class]] ? child[@"data"] : nil;
+        id postID = [post isKindOfClass:[NSDictionary class]] ? post[@"id"] : nil;
+        return [postID isKindOfClass:[NSString class]] && [postIDs containsObject:postID];
+    }];
+    if (drop.count == 0) return listing;
+    [children removeObjectsAtIndexes:drop];
+    data[@"dist"] = @(children.count);
+    if (removed) *removed = drop.count;
+    return [NSJSONSerialization dataWithJSONObject:object options:0 error:nil];
+}
+
 // MARK: - Post media
 
 static NSString *ApolloOfflineString(id value) {

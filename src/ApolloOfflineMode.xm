@@ -31,6 +31,7 @@
 #import "ApolloOfflineMode.h"
 #import "ApolloOfflineDownloader.h"
 #import "UserDefaultConstants.h"
+#import "ApolloPostReadState.h"
 
 NSNotificationName const ApolloOfflineModeDidChangeNotification = @"ApolloOfflineModeDidChangeNotification";
 
@@ -38,6 +39,10 @@ NSNotificationName const ApolloOfflineModeDidChangeNotification = @"ApolloOfflin
 static NSString *const kApolloOfflineBypassKey = @"ApolloOfflineBypass";
 
 static atomic_bool sApolloOfflineServing = false;
+
+BOOL ApolloOfflineModeIsServing(void) {
+    return atomic_load_explicit(&sApolloOfflineServing, memory_order_relaxed);
+}
 #if APOLLO_SIM_BUILD
 // Sim-only: APOLLO_OFFLINE_SIMULATE_NO_NETWORK=1 makes the app behave as if
 // the device were in airplane mode (connectivity reads as down and every
@@ -48,7 +53,7 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
 
 @interface ApolloOfflineModeController ()
 - (void)recompute;
-- (void)networkChanged:(BOOL)available;
+- (void)networkChangedWithFlags:(SCNetworkReachabilityFlags)flags;
 - (void)startMonitoring;
 @end
 
@@ -179,7 +184,25 @@ static BOOL ApolloOfflineFlagsMeanOnline(SCNetworkReachabilityFlags flags) {
 
 static void ApolloOfflineReachabilityChanged(__unused SCNetworkReachabilityRef target, SCNetworkReachabilityFlags flags, void *info) {
     ApolloOfflineModeController *controller = (__bridge ApolloOfflineModeController *)info;
-    [controller networkChanged:ApolloOfflineFlagsMeanOnline(flags)];
+    [controller networkChangedWithFlags:flags];
+}
+
+// Posts the user has read: Apollo's live tracker plus the "ReadPostIDs" copy it
+// saves to defaults. The live snapshot is nil until Apollo's tracker exists,
+// which is exactly when Keep Fresh runs (right at launch); verified in the sim,
+// where a launch-time refresh with the live snapshot alone kept 7 read posts.
+// A stale saved copy (after a history clear) only means skipping a few posts.
+static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
+    NSMutableSet<NSString *> *ids = [NSMutableSet set];
+    NSArray *live = ApolloReadPostIDsSnapshot();
+    if (live) [ids addObjectsFromArray:live];
+    id saved = [NSUserDefaults.standardUserDefaults objectForKey:@"ReadPostIDs"];
+    if ([saved isKindOfClass:[NSArray class]]) {
+        for (id postID in saved) {
+            if ([postID isKindOfClass:[NSString class]]) [ids addObject:postID];
+        }
+    }
+    return ids;
 }
 
 // MARK: - Controller
@@ -188,6 +211,8 @@ static void ApolloOfflineReachabilityChanged(__unused SCNetworkReachabilityRef t
     SCNetworkReachabilityRef _reachability;
     ApolloOfflineDownloader *_downloader;
     UIBackgroundTaskIdentifier _backgroundTask;
+    NSTimer *_keepFreshTimer;
+    CFAbsoluteTime _lastAutoAttempt;
     BOOL _restoreIdleTimer;
 }
 
@@ -210,6 +235,8 @@ static void ApolloOfflineReachabilityChanged(__unused SCNetworkReachabilityRef t
             UDKeyOfflineIncludeComments: @YES,
             UDKeyOfflineIncludeImages: @YES,
             UDKeyOfflineBudgetMB: @100,
+            UDKeyOfflineAutoRefresh: @YES,
+            UDKeyOfflineSkipRead: @YES,
         }];
     }
     return self;
@@ -229,22 +256,64 @@ static void ApolloOfflineReachabilityChanged(__unused SCNetworkReachabilityRef t
         SCNetworkReachabilityFlags flags = 0;
         if (SCNetworkReachabilityGetFlags(_reachability, &flags)) {
             _networkAvailable = ApolloOfflineFlagsMeanOnline(flags);
+            _onWiFi = _networkAvailable && !(flags & kSCNetworkReachabilityFlagsIsWWAN);
         }
     }
 #if APOLLO_SIM_BUILD
     if (sApolloOfflineSimulateNoNetwork) _networkAvailable = NO;
 #endif
     [self recompute];
+
+    // Keep Fresh checks: on launch, whenever Apollo comes back to the front,
+    // when the connection or Low Power Mode changes, and every 10 minutes
+    // while Apollo is open (a timer only fires while the app runs).
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    __weak typeof(self) weakSelf = self;
+    [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
+                    usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"app active"]; }];
+    [center addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+                    usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"power state"]; }];
+    _keepFreshTimer = [NSTimer scheduledTimerWithTimeInterval:10 * 60 repeats:YES block:^(__unused NSTimer *timer) {
+        [weakSelf considerKeepFresh:@"timer"];
+    }];
+    _keepFreshTimer.tolerance = 60;
+    [self considerKeepFresh:@"launch"];
 }
 
-- (void)networkChanged:(BOOL)available {
+- (void)networkChangedWithFlags:(SCNetworkReachabilityFlags)flags {
+    BOOL available = ApolloOfflineFlagsMeanOnline(flags);
 #if APOLLO_SIM_BUILD
     if (sApolloOfflineSimulateNoNetwork) available = NO;
 #endif
-    if (available == _networkAvailable) return;
+    BOOL wifi = available && !(flags & kSCNetworkReachabilityFlagsIsWWAN);
+    if (available == _networkAvailable && wifi == _onWiFi) return;
     _networkAvailable = available;
-    ApolloLog(@"[Offline] connectivity: %@", available ? @"online" : @"offline");
+    _onWiFi = wifi;
+    ApolloLog(@"[Offline] connectivity: %@", available ? (wifi ? @"Wi-Fi" : @"cellular") : @"offline");
     [self recompute];
+    [self considerKeepFresh:@"connectivity"];
+}
+
+// MARK: Keep Fresh
+
+- (void)considerKeepFresh:(NSString *)reason {
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
+    ApolloOfflineAutoRefreshState state = {
+        .enabled = [NSUserDefaults.standardUserDefaults boolForKey:UDKeyOfflineAutoRefresh],
+        .hasLibrary = library.hasContent,
+        .libraryAge = library.downloadedAt ? -library.downloadedAt.timeIntervalSinceNow : DBL_MAX,
+        .networkAvailable = _networkAvailable,
+        .onWiFi = _onWiFi,
+        .lowPowerMode = NSProcessInfo.processInfo.lowPowerModeEnabled,
+        .serving = _serving,
+        .downloading = _downloading,
+        .sinceLastAttempt = _lastAutoAttempt > 0 ? CFAbsoluteTimeGetCurrent() - _lastAutoAttempt : DBL_MAX,
+    };
+    if (!ApolloOfflineShouldAutoRefresh(state)) return;
+    _lastAutoAttempt = CFAbsoluteTimeGetCurrent();
+    ApolloLog(@"[Offline] Keep Fresh: batch is %.1f h old on Wi-Fi (%@); refreshing", state.libraryAge / 3600, reason);
+    [self startDownloadAutomatically:YES completion:nil];
 }
 
 - (ApolloOfflineUseMode)useMode {
@@ -332,6 +401,10 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
 }
 
 - (void)startDownloadWithCompletion:(void (^)(BOOL, NSString *))completion {
+    [self startDownloadAutomatically:NO completion:completion];
+}
+
+- (void)startDownloadAutomatically:(BOOL)automatic completion:(void (^)(BOOL, NSString *))completion {
     if (_downloading) return;
     NSArray<ApolloOfflineFeedSource *> *sources = [self plannedSources];
     if (sources.count == 0) {
@@ -346,6 +419,12 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
     options.includeImages = [defaults boolForKey:UDKeyOfflineIncludeImages];
     CGFloat screenPixels = UIScreen.mainScreen.nativeBounds.size.width;
     options.maxImageWidth = (NSInteger)MIN(1440, MAX(640, screenPixels));
+    if ([defaults boolForKey:UDKeyOfflineSkipRead]) {
+        options.skipPostIDs = ApolloOfflineReadPostIDs();
+    }
+    // Keep Fresh runs while the user is browsing: leave them more of Reddit's
+    // per-minute request allowance.
+    if (automatic) options.apiSpacing = 1.5;
 
     ApolloOfflineFetcher fetcher = ^(NSURLRequest *request, ApolloOfflineFetchCompletion done) {
         NSMutableURLRequest *marked = [request mutableCopy];
@@ -371,20 +450,22 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
     _downloader = [[ApolloOfflineDownloader alloc] initWithLibraryDirectory:[ApolloOfflineLibrary defaultDirectory]
                                                                     fetcher:fetcher requestBuilder:builder];
     _downloading = YES;
+    _downloadingAutomatically = automatic;
     _progressBytes = 0;
     _progressText = @"Starting…";
     // Downloads only run while Apollo is open: keep the screen on and ask for
     // a little background time if the user switches away.
-    _restoreIdleTimer = !UIApplication.sharedApplication.idleTimerDisabled;
-    UIApplication.sharedApplication.idleTimerDisabled = YES;
+    // (Keep Fresh leaves the screen timeout alone.)
+    _restoreIdleTimer = !automatic && !UIApplication.sharedApplication.idleTimerDisabled;
+    if (_restoreIdleTimer) UIApplication.sharedApplication.idleTimerDisabled = YES;
     __weak typeof(self) weakSelf = self;
     _backgroundTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"ApolloOfflineDownload" expirationHandler:^{
         ApolloLog(@"[Offline] background time ran out; cancelling download");
         [weakSelf cancelDownload];
     }];
-    ApolloLog(@"[Offline] download start: %@, budget %llu MB, comments=%d images=%d",
+    ApolloLog(@"[Offline] download start: %@, budget %llu MB, comments=%d images=%d, %lu read posts to skip",
               [[sources valueForKey:@"title"] componentsJoinedByString:@", "], options.byteBudget / (1000 * 1000),
-              options.includeComments, options.includeImages);
+              options.includeComments, options.includeImages, (unsigned long)options.skipPostIDs.count);
     [self recompute];
 
     [_downloader startWithOptions:options progress:^(unsigned long long bytes, __unused NSUInteger posts, NSString *status) {
@@ -398,6 +479,8 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         ApolloOfflineModeController *strongSelf = weakSelf;
         if (!strongSelf) return;
         strongSelf->_downloading = NO;
+        strongSelf->_downloadingAutomatically = NO;
+        NSUInteger skipped = strongSelf->_downloader.skippedPostCount;
         strongSelf->_downloader = nil;
         strongSelf->_progressText = @"";
         [strongSelf endDownloadSideEffects];
@@ -406,7 +489,8 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         if (committed) {
             message = [NSString stringWithFormat:@"Saved %lu posts (%@) for offline reading.", (unsigned long)posts,
                        [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile]];
-            ApolloLog(@"[Offline] download done: %lu posts, %llu bytes", (unsigned long)posts, bytes);
+            ApolloLog(@"[Offline] download done%@: %lu posts, %llu bytes, %lu already-read posts skipped",
+                      automatic ? @" (Keep Fresh)" : @"", (unsigned long)posts, bytes, (unsigned long)skipped);
         } else {
             message = error.localizedDescription ?: @"The download didn't finish.";
             ApolloLog(@"[Offline] download ended without saving: %@ (%@ %ld)", message, error.domain, (long)error.code);

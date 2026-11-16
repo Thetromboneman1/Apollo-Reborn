@@ -271,6 +271,54 @@ static void TestDownloaderFailureKeepsOldLibrary(void) {
     [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
 }
 
+static void TestRemovingReadPosts(void) {
+    NSUInteger removed = 0;
+    NSData *filtered = ApolloOfflineListingRemovingPosts(ListingData(@[ @"a", @"b", @"c" ], @"t3_c"), [NSSet setWithArray:@[ @"b", @"zz" ]], &removed);
+    NSDictionary *root = [NSJSONSerialization JSONObjectWithData:filtered options:0 error:nil];
+    CHECK(removed == 1, "one removed: %lu", (unsigned long)removed);
+    CHECK([[root[@"data"][@"children"] valueForKeyPath:@"data.id"] isEqualToArray:(@[ @"a", @"c" ])], "kept order");
+    CHECK([root[@"data"][@"after"] isEqual:@"t3_c"] && [root[@"data"][@"dist"] integerValue] == 2, "after kept, dist updated");
+    CHECK(ApolloOfflineListingRemovingPosts(JSON(@[ @1 ]), [NSSet setWithObject:@"a"], NULL) == nil, "not a listing");
+}
+
+static void TestAutoRefreshPolicy(void) {
+    ApolloOfflineAutoRefreshState s = {
+        .enabled = YES, .hasLibrary = YES, .libraryAge = 7 * 3600, .networkAvailable = YES, .onWiFi = YES,
+        .lowPowerMode = NO, .serving = NO, .downloading = NO, .sinceLastAttempt = 3600,
+    };
+    CHECK(ApolloOfflineShouldAutoRefresh(s), "stale batch on Wi-Fi refreshes");
+    ApolloOfflineAutoRefreshState t = s; t.enabled = NO;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "setting off");
+    t = s; t.hasLibrary = NO;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "never before a first manual download");
+    t = s; t.onWiFi = NO;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "never on cellular");
+    t = s; t.lowPowerMode = YES;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "never in Low Power Mode");
+    t = s; t.serving = YES;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "not while the batch is being browsed");
+    t = s; t.libraryAge = 3 * 3600;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "fresh batch kept");
+    t = s; t.sinceLastAttempt = 60;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "a failed try isn't retried right away");
+}
+
+static void TestDownloaderSkipsReadPosts(void) {
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    // Page one is entirely read: its saved stand-in is page two, under page one's key.
+    ApolloOfflineDownloadOptions *options = Options(100ull * 1024 * 1024);
+    options.skipPostIDs = [NSSet setWithArray:@[ @"a1", @"a2", @"a3", @"b2" ]];
+    RunResult result = RunDownload(dir, options, ResponsesForTwoPages(), requested);
+    CHECK(result.committed && result.posts == 2, "two unread posts: %lu", (unsigned long)result.posts);
+    CHECK(![requested containsObject:@"/comments/a1"] && ![requested containsObject:@"/comments/b2"], "read posts not downloaded");
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    NSDictionary *first = [NSJSONSerialization JSONObjectWithData:[library dataForKey:Key(@"https://oauth.reddit.com/hot") contentType:nil] options:0 error:nil];
+    CHECK([[first[@"data"][@"children"] valueForKeyPath:@"data.id"] isEqualToArray:(@[ @"b1", @"b3" ])], "page one shows the next unread posts");
+    CHECK(first[@"data"][@"after"] == [NSNull null], "and ends the feed");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+}
+
 int main(void) {
     @autoreleasepool {
         TestFeedKeys();
@@ -282,6 +330,9 @@ int main(void) {
         TestDownloaderWholeFeed();
         TestDownloaderBudget();
         TestDownloaderFailureKeepsOldLibrary();
+        TestRemovingReadPosts();
+        TestAutoRefreshPolicy();
+        TestDownloaderSkipsReadPosts();
     }
     if (sFailures) {
         fprintf(stderr, "%d failure(s)\n", sFailures);

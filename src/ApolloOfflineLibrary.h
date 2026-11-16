@@ -63,6 +63,29 @@ typedef NS_ENUM(NSInteger, ApolloOfflineUseMode) {
 // Whether saved entries should answer requests right now.
 BOOL ApolloOfflineShouldServe(ApolloOfflineUseMode mode, BOOL networkAvailable, BOOL hasLibrary, BOOL downloading);
 
+// The listing JSON without the posts whose bare id ("abc123") is in `postIDs`.
+// data.after is kept, so the page still chains to the same next page. Sets
+// *removed to how many were dropped. nil when the data isn't a listing.
+NSData * _Nullable ApolloOfflineListingRemovingPosts(NSData *listing, NSSet<NSString *> *postIDs, NSUInteger * _Nullable removed);
+
+// Inputs for "Keep fresh": refresh the batch on its own while Apollo is open.
+typedef struct {
+    BOOL enabled;                   // the user's setting
+    BOOL hasLibrary;                // only after a first manual download (an opt-in)
+    NSTimeInterval libraryAge;      // seconds since the last batch
+    BOOL networkAvailable;
+    BOOL onWiFi;                    // never on cellular
+    BOOL lowPowerMode;
+    BOOL serving;                   // the library is answering requests
+    BOOL downloading;
+    NSTimeInterval sinceLastAttempt; // seconds since the last automatic try
+} ApolloOfflineAutoRefreshState;
+
+extern const NSTimeInterval ApolloOfflineAutoRefreshMaxAge;       // 6 hours
+extern const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval; // 30 minutes
+
+BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
+
 #ifdef __cplusplus
 }
 #endif

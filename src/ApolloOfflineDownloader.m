@@ -76,6 +76,9 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     NSString *_pageKey;
     NSData *_pageData;
     NSString *_nextAfter;
+    NSString *_pageKeyOverride;
+    NSUInteger _emptyPagesSkipped;
+    NSUInteger _skippedRead;
 }
 
 - (instancetype)initWithLibraryDirectory:(NSURL *)directory fetcher:(ApolloOfflineFetcher)fetcher requestBuilder:(ApolloOfflineRequestBuilder)requestBuilder {
@@ -105,9 +108,16 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         self->_cancelled = NO;
         self->_lastError = nil;
         self->_lastAPICall = 0;
+        self->_skippedRead = 0;
         self->_feedIndex = 0;
         [self startFeed];
     });
+}
+
+- (NSUInteger)skippedPostCount {
+    __block NSUInteger count = 0;
+    dispatch_sync(_queue, ^{ count = self->_skippedRead; });
+    return count;
 }
 
 - (void)cancel {
@@ -200,6 +210,8 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     _keptInFeed = 0;
     _after = nil;
     _pending = nil;
+    _pageKeyOverride = nil;
+    _emptyPagesSkipped = 0;
     [self fetchPage];
 }
 
@@ -220,13 +232,33 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     if (_after.length > 0) [query addObject:[NSURLQueryItem queryItemWithName:@"after" value:_after]];
     [self report:[NSString stringWithFormat:@"Loading %@…", source.title]];
 
-    [self fetchAPI:source.path query:query completion:^(NSURLRequest *request, NSData *data, NSHTTPURLResponse *response, NSError *error) {
+    [self fetchAPI:source.path query:query completion:^(NSURLRequest *request, NSData *fetched, NSHTTPURLResponse *response, NSError *error) {
         if ([self stopIfCancelled]) return;
+        // Leave out posts the user has already read before anything else sees the page.
+        NSData *data = fetched;
+        if (ApolloOfflineIsSuccess(response, fetched, error) && self->_options.skipPostIDs.count > 0) {
+            NSUInteger removed = 0;
+            data = ApolloOfflineListingRemovingPosts(fetched, self->_options.skipPostIDs, &removed) ?: fetched;
+            self->_skippedRead += removed;
+        }
         NSDictionary *root = ApolloOfflineIsSuccess(response, data, error)
             ? ApolloOfflineDictValue([NSJSONSerialization JSONObjectWithData:data options:0 error:nil]) : nil;
         NSDictionary *listing = ApolloOfflineDictValue(root[@"data"]);
         NSArray *children = [listing[@"children"] isKindOfClass:[NSArray class]] ? listing[@"children"] : nil;
-        NSString *key = ApolloOfflineKeyForURL(request.URL);
+        // A page that came back all-read is stood in for by the next one under
+        // the key Apollo will ask for (see skipPostIDs).
+        NSString *key = self->_pageKeyOverride ?: ApolloOfflineKeyForURL(request.URL);
+        id nextAfterValue = listing[@"after"];
+        NSString *nextAfter = [nextAfterValue isKindOfClass:[NSString class]] ? nextAfterValue : nil;
+        if (children && key && children.count == 0 && nextAfter.length > 0 && self->_emptyPagesSkipped < 10) {
+            self->_pageKeyOverride = key;
+            self->_emptyPagesSkipped++;
+            self->_after = nextAfter;
+            [self fetchPage];
+            return;
+        }
+        self->_pageKeyOverride = nil;
+        self->_emptyPagesSkipped = 0;
         if (!children || !key) {
             self->_lastError = error ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:@{
                 NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Reddit answered %ld for %@.", (long)response.statusCode, source.title],
@@ -243,8 +275,7 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         self->_pageKey = key;
         self->_pageData = data;
         self->_pagePosts = posts;
-        id after = listing[@"after"];
-        self->_nextAfter = [after isKindOfClass:[NSString class]] ? after : nil;
+        self->_nextAfter = nextAfter;
         [self processPostAtIndex:0];
     }];
 }

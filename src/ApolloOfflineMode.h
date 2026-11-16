@@ -11,11 +11,24 @@ NS_ASSUME_NONNULL_BEGIN
 // or the serving state changes.
 extern NSNotificationName const ApolloOfflineModeDidChangeNotification;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+// YES while saved entries answer requests. Thread-safe. Features that would
+// fetch Home some other way (For You) check this and step aside.
+BOOL ApolloOfflineModeIsServing(void);
+#ifdef __cplusplus
+}
+#endif
+
 @interface ApolloOfflineModeController : NSObject
 
 + (instancetype)sharedController;
 
 @property (nonatomic, readonly) BOOL downloading;
+// The running download was started by Keep Fresh, not by the user.
+@property (nonatomic, readonly) BOOL downloadingAutomatically;
+@property (nonatomic, readonly) BOOL onWiFi;
 @property (nonatomic, readonly) BOOL networkAvailable;
 // YES while saved entries are answering requests.
 @property (nonatomic, readonly) BOOL serving;

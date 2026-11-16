@@ -37,6 +37,11 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 @property (nonatomic) unsigned long long maxImageBytes; // default 12 MB (skips huge GIFs)
 // Gap between Reddit API calls, to stay well under Reddit's ~100/minute limit.
 @property (nonatomic) NSTimeInterval apiSpacing;       // default 0.75 s
+// Bare post ids ("abc123") to leave out: posts the user has already read.
+// They're removed from the saved pages too, so offline feeds only show new
+// posts. A page that's entirely read is replaced by the next one under the
+// same key, so the feed doesn't end early.
+@property (nonatomic, copy) NSSet<NSString *> *skipPostIDs;
 @end
 
 typedef void (^ApolloOfflineProgress)(unsigned long long bytes, NSUInteger posts, NSString *status);
@@ -57,6 +62,8 @@ typedef NS_ENUM(NSInteger, ApolloOfflineErrorCode) {
 - (instancetype)init NS_UNAVAILABLE;
 
 @property (nonatomic, readonly) BOOL running;
+// Posts left out of the last run because they were already read.
+@property (nonatomic, readonly) NSUInteger skippedPostCount;
 
 // Callbacks arrive on the main queue. The library on disk is replaced only
 // when the batch commits; a failed or cancelled run leaves the old one.
