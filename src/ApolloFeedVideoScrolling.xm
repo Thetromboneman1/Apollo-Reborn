@@ -98,6 +98,7 @@ static const int32_t kApolloInlineVideoTimeObserverTimescale = 30;
 - (void)setPeriodicTimeObserverTimescale:(int32_t)timescale;
 - (id)asset;
 - (id)player;
+- (id)currentItem;
 - (id)constructPlayerItem;
 - (void)setCurrentItem:(id)item;
 - (void)setPlayer:(id)player;
@@ -111,6 +112,7 @@ static const int32_t kApolloInlineVideoTimeObserverTimescale = 30;
 @protocol ApolloVideoNodeDelegateProbe <NSObject>
 @optional
 - (void)videoNode:(id)videoNode didSetCurrentItem:(id)item;
+- (void)videoNode:(id)videoNode willChangePlayerState:(NSInteger)fromState toState:(NSInteger)toState;
 @end
 
 #if APOLLO_SIM_BUILD
@@ -390,6 +392,30 @@ static BOOL ApolloFeedCellHasInlineVideo(id cell) {
 // MARK: - Hooks
 // =============================================================================
 
+// Starts loading the video tracks' sizes as soon as a player is attached, so
+// Apollo's RichMediaNode layout (which also reads -naturalSize, on the main
+// thread when Texture lays out there) finds them loaded instead of loading
+// them synchronously. Never blocks: everything here is asynchronous.
+static void ApolloFeedVideoPreloadVideoSizes(AVAsset *asset) {
+    if (!asset) return;
+    void (^loadSizes)(NSArray<AVAssetTrack *> *) = ^(NSArray<AVAssetTrack *> *tracks) {
+        for (AVAssetTrack *track in tracks) {
+            if ([track statusOfValueForKey:@"naturalSize" error:NULL] == AVKeyValueStatusLoaded) continue;
+            [track loadValuesAsynchronouslyForKeys:@[@"naturalSize"] completionHandler:^{}];
+        }
+    };
+    if (@available(iOS 15.0, *)) {
+        [asset loadTracksWithMediaType:AVMediaTypeVideo completionHandler:^(NSArray<AVAssetTrack *> *tracks, NSError *error) {
+            if (tracks.count) loadSizes(tracks);
+        }];
+    } else {
+        [asset loadValuesAsynchronouslyForKeys:@[@"tracks"] completionHandler:^{
+            if ([asset statusOfValueForKey:@"tracks" error:NULL] != AVKeyValueStatusLoaded) return;
+            loadSizes([asset tracksWithMediaType:AVMediaTypeVideo]);
+        }];
+    }
+}
+
 %group FeedVideoObserver
 
 %hook ASVideoNode
@@ -412,6 +438,7 @@ static BOOL ApolloFeedCellHasInlineVideo(id cell) {
         os_log_debug(ApolloFixLog(), "[ApolloFix] [FeedVideoScrolling] leaving non-default timescale %d on %{public}@",
                        timescale, [self class]);
     }
+    ApolloFeedVideoPreloadVideoSizes(player.currentItem.asset);
     %orig;
 }
 
@@ -440,6 +467,92 @@ static BOOL ApolloFeedCellHasInlineVideo(id cell) {
 - (BOOL)neverShowPlaceholders {
     if (sFeedVideoScrollSmoothing && ApolloFeedCellHasInlineVideo(self)) return NO;
     return %orig;
+}
+
+%end
+
+%end
+
+// =============================================================================
+// MARK: - Video size without blocking the main thread
+// =============================================================================
+//
+// Apollo's -[RichMediaNode videoNode:willChangePlayerState:toState:] walks the
+// player item's tracks, reads the video track's -naturalSize, compares it with
+// the node's bounds and then sets the player layer's videoGravity and un-hides
+// it. When that track's size hasn't loaded yet the read loads it synchronously
+// on the main thread. AVFoundation reports it ("[AVFoundation Hang Risk] Asset
+// track property "naturalSize" accessed synchronously before being loaded"),
+// and the wait also holds up every other asset's track property loads, so on a
+// slow host one feed video can freeze scrolling and leave the next ones
+// spinning (#1698/#1714/#1720/#1721 on upstream). Seen 84 times in one
+// 5-minute feed session on an iPhone 15 Pro (build 374).
+//
+// When a video track's size isn't loaded, load it asynchronously first and
+// replay the delegate call on the main thread once it is. Only a node's newest
+// call is replayed, and only while the node still shows the same item. Calls
+// whose size is already loaded run untouched.
+
+static const void *kApolloRichMediaSizeGenerationKey = &kApolloRichMediaSizeGenerationKey;
+static BOOL sApolloRichMediaSizeReplaying = NO; // main thread only
+
+static NSArray<AVAssetTrack *> *ApolloRichMediaUnloadedVideoTracks(AVPlayerItem *item) {
+    NSMutableArray<AVAssetTrack *> *pending = nil;
+    for (AVPlayerItemTrack *itemTrack in item.tracks) {
+        AVAssetTrack *track = itemTrack.assetTrack;
+        if (![track.mediaType isEqualToString:AVMediaTypeVideo]) continue;
+        if ([track statusOfValueForKey:@"naturalSize" error:NULL] == AVKeyValueStatusLoaded) continue;
+        if (!pending) pending = [NSMutableArray array];
+        [pending addObject:track];
+    }
+    return pending;
+}
+
+static NSUInteger ApolloRichMediaBumpSizeGeneration(id node) {
+    NSUInteger generation = [objc_getAssociatedObject(node, kApolloRichMediaSizeGenerationKey) unsignedIntegerValue] + 1;
+    objc_setAssociatedObject(node, kApolloRichMediaSizeGenerationKey, @(generation), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return generation;
+}
+
+%group FeedVideoNaturalSize
+
+%hook RichMediaNode
+
+- (void)videoNode:(ASVideoNode *)videoNode willChangePlayerState:(NSInteger)fromState toState:(NSInteger)toState {
+    if (sApolloRichMediaSizeReplaying || !videoNode) { %orig; return; }
+    NSUInteger generation = ApolloRichMediaBumpSizeGeneration(self);
+    AVPlayerItem *item = [videoNode currentItem];
+    NSArray<AVAssetTrack *> *pending = item ? ApolloRichMediaUnloadedVideoTracks(item) : nil;
+    if (pending.count == 0) { %orig; return; }
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ApolloLog(@"[FeedVideoScrolling] video size not loaded at a player state change — loading it off the main thread before Apollo reads it");
+    });
+    CFTimeInterval start = CACurrentMediaTime();
+    __weak id weakSelf = self;
+    __weak ASVideoNode *weakVideoNode = videoNode;
+    __weak AVPlayerItem *weakItem = item;
+    dispatch_group_t group = dispatch_group_create();
+    for (AVAssetTrack *track in pending) {
+        dispatch_group_enter(group);
+        [track loadValuesAsynchronouslyForKeys:@[@"naturalSize"] completionHandler:^{ dispatch_group_leave(group); }];
+    }
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        id strongSelf = weakSelf;
+        ASVideoNode *strongVideoNode = weakVideoNode;
+        AVPlayerItem *strongItem = weakItem;
+        if (!strongSelf || !strongVideoNode || !strongItem) return;
+        if ([objc_getAssociatedObject(strongSelf, kApolloRichMediaSizeGenerationKey) unsignedIntegerValue] != generation) return; // a newer state change ran
+        if ([strongVideoNode currentItem] != strongItem) return; // the node moved on to another item
+        CFTimeInterval seconds = CACurrentMediaTime() - start;
+        if (seconds >= kApolloFeedVideoPrewarmSlowLog) {
+            ApolloLog(@"[FeedVideoScrolling] video size took %.2fs to load node=%p (main thread stayed free)", seconds, strongVideoNode);
+        }
+        sApolloRichMediaSizeReplaying = YES;
+        [strongSelf videoNode:strongVideoNode willChangePlayerState:fromState toState:toState];
+        sApolloRichMediaSizeReplaying = NO;
+    });
 }
 
 %end
@@ -711,6 +824,16 @@ static void ApolloLogRangeTuningOnce(void) {
               sFeedVideoPrewarmAvailable ? @"available" : @"UNAVAILABLE — stock path",
               sFeedVideoPrewarmCanTryLock ? @"on" : @"off",
               sFeedVideoScrollSmoothing ? @"on" : @"off");
+
+    Class richMediaClass = objc_getClass("_TtC6Apollo13RichMediaNode");
+    if (richMediaClass
+        && [richMediaClass instancesRespondToSelector:@selector(videoNode:willChangePlayerState:toState:)]
+        && [videoNodeClass instancesRespondToSelector:@selector(currentItem)]) {
+        %init(FeedVideoNaturalSize, RichMediaNode = richMediaClass);
+        ApolloLog(@"[FeedVideoScrolling] hook installed: RichMediaNode videoNode:willChangePlayerState:toState: (video size loads off the main thread)");
+    } else {
+        ApolloLog(@"[FeedVideoScrolling] ctor: RichMediaNode=%p lacks videoNode:willChangePlayerState:toState: — video size check stays synchronous", (__bridge void *)richMediaClass);
+    }
 
     Class cellClass = objc_getClass("_TtC6Apollo17LargePostCellNode");
     if (cellClass && [cellClass instancesRespondToSelector:@selector(neverShowPlaceholders)]) {
