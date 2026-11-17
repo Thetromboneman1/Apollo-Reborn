@@ -53,12 +53,15 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 // Profile pictures for the people in each saved thread: the post's author and
 // its first `avatarAuthorsPerPost` commenters, looked up 100 at a time
 // (/api/user_data_by_account_ids) after the feeds, with their pictures. Needs
-// includeImages. They get `avatarShare` of the data limit (at most
-// maxAvatarBytes), set aside from what the feeds use.
+// includeImages. Pictures get `avatarShare` of the data limit (at most
+// maxAvatarBytes), set aside from what the feeds use. Lookups keep going after
+// that runs out (up to maxAvatarAuthors): they're tiny, and everyone with one
+// of Reddit's default avatars shares a picture that's already saved.
 @property (nonatomic) BOOL includeAvatars;             // default YES
 @property (nonatomic) NSUInteger avatarAuthorsPerPost; // default 30
-@property (nonatomic) double avatarShare;              // default 0.08
-@property (nonatomic) unsigned long long maxAvatarBytes; // default 15 MB
+@property (nonatomic) double avatarShare;              // default 0.12
+@property (nonatomic) unsigned long long maxAvatarBytes; // default 20 MB
+@property (nonatomic) NSUInteger maxAvatarAuthors;     // default 3000
 // Account reads saved once per batch after the feeds ("/api/me",
 // "/message/inbox", "/r/pics/about", ...), so profile, inbox, Subreddits and
 // subreddit headers load offline. Listings follow `after` up to 10 pages.

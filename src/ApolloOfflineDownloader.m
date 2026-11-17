@@ -39,8 +39,9 @@ NSErrorDomain const ApolloOfflineErrorDomain = @"ApolloOfflineErrorDomain";
         _maxPageBytes = 5ull * 1000 * 1000;
         _includeAvatars = YES;
         _avatarAuthorsPerPost = 30;
-        _avatarShare = 0.08;
-        _maxAvatarBytes = 15ull * 1000 * 1000;
+        _avatarShare = 0.12;
+        _maxAvatarBytes = 20ull * 1000 * 1000;
+        _maxAvatarAuthors = 3000;
     }
     return self;
 }
@@ -792,12 +793,15 @@ static NSURL *ApolloOfflineHTTPSURL(id value) {
 - (void)saveAvatarChunkAtIndex:(NSUInteger)index {
     if ([self stopIfCancelled]) return;
     NSUInteger start = index * 100;
-    if (start >= _avatarIDs.count || _writer.bytesWritten >= _avatarBudgetEnd) {
+    // Lookups go on after the picture allowance is used: a record is a few
+    // hundred bytes, and default-avatar users need no new picture.
+    if (start >= MIN(_avatarIDs.count, _options.maxAvatarAuthors) || _writer.bytesWritten >= _options.byteBudget) {
         [self startFeed];
         return;
     }
     if (index == 0) [self report:@"Saving profile pictures"];
-    NSArray<NSString *> *chunk = [_avatarIDs.array subarrayWithRange:NSMakeRange(start, MIN((NSUInteger)100, _avatarIDs.count - start))];
+    NSUInteger end = MIN(_avatarIDs.count, _options.maxAvatarAuthors);
+    NSArray<NSString *> *chunk = [_avatarIDs.array subarrayWithRange:NSMakeRange(start, MIN((NSUInteger)100, end - start))];
     NSArray *query = @[
         [NSURLQueryItem queryItemWithName:@"ids" value:[chunk componentsJoinedByString:@","]],
         [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"],
@@ -814,7 +818,7 @@ static NSURL *ApolloOfflineHTTPSURL(id value) {
                 if (!record) continue;
                 self->_avatarAuthors++;
                 NSURL *picture = ApolloOfflineHTTPSURL(record[@"profile_img"]);
-                if (picture && [self claimKey:ApolloOfflineKeyForURL(picture)]) [pictures addObject:picture];
+                if (picture) [pictures addObject:picture];
             }
         } else if (error) {
             self->_lastError = error;
@@ -823,15 +827,29 @@ static NSURL *ApolloOfflineHTTPSURL(id value) {
     }];
 }
 
-// Several pictures at a time (CDN, not the Reddit API), until the allowance is used.
+// Reddit's default avatars (a handful of shared files on redditstatic.com).
+static BOOL ApolloOfflineIsDefaultAvatar(NSURL *url) {
+    NSString *host = url.host.lowercaseString;
+    return [host isEqualToString:@"redditstatic.com"] || [host hasSuffix:@".redditstatic.com"];
+}
+
+// Several pictures at a time (CDN, not the Reddit API). Custom pictures stop
+// at the allowance; the shared default ones are always kept (while the data
+// limit has room), since one file covers everyone who has it. A picture is
+// claimed only when it's actually fetched, so one first met after the
+// allowance ran out isn't lost for a later author who'd get it free.
 - (void)saveAvatarPictures:(NSArray<NSURL *> *)urls then:(void (^)(void))then {
     __block NSUInteger next = 0, active = 0;
     __block BOOL finished = NO;
     __block void (^pump)(void) = nil;
     pump = ^{
-        while (active < 8 && next < urls.count && !self->_cancelled && self->_writer.bytesWritten < self->_avatarBudgetEnd) {
+        while (active < 8 && next < urls.count && !self->_cancelled) {
             NSURL *url = urls[next++];
+            BOOL shared = ApolloOfflineIsDefaultAvatar(url);
+            unsigned long long written = self->_writer.bytesWritten;
+            BOOL room = shared ? written < self->_options.byteBudget : written < self->_avatarBudgetEnd;
             NSString *key = ApolloOfflineKeyForURL(url);
+            if (!room || ![self claimKey:key]) continue;
             active++;
             [self saveImage:url then:^{
                 if ([self->_writer hasKey:key]) self->_avatarImages++;

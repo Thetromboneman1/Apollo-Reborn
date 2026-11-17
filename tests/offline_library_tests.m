@@ -520,6 +520,23 @@ static void TestDownloaderAvatars(void) {
           "beyond the per-post limit: c3 not looked up");
     [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
 
+    // No picture allowance left: every author is still looked up, the shared
+    // default avatar is still kept (one file covers everyone who has it), and
+    // custom pictures are skipped.
+    NSURL *dir3 = TempDirectory();
+    [requested removeAllObjects];
+    options = Options(100ull * 1024 * 1024);
+    options.avatarAuthorsPerPost = 5;
+    options.maxAvatarBytes = 0;
+    RunDownload(dir3, options, responses, requested);
+    library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir3];
+    NSURL *everyone = [NSURL URLWithString:@"https://oauth.reddit.com/api/user_data_by_account_ids?ids=t2_op1,t2_op2,t2_c1,t2_c2,t2_c3"];
+    answer = [NSJSONSerialization JSONObjectWithData:[library userDataResponseForURL:everyone] ?: [NSData data] options:0 error:nil];
+    CHECK(answer.count == 5, "all five authors looked up past the allowance: %lu", (unsigned long)answer.count);
+    CHECK([library hasEntryForKey:Key(@"https://www.redditstatic.com/avatars/defaults/v2/avatar_default_3.png")], "shared default avatar kept");
+    CHECK(![library hasEntryForKey:Key(@"https://styles.redditmedia.com/t5_t2_c1/styles/profileIcon_x.png")], "custom pictures skipped");
+    [NSFileManager.defaultManager removeItemAtURL:dir3.URLByDeletingLastPathComponent error:nil];
+
     // Images off: no lookups at all.
     NSURL *dir2 = TempDirectory();
     [requested removeAllObjects];
