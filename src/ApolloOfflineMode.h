@@ -31,6 +31,8 @@ BOOL ApolloOfflineModeIsServing(void);
 @property (nonatomic, readonly) BOOL onWiFi;
 // Re-checks whether Keep Fresh should refresh now (after a setting changes).
 - (void)considerKeepFresh:(NSString *)reason;
+// Stops a running Keep Fresh refresh the current network or settings no longer allow.
+- (void)stopKeepFreshIfNotAllowed:(NSString *)reason;
 @property (nonatomic, readonly) BOOL networkAvailable;
 // YES while saved entries are answering requests.
 @property (nonatomic, readonly) BOOL serving;

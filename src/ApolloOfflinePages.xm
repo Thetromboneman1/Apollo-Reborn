@@ -49,35 +49,31 @@ static NSString *const kApolloOfflineCleanupScript =
 static WKContentRuleList *sApolloOfflineSaveRuleList;
 static BOOL sApolloOfflineSaveRulesSettled; // compiled or failed
 
-// One off-screen web view, one page at a time. Main thread only.
-@interface ApolloOfflinePageSaver : NSObject <WKNavigationDelegate>
-@property (nonatomic, strong) NSMutableArray<NSArray *> *queue; // @[ url, done ]
+// Up to kApolloOfflinePageWorkers off-screen web views loading pages side by
+// side (each is its own web content process). Main thread only.
+static const NSUInteger kApolloOfflinePageWorkers = 3;
+
+@class ApolloOfflinePageSaver;
+
+// One off-screen web view, one page at a time.
+@interface ApolloOfflinePageWorker : NSObject <WKNavigationDelegate>
+@property (nonatomic, weak) ApolloOfflinePageSaver *saver;
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, copy) void (^current)(NSData *);
 @property (nonatomic) NSUInteger generation;
-@property (nonatomic) BOOL waitingForRules;
+- (void)load:(NSURL *)url done:(void (^)(NSData *))done;
+- (void)stop;
 @end
 
-@implementation ApolloOfflinePageSaver
+@interface ApolloOfflinePageSaver : NSObject
+@property (nonatomic, strong) NSMutableArray<NSArray *> *queue; // @[ url, done ]
+@property (nonatomic, strong) NSMutableArray<ApolloOfflinePageWorker *> *workers;
+@property (nonatomic) BOOL waitingForRules;
++ (instancetype)shared;
+- (void)workerFinished:(ApolloOfflinePageWorker *)worker;
+@end
 
-+ (instancetype)shared {
-    static ApolloOfflinePageSaver *saver;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        saver = [ApolloOfflinePageSaver new];
-        saver.queue = [NSMutableArray array];
-        [WKContentRuleListStore.defaultStore compileContentRuleListForIdentifier:@"ApolloOfflineSaveRules"
-                                                         encodedContentRuleList:kApolloOfflineSaveRules
-                                                              completionHandler:^(WKContentRuleList *list, NSError *error) {
-            if (error) ApolloLog(@"[Offline] page rules didn't compile: %@", error.localizedDescription);
-            dispatch_async(dispatch_get_main_queue(), ^{
-                sApolloOfflineSaveRuleList = list;
-                sApolloOfflineSaveRulesSettled = YES;
-            });
-        }];
-    });
-    return saver;
-}
+@implementation ApolloOfflinePageWorker
 
 - (WKWebView *)makeWebView {
     WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
@@ -94,34 +90,8 @@ static BOOL sApolloOfflineSaveRulesSettled; // compiled or failed
     return webView;
 }
 
-- (void)enqueue:(NSURL *)url done:(void (^)(NSData *))done {
-    [self.queue addObject:@[ url, [done copy] ]];
-    if (!self.current && !self.waitingForRules) [self next];
-}
-
-- (void)next {
-    // The save rules compile once, asynchronously; give them a moment so the
-    // first page isn't saved without them.
-    static NSUInteger waits;
-    if (!sApolloOfflineSaveRulesSettled && waits < 30 && self.queue.count > 0) {
-        waits++;
-        self.waitingForRules = YES;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            self.waitingForRules = NO;
-            [self next];
-        });
-        return;
-    }
-    NSArray *item = self.queue.firstObject;
-    if (!item) {
-        // Nothing left: let the web view (and its web content process) go.
-        [self.webView removeFromSuperview];
-        self.webView = nil;
-        return;
-    }
-    [self.queue removeObjectAtIndex:0];
-    NSURL *url = item[0];
-    self.current = item[1];
+- (void)load:(NSURL *)url done:(void (^)(NSData *))done {
+    self.current = done;
     NSUInteger generation = ++self.generation;
     if (!self.webView) self.webView = [self makeWebView];
     // In the window but off screen, so WebKit doesn't throttle it as hidden.
@@ -133,12 +103,20 @@ static BOOL sApolloOfflineSaveRulesSettled; // compiled or failed
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.timeoutInterval = 20;
     [self.webView loadRequest:request];
-    // Pages full of trackers may never "finish": archive what's there at 25 s.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Pages full of trackers may never "finish": archive what's there at 20 s.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (self.generation != generation || !self.current) return;
         [self.webView stopLoading];
         [self archiveGeneration:generation];
     });
+}
+
+// Drops the page being loaded (its caller gets nil) and the web view.
+- (void)stop {
+    [self.webView stopLoading];
+    [self.webView removeFromSuperview];
+    self.webView = nil;
+    [self finish:nil generation:self.generation];
 }
 
 - (void)finish:(NSData *)archive generation:(NSUInteger)generation {
@@ -146,7 +124,7 @@ static BOOL sApolloOfflineSaveRulesSettled; // compiled or failed
     void (^done)(NSData *) = self.current;
     self.current = nil;
     done(archive);
-    [self next];
+    [self.saver workerFinished:self];
 }
 
 - (void)archiveGeneration:(NSUInteger)generation {
@@ -199,6 +177,81 @@ decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
 
 @end
 
+@implementation ApolloOfflinePageSaver
+
++ (instancetype)shared {
+    static ApolloOfflinePageSaver *saver;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        saver = [ApolloOfflinePageSaver new];
+        saver.queue = [NSMutableArray array];
+        saver.workers = [NSMutableArray array];
+        for (NSUInteger i = 0; i < kApolloOfflinePageWorkers; i++) {
+            ApolloOfflinePageWorker *worker = [ApolloOfflinePageWorker new];
+            worker.saver = saver;
+            [saver.workers addObject:worker];
+        }
+        [WKContentRuleListStore.defaultStore compileContentRuleListForIdentifier:@"ApolloOfflineSaveRules"
+                                                         encodedContentRuleList:kApolloOfflineSaveRules
+                                                              completionHandler:^(WKContentRuleList *list, NSError *error) {
+            if (error) ApolloLog(@"[Offline] page rules didn't compile: %@", error.localizedDescription);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                sApolloOfflineSaveRuleList = list;
+                sApolloOfflineSaveRulesSettled = YES;
+            });
+        }];
+    });
+    return saver;
+}
+
+- (void)enqueue:(NSURL *)url done:(void (^)(NSData *))done {
+    [self.queue addObject:@[ url, [done copy] ]];
+    if (!self.waitingForRules) [self next];
+}
+
+- (void)next {
+    // The save rules compile once, asynchronously; give them a moment so the
+    // first pages aren't saved without them.
+    static NSUInteger waits;
+    if (!sApolloOfflineSaveRulesSettled && waits < 30 && self.queue.count > 0) {
+        waits++;
+        self.waitingForRules = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self.waitingForRules = NO;
+            [self next];
+        });
+        return;
+    }
+    for (ApolloOfflinePageWorker *worker in self.workers) {
+        if (self.queue.count == 0) break;
+        if (worker.current) continue;
+        NSArray *item = self.queue.firstObject;
+        [self.queue removeObjectAtIndex:0];
+        [worker load:item[0] done:item[1]];
+    }
+}
+
+- (void)workerFinished:(ApolloOfflinePageWorker *)worker {
+    if (self.queue.count > 0) {
+        [self next];
+        return;
+    }
+    // Nothing left for it: let the web view (and its web content process) go.
+    [worker.webView removeFromSuperview];
+    worker.webView = nil;
+}
+
+- (void)cancelAll {
+    NSArray<NSArray *> *queued = [self.queue copy];
+    [self.queue removeAllObjects];
+    for (NSArray *item in queued) ((void (^)(NSData *))item[1])(nil);
+    for (ApolloOfflinePageWorker *worker in self.workers) {
+        if (worker.current) [worker stop];
+    }
+}
+
+@end
+
 void ApolloOfflineSaveWebPage(NSURL *url, void (^done)(NSData *archive)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [[ApolloOfflinePageSaver shared] enqueue:url done:^(NSData *archive) {
@@ -207,6 +260,10 @@ void ApolloOfflineSaveWebPage(NSURL *url, void (^done)(NSData *archive)) {
             done(archive);
         }];
     });
+}
+
+void ApolloOfflineCancelWebPageSaves(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ [[ApolloOfflinePageSaver shared] cancelAll]; });
 }
 
 // MARK: - Reading offline

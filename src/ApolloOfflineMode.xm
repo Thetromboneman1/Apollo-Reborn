@@ -393,7 +393,10 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
     [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
                     usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"app active"]; }];
     [center addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
-                    usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"power state"]; }];
+                    usingBlock:^(__unused NSNotification *note) {
+        [weakSelf stopKeepFreshIfNotAllowed:@"power state"];
+        [weakSelf considerKeepFresh:@"power state"];
+    }];
     [center addObserverForName:ApolloPostReadStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
                     usingBlock:^(__unused NSNotification *note) { [weakSelf considerKeepFresh:@"post read"]; }];
     _keepFreshTimer = [NSTimer scheduledTimerWithTimeInterval:5 * 60 repeats:YES block:^(__unused NSTimer *timer) {
@@ -420,6 +423,7 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
     _onWiFi = wifi;
     ApolloLog(@"[Offline] connectivity: %@", available ? (wifi ? @"Wi-Fi" : @"cellular") : @"offline");
     [self recompute];
+    [self stopKeepFreshIfNotAllowed:@"connectivity"];
     [self considerKeepFresh:@"connectivity"];
 }
 
@@ -427,6 +431,7 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
     if (constrained == _lowDataMode) return;
     _lowDataMode = constrained;
     ApolloLog(@"[Offline] Low Data Mode %@", constrained ? @"on" : @"off");
+    [self stopKeepFreshIfNotAllowed:@"low data mode"];
     [self considerKeepFresh:@"low data mode"];
 }
 
@@ -546,7 +551,9 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         // Web JSON / API-key-free routing to these reads.
         NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
         configuration.timeoutIntervalForRequest = 30;
-        configuration.HTTPMaximumConnectionsPerHost = 4;
+        // Several posts download at once; most of their images and videos
+        // come from the same two or three Reddit media hosts.
+        configuration.HTTPMaximumConnectionsPerHost = 8;
         configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
         session = [NSURLSession sessionWithConfiguration:configuration];
     });
@@ -599,8 +606,12 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
     if ([defaults boolForKey:UDKeyOfflineSkipRead]) {
         options.skipPostIDs = ApolloOfflineReadPostIDs();
     }
-    // Keep Fresh runs while the user is browsing: leave them more of Reddit's
-    // per-minute request allowance.
+    // Speed: several posts at once, and Reddit calls paced by the rate limit
+    // Reddit reports, keeping a share of it for browsing. Keep Fresh runs while
+    // the user is browsing, so it keeps more back and goes a little easier.
+    options.postConcurrency = automatic ? 3 : 6;
+    options.apiMinSpacing = automatic ? 0.5 : 0.25;
+    options.apiReserveFraction = automatic ? 0.4 : 0.2;
     if (automatic) options.apiSpacing = 1.5;
 
     ApolloOfflineFetcher fetcher = ^(NSURLRequest *request, ApolloOfflineFetchCompletion done) {
@@ -646,10 +657,13 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         ApolloLog(@"[Offline] background time ran out; cancelling download");
         [weakSelf cancelDownload];
     }];
-    ApolloLog(@"[Offline] download start: %@, budget %llu MB, comments=%d images=%d videos=%d pages=%d, %lu read posts to skip",
+    ApolloLog(@"[Offline] download start%@ on %@: %@, budget %llu MB, comments=%d images=%d videos=%d pages=%d, "
+              "%lu posts at once, %lu read posts to skip",
+              automatic ? @" (Keep Fresh)" : @"", _onWiFi ? @"Wi-Fi" : @"cellular",
               [[sources valueForKey:@"title"] componentsJoinedByString:@", "], options.byteBudget / (1000 * 1000),
               options.includeComments, options.includeImages, options.includeVideos, options.includePages,
-              (unsigned long)options.skipPostIDs.count);
+              (unsigned long)options.postConcurrency, (unsigned long)options.skipPostIDs.count);
+    CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
     [self recompute];
 
     [_downloader startWithOptions:options progress:^(unsigned long long bytes, __unused NSUInteger posts, NSString *status) {
@@ -674,9 +688,10 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
             message = [NSString stringWithFormat:@"Saved %lu posts (%@) for offline reading.", (unsigned long)posts,
                        [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile]];
             ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
-            ApolloLog(@"[Offline] download done%@: %lu posts, %lu videos (%.0f s), %lu pages, %llu bytes, %lu already-read posts skipped",
-                      automatic ? @" (Keep Fresh)" : @"", (unsigned long)posts, (unsigned long)library.videoCount,
-                      library.videoSeconds, (unsigned long)library.pageCount, bytes, (unsigned long)skipped);
+            ApolloLog(@"[Offline] download done%@ in %.0f s: %lu posts, %lu videos (%.0f s), %lu pages, %llu bytes, %lu already-read posts skipped",
+                      automatic ? @" (Keep Fresh)" : @"", CFAbsoluteTimeGetCurrent() - startedAt, (unsigned long)posts,
+                      (unsigned long)library.videoCount, library.videoSeconds, (unsigned long)library.pageCount, bytes,
+                      (unsigned long)skipped);
         } else {
             message = error.localizedDescription ?: @"The download didn't finish.";
             ApolloLog(@"[Offline] download ended without saving: %@ (%@ %ld)", message, error.domain, (long)error.code);
@@ -687,7 +702,29 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
 }
 
 - (void)cancelDownload {
+    if (!_downloading) return;
     [_downloader cancel];
+    // Don't wait for what's in flight: stop page loads and drop open requests,
+    // so the posts being worked on wind down right away.
+    ApolloOfflineCancelWebPageSaves();
+    [ApolloOfflineDownloadSession() getAllTasksWithCompletionHandler:^(NSArray<__kindof NSURLSessionTask *> *tasks) {
+        for (NSURLSessionTask *task in tasks) [task cancel];
+    }];
+}
+
+// Keep Fresh only runs where it's allowed to start: a refresh that began on
+// Wi-Fi stops if the phone moves to cellular (unless Use Cellular Data is on),
+// or Low Data Mode or Low Power Mode turns on. The old batch stays.
+- (void)stopKeepFreshIfNotAllowed:(NSString *)reason {
+    if (!_downloading || !_downloadingAutomatically) return;
+    BOOL allowCellular = [NSUserDefaults.standardUserDefaults boolForKey:UDKeyOfflineAutoRefreshCellular];
+    BOOL allowed = _networkAvailable && (_onWiFi || allowCellular) && !_lowDataMode &&
+                   !NSProcessInfo.processInfo.lowPowerModeEnabled &&
+                   [NSUserDefaults.standardUserDefaults boolForKey:UDKeyOfflineAutoRefresh];
+    if (allowed) return;
+    ApolloLog(@"[Offline] Keep Fresh stopped (%@): %@", reason,
+              !_networkAvailable ? @"no connection" : (!_onWiFi && !allowCellular) ? @"on cellular" : @"not allowed now");
+    [self cancelDownload];
 }
 
 - (void)deleteLibrary {

@@ -172,9 +172,20 @@ typedef struct {
 // Set by a test to give the downloader a (fake) remuxer.
 static ApolloOfflineVideoMuxer sTestMuxer = nil;
 static ApolloOfflinePageSaver sTestPageSaver = nil;
+// Concurrency and pacing tests: a delay for every fake reply, a count of
+// comment reads in flight, rate-limit headers for the first API reply, the
+// time of each API read, and a cancel after N comment reads.
+static double sTestDelay = 0;
+static NSInteger sCommentsInFlight = 0, sMaxCommentsInFlight = 0;
+static NSDictionary<NSString *, NSString *> *sFirstAPIHeaders = nil;
+static NSMutableArray<NSDate *> *sAPITimes = nil;
+static NSUInteger sCancelAfterComments = 0;
 
 static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, NSDictionary<NSString *, NSData *> *responses,
                              NSMutableArray<NSString *> *requested) {
+    __block __weak ApolloOfflineDownloader *weakDownloader = nil;
+    __block NSUInteger commentReads = 0;
+    __block BOOL sentHeaders = NO;
     ApolloOfflineFetcher fetcher = ^(NSURLRequest *request, ApolloOfflineFetchCompletion completion) {
         NSURLComponents *c = [NSURLComponents componentsWithURL:request.URL resolvingAgainstBaseURL:NO];
         NSString *after = nil;
@@ -189,9 +200,28 @@ static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, 
         }
         @synchronized (requested) { [requested addObject:lookup]; }
         NSData *body = responses[lookup];
+        BOOL api = [request.URL.host isEqualToString:@"oauth.reddit.com"];
+        BOOL comments = [lookup hasPrefix:@"/comments/"];
+        NSMutableDictionary *headers = [@{ @"Content-Type": [lookup hasPrefix:@"/"] ? @"application/json" : @"image/jpeg" } mutableCopy];
+        @synchronized (requested) {
+            if (api && sAPITimes) [sAPITimes addObject:[NSDate date]];
+            if (api && sFirstAPIHeaders && !sentHeaders) {
+                sentHeaders = YES;
+                [headers addEntriesFromDictionary:sFirstAPIHeaders];
+            }
+            if (comments) {
+                sCommentsInFlight++;
+                sMaxCommentsInFlight = MAX(sMaxCommentsInFlight, sCommentsInFlight);
+                commentReads++;
+                if (sCancelAfterComments > 0 && commentReads == sCancelAfterComments) [weakDownloader cancel];
+            }
+        }
         NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:body ? 200 : 404 HTTPVersion:@"HTTP/1.1"
-            headerFields:@{ @"Content-Type": [lookup hasPrefix:@"/"] ? @"application/json" : @"image/jpeg" }];
-        dispatch_async(dispatch_get_global_queue(0, 0), ^{ completion(body, response, nil); });
+            headerFields:headers];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sTestDelay * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+            if (comments) @synchronized (requested) { sCommentsInFlight--; }
+            completion(body, response, nil);
+        });
     };
     ApolloOfflineRequestBuilder builder = ^NSURLRequest *(NSString *path, NSArray<NSURLQueryItem *> *query) {
         NSURLComponents *c = [NSURLComponents componentsWithString:[@"https://oauth.reddit.com" stringByAppendingString:path]];
@@ -199,6 +229,7 @@ static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, 
         return [NSURLRequest requestWithURL:c.URL];
     };
     ApolloOfflineDownloader *downloader = [[ApolloOfflineDownloader alloc] initWithLibraryDirectory:dir fetcher:fetcher requestBuilder:builder];
+    weakDownloader = downloader;
     downloader.videoMuxer = sTestMuxer;
     downloader.pageSaver = sTestPageSaver;
     __block RunResult result = { NO, NO, 0 };
@@ -289,6 +320,101 @@ static void TestDownloaderFailureKeepsOldLibrary(void) {
     CHECK(!failed.committed, "nothing downloaded isn't committed");
     ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
     CHECK(library.postCount == 6, "old library survives a failed refresh: %lu", (unsigned long)library.postCount);
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+}
+
+static void TestAPISpacing(void) {
+    CHECK(ApolloOfflineAPISpacing(-1, -1, -1, 0.2, 0.25, 0.75) == 0.75, "no headers: the fixed gap");
+    CHECK(ApolloOfflineAPISpacing(900, 100, 400, 0.2, 0.25, 0.75) == 0.25, "plenty left: as fast as allowed");
+    CHECK(ApolloOfflineAPISpacing(90, 10, 50, 0.2, 0.25, 0.75) == 0.25, "same rule on a 100-call window");
+    // Into the reserve (150 of 1000 left): half of it over the 300 s still to go.
+    CHECK(fabs(ApolloOfflineAPISpacing(150, 850, 300, 0.2, 0.25, 0.75) - 4.0) < 0.001, "into the reserve: 300 s / 75 calls");
+    CHECK(ApolloOfflineAPISpacing(150, 850, 300, 0.4, 0.5, 1.5) > 0.5, "Keep Fresh keeps a bigger reserve");
+    CHECK(ApolloOfflineAPISpacing(0, 1000, 42, 0.2, 0.25, 0.75) == 43, "spent: wait out the window");
+    CHECK(ApolloOfflineAPISpacing(1, 999, 5000, 0.2, 0.25, 0.75) == 600, "never more than 10 minutes");
+}
+
+static void ResetConcurrencyProbes(void) {
+    sTestDelay = 0;
+    sCommentsInFlight = 0;
+    sMaxCommentsInFlight = 0;
+    sFirstAPIHeaders = nil;
+    sAPITimes = nil;
+    sCancelAfterComments = 0;
+}
+
+static void TestDownloaderRunsPostsTogether(void) {
+    // Every reply takes 0.15 s. One post at a time is ~2 s for these six posts;
+    // four at a time is well under half that, with the same library.
+    NSURL *serialDir = TempDirectory(), *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    ResetConcurrencyProbes();
+    sTestDelay = 0.15;
+    ApolloOfflineDownloadOptions *serial = Options(100ull * 1024 * 1024);
+    serial.postConcurrency = 1;
+    NSDate *start = [NSDate date];
+    RunResult one = RunDownload(serialDir, serial, ResponsesForTwoPages(), requested);
+    NSTimeInterval serialTime = -start.timeIntervalSinceNow;
+    CHECK(one.committed && one.posts == 6 && sMaxCommentsInFlight == 1, "one at a time: posts=%lu inFlight=%ld",
+          (unsigned long)one.posts, (long)sMaxCommentsInFlight);
+
+    sMaxCommentsInFlight = 0;
+    start = [NSDate date];
+    RunResult together = RunDownload(dir, Options(100ull * 1024 * 1024), ResponsesForTwoPages(), requested);
+    NSTimeInterval togetherTime = -start.timeIntervalSinceNow;
+    CHECK(together.committed && together.posts == 6, "together: all six posts (%lu)", (unsigned long)together.posts);
+    CHECK(sMaxCommentsInFlight >= 3, "posts overlap: %ld comment reads at once", (long)sMaxCommentsInFlight);
+    CHECK(togetherTime < serialTime * 0.6, "faster: %.2f s vs %.2f s one at a time", togetherTime, serialTime);
+    printf("posts side by side: %.2f s, one at a time: %.2f s\n", togetherTime, serialTime);
+
+    ApolloOfflineLibrary *a = [[ApolloOfflineLibrary alloc] initWithDirectory:serialDir];
+    ApolloOfflineLibrary *b = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    NSArray *idsA = [a.savedPostIDs sortedArrayUsingSelector:@selector(compare:)], *idsB = [b.savedPostIDs sortedArrayUsingSelector:@selector(compare:)];
+    CHECK([idsA isEqualToArray:idsB], "same posts either way");
+    for (NSString *key in @[ @"feed:home|", @"feed:home|t3_a3" ]) {
+        NSDictionary *pa = [NSJSONSerialization JSONObjectWithData:[a dataForKey:key contentType:nil] options:0 error:nil];
+        NSDictionary *pb = [NSJSONSerialization JSONObjectWithData:[b dataForKey:key contentType:nil] options:0 error:nil];
+        CHECK([[pa[@"data"][@"children"] valueForKeyPath:@"data.id"] isEqualToArray:[pb[@"data"][@"children"] valueForKeyPath:@"data.id"]],
+              "page %s saved in feed order", key.UTF8String);
+    }
+    CHECK([b hasEntryForKey:Key(@"https://oauth.reddit.com/r/x/comments/b3/slug")], "comments saved");
+    ResetConcurrencyProbes();
+    [NSFileManager.defaultManager removeItemAtURL:serialDir.URLByDeletingLastPathComponent error:nil];
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+}
+
+static void TestDownloaderCancelWithPostsInFlight(void) {
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    ResetConcurrencyProbes();
+    RunDownload(dir, Options(100ull * 1024 * 1024), ResponsesForTwoPages(), requested);
+    sTestDelay = 0.2;
+    sCancelAfterComments = 2;
+    NSDate *start = [NSDate date];
+    RunResult cancelled = RunDownload(dir, Options(100ull * 1024 * 1024), ResponsesForTwoPages(), requested);
+    CHECK(!cancelled.committed, "cancelled run isn't committed");
+    CHECK(-start.timeIntervalSinceNow < 1.5, "cancel stops promptly (%.2f s)", -start.timeIntervalSinceNow);
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    CHECK(library.postCount == 6, "old library kept after a cancel: %lu", (unsigned long)library.postCount);
+    ResetConcurrencyProbes();
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+}
+
+static void TestDownloaderHonorsRateLimitHeaders(void) {
+    // Reddit says 1 call is left and the window is about to reset: the next
+    // read waits for it (reset + 1 s) instead of spending the last call.
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    ResetConcurrencyProbes();
+    sFirstAPIHeaders = @{ @"x-ratelimit-remaining": @"1.0", @"x-ratelimit-used": @"999", @"x-ratelimit-reset": @"0" };
+    sAPITimes = [NSMutableArray array];
+    ApolloOfflineDownloadOptions *options = Options(100ull * 1024 * 1024);
+    options.apiMinSpacing = 0;
+    RunResult result = RunDownload(dir, options, ResponsesForTwoPages(), requested);
+    CHECK(result.committed && result.posts == 6, "finishes after the wait");
+    NSTimeInterval gap = sAPITimes.count >= 2 ? [sAPITimes[1] timeIntervalSinceDate:sAPITimes[0]] : 0;
+    CHECK(gap >= 0.9, "second read waited for the window: %.2f s", gap);
+    ResetConcurrencyProbes();
     [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
 }
 
@@ -700,6 +826,10 @@ int main(void) {
         TestDownloaderBudget();
         TestDownloaderFailureKeepsOldLibrary();
         TestRemovingReadPosts();
+        TestAPISpacing();
+        TestDownloaderRunsPostsTogether();
+        TestDownloaderCancelWithPostsInFlight();
+        TestDownloaderHonorsRateLimitHeaders();
         TestAutoRefreshPolicy();
         TestDownloaderSkipsReadPosts();
         TestVideoKeys();

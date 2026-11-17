@@ -27,6 +27,9 @@ NSErrorDomain const ApolloOfflineErrorDomain = @"ApolloOfflineErrorDomain";
         _maxImageWidth = 1080;
         _maxImageBytes = 12ull * 1024 * 1024;
         _apiSpacing = 0.75;
+        _apiMinSpacing = 0.25;
+        _apiReserveFraction = 0.2;
+        _postConcurrency = 4;
         _includeVideos = YES;
         _maxVideoHeight = 720;
         _maxVideoBytes = 60ull * 1000 * 1000;
@@ -73,6 +76,15 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     BOOL _cancelled;
     NSError *_lastError;
     CFAbsoluteTime _lastAPICall;
+    NSTimeInterval _apiGap;             // current gap between Reddit calls
+    unsigned long long _reservedBytes;  // videos being fetched, counted toward the limit
+    NSMutableSet<NSString *> *_claimedKeys; // videos and pages being fetched by some post
+
+    // Posts of the current page being worked on (see -pumpPosts).
+    NSUInteger _nextPost;
+    NSUInteger _postsInFlight;
+    BOOL _pageStopped;
+    BOOL _pageEndsFeed;
 
     NSUInteger _feedIndex;
     unsigned long long _feedBudgetEnd;
@@ -117,6 +129,9 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         self->_cancelled = NO;
         self->_lastError = nil;
         self->_lastAPICall = 0;
+        self->_apiGap = options.apiSpacing;
+        self->_reservedBytes = 0;
+        self->_claimedKeys = [NSMutableSet set];
         self->_skippedRead = 0;
         self->_redgifsToken = nil;
         self->_accountDone = NO;
@@ -183,15 +198,33 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
 
 // MARK: - Transport
 
-// Reddit API reads are spaced out; CDN image fetches are not.
+static double ApolloOfflineHeaderNumber(NSHTTPURLResponse *response, NSString *name) {
+    NSString *value = [response valueForHTTPHeaderField:name];
+    return value.length > 0 ? value.doubleValue : -1;
+}
+
+// Reddit API reads are paced by Reddit's own rate-limit headers; CDN fetches aren't paced.
 - (void)fetchAPI:(NSString *)path query:(NSArray<NSURLQueryItem *> *)query completion:(void (^)(NSURLRequest *request, NSData *data, NSHTTPURLResponse *response, NSError *error))completion {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    NSTimeInterval wait = MAX(0, _options.apiSpacing - (now - _lastAPICall));
+    NSTimeInterval wait = MAX(0, _apiGap - (now - _lastAPICall));
     _lastAPICall = now + wait;
     NSURLRequest *request = _requestBuilder(path, query);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), _queue, ^{
+        if (self->_cancelled) {
+            completion(request, nil, nil, [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil]);
+            return;
+        }
         self->_fetcher(request, ^(NSData *data, NSHTTPURLResponse *response, NSError *error) {
-            dispatch_async(self->_queue, ^{ completion(request, data, response, error); });
+            dispatch_async(self->_queue, ^{
+                if (response) {
+                    ApolloOfflineDownloadOptions *options = self->_options;
+                    self->_apiGap = ApolloOfflineAPISpacing(ApolloOfflineHeaderNumber(response, @"x-ratelimit-remaining"),
+                                                            ApolloOfflineHeaderNumber(response, @"x-ratelimit-used"),
+                                                            ApolloOfflineHeaderNumber(response, @"x-ratelimit-reset"),
+                                                            options.apiReserveFraction, options.apiMinSpacing, options.apiSpacing);
+                }
+                completion(request, data, response, error);
+            });
         });
     });
 }
@@ -295,41 +328,79 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         self->_pageData = data;
         self->_pagePosts = posts;
         self->_nextAfter = nextAfter;
-        [self processPostAtIndex:0];
+        [self startPosts];
     }];
 }
 
 // MARK: - Posts
 
-- (BOOL)budgetSpent {
-    return _writer.bytesWritten >= _feedBudgetEnd || _keptInFeed >= _options.maxPostsPerFeed;
+// Posts run side by side and can share a video or an article (crossposts,
+// the same link twice): the first one to ask fetches it, the others skip it.
+- (BOOL)claimKey:(NSString *)key {
+    if (key.length == 0 || [_writer hasKey:key] || [_claimedKeys containsObject:key]) return NO;
+    [_claimedKeys addObject:key];
+    return YES;
 }
 
-- (void)processPostAtIndex:(NSUInteger)index {
-    if ([self stopIfCancelled]) return;
-    if (index >= _pagePosts.count) {
-        [self completePageKeeping:index endFeed:NO];
+- (BOOL)budgetSpent {
+    return _writer.bytesWritten + _reservedBytes >= _feedBudgetEnd ||
+           _keptInFeed + _postsInFlight >= _options.maxPostsPerFeed;
+}
+
+- (void)startPosts {
+    _nextPost = 0;
+    _postsInFlight = 0;
+    _pageStopped = NO;
+    _pageEndsFeed = NO;
+    [self pumpPosts];
+}
+
+// Keeps up to postConcurrency posts of the page going. Posts start in order,
+// so the ones started are always the page's first `_nextPost`, which is what
+// the saved page is cut to. The page completes once they've all finished.
+- (void)pumpPosts {
+    if (_cancelled) {
+        // Let the posts already going wind down (each step skips once
+        // cancelled), then stop.
+        if (_postsInFlight == 0) [self stopIfCancelled];
         return;
     }
-    if ([self budgetSpent]) {
-        [self completePageKeeping:index endFeed:YES];
-        return;
-    }
-    NSDictionary *post = _pagePosts[index];
-    void (^next)(void) = ^{
-        self->_keptInFeed++;
-        [self report:[NSString stringWithFormat:@"Saved %lu posts", (unsigned long)(self->_writer.postCount + self->_keptInFeed)]];
-        [self processPostAtIndex:index + 1];
-    };
-    [self saveCommentsForPost:post then:^{
-        [self saveImagesForPost:post then:^{
-            [self saveVideoForPost:post then:^{
-                [self saveHostedVideoForPost:post then:^{
-                    [self savePageForPost:post then:next];
-                }];
+    NSUInteger limit = MAX((NSUInteger)1, _options.postConcurrency);
+    while (!_pageStopped && _postsInFlight < limit) {
+        if (_nextPost >= _pagePosts.count) {
+            _pageStopped = YES;
+        } else if ([self budgetSpent]) {
+            _pageStopped = YES;
+            _pageEndsFeed = YES;
+        } else {
+            NSDictionary *post = _pagePosts[_nextPost++];
+            _postsInFlight++;
+            [self savePost:post then:^{
+                self->_postsInFlight--;
+                self->_keptInFeed++;
+                [self report:[NSString stringWithFormat:@"Saved %lu posts", (unsigned long)(self->_writer.postCount + self->_keptInFeed)]];
+                [self pumpPosts];
             }];
-        }];
-    }];
+        }
+    }
+    if (_pageStopped && _postsInFlight == 0) [self completePageKeeping:_nextPost endFeed:_pageEndsFeed];
+}
+
+- (void)savePost:(NSDictionary *)post then:(void (^)(void))then {
+    // Each step is skipped once the download is cancelled.
+    void (^step)(void (^)(void (^)(void)), void (^)(void)) = ^(void (^work)(void (^)(void)), void (^next)(void)) {
+        if (self->_cancelled) next();
+        else work(next);
+    };
+    step(^(void (^done)(void)) { [self saveCommentsForPost:post then:done]; }, ^{
+        step(^(void (^done)(void)) { [self saveImagesForPost:post then:done]; }, ^{
+            step(^(void (^done)(void)) { [self saveVideoForPost:post then:done]; }, ^{
+                step(^(void (^done)(void)) { [self saveHostedVideoForPost:post then:done]; }, ^{
+                    step(^(void (^done)(void)) { [self savePageForPost:post then:done]; }, then);
+                });
+            });
+        });
+    });
 }
 
 - (void)saveCommentsForPost:(NSDictionary *)post then:(void (^)(void))then {
@@ -415,7 +486,7 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     NSString *videoID = video[@"id"];
     NSString *key = ApolloOfflineVideoKey(videoID);
     NSTimeInterval duration = [video[@"duration"] doubleValue];
-    if ([_writer hasKey:key] || duration > _options.maxVideoDuration) {
+    if (duration > _options.maxVideoDuration || ![self claimKey:key]) {
         then();
         return;
     }
@@ -432,56 +503,65 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         double seconds = duration > 0 ? duration : 30;
         unsigned long long estimate = (unsigned long long)(([renditions[@"videoBandwidth"] doubleValue] +
                                                             (audioURL ? [renditions[@"audioBandwidth"] doubleValue] : 0)) * seconds / 8.0);
-        if (estimate > self->_options.maxVideoBytes || self->_writer.bytesWritten + estimate > self->_feedBudgetEnd) {
+        // Videos still downloading count toward the limit, so posts saving
+        // at the same time can't all squeeze in a video that won't fit.
+        if (estimate > self->_options.maxVideoBytes ||
+            self->_writer.bytesWritten + self->_reservedBytes + estimate > self->_feedBudgetEnd) {
             then();
             return;
         }
+        self->_reservedBytes += estimate;
+        void (^release)(void) = ^{
+            self->_reservedBytes -= MIN(self->_reservedBytes, estimate);
+            then();
+        };
         [self report:@"Saving videos"];
+        // Video, audio and Apollo's master playlist (it reads that to tell a
+        // video with sound from a silent "GIF") download side by side.
         unsigned long long maxBytes = self->_options.maxVideoBytes;
-        [self fetchMedia:renditions[@"video"] maxBytes:maxBytes then:^(NSData *videoData) {
-            void (^withAudio)(NSData *) = ^(NSData *audioData) {
-                ApolloOfflineLibraryWriter *writer = self->_writer;
-                if (!videoData || !writer || [self stopIfCancelledQuietly] || (audioURL && !audioData)) {
-                    then();
-                    return;
-                }
-                NSURL *videoFile = [writer scratchFileURLWithExtension:@"mp4"];
-                NSURL *audioFile = audioData ? [writer scratchFileURLWithExtension:@"mp4"] : nil;
-                NSURL *output = [writer scratchFileURLWithExtension:@"mp4"];
-                if (![videoData writeToURL:videoFile atomically:NO] || (audioFile && ![audioData writeToURL:audioFile atomically:NO])) {
-                    then();
-                    return;
-                }
-                // Apollo reads the master playlist to tell a video with sound
-                // from a silent "GIF"; keep Reddit's own copy for offline.
-                NSURL *masterURL = video[@"hls"];
-                [self fetchMedia:masterURL maxBytes:256 * 1024 then:^(NSData *master) {
-                    muxer(videoFile, audioFile, output, ^(BOOL ok, NSTimeInterval muxedDuration) {
-                        dispatch_async(self->_queue, ^{
-                            NSFileManager *fm = NSFileManager.defaultManager;
-                            [fm removeItemAtURL:videoFile error:nil];
-                            if (audioFile) [fm removeItemAtURL:audioFile error:nil];
-                            ApolloOfflineLibraryWriter *current = self->_writer;
-                            if (ok && current == writer) {
-                                NSString *masterKey = ApolloOfflineKeyForURL(masterURL);
-                                if (master && masterKey) {
-                                    [current storeData:master contentType:@"application/vnd.apple.mpegurl" forKey:masterKey];
-                                }
-                                [current storeVideoFile:output forKey:key pathExtension:@"mp4"
-                                               duration:muxedDuration > 0 ? muxedDuration : duration];
-                            }
-                            [fm removeItemAtURL:output error:nil];
-                            then();
-                        });
-                    });
-                }];
-            };
-            if (audioURL && videoData) {
-                [self fetchMedia:audioURL maxBytes:maxBytes then:withAudio];
-            } else {
-                withAudio(nil);
+        NSURL *masterURL = video[@"hls"];
+        __block NSData *videoData = nil, *audioData = nil, *master = nil;
+        dispatch_group_t group = dispatch_group_create();
+        dispatch_group_enter(group);
+        [self fetchMedia:renditions[@"video"] maxBytes:maxBytes then:^(NSData *data) { videoData = data; dispatch_group_leave(group); }];
+        if (audioURL) {
+            dispatch_group_enter(group);
+            [self fetchMedia:audioURL maxBytes:maxBytes then:^(NSData *data) { audioData = data; dispatch_group_leave(group); }];
+        }
+        dispatch_group_enter(group);
+        [self fetchMedia:masterURL maxBytes:256 * 1024 then:^(NSData *data) { master = data; dispatch_group_leave(group); }];
+        dispatch_group_notify(group, self->_queue, ^{
+            ApolloOfflineLibraryWriter *writer = self->_writer;
+            if (!videoData || !writer || [self stopIfCancelledQuietly] || (audioURL && !audioData)) {
+                release();
+                return;
             }
-        }];
+            NSURL *videoFile = [writer scratchFileURLWithExtension:@"mp4"];
+            NSURL *audioFile = audioData ? [writer scratchFileURLWithExtension:@"mp4"] : nil;
+            NSURL *output = [writer scratchFileURLWithExtension:@"mp4"];
+            if (![videoData writeToURL:videoFile atomically:NO] || (audioFile && ![audioData writeToURL:audioFile atomically:NO])) {
+                release();
+                return;
+            }
+            muxer(videoFile, audioFile, output, ^(BOOL ok, NSTimeInterval muxedDuration) {
+                dispatch_async(self->_queue, ^{
+                    NSFileManager *fm = NSFileManager.defaultManager;
+                    [fm removeItemAtURL:videoFile error:nil];
+                    if (audioFile) [fm removeItemAtURL:audioFile error:nil];
+                    ApolloOfflineLibraryWriter *current = self->_writer;
+                    if (ok && current == writer) {
+                        NSString *masterKey = ApolloOfflineKeyForURL(masterURL);
+                        if (master && masterKey) {
+                            [current storeData:master contentType:@"application/vnd.apple.mpegurl" forKey:masterKey];
+                        }
+                        [current storeVideoFile:output forKey:key pathExtension:@"mp4"
+                                       duration:muxedDuration > 0 ? muxedDuration : duration];
+                    }
+                    [fm removeItemAtURL:output error:nil];
+                    release();
+                });
+            });
+        });
     }];
 }
 
@@ -511,7 +591,7 @@ static NSURL *ApolloOfflineHTTPSURL(id value) {
 - (void)saveProgressiveVideo:(NSURL *)url aliases:(NSArray<NSURL *> *)aliases duration:(NSTimeInterval)duration
                         then:(void (^)(void))then {
     NSString *key = ApolloOfflineKeyForURL(url);
-    if (!key || [_writer hasKey:key] || duration > _options.maxVideoDuration) {
+    if (!key || duration > _options.maxVideoDuration || ![self claimKey:key]) {
         then();
         return;
     }
@@ -704,7 +784,7 @@ static NSURL *ApolloOfflineHTTPSURL(id value) {
     NSURL *url = ApolloOfflineArticleURLForPost(post);
     ApolloOfflinePageSaver saver = self.pageSaver;
     NSString *key = ApolloOfflinePageKey(url);
-    if (!url || !key || [_writer hasKey:key]) {
+    if (!url || !key || ![self claimKey:key]) {
         then();
         return;
     }

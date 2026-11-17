@@ -177,6 +177,17 @@ BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState s) {
     return s.libraryAge >= ApolloOfflineAutoRefreshMinAge && s.readFraction >= ApolloOfflineAutoRefreshReadFraction;
 }
 
+NSTimeInterval ApolloOfflineAPISpacing(double remaining, double used, double reset, double reserveFraction,
+                                       NSTimeInterval minSpacing, NSTimeInterval fallback) {
+    if (remaining < 0 || reset < 0) return fallback;
+    double limit = remaining + MAX(0, used);
+    if (remaining - 1 > limit * reserveFraction) return minSpacing;
+    double share = remaining / 2;
+    // Spent: wait for Reddit's window to reset (it's at most 10 minutes).
+    NSTimeInterval wait = share < 1 ? reset + 1 : reset / share;
+    return MIN(600, MAX(minSpacing, wait));
+}
+
 NSData *ApolloOfflineListingRemovingPosts(NSData *listing, NSSet<NSString *> *postIDs, NSUInteger *removed) {
     if (removed) *removed = 0;
     if (listing.length == 0) return nil;

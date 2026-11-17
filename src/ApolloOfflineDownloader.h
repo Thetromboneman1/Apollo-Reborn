@@ -54,8 +54,17 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 // "/message/inbox", "/r/pics/about", ...), so profile, inbox, Subreddits and
 // subreddit headers load offline. Listings follow `after` up to 10 pages.
 @property (nonatomic, copy) NSArray<NSString *> *accountPaths;
-// Gap between Reddit API calls, to stay well under Reddit's ~100/minute limit.
+// Reddit API pacing. Reddit reports its rate limit on every reply; while more
+// than `apiReserveFraction` of the window's allowance is left (kept for normal
+// browsing), calls go `apiMinSpacing` apart, then slow down to spread the rest
+// (ApolloOfflineAPISpacing). `apiSpacing` is the gap when Reddit doesn't say.
 @property (nonatomic) NSTimeInterval apiSpacing;       // default 0.75 s
+@property (nonatomic) NSTimeInterval apiMinSpacing;    // default 0.25 s
+@property (nonatomic) double apiReserveFraction;       // default 0.2
+// Posts worked on at once. A post's comments, images, video and page are
+// fetched while the next posts' start, so one slow page doesn't hold up the
+// rest. Feeds are still saved in order.
+@property (nonatomic) NSUInteger postConcurrency;      // default 4
 // Bare post ids ("abc123") to leave out: posts the user has already read.
 // They're removed from the saved pages too, so offline feeds only show new
 // posts. A page that's entirely read is replaced by the next one under the

@@ -162,6 +162,15 @@ extern const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval; // 15 minutes
 
 BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
 
+// Seconds to wait before the next Reddit API call, from the rate-limit headers
+// Reddit sends with every reply (x-ratelimit-remaining / -used / -reset; pass
+// -1 for a missing one). While more than `reserveFraction` of the window's
+// allowance is left, calls go `minSpacing` apart; past that, at most half of
+// what's left is spread over the rest of the window, so browsing always keeps
+// some. Without the headers, `fallback`.
+NSTimeInterval ApolloOfflineAPISpacing(double remaining, double used, double reset, double reserveFraction,
+                                       NSTimeInterval minSpacing, NSTimeInterval fallback);
+
 #ifdef __cplusplus
 }
 #endif

@@ -257,6 +257,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
             [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:ApolloOfflineSectionAutomatic]
                           withRowAnimation:UITableViewRowAnimationNone];
         }
+        [self.controller stopKeepFreshIfNotAllowed:@"setting"];
         [self.controller considerKeepFresh:@"setting"];
     }
 }
