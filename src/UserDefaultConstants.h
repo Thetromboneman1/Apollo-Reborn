@@ -757,6 +757,11 @@ static NSString *const UDKeyOfflineIncludePopular = @"OfflineIncludePopular";
 static NSString *const UDKeyOfflineSubreddits = @"OfflineSubreddits";
 static NSString *const UDKeyOfflineIncludeComments = @"OfflineIncludeComments";
 static NSString *const UDKeyOfflineIncludeImages = @"OfflineIncludeImages";
+// Reddit-hosted videos, saved as one mp4 with sound at up to 720p (default on).
+static NSString *const UDKeyOfflineIncludeVideos = @"OfflineIncludeVideos";
+// The account's Saved posts as an offline archive (default on): save a post in
+// Apollo and the next download keeps it, read or not; unsave to drop it.
+static NSString *const UDKeyOfflineIncludeSaved = @"OfflineIncludeSaved";
 // Data limit for one download, in megabytes (default 100).
 static NSString *const UDKeyOfflineBudgetMB = @"OfflineBudgetMB";
 // Keep Fresh: re-download the batch on its own while Apollo is open on Wi-Fi,

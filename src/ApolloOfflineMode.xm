@@ -16,10 +16,15 @@
 //   • When not serving, +canInitWithRequest: returns NO after one atomic
 //     load, so online behaviour and cost are unchanged.
 //
-// Not covered: video playback. AVFoundation fetches HLS variants and
-// segments with its own HTTP stack, which URL protocols never see; offline a
-// video post shows its saved poster and Apollo's normal playback error.
+// Video: AVFoundation fetches HLS variants and segments with its own HTTP
+// stack, which URL protocols never see, so streaming can't be answered from
+// disk. Instead the download saves each Reddit video as one local mp4 with
+// its sound (ApolloOfflineMuxVideo below: the DASH video and audio files
+// remuxed, no re-encode), and while serving, -[AVURLAsset initWithURL:options:]
+// swaps any URL naming that v.redd.it id (Apollo's player URL included) for
+// the file. Apollo's player, controls and "has sound" check run unchanged.
 
+#import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <UIKit/UIKit.h>
@@ -32,6 +37,7 @@
 #import "ApolloOfflineDownloader.h"
 #import "UserDefaultConstants.h"
 #import "ApolloPostReadState.h"
+#import "ApolloAccountCredentials.h"
 
 NSNotificationName const ApolloOfflineModeDidChangeNotification = @"ApolloOfflineModeDidChangeNotification";
 
@@ -138,6 +144,98 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
 
 @end
 
+// MARK: - Video
+
+// The saved mp4 for whatever v.redd.it video `url` names, while serving.
+static NSURL *ApolloOfflineLocalVideoURL(NSURL *url) {
+    if (!url || url.isFileURL) return nil;
+    if (!atomic_load_explicit(&sApolloOfflineServing, memory_order_relaxed)) return nil;
+    NSString *videoID = ApolloOfflineRedditVideoIDForURL(url);
+    if (!videoID) return nil;
+    NSURL *file = [[ApolloOfflineLibrary sharedLibrary] fileURLForKey:ApolloOfflineVideoKey(videoID)];
+    ApolloLog(@"[Offline] video %@ (%@://%@): %@", videoID, url.scheme ?: @"?", url.host ?: @"?",
+              file ? @"playing the saved copy" : @"not saved");
+    return file;
+}
+
+// Every AVURLAsset Apollo builds, whatever the entry point (AVPlayerItem
+// +playerItemWithURL:, AVPlayer +playerWithURL: and Swift's AVURLAsset(url:)
+// all end here). A file URL needs no resource loader, so Apollo's
+// video-player:// loader simply never gets asked.
+%hook AVURLAsset
+
+- (instancetype)initWithURL:(NSURL *)URL options:(NSDictionary<NSString *, id> *)options {
+    NSURL *local = ApolloOfflineLocalVideoURL(URL);
+    return local ? %orig(local, options) : %orig;
+}
+
+%end
+
+// Remuxes Reddit's separate DASH video and audio files into one mp4
+// (passthrough: no re-encode), trimmed to the shorter track. Without audio the
+// video is still rewritten, so what's saved is a plain mp4, not a fragment.
+static void ApolloOfflineMuxVideo(NSURL *videoFile, NSURL *audioFile, NSURL *output,
+                                  void (^done)(BOOL ok, NSTimeInterval duration)) {
+    NSDictionary *precise = @{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES };
+    AVURLAsset *videoAsset = [AVURLAsset URLAssetWithURL:videoFile options:precise];
+    AVURLAsset *audioAsset = audioFile ? [AVURLAsset URLAssetWithURL:audioFile options:precise] : nil;
+    AVAssetTrack *sourceVideo = [videoAsset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    AVAssetTrack *sourceAudio = [audioAsset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    if (!sourceVideo) {
+        done(NO, 0);
+        return;
+    }
+    CMTime duration = videoAsset.duration;
+    if (sourceAudio && CMTIME_IS_NUMERIC(audioAsset.duration) && CMTimeGetSeconds(audioAsset.duration) > 0) {
+        duration = CMTimeMinimum(duration, audioAsset.duration);
+    }
+    if (!CMTIME_IS_NUMERIC(duration) || CMTimeGetSeconds(duration) <= 0) {
+        done(NO, 0);
+        return;
+    }
+    CMTimeRange range = CMTimeRangeMake(kCMTimeZero, duration);
+    AVMutableComposition *composition = [AVMutableComposition composition];
+    AVMutableCompositionTrack *videoTrack = [composition addMutableTrackWithMediaType:AVMediaTypeVideo
+                                                                     preferredTrackID:kCMPersistentTrackID_Invalid];
+    if (![videoTrack insertTimeRange:range ofTrack:sourceVideo atTime:kCMTimeZero error:nil]) {
+        done(NO, 0);
+        return;
+    }
+    videoTrack.preferredTransform = sourceVideo.preferredTransform;
+    if (sourceAudio) {
+        AVMutableCompositionTrack *audioTrack = [composition addMutableTrackWithMediaType:AVMediaTypeAudio
+                                                                         preferredTrackID:kCMPersistentTrackID_Invalid];
+        if (![audioTrack insertTimeRange:range ofTrack:sourceAudio atTime:kCMTimeZero error:nil]) {
+            // A video that has sound online must not be saved silent.
+            done(NO, 0);
+            return;
+        }
+    }
+    [NSFileManager.defaultManager removeItemAtURL:output error:nil];
+    AVAssetExportSession *session = [[AVAssetExportSession alloc] initWithAsset:composition presetName:AVAssetExportPresetPassthrough];
+    if (!session) {
+        done(NO, 0);
+        return;
+    }
+    session.outputURL = output;
+    session.outputFileType = AVFileTypeMPEG4;
+    session.shouldOptimizeForNetworkUse = YES; // moov first: playback starts at once
+    NSTimeInterval seconds = CMTimeGetSeconds(duration);
+    [session exportAsynchronouslyWithCompletionHandler:^{
+        BOOL ok = session.status == AVAssetExportSessionStatusCompleted;
+        if (!ok) ApolloLog(@"[Offline] video remux failed: %@", session.error.localizedDescription ?: @"unknown");
+        done(ok, seconds);
+    }];
+    // A stuck export must not stall the whole download.
+    __weak AVAssetExportSession *weakSession = session;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(90 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        AVAssetExportSession *running = weakSession;
+        if (running.status == AVAssetExportSessionStatusWaiting || running.status == AVAssetExportSessionStatusExporting) {
+            [running cancelExport];
+        }
+    });
+}
+
 // A copy of `configuration` with the offline protocol first, or the original
 // when it already has it or is a background configuration (those can't run
 // custom protocols).
@@ -234,6 +332,8 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
             UDKeyOfflineIncludePopular: @NO,
             UDKeyOfflineIncludeComments: @YES,
             UDKeyOfflineIncludeImages: @YES,
+            UDKeyOfflineIncludeVideos: @YES,
+            UDKeyOfflineIncludeSaved: @YES,
             UDKeyOfflineBudgetMB: @100,
             UDKeyOfflineAutoRefresh: @YES,
             UDKeyOfflineSkipRead: @YES,
@@ -363,6 +463,17 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
 - (NSArray<ApolloOfflineFeedSource *> *)plannedSources {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSMutableArray<ApolloOfflineFeedSource *> *sources = [NSMutableArray array];
+    // Saved first: it's the user's own archive, and usually small.
+    NSString *username = ApolloActiveAccountUsername();
+    if ([defaults boolForKey:UDKeyOfflineIncludeSaved] && username.length > 0) {
+        ApolloOfflineFeedSource *saved = [ApolloOfflineFeedSource sourceWithPath:[NSString stringWithFormat:@"/user/%@/saved", username]
+                                                                           title:@"Saved"];
+        saved.keepsReadPosts = YES;
+        // Posts only: Apollo's Saved list asks for everything, and the saved
+        // pages must line up with the posts they were cut to.
+        saved.queryItems = @[ [NSURLQueryItem queryItemWithName:@"type" value:@"links"] ];
+        [sources addObject:saved];
+    }
     if ([defaults boolForKey:UDKeyOfflineIncludeHome]) {
         [sources addObject:[ApolloOfflineFeedSource sourceWithPath:@"/best" title:@"Home"]];
     }
@@ -430,6 +541,7 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
     options.byteBudget = self.budgetBytes;
     options.includeComments = [defaults boolForKey:UDKeyOfflineIncludeComments];
     options.includeImages = [defaults boolForKey:UDKeyOfflineIncludeImages];
+    options.includeVideos = [defaults boolForKey:UDKeyOfflineIncludeVideos];
     CGFloat screenPixels = UIScreen.mainScreen.nativeBounds.size.width;
     options.maxImageWidth = (NSInteger)MIN(1440, MAX(640, screenPixels));
     if ([defaults boolForKey:UDKeyOfflineSkipRead]) {
@@ -462,6 +574,9 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
 
     _downloader = [[ApolloOfflineDownloader alloc] initWithLibraryDirectory:[ApolloOfflineLibrary defaultDirectory]
                                                                     fetcher:fetcher requestBuilder:builder];
+    _downloader.videoMuxer = ^(NSURL *video, NSURL *audio, NSURL *output, void (^done)(BOOL, NSTimeInterval)) {
+        ApolloOfflineMuxVideo(video, audio, output, done);
+    };
     _downloading = YES;
     _downloadingAutomatically = automatic;
     _progressBytes = 0;
@@ -476,9 +591,9 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         ApolloLog(@"[Offline] background time ran out; cancelling download");
         [weakSelf cancelDownload];
     }];
-    ApolloLog(@"[Offline] download start: %@, budget %llu MB, comments=%d images=%d, %lu read posts to skip",
+    ApolloLog(@"[Offline] download start: %@, budget %llu MB, comments=%d images=%d videos=%d, %lu read posts to skip",
               [[sources valueForKey:@"title"] componentsJoinedByString:@", "], options.byteBudget / (1000 * 1000),
-              options.includeComments, options.includeImages, (unsigned long)options.skipPostIDs.count);
+              options.includeComments, options.includeImages, options.includeVideos, (unsigned long)options.skipPostIDs.count);
     [self recompute];
 
     [_downloader startWithOptions:options progress:^(unsigned long long bytes, __unused NSUInteger posts, NSString *status) {
@@ -502,8 +617,10 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         if (committed) {
             message = [NSString stringWithFormat:@"Saved %lu posts (%@) for offline reading.", (unsigned long)posts,
                        [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile]];
-            ApolloLog(@"[Offline] download done%@: %lu posts, %llu bytes, %lu already-read posts skipped",
-                      automatic ? @" (Keep Fresh)" : @"", (unsigned long)posts, bytes, (unsigned long)skipped);
+            ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
+            ApolloLog(@"[Offline] download done%@: %lu posts, %lu videos (%.0f s), %llu bytes, %lu already-read posts skipped",
+                      automatic ? @" (Keep Fresh)" : @"", (unsigned long)posts, (unsigned long)library.videoCount,
+                      library.videoSeconds, bytes, (unsigned long)skipped);
         } else {
             message = error.localizedDescription ?: @"The download didn't finish.";
             ApolloLog(@"[Offline] download ended without saving: %@ (%@ %ld)", message, error.domain, (long)error.code);
@@ -526,6 +643,15 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
     [self recompute];
 }
 
+// "45 min", "1 hr 20 min".
+static NSString *ApolloOfflineDurationText(NSTimeInterval seconds) {
+    NSInteger minutes = MAX(1, (NSInteger)lround(seconds / 60.0));
+    if (minutes < 60) return [NSString stringWithFormat:@"%ld min", (long)minutes];
+    NSInteger hours = minutes / 60, rest = minutes % 60;
+    return rest == 0 ? [NSString stringWithFormat:@"%ld hr", (long)hours]
+                     : [NSString stringWithFormat:@"%ld hr %ld min", (long)hours, (long)rest];
+}
+
 - (NSString *)librarySummary {
     ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
     if (!library.hasContent) return @"Not downloaded";
@@ -538,7 +664,11 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         formatter.doesRelativeDateFormatting = YES;
         when = [@" · " stringByAppendingString:[formatter stringFromDate:library.downloadedAt]];
     }
-    return [NSString stringWithFormat:@"%lu posts · %@%@", (unsigned long)library.postCount, size, when];
+    NSString *videos = library.videoCount > 0
+        ? [NSString stringWithFormat:@" · %lu video%@", (unsigned long)library.videoCount, library.videoCount == 1 ? @"" : @"s"] : @"";
+    NSTimeInterval browse = ApolloOfflineEstimatedBrowseTime(library.postCount, library.videoSeconds);
+    return [NSString stringWithFormat:@"%lu posts%@ · %@\nAbout %@ of scrolling%@", (unsigned long)library.postCount,
+            videos, size, ApolloOfflineDurationText(browse), when];
 }
 
 @end

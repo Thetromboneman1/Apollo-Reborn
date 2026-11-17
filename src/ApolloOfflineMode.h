@@ -47,7 +47,8 @@ BOOL ApolloOfflineModeIsServing(void);
 - (void)cancelDownload;
 - (void)deleteLibrary;
 
-// "42 posts · 87 MB · Today" or "Not downloaded".
+// "42 posts · 3 videos · 87 MB\nAbout 12 min of scrolling · Today, 7:01 AM"
+// (two lines) or "Not downloaded".
 - (NSString *)librarySummary;
 
 @end

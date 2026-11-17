@@ -1470,7 +1470,10 @@ typedef NS_ENUM(NSInteger, Tag) {
     palHome.iconSystemName = @"house.fill";
     palHome.iconTileColor = [UIColor systemBrownColor];
     ApolloSettingsRow *offline = [self hubDisclosureRowWithID:@"feat.offline" title:@"Offline Mode"
-        subtitle:^NSString * { return [[ApolloOfflineModeController sharedController] librarySummary]; }
+        subtitle:^NSString * {
+            // First line only: what's saved ("42 posts · 3 videos · 87 MB").
+            return [[[ApolloOfflineModeController sharedController] librarySummary] componentsSeparatedByString:@"\n"].firstObject;
+        }
         push:^UIViewController * { return ApolloSettingsRouteInstantiate(@"offline-mode"); }];
     offline.iconSystemName = @"airplane";
     offline.iconTileColor = [UIColor systemCyanColor];

@@ -27,6 +27,10 @@ NSErrorDomain const ApolloOfflineErrorDomain = @"ApolloOfflineErrorDomain";
         _maxImageWidth = 1080;
         _maxImageBytes = 12ull * 1024 * 1024;
         _apiSpacing = 0.75;
+        _includeVideos = YES;
+        _maxVideoHeight = 720;
+        _maxVideoBytes = 60ull * 1000 * 1000;
+        _maxVideoDuration = 5 * 60;
     }
     return self;
 }
@@ -230,13 +234,14 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         [NSURLQueryItem queryItemWithName:@"limit" value:[NSString stringWithFormat:@"%lu", (unsigned long)_options.pageSize]],
         [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"], nil];
     if (_after.length > 0) [query addObject:[NSURLQueryItem queryItemWithName:@"after" value:_after]];
+    if (source.queryItems.count > 0) [query addObjectsFromArray:source.queryItems];
     [self report:[NSString stringWithFormat:@"Loading %@…", source.title]];
 
     [self fetchAPI:source.path query:query completion:^(NSURLRequest *request, NSData *fetched, NSHTTPURLResponse *response, NSError *error) {
         if ([self stopIfCancelled]) return;
         // Leave out posts the user has already read before anything else sees the page.
         NSData *data = fetched;
-        if (ApolloOfflineIsSuccess(response, fetched, error) && self->_options.skipPostIDs.count > 0) {
+        if (ApolloOfflineIsSuccess(response, fetched, error) && self->_options.skipPostIDs.count > 0 && !source.keepsReadPosts) {
             NSUInteger removed = 0;
             data = ApolloOfflineListingRemovingPosts(fetched, self->_options.skipPostIDs, &removed) ?: fetched;
             self->_skippedRead += removed;
@@ -303,7 +308,9 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         [self processPostAtIndex:index + 1];
     };
     [self saveCommentsForPost:post then:^{
-        [self saveImagesForPost:post then:next];
+        [self saveImagesForPost:post then:^{
+            [self saveVideoForPost:post then:next];
+        }];
     }];
 }
 
@@ -366,6 +373,104 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         });
     }
     dispatch_group_notify(group, _queue, then);
+}
+
+// MARK: - Video
+
+// Fetches one file for a video; nil on failure or when it's over `maxBytes`.
+- (void)fetchMedia:(NSURL *)url maxBytes:(unsigned long long)maxBytes then:(void (^)(NSData *data))then {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.timeoutInterval = 30;
+    _fetcher(request, ^(NSData *data, NSHTTPURLResponse *response, NSError *error) {
+        BOOL ok = ApolloOfflineIsSuccess(response, data, error) && data.length <= maxBytes;
+        dispatch_async(self->_queue, ^{ then(ok ? data : nil); });
+    });
+}
+
+- (void)saveVideoForPost:(NSDictionary *)post then:(void (^)(void))then {
+    NSDictionary *video = ApolloOfflineRedditVideoForPost(post);
+    ApolloOfflineVideoMuxer muxer = self.videoMuxer;
+    if (!_options.includeVideos || !video || !muxer || !_writer) {
+        then();
+        return;
+    }
+    NSString *videoID = video[@"id"];
+    NSString *key = ApolloOfflineVideoKey(videoID);
+    NSTimeInterval duration = [video[@"duration"] doubleValue];
+    if ([_writer hasKey:key] || duration > _options.maxVideoDuration) {
+        then();
+        return;
+    }
+    NSURL *manifestURL = video[@"dash"];
+    [self fetchMedia:manifestURL maxBytes:1024 * 1024 then:^(NSData *manifest) {
+        NSDictionary *renditions = ApolloOfflineRedditVideoRenditions(manifest, manifestURL, self->_options.maxVideoHeight);
+        if (!renditions || [self stopIfCancelledQuietly]) {
+            then();
+            return;
+        }
+        NSURL *audioURL = [video[@"hasAudio"] boolValue] ? renditions[@"audio"] : nil;
+        // Skip a video that would overrun this feed's share of the limit
+        // (bitrates from the manifest; 30 s assumed when Reddit omits the length).
+        double seconds = duration > 0 ? duration : 30;
+        unsigned long long estimate = (unsigned long long)(([renditions[@"videoBandwidth"] doubleValue] +
+                                                            (audioURL ? [renditions[@"audioBandwidth"] doubleValue] : 0)) * seconds / 8.0);
+        if (estimate > self->_options.maxVideoBytes || self->_writer.bytesWritten + estimate > self->_feedBudgetEnd) {
+            then();
+            return;
+        }
+        [self report:@"Saving videos"];
+        unsigned long long maxBytes = self->_options.maxVideoBytes;
+        [self fetchMedia:renditions[@"video"] maxBytes:maxBytes then:^(NSData *videoData) {
+            void (^withAudio)(NSData *) = ^(NSData *audioData) {
+                ApolloOfflineLibraryWriter *writer = self->_writer;
+                if (!videoData || !writer || [self stopIfCancelledQuietly] || (audioURL && !audioData)) {
+                    then();
+                    return;
+                }
+                NSURL *videoFile = [writer scratchFileURLWithExtension:@"mp4"];
+                NSURL *audioFile = audioData ? [writer scratchFileURLWithExtension:@"mp4"] : nil;
+                NSURL *output = [writer scratchFileURLWithExtension:@"mp4"];
+                if (![videoData writeToURL:videoFile atomically:NO] || (audioFile && ![audioData writeToURL:audioFile atomically:NO])) {
+                    then();
+                    return;
+                }
+                // Apollo reads the master playlist to tell a video with sound
+                // from a silent "GIF"; keep Reddit's own copy for offline.
+                NSURL *masterURL = video[@"hls"];
+                [self fetchMedia:masterURL maxBytes:256 * 1024 then:^(NSData *master) {
+                    muxer(videoFile, audioFile, output, ^(BOOL ok, NSTimeInterval muxedDuration) {
+                        dispatch_async(self->_queue, ^{
+                            NSFileManager *fm = NSFileManager.defaultManager;
+                            [fm removeItemAtURL:videoFile error:nil];
+                            if (audioFile) [fm removeItemAtURL:audioFile error:nil];
+                            ApolloOfflineLibraryWriter *current = self->_writer;
+                            if (ok && current == writer) {
+                                NSString *masterKey = ApolloOfflineKeyForURL(masterURL);
+                                if (master && masterKey) {
+                                    [current storeData:master contentType:@"application/vnd.apple.mpegurl" forKey:masterKey];
+                                }
+                                [current storeVideoFile:output forKey:key pathExtension:@"mp4"
+                                               duration:muxedDuration > 0 ? muxedDuration : duration];
+                            }
+                            [fm removeItemAtURL:output error:nil];
+                            then();
+                        });
+                    });
+                }];
+            };
+            if (audioURL && videoData) {
+                [self fetchMedia:audioURL maxBytes:maxBytes then:withAudio];
+            } else {
+                withAudio(nil);
+            }
+        }];
+    }];
+}
+
+// Like -stopIfCancelled, for the middle of a post: lets the post finish its
+// chain (the next -processPostAtIndex: does the actual stop).
+- (BOOL)stopIfCancelledQuietly {
+    return _cancelled;
 }
 
 // MARK: - Pages

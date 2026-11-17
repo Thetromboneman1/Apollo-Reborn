@@ -11,7 +11,8 @@
 //     key of page N+1) and the last kept page has `after: null`, so the feed
 //     ends cleanly instead of failing on a page that was never fetched;
 //   • a page is cut to the posts whose comments and images were saved, so
-//     every post you can scroll to opens offline.
+//     every post you can scroll to opens offline;
+//   • a post's Reddit video plays offline with sound when it fit the limits.
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -23,6 +24,10 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 @interface ApolloOfflineFeedSource : NSObject
 @property (nonatomic, copy, readonly) NSString *path;   // "/best", "/r/popular/hot", "/r/pics/hot"
 @property (nonatomic, copy, readonly) NSString *title;  // "Home", "r/pics"
+// Keep posts the user has read (Saved Posts: they were saved on purpose).
+@property (nonatomic) BOOL keepsReadPosts;
+// Extra query items for every page of this feed (Saved: type=links).
+@property (nonatomic, copy, nullable) NSArray<NSURLQueryItem *> *queryItems;
 + (instancetype)sourceWithPath:(NSString *)path title:(NSString *)title;
 @end
 
@@ -35,6 +40,11 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 @property (nonatomic) NSUInteger maxPostsPerFeed;      // default 300
 @property (nonatomic) NSInteger maxImageWidth;         // default 1080 px
 @property (nonatomic) unsigned long long maxImageBytes; // default 12 MB (skips huge GIFs)
+// Reddit-hosted videos, saved as one mp4 with sound (needs a videoMuxer).
+@property (nonatomic) BOOL includeVideos;              // default YES
+@property (nonatomic) NSInteger maxVideoHeight;        // default 720 px
+@property (nonatomic) unsigned long long maxVideoBytes; // default 60 MB per video
+@property (nonatomic) NSTimeInterval maxVideoDuration; // default 5 minutes
 // Gap between Reddit API calls, to stay well under Reddit's ~100/minute limit.
 @property (nonatomic) NSTimeInterval apiSpacing;       // default 0.75 s
 // Bare post ids ("abc123") to leave out: posts the user has already read.
@@ -43,6 +53,12 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 // same key, so the feed doesn't end early.
 @property (nonatomic, copy) NSSet<NSString *> *skipPostIDs;
 @end
+
+// Combines a video-only file and an optional audio-only file into one mp4 at
+// `output` without re-encoding, then calls `done` (any queue) with the
+// result's running time. Supplied by the app (AVFoundation); tests fake it.
+typedef void (^ApolloOfflineVideoMuxer)(NSURL *video, NSURL * _Nullable audio, NSURL *output,
+                                        void (^done)(BOOL ok, NSTimeInterval duration));
 
 typedef void (^ApolloOfflineProgress)(unsigned long long bytes, NSUInteger posts, NSString *status);
 typedef void (^ApolloOfflineCompletion)(BOOL committed, NSUInteger posts, unsigned long long bytes, NSError * _Nullable error);
@@ -62,6 +78,8 @@ typedef NS_ENUM(NSInteger, ApolloOfflineErrorCode) {
 - (instancetype)init NS_UNAVAILABLE;
 
 @property (nonatomic, readonly) BOOL running;
+// Set before starting; without it videos are skipped (posters still save).
+@property (nonatomic, copy, nullable) ApolloOfflineVideoMuxer videoMuxer;
 // Posts left out of the last run because they were already read.
 @property (nonatomic, readonly) NSUInteger skippedPostCount;
 

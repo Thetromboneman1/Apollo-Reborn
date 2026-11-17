@@ -18,7 +18,8 @@ typedef NS_ENUM(NSInteger, ApolloOfflineLibraryRow) {
 };
 
 typedef NS_ENUM(NSInteger, ApolloOfflineFeedRow) {
-    ApolloOfflineFeedRowHome = 0,
+    ApolloOfflineFeedRowSaved = 0,
+    ApolloOfflineFeedRowHome,
     ApolloOfflineFeedRowPopular,
     ApolloOfflineFeedRowSubreddits,
 };
@@ -26,6 +27,7 @@ typedef NS_ENUM(NSInteger, ApolloOfflineFeedRow) {
 typedef NS_ENUM(NSInteger, ApolloOfflineContentRow) {
     ApolloOfflineContentRowComments = 0,
     ApolloOfflineContentRowImages,
+    ApolloOfflineContentRowVideos,
     ApolloOfflineContentRowSkipRead,
     ApolloOfflineContentRowBudget,
 };
@@ -91,7 +93,8 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         return canDelete ? 3 : 2;
     }
     if (section == ApolloOfflineSectionAutomatic) return 1;
-    if (section == ApolloOfflineSectionContent) return 4;
+    if (section == ApolloOfflineSectionContent) return 5;
+    if (section == ApolloOfflineSectionFeeds) return 4;
     return 3;
 }
 
@@ -112,7 +115,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         case ApolloOfflineSectionLibrary:
             return @"Download a batch of posts while you have a connection, then scroll it on a flight or "
                     "anywhere without signal. Each download replaces the last one. Keep Apollo open until it "
-                    "finishes. Videos don't play offline, but their preview images do show.";
+                    "finishes. Videos play offline with sound, in the same player as always.";
         case ApolloOfflineSectionUse: {
             NSString *now = controller.serving ? @"Showing your offline library now."
                           : (controller.networkAvailable ? @"Online now." : @"No connection right now.");
@@ -125,10 +128,15 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                     "or sooner once you've read half of them. Never on cellular or in Low Power Mode, and only "
                     "after you've downloaded once yourself.";
         case ApolloOfflineSectionFeeds:
-            return @"Offline, each feed shows the posts that were downloaded, whatever sort you pick.";
+            return @"Saved Posts works as your offline archive: save a post in Apollo (swipe or the post menu) and "
+                    "every download keeps it, with its comments, images and video, even after you've read it. "
+                    "Unsave it to let it go. Offline, each feed shows the posts that were downloaded, whatever "
+                    "sort you pick.";
         case ApolloOfflineSectionContent:
             return @"Skipping read posts means a new batch is all posts you haven't seen. The download stops once "
-                    "it reaches the data limit. Images are saved at your screen's size.";
+                    "it reaches the data limit. Images are saved at your screen's size. Reddit videos are saved "
+                    "at up to 720p with sound (videos over 5 minutes are skipped); they use the most data, so "
+                    "turn Videos off to fit more posts in the same limit.";
     }
     return nil;
 }
@@ -161,7 +169,15 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
     switch (indexPath.section) {
         case ApolloOfflineSectionLibrary: {
             if (indexPath.row == ApolloOfflineLibraryRowStatus) {
-                UITableViewCell *cell = [self valueCellWithTitle:@"Saved" detail:[controller librarySummary]];
+                // What's saved on the first line; roughly how long it lasts and
+                // when it was fetched on the second.
+                NSArray<NSString *> *lines = [[controller librarySummary] componentsSeparatedByString:@"\n"];
+                UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+                cell.textLabel.text = lines.firstObject;
+                cell.detailTextLabel.text = lines.count > 1 ? lines[1] : nil;
+                cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+                cell.detailTextLabel.numberOfLines = 0;
+                [self apollo_applyPrimaryTextColorToCell:cell];
                 cell.selectionStyle = UITableViewCellSelectionStyleNone;
                 return cell;
             }
@@ -194,6 +210,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         case ApolloOfflineSectionAutomatic:
             return [self switchCellWithTitle:@"Keep Fresh on Wi-Fi" key:UDKeyOfflineAutoRefresh];
         case ApolloOfflineSectionFeeds: {
+            if (indexPath.row == ApolloOfflineFeedRowSaved) return [self switchCellWithTitle:@"Saved Posts" key:UDKeyOfflineIncludeSaved];
             if (indexPath.row == ApolloOfflineFeedRowHome) return [self switchCellWithTitle:@"Home" key:UDKeyOfflineIncludeHome];
             if (indexPath.row == ApolloOfflineFeedRowPopular) return [self switchCellWithTitle:@"Popular" key:UDKeyOfflineIncludePopular];
             NSArray *subs = [self subreddits];
@@ -205,6 +222,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         case ApolloOfflineSectionContent: {
             if (indexPath.row == ApolloOfflineContentRowComments) return [self switchCellWithTitle:@"Comments" key:UDKeyOfflineIncludeComments];
             if (indexPath.row == ApolloOfflineContentRowImages) return [self switchCellWithTitle:@"Images" key:UDKeyOfflineIncludeImages];
+            if (indexPath.row == ApolloOfflineContentRowVideos) return [self switchCellWithTitle:@"Videos" key:UDKeyOfflineIncludeVideos];
             if (indexPath.row == ApolloOfflineContentRowSkipRead) return [self switchCellWithTitle:@"Skip Posts I've Read" key:UDKeyOfflineSkipRead];
             UITableViewCell *cell = [self valueCellWithTitle:@"Data Limit"
                                                       detail:ApolloOfflineBudgetText((NSInteger)(controller.budgetBytes / (1000 * 1000)))];

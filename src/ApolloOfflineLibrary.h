@@ -22,8 +22,9 @@ NS_ASSUME_NONNULL_BEGIN
 extern "C" {
 #endif
 
-// "home", "r/<sub>" or "m/<user>/<multi>" for a Reddit listing path such as
-// "/", "/best", "/r/Pics/top", "/user/x/m/y/new" (".json" and a trailing slash
+// "home", "r/<sub>", "m/<user>/<multi>" or "saved/<user>" for a Reddit
+// listing path such as "/", "/best", "/r/Pics/top", "/user/x/m/y/new",
+// "/user/x/saved" (".json" and a trailing slash
 // are ignored, names are lowercased). nil for any other path. Sort is
 // deliberately dropped: offline, a feed shows the batch that was downloaded
 // whatever sort Apollo asks for.
@@ -45,9 +46,41 @@ BOOL ApolloOfflineURLIsRedditAPI(NSURL *url);
 // the preview at the largest resolution no wider than maxWidth (or the
 // source), every gallery image, the thumbnail, a direct i.redd.it/i.imgur.com
 // image, and the same for a crosspost's parent. Duplicates by library key are
-// removed. Video is not included: AVFoundation fetches HLS segments outside
-// NSURLSession, so it can't be served offline; the video's poster still is.
+// removed. Videos are saved separately (below); this covers their posters.
 NSArray<NSURL *> *ApolloOfflineImageURLsForPost(NSDictionary *post, NSInteger maxWidth);
+
+// MARK: Video
+//
+// A Reddit-hosted video (v.redd.it, including the silent clips Apollo labels
+// "GIF") is saved as ONE local mp4 with its sound: the downloader picks a
+// video and an audio rendition from the post's DASH manifest, fetches both
+// files and remuxes them (no re-encode). Offline, ApolloOfflineMode.xm hands
+// Apollo's player that file in place of the streaming URL, so playback never
+// touches the network. The master playlist is saved as well, because Apollo
+// reads it to decide whether a post has sound (no sound = "GIF" pill).
+
+// The v.redd.it id in any URL that names one: the https master/variant/media
+// URLs and Apollo's own player URLs, whatever their scheme. nil otherwise.
+NSString * _Nullable ApolloOfflineRedditVideoIDForURL(NSURL * _Nullable url);
+// "video:<id>", the library key for a saved video file.
+NSString *ApolloOfflineVideoKey(NSString *videoID);
+
+// The post's Reddit-hosted video (its own, else its crosspost parent's):
+// @{ "id", "dash" (NSURL), "hls" (NSURL), "duration" (NSNumber, seconds),
+//    "hasAudio" (NSNumber BOOL) }. nil when it has none.
+NSDictionary * _Nullable ApolloOfflineRedditVideoForPost(NSDictionary *post);
+
+// The renditions to save from a DASH manifest: the tallest video no taller
+// than maxHeight (else the shortest one) and the highest-bandwidth audio:
+// @{ "video" (NSURL), "videoBandwidth", "height", optional "audio" (NSURL),
+//    "audioBandwidth" }. Only self-contained files (a BaseURL per
+// Representation) qualify; nil when there's no usable video.
+NSDictionary * _Nullable ApolloOfflineRedditVideoRenditions(NSData *manifest, NSURL *manifestURL, NSInteger maxHeight);
+
+// Rough time it takes to get through a batch: ~12 s per post plus the running
+// time of its saved videos. Shown next to the size so "how much is this?" can
+// be read in minutes as well as megabytes.
+NSTimeInterval ApolloOfflineEstimatedBrowseTime(NSUInteger posts, NSTimeInterval videoSeconds);
 
 // The listing JSON with only its first `keep` children and, when `endHere`,
 // data.after set to null so Apollo treats it as the last page. nil when the
@@ -124,6 +157,13 @@ BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
 // Bare ids ("abc123") of every post saved in feed pages.
 @property (nonatomic, readonly) NSArray<NSString *> *savedPostIDs;
 
+// Videos saved in this batch and their total running time.
+@property (nonatomic, readonly) NSUInteger videoCount;
+@property (nonatomic, readonly) NSTimeInterval videoSeconds;
+
+// The file behind a stored entry (videos are played straight from disk).
+- (nullable NSURL *)fileURLForKey:(NSString *)key;
+
 // Re-reads the index from disk (after a download commits).
 - (void)reload;
 // Deletes the library from disk.
@@ -149,6 +189,12 @@ BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
 // often loaded page one online with its own page size, so its next-page
 // cursor is a post in the middle of a saved page, not a saved page's key.
 - (BOOL)storeFeedPage:(NSData *)data forKey:(NSString *)key postNames:(NSArray<NSString *> *)names;
+// Moves `file` into the batch (keeping `pathExtension`, which AVFoundation
+// uses to recognise a local mp4) and counts it as one saved video.
+- (BOOL)storeVideoFile:(NSURL *)file forKey:(NSString *)key pathExtension:(NSString *)pathExtension
+              duration:(NSTimeInterval)duration;
+// A fresh scratch file path inside the staging folder (gone after commit).
+- (NSURL *)scratchFileURLWithExtension:(NSString *)pathExtension;
 - (void)noteFeedTitle:(NSString *)title posts:(NSUInteger)posts;
 - (BOOL)commit:(NSError **)error;
 - (void)discard;

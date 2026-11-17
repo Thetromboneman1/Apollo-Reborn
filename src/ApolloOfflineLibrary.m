@@ -44,6 +44,10 @@ NSString *ApolloOfflineFeedKeyForPath(NSString *path) {
         }
         return nil;
     }
+    // The account's Saved list, which Offline Mode keeps as an archive.
+    if (([c[0] isEqualToString:@"user"] || [c[0] isEqualToString:@"u"]) && c.count == 3 && [c[2] isEqualToString:@"saved"]) {
+        return [@"saved/" stringByAppendingString:c[1]];
+    }
     if (([c[0] isEqualToString:@"user"] || [c[0] isEqualToString:@"u"]) && c.count >= 4 && [c[2] isEqualToString:@"m"]) {
         if (c.count == 4 || (c.count == 5 && [sorts containsObject:c[4]])) {
             return [NSString stringWithFormat:@"m/%@/%@", c[1], c[3]];
@@ -258,6 +262,171 @@ NSArray<NSURL *> *ApolloOfflineImageURLsForPost(NSDictionary *post, NSInteger ma
     return urls;
 }
 
+// MARK: - Video
+
+NSString *ApolloOfflineRedditVideoIDForURL(NSURL *url) {
+    // Matched on the text, not url.host: Apollo's player rewrites the scheme
+    // (and may wrap the original URL), but "v.redd.it/<id>" always survives.
+    NSString *string = url.absoluteString;
+    if (string.length == 0) return nil;
+    NSRange marker = [string rangeOfString:@"v.redd.it/" options:NSCaseInsensitiveSearch];
+    if (marker.location == NSNotFound) return nil;
+    NSUInteger start = NSMaxRange(marker);
+    NSUInteger end = start;
+    NSCharacterSet *allowed = [NSCharacterSet alphanumericCharacterSet];
+    while (end < string.length && [allowed characterIsMember:[string characterAtIndex:end]]) end++;
+    if (end - start < 4) return nil;
+    return [[string substringWithRange:NSMakeRange(start, end - start)] lowercaseString];
+}
+
+NSString *ApolloOfflineVideoKey(NSString *videoID) {
+    return [@"video:" stringByAppendingString:videoID.lowercaseString ?: @""];
+}
+
+static NSDictionary *ApolloOfflineRedditVideoOf(NSDictionary *post) {
+    for (NSString *field in @[ @"secure_media", @"media" ]) {
+        NSDictionary *video = ApolloOfflineDict(ApolloOfflineDict(post[field])[@"reddit_video"]);
+        if (!video) continue;
+        NSURL *dash = ApolloOfflineMediaURL(ApolloOfflineString(video[@"dash_url"]));
+        NSURL *hls = ApolloOfflineMediaURL(ApolloOfflineString(video[@"hls_url"]));
+        NSURL *fallback = ApolloOfflineMediaURL(ApolloOfflineString(video[@"fallback_url"]));
+        NSString *videoID = ApolloOfflineRedditVideoIDForURL(dash) ?: ApolloOfflineRedditVideoIDForURL(hls)
+                            ?: ApolloOfflineRedditVideoIDForURL(fallback);
+        if (!videoID) continue;
+        if (!dash) dash = [NSURL URLWithString:[NSString stringWithFormat:@"https://v.redd.it/%@/DASHPlaylist.mpd", videoID]];
+        if (!hls) hls = [NSURL URLWithString:[NSString stringWithFormat:@"https://v.redd.it/%@/HLSPlaylist.m3u8", videoID]];
+        id duration = video[@"duration"];
+        id hasAudio = video[@"has_audio"];
+        return @{
+            @"id": videoID,
+            @"dash": dash,
+            @"hls": hls,
+            @"duration": @([duration respondsToSelector:@selector(doubleValue)] ? [duration doubleValue] : 0),
+            // Older posts omit has_audio; the manifest decides then.
+            @"hasAudio": @([hasAudio respondsToSelector:@selector(boolValue)] ? [hasAudio boolValue] : YES),
+        };
+    }
+    return nil;
+}
+
+NSDictionary *ApolloOfflineRedditVideoForPost(NSDictionary *post) {
+    if (![post isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *video = ApolloOfflineRedditVideoOf(post);
+    if (video) return video;
+    NSDictionary *parent = ApolloOfflineDict(ApolloOfflineArray(post[@"crosspost_parent_list"]).firstObject);
+    return parent ? ApolloOfflineRedditVideoOf(parent) : nil;
+}
+
+// Walks a DASH MPD keeping the kind (from AdaptationSet or Representation
+// contentType/mimeType) and the BaseURL of each Representation. Reddit's
+// manifests list each rendition as one file (CMAF_720.mp4, DASH_AUDIO_128.mp4)
+// with a SegmentBase index; a SegmentTemplate/SegmentList rendition is a set
+// of segments, not one file, and is skipped.
+@interface ApolloOfflineManifestParser : NSObject <NSXMLParserDelegate>
+@property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *representations;
+@property (nonatomic, copy) NSString *setKind;
+@property (nonatomic, strong) NSMutableDictionary *current;
+@property (nonatomic, strong) NSMutableString *text;
+@end
+
+static NSString *ApolloOfflineManifestKind(NSDictionary<NSString *, NSString *> *attributes) {
+    NSString *contentType = attributes[@"contentType"].lowercaseString;
+    NSString *mimeType = attributes[@"mimeType"].lowercaseString;
+    if ([contentType isEqualToString:@"audio"] || [mimeType hasPrefix:@"audio/"]) return @"audio";
+    if ([contentType isEqualToString:@"video"] || [mimeType hasPrefix:@"video/"]) return @"video";
+    if (contentType.length || mimeType.length) return @"other";
+    return nil;
+}
+
+@implementation ApolloOfflineManifestParser
+
+- (void)parser:(__unused NSXMLParser *)parser didStartElement:(NSString *)elementName namespaceURI:(__unused NSString *)namespaceURI
+ qualifiedName:(__unused NSString *)qName attributes:(NSDictionary<NSString *, NSString *> *)attributes {
+    NSString *name = [elementName componentsSeparatedByString:@":"].lastObject;
+    if ([name isEqualToString:@"AdaptationSet"]) {
+        self.setKind = ApolloOfflineManifestKind(attributes);
+    } else if ([name isEqualToString:@"Representation"]) {
+        self.current = [NSMutableDictionary dictionary];
+        self.current[@"kind"] = ApolloOfflineManifestKind(attributes) ?: self.setKind ?: @"other";
+        self.current[@"bandwidth"] = @([attributes[@"bandwidth"] longLongValue]);
+        self.current[@"height"] = @([attributes[@"height"] integerValue]);
+    } else if ([name isEqualToString:@"BaseURL"] && self.current) {
+        self.text = [NSMutableString string];
+    } else if (([name isEqualToString:@"SegmentTemplate"] || [name isEqualToString:@"SegmentList"]) && self.current) {
+        self.current[@"segmented"] = @YES;
+    }
+}
+
+- (void)parser:(__unused NSXMLParser *)parser foundCharacters:(NSString *)string {
+    [self.text appendString:string];
+}
+
+- (void)parser:(__unused NSXMLParser *)parser didEndElement:(NSString *)elementName namespaceURI:(__unused NSString *)namespaceURI
+ qualifiedName:(__unused NSString *)qName {
+    NSString *name = [elementName componentsSeparatedByString:@":"].lastObject;
+    if ([name isEqualToString:@"BaseURL"] && self.current && self.text) {
+        self.current[@"base"] = [self.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        self.text = nil;
+    } else if ([name isEqualToString:@"Representation"] && self.current) {
+        if ([self.current[@"base"] length] > 0 && ![self.current[@"segmented"] boolValue]) {
+            [self.representations addObject:self.current];
+        }
+        self.current = nil;
+    } else if ([name isEqualToString:@"AdaptationSet"]) {
+        self.setKind = nil;
+    }
+}
+
+@end
+
+NSDictionary *ApolloOfflineRedditVideoRenditions(NSData *manifest, NSURL *manifestURL, NSInteger maxHeight) {
+    if (manifest.length == 0 || !manifestURL) return nil;
+    ApolloOfflineManifestParser *delegate = [ApolloOfflineManifestParser new];
+    delegate.representations = [NSMutableArray array];
+    NSXMLParser *parser = [[NSXMLParser alloc] initWithData:manifest];
+    parser.delegate = delegate;
+    parser.shouldResolveExternalEntities = NO;
+    if (![parser parse]) return nil;
+
+    // Relative BaseURLs resolve against the manifest without its query.
+    NSURLComponents *baseComponents = [NSURLComponents componentsWithURL:manifestURL resolvingAgainstBaseURL:NO];
+    baseComponents.query = nil;
+    NSURL *base = baseComponents.URL;
+
+    NSDictionary *bestFit = nil, *shortest = nil, *audio = nil;
+    for (NSDictionary *rep in delegate.representations) {
+        NSInteger height = [rep[@"height"] integerValue];
+        long long bandwidth = [rep[@"bandwidth"] longLongValue];
+        if ([rep[@"kind"] isEqualToString:@"video"]) {
+            if (height > 0 && height <= maxHeight) {
+                NSInteger bestHeight = [bestFit[@"height"] integerValue];
+                if (!bestFit || height > bestHeight || (height == bestHeight && bandwidth > [bestFit[@"bandwidth"] longLongValue])) bestFit = rep;
+            }
+            if (!shortest || (height > 0 && height < [shortest[@"height"] integerValue])) shortest = rep;
+        } else if ([rep[@"kind"] isEqualToString:@"audio"]) {
+            if (!audio || bandwidth > [audio[@"bandwidth"] longLongValue]) audio = rep;
+        }
+    }
+    NSDictionary *video = bestFit ?: shortest;
+    NSURL *videoURL = video ? [NSURL URLWithString:video[@"base"] relativeToURL:base].absoluteURL : nil;
+    if (!videoURL) return nil;
+    NSMutableDictionary *result = [@{
+        @"video": videoURL,
+        @"videoBandwidth": video[@"bandwidth"],
+        @"height": video[@"height"],
+    } mutableCopy];
+    NSURL *audioURL = audio ? [NSURL URLWithString:audio[@"base"] relativeToURL:base].absoluteURL : nil;
+    if (audioURL) {
+        result[@"audio"] = audioURL;
+        result[@"audioBandwidth"] = audio[@"bandwidth"];
+    }
+    return result;
+}
+
+NSTimeInterval ApolloOfflineEstimatedBrowseTime(NSUInteger posts, NSTimeInterval videoSeconds) {
+    return posts * 12.0 + MAX(0, videoSeconds);
+}
+
 NSData *ApolloOfflineTruncatedListing(NSData *listing, NSUInteger keep, BOOL endHere) {
     if (listing.length == 0) return nil;
     id root = [NSJSONSerialization JSONObjectWithData:listing options:NSJSONReadingMutableContainers error:nil];
@@ -298,6 +467,8 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     unsigned long long _totalBytes;
     NSDate *_downloadedAt;
     NSArray<NSString *> *_feedTitles;
+    NSUInteger _videoCount;
+    NSTimeInterval _videoSeconds;
 }
 
 + (NSURL *)defaultDirectory {
@@ -350,6 +521,8 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     _totalBytes = [index[@"bytes"] unsignedLongLongValue];
     _downloadedAt = downloaded ? [NSDate dateWithTimeIntervalSince1970:downloaded.doubleValue] : nil;
     _feedTitles = titles;
+    _videoCount = [index[@"videos"] unsignedIntegerValue];
+    _videoSeconds = [index[@"videoSeconds"] doubleValue];
     [_lock unlock];
 }
 
@@ -364,6 +537,19 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
 - (unsigned long long)totalBytes { [_lock lock]; unsigned long long v = _totalBytes; [_lock unlock]; return v; }
 - (NSDate *)downloadedAt { [_lock lock]; NSDate *v = _downloadedAt; [_lock unlock]; return v; }
 - (NSArray<NSString *> *)feedTitles { [_lock lock]; NSArray *v = _feedTitles; [_lock unlock]; return v; }
+- (NSUInteger)videoCount { [_lock lock]; NSUInteger v = _videoCount; [_lock unlock]; return v; }
+- (NSTimeInterval)videoSeconds { [_lock lock]; NSTimeInterval v = _videoSeconds; [_lock unlock]; return v; }
+
+- (NSURL *)fileURLForKey:(NSString *)key {
+    if (key.length == 0) return nil;
+    [_lock lock];
+    NSDictionary *entry = ApolloOfflineDict(_entries[key]);
+    [_lock unlock];
+    NSString *file = ApolloOfflineString(entry[@"file"]);
+    if (file.length == 0 || [file containsString:@"/"]) return nil;
+    NSURL *url = [_directory URLByAppendingPathComponent:file isDirectory:NO];
+    return [NSFileManager.defaultManager fileExistsAtPath:url.path] ? url : nil;
+}
 
 - (NSArray<NSString *> *)savedPostIDs {
     [_lock lock];
@@ -453,6 +639,8 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     NSMutableDictionary<NSString *, NSDictionary *> *_entries;
     NSMutableArray<NSString *> *_feedTitles;
     NSUInteger _nextFile;
+    NSUInteger _videoCount;
+    NSTimeInterval _videoSeconds;
     BOOL _finished;
 }
 
@@ -501,6 +689,36 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     return YES;
 }
 
+- (BOOL)storeVideoFile:(NSURL *)file forKey:(NSString *)key pathExtension:(NSString *)pathExtension
+              duration:(NSTimeInterval)duration {
+    if (_finished || !file || key.length == 0) return NO;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    unsigned long long bytes = [[fm attributesOfItemAtPath:file.path error:nil] fileSize];
+    if (bytes == 0) return NO;
+    NSString *name = [NSString stringWithFormat:@"e%lu", (unsigned long)++_nextFile];
+    if (pathExtension.length > 0) name = [name stringByAppendingPathExtension:pathExtension];
+    if (![fm moveItemAtURL:file toURL:[_stagingDirectory URLByAppendingPathComponent:name] error:nil]) return NO;
+    NSDictionary *previous = _entries[key];
+    if (previous) {
+        _bytesWritten -= [previous[@"bytes"] unsignedLongLongValue];
+        [fm removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:previous[@"file"]] error:nil];
+    } else {
+        _videoCount++;
+        _videoSeconds += MAX(0, duration);
+    }
+    _entries[key] = @{ @"file": name, @"type": @"video/mp4", @"bytes": @(bytes) };
+    _bytesWritten += bytes;
+    return YES;
+}
+
+- (NSURL *)scratchFileURLWithExtension:(NSString *)pathExtension {
+    NSURL *scratch = [_stagingDirectory URLByAppendingPathComponent:@"scratch" isDirectory:YES];
+    [NSFileManager.defaultManager createDirectoryAtURL:scratch withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *name = NSUUID.UUID.UUIDString;
+    if (pathExtension.length > 0) name = [name stringByAppendingPathExtension:pathExtension];
+    return [scratch URLByAppendingPathComponent:name isDirectory:NO];
+}
+
 - (void)noteFeedTitle:(NSString *)title posts:(NSUInteger)posts {
     if (posts == 0) return;
     [_feedTitles addObject:title];
@@ -516,8 +734,11 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
         @"posts": @(_postCount),
         @"bytes": @(_bytesWritten),
         @"feeds": _feedTitles,
+        @"videos": @(_videoCount),
+        @"videoSeconds": @(_videoSeconds),
         @"entries": _entries,
     };
+    [NSFileManager.defaultManager removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:@"scratch" isDirectory:YES] error:nil];
     NSData *json = [NSJSONSerialization dataWithJSONObject:index options:0 error:error];
     if (!json || ![json writeToURL:[_stagingDirectory URLByAppendingPathComponent:kApolloOfflineIndexName] options:NSDataWritingAtomic error:error]) {
         [self discard];

@@ -162,6 +162,9 @@ typedef struct {
     NSUInteger posts;
 } RunResult;
 
+// Set by a test to give the downloader a (fake) remuxer.
+static ApolloOfflineVideoMuxer sTestMuxer = nil;
+
 static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, NSDictionary<NSString *, NSData *> *responses,
                              NSMutableArray<NSString *> *requested) {
     ApolloOfflineFetcher fetcher = ^(NSURLRequest *request, ApolloOfflineFetchCompletion completion) {
@@ -169,7 +172,8 @@ static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, 
         NSString *after = nil;
         for (NSURLQueryItem *item in c.queryItems) if ([item.name isEqualToString:@"after"]) after = item.value;
         NSString *lookup = after ? [NSString stringWithFormat:@"%@?after=%@", c.path, after] : (c.path ?: @"");
-        if ([request.URL.host hasSuffix:@"redd.it"] || [request.URL.host hasSuffix:@"redditmedia.com"]) lookup = request.URL.host;
+        if ([request.URL.host isEqualToString:@"v.redd.it"]) lookup = [request.URL.host stringByAppendingString:request.URL.path];
+        else if ([request.URL.host hasSuffix:@"redd.it"] || [request.URL.host hasSuffix:@"redditmedia.com"]) lookup = request.URL.host;
         @synchronized (requested) { [requested addObject:lookup]; }
         NSData *body = responses[lookup];
         NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:body ? 200 : 404 HTTPVersion:@"HTTP/1.1"
@@ -182,6 +186,7 @@ static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, 
         return [NSURLRequest requestWithURL:c.URL];
     };
     ApolloOfflineDownloader *downloader = [[ApolloOfflineDownloader alloc] initWithLibraryDirectory:dir fetcher:fetcher requestBuilder:builder];
+    downloader.videoMuxer = sTestMuxer;
     __block RunResult result = { NO, NO, 0 };
     [downloader startWithOptions:options progress:nil completion:^(BOOL committed, NSUInteger posts, __unused unsigned long long bytes, __unused NSError *error) {
         result.done = YES;
@@ -325,6 +330,161 @@ static void TestDownloaderSkipsReadPosts(void) {
     [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
 }
 
+// MARK: - Video and Saved
+
+static NSData *Manifest(void) {
+    NSString *mpd = @"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period>"
+        "<AdaptationSet contentType=\"video\">"
+        "<Representation id=\"1\" bandwidth=\"300000\" height=\"240\"><BaseURL>CMAF_240.mp4</BaseURL><SegmentBase indexRange=\"0-9\"/></Representation>"
+        "<Representation id=\"2\" bandwidth=\"900000\" height=\"480\"><BaseURL>CMAF_480.mp4</BaseURL></Representation>"
+        "<Representation id=\"3\" bandwidth=\"1800000\" height=\"720\"><BaseURL>CMAF_720.mp4</BaseURL></Representation>"
+        "<Representation id=\"4\" bandwidth=\"4000000\" height=\"1080\"><BaseURL>CMAF_1080.mp4</BaseURL></Representation>"
+        "<Representation id=\"5\" bandwidth=\"9000000\" height=\"1440\"><SegmentTemplate media=\"seg_$Number$.m4s\"/></Representation>"
+        "</AdaptationSet>"
+        "<AdaptationSet mimeType=\"audio/mp4\">"
+        "<Representation id=\"6\" bandwidth=\"64000\"><BaseURL>CMAF_AUDIO_64.mp4</BaseURL></Representation>"
+        "<Representation id=\"7\" bandwidth=\"128000\"><BaseURL>CMAF_AUDIO_128.mp4</BaseURL></Representation>"
+        "</AdaptationSet></Period></MPD>";
+    return [mpd dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static NSDictionary *VideoPost(NSString *postID, NSString *videoID, BOOL hasAudio) {
+    NSMutableDictionary *post = [PostData(postID) mutableCopy];
+    post[@"is_video"] = @YES;
+    post[@"secure_media"] = @{ @"reddit_video": @{
+        @"fallback_url": [NSString stringWithFormat:@"https://v.redd.it/%@/CMAF_720.mp4?source=fallback", videoID],
+        @"dash_url": [NSString stringWithFormat:@"https://v.redd.it/%@/DASHPlaylist.mpd?a=1&amp;v=1&amp;f=sd", videoID],
+        @"hls_url": [NSString stringWithFormat:@"https://v.redd.it/%@/HLSPlaylist.m3u8?a=1&amp;v=1&amp;f=sd", videoID],
+        @"duration": @12,
+        @"has_audio": @(hasAudio),
+    } };
+    return post;
+}
+
+static void TestVideoKeys(void) {
+    CHECK([ApolloOfflineRedditVideoIDForURL([NSURL URLWithString:@"https://v.redd.it/AbC123xy/HLSPlaylist.m3u8?a=1"]) isEqualToString:@"abc123xy"], "master");
+    CHECK([ApolloOfflineRedditVideoIDForURL([NSURL URLWithString:@"video-player://v.redd.it/abc123xy/HLSPlaylist.m3u8"]) isEqualToString:@"abc123xy"], "player scheme");
+    CHECK([ApolloOfflineRedditVideoIDForURL([NSURL URLWithString:@"https://v.redd.it/abc123xy/CMAF_720.mp4"]) isEqualToString:@"abc123xy"], "media file");
+    CHECK(ApolloOfflineRedditVideoIDForURL([NSURL URLWithString:@"https://i.redd.it/abc123xy.gif"]) == nil, "image host");
+    CHECK(ApolloOfflineRedditVideoIDForURL(nil) == nil, "nil");
+    CHECK([ApolloOfflineVideoKey(@"ABC123xy") isEqualToString:@"video:abc123xy"], "video key");
+    CHECK([Key(@"https://v.redd.it/abc123xy/HLSPlaylist.m3u8?a=9&f=sd") isEqualToString:@"url:v.redd.it/abc123xy/HLSPlaylist.m3u8"], "master key drops query");
+
+    CHECK([ApolloOfflineFeedKeyForPath(@"/user/Bob/saved") isEqualToString:@"saved/bob"], "saved feed");
+    CHECK([Key(@"https://oauth.reddit.com/user/bob/saved?type=links&after=t3_X1") isEqualToString:@"feed:saved/bob|t3_x1"], "saved page key");
+    CHECK(ApolloOfflineFeedKeyForPath(@"/user/bob/saved/extra") == nil, "not the saved list");
+}
+
+static void TestVideoForPost(void) {
+    NSDictionary *video = ApolloOfflineRedditVideoForPost(VideoPost(@"p1", @"vid111", YES));
+    CHECK([video[@"id"] isEqualToString:@"vid111"] && [video[@"duration"] doubleValue] == 12 && [video[@"hasAudio"] boolValue], "own video");
+    CHECK([[video[@"dash"] absoluteString] isEqualToString:@"https://v.redd.it/vid111/DASHPlaylist.mpd?a=1&v=1&f=sd"], "dash unescaped: %s", [[video[@"dash"] absoluteString] UTF8String]);
+    NSDictionary *crosspost = @{ @"id": @"p2", @"crosspost_parent_list": @[ VideoPost(@"p0", @"vid222", NO) ] };
+    NSDictionary *parent = ApolloOfflineRedditVideoForPost(crosspost);
+    CHECK([parent[@"id"] isEqualToString:@"vid222"] && ![parent[@"hasAudio"] boolValue], "crosspost parent's video");
+    CHECK(ApolloOfflineRedditVideoForPost(PostData(@"p3")) == nil, "image post has none");
+}
+
+static void TestRenditions(void) {
+    NSURL *manifestURL = [NSURL URLWithString:@"https://v.redd.it/vid111/DASHPlaylist.mpd?a=1&f=sd"];
+    NSDictionary *r = ApolloOfflineRedditVideoRenditions(Manifest(), manifestURL, 720);
+    CHECK([[r[@"video"] absoluteString] isEqualToString:@"https://v.redd.it/vid111/CMAF_720.mp4"], "720 cap: %s", [[r[@"video"] absoluteString] UTF8String]);
+    CHECK([[r[@"audio"] absoluteString] isEqualToString:@"https://v.redd.it/vid111/CMAF_AUDIO_128.mp4"], "best audio");
+    CHECK([r[@"videoBandwidth"] longLongValue] == 1800000 && [r[@"audioBandwidth"] longLongValue] == 128000, "bandwidths");
+    NSDictionary *tiny = ApolloOfflineRedditVideoRenditions(Manifest(), manifestURL, 100);
+    CHECK([[tiny[@"video"] lastPathComponent] isEqualToString:@"CMAF_240.mp4"], "nothing fits: shortest");
+    NSDictionary *huge = ApolloOfflineRedditVideoRenditions(Manifest(), manifestURL, 4000);
+    CHECK([[huge[@"video"] lastPathComponent] isEqualToString:@"CMAF_1080.mp4"], "segmented 1440 skipped");
+    CHECK(ApolloOfflineRedditVideoRenditions([@"not xml" dataUsingEncoding:NSUTF8StringEncoding], manifestURL, 720) == nil, "garbage");
+    CHECK(ApolloOfflineEstimatedBrowseTime(10, 30) == 150, "browse time");
+}
+
+static NSMutableDictionary *VideoResponses(void) {
+    NSMutableDictionary *responses = [NSMutableDictionary dictionary];
+    NSDictionary *listing = @{ @"kind": @"Listing", @"data": @{ @"after": [NSNull null], @"children": @[
+        @{ @"kind": @"t3", @"data": VideoPost(@"v1", @"vid111", YES) },
+        @{ @"kind": @"t3", @"data": PostData(@"i1") },
+    ] } };
+    responses[@"/best"] = JSON(listing);
+    for (NSString *postID in @[ @"v1", @"i1" ]) {
+        responses[[@"/comments/" stringByAppendingString:postID]] = JSON(@[ @{ @"kind": @"Listing" }, @{ @"kind": @"Listing" } ]);
+    }
+    responses[@"preview.redd.it"] = [NSMutableData dataWithLength:1000];
+    responses[@"b.thumbs.redditmedia.com"] = [NSMutableData dataWithLength:100];
+    responses[@"v.redd.it/vid111/DASHPlaylist.mpd"] = Manifest();
+    responses[@"v.redd.it/vid111/CMAF_720.mp4"] = [NSMutableData dataWithLength:5000];
+    responses[@"v.redd.it/vid111/CMAF_AUDIO_128.mp4"] = [NSMutableData dataWithLength:700];
+    responses[@"v.redd.it/vid111/HLSPlaylist.m3u8"] = [@"#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO\n" dataUsingEncoding:NSUTF8StringEncoding];
+    return responses;
+}
+
+static void TestDownloaderVideo(void) {
+    __block NSUInteger muxCalls = 0;
+    __block BOOL sawAudio = NO;
+    sTestMuxer = ^(NSURL *video, NSURL *audio, NSURL *output, void (^done)(BOOL, NSTimeInterval)) {
+        muxCalls++;
+        sawAudio = audio != nil;
+        NSMutableData *joined = [NSMutableData dataWithContentsOfURL:video];
+        if (audio) [joined appendData:[NSData dataWithContentsOfURL:audio]];
+        BOOL ok = [joined writeToURL:output atomically:NO];
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{ done(ok, 11.5); });
+    };
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    RunResult result = RunDownload(dir, Options(100ull * 1000 * 1000), VideoResponses(), requested);
+    CHECK(result.committed && result.posts == 2, "both posts: %lu", (unsigned long)result.posts);
+    CHECK(muxCalls == 1 && sawAudio, "one remux with audio (%lu)", (unsigned long)muxCalls);
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    NSURL *file = [library fileURLForKey:@"video:vid111"];
+    NSDictionary *attributes = file ? [NSFileManager.defaultManager attributesOfItemAtPath:file.path error:nil] : nil;
+    CHECK([file.pathExtension isEqualToString:@"mp4"] && attributes.fileSize == 5700, "saved mp4 with sound: %s %llu",
+          file.path.UTF8String, attributes.fileSize);
+    CHECK(library.videoCount == 1 && library.videoSeconds == 11.5, "video stats %lu %.1f", (unsigned long)library.videoCount, library.videoSeconds);
+    CHECK([library hasEntryForKey:Key(@"https://v.redd.it/vid111/HLSPlaylist.m3u8?a=2")], "master saved for Apollo's sound check");
+    CHECK(![NSFileManager.defaultManager fileExistsAtPath:[dir.path stringByAppendingPathComponent:@"scratch"]], "no scratch left behind");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+
+    // Without a remuxer, or with Videos off, the post still saves; the video doesn't.
+    dir = TempDirectory();
+    ApolloOfflineDownloadOptions *options = Options(100ull * 1000 * 1000);
+    options.includeVideos = NO;
+    muxCalls = 0;
+    result = RunDownload(dir, options, VideoResponses(), requested);
+    library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    CHECK(result.posts == 2 && muxCalls == 0 && ![library hasEntryForKey:@"video:vid111"], "videos off");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+
+    // A video bigger than what's left of the limit is skipped, the post kept.
+    dir = TempDirectory();
+    [requested removeAllObjects];
+    result = RunDownload(dir, Options(20000), VideoResponses(), requested);
+    library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    CHECK(result.posts >= 1 && ![library hasEntryForKey:@"video:vid111"] && ![requested containsObject:@"v.redd.it/vid111/CMAF_720.mp4"],
+          "over the limit: skipped before downloading");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+    sTestMuxer = nil;
+}
+
+static void TestSavedSourceKeepsReadPosts(void) {
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    NSMutableDictionary *responses = [ResponsesForTwoPages() mutableCopy];
+    responses[@"/user/bob/saved"] = responses[@"/best"];
+    responses[@"/user/bob/saved?after=t3_a3"] = responses[@"/best?after=t3_a3"];
+    ApolloOfflineDownloadOptions *options = Options(100ull * 1024 * 1024);
+    ApolloOfflineFeedSource *saved = [ApolloOfflineFeedSource sourceWithPath:@"/user/bob/saved" title:@"Saved"];
+    saved.keepsReadPosts = YES;
+    saved.queryItems = @[ [NSURLQueryItem queryItemWithName:@"type" value:@"links"] ];
+    options.sources = @[ saved ];
+    options.skipPostIDs = [NSSet setWithArray:@[ @"a1", @"a2" ]];
+    RunResult result = RunDownload(dir, options, responses, requested);
+    CHECK(result.committed && result.posts == 6, "saved keeps read posts: %lu", (unsigned long)result.posts);
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    CHECK([library hasEntryForKey:Key(@"https://oauth.reddit.com/user/bob/saved?raw_json=1")], "Apollo's Saved list resolves");
+    CHECK([library.feedTitles isEqualToArray:@[ @"Saved" ]], "titled Saved");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+}
+
 int main(void) {
     @autoreleasepool {
         TestFeedKeys();
@@ -339,6 +499,11 @@ int main(void) {
         TestRemovingReadPosts();
         TestAutoRefreshPolicy();
         TestDownloaderSkipsReadPosts();
+        TestVideoKeys();
+        TestVideoForPost();
+        TestRenditions();
+        TestDownloaderVideo();
+        TestSavedSourceKeepsReadPosts();
     }
     if (sFailures) {
         fprintf(stderr, "%d failure(s)\n", sFailures);
