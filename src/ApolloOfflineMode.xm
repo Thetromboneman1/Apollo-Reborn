@@ -90,6 +90,9 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
     if (key && [library hasEntryForKey:key]) return YES;
     // A saved article: Apollo reads the page itself to title its link card.
     if ([library hasPageForURL:request.URL]) return YES;
+    // Profile pictures: author lookups answered from the saved records.
+    if ([library hasUserDataForURL:request.URL]) return YES;
+    if ([NSURLProtocol propertyForKey:ApolloOfflineProfileLookupProperty inRequest:request] && [library hasProfileForURL:request.URL]) return YES;
 #if APOLLO_SIM_BUILD
     NSString *scheme = request.URL.scheme.lowercaseString;
     if (sApolloOfflineSimulateNoNetwork && ([scheme isEqualToString:@"https"] || [scheme isEqualToString:@"http"])) return YES;
@@ -113,6 +116,11 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
         ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
         NSData *data = key ? [library dataForKey:key contentType:&type] : nil;
         if (!data) data = [library pageDocumentForURL:request.URL contentType:&type];
+        if (!data && (data = [library userDataResponseForURL:request.URL])) type = @"application/json; charset=UTF-8";
+        if (!data && [NSURLProtocol propertyForKey:ApolloOfflineProfileLookupProperty inRequest:request] &&
+            (data = [library profileResponseForURL:request.URL])) {
+            type = @"application/json; charset=UTF-8";
+        }
         if (!data) {
             // Only the first two path segments: later ones can be usernames.
             NSArray *segments = [request.URL.path componentsSeparatedByString:@"/"];
@@ -126,7 +134,9 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
             [self onClientThread:^{ [self.client URLProtocol:self didFailWithError:error]; }];
             return;
         }
-        ApolloLog(@"[Offline] served %@ (%lu bytes)", key, (unsigned long)data.length);
+        ApolloLog(@"[Offline] served %@ (%lu bytes)", key ?: (ApolloOfflineUserDataIDsForURL(request.URL) ? @"user data"
+                                                     : ApolloOfflineProfileUsernameForURL(request.URL) ? @"profile picture lookup" : @"page"),
+                  (unsigned long)data.length);
         NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{
             @"Content-Type": type ?: @"application/octet-stream",
             @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length],
@@ -252,37 +262,8 @@ static void ApolloOfflineMuxVideo(NSURL *videoFile, NSURL *audioFile, NSURL *out
     });
 }
 
-// A copy of `configuration` with the offline protocol first, or the original
-// when it already has it or is a background configuration (those can't run
-// custom protocols).
-static NSURLSessionConfiguration *ApolloOfflineConfigurationWithProtocol(NSURLSessionConfiguration *configuration) {
-    if (!configuration || configuration.identifier.length > 0) return configuration;
-    NSArray *existing = configuration.protocolClasses ?: @[];
-    if ([existing containsObject:[ApolloOfflineURLProtocol class]]) return configuration;
-    NSURLSessionConfiguration *copy = [configuration copy];
-    NSMutableArray *protocols = [NSMutableArray arrayWithArray:existing];
-    [protocols insertObject:[ApolloOfflineURLProtocol class] atIndex:0];
-    copy.protocolClasses = protocols;
-    return copy;
-}
-
-// Hooked at session creation, not at +defaultSessionConfiguration: Apollo's
-// RedditKit client is an AFHTTPSessionManager restored from the account
-// archive, whose configuration is decoded rather than built from
-// +defaultSessionConfiguration (verified in the sim: its comment and listing
-// reads never reached a config-hooked protocol). Every session is created
-// here, so this covers the archived client, PINRemoteImage and the rest.
-%hook NSURLSession
-
-+ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration {
-    return %orig(ApolloOfflineConfigurationWithProtocol(configuration));
-}
-
-+ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration delegate:(id<NSURLSessionDelegate>)delegate delegateQueue:(NSOperationQueue *)queue {
-    return %orig(ApolloOfflineConfigurationWithProtocol(configuration), delegate, queue);
-}
-
-%end
+// The protocol is added to every session by ApolloOfflineSessionHook.xm,
+// which loads first so sessions made in other modules' %ctors get it too.
 
 // MARK: - Connectivity
 
@@ -679,6 +660,7 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         strongSelf->_downloading = NO;
         strongSelf->_downloadingAutomatically = NO;
         NSUInteger skipped = strongSelf->_downloader.skippedPostCount;
+        NSUInteger avatarAuthors = strongSelf->_downloader.avatarAuthorCount, avatarImages = strongSelf->_downloader.avatarImageCount;
         strongSelf->_downloader = nil;
         strongSelf->_progressText = @"";
         [strongSelf endDownloadSideEffects];
@@ -688,10 +670,11 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
             message = [NSString stringWithFormat:@"Saved %lu posts (%@) for offline reading.", (unsigned long)posts,
                        [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile]];
             ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
-            ApolloLog(@"[Offline] download done%@ in %.0f s: %lu posts, %lu videos (%.0f s), %lu pages, %llu bytes, %lu already-read posts skipped",
+            ApolloLog(@"[Offline] download done%@ in %.0f s: %lu posts, %lu videos (%.0f s), %lu pages, %lu authors / %lu profile pictures, "
+                      "%llu bytes, %lu already-read posts skipped",
                       automatic ? @" (Keep Fresh)" : @"", CFAbsoluteTimeGetCurrent() - startedAt, (unsigned long)posts,
-                      (unsigned long)library.videoCount, library.videoSeconds, (unsigned long)library.pageCount, bytes,
-                      (unsigned long)skipped);
+                      (unsigned long)library.videoCount, library.videoSeconds, (unsigned long)library.pageCount,
+                      (unsigned long)avatarAuthors, (unsigned long)avatarImages, bytes, (unsigned long)skipped);
         } else {
             message = error.localizedDescription ?: @"The download didn't finish.";
             ApolloLog(@"[Offline] download ended without saving: %@ (%@ %ld)", message, error.domain, (long)error.code);

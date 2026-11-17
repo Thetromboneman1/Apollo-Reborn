@@ -41,6 +41,11 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
     return mb >= 1000 ? [NSString stringWithFormat:@"%.0f GB", mb / 1000.0] : [NSString stringWithFormat:@"%ld MB", (long)mb];
 }
 
+@interface ApolloOfflineModeSettingsViewController ()
+// The connection line last shown under Use Offline Library.
+@property (nonatomic, copy) NSString *shownConnectionStatus;
+@end
+
 @implementation ApolloOfflineModeSettingsViewController
 
 - (void)viewDidLoad {
@@ -60,12 +65,22 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
 }
 
 - (void)offlineStateChanged:(__unused NSNotification *)note {
-    // Progress ticks often; refresh just the library rows' text in place.
+    // Progress ticks often; refresh just the library rows' text in place, and
+    // the "Online now." line under Use Offline Library when the connection
+    // (or whether the library is showing) changed.
     if (!self.isViewLoaded || !self.view.window) return;
+    NSMutableIndexSet *sections = [NSMutableIndexSet indexSetWithIndex:ApolloOfflineSectionLibrary];
+    NSString *status = [self connectionStatusText];
+    if (![status isEqualToString:self.shownConnectionStatus]) [sections addIndex:ApolloOfflineSectionUse];
     [UIView performWithoutAnimation:^{
-        [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:ApolloOfflineSectionLibrary]
-                      withRowAnimation:UITableViewRowAnimationNone];
+        [self.tableView reloadSections:sections withRowAnimation:UITableViewRowAnimationNone];
     }];
+}
+
+- (NSString *)connectionStatusText {
+    ApolloOfflineModeController *controller = self.controller;
+    return controller.serving ? @"Showing your offline library now."
+         : (controller.networkAvailable ? @"Online now." : @"No connection right now.");
 }
 
 - (ApolloOfflineModeController *)controller {
@@ -119,8 +134,8 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                     "finishes. Videos play offline with sound in the same player as always, and links to articles "
                     "open the saved page.";
         case ApolloOfflineSectionUse: {
-            NSString *now = controller.serving ? @"Showing your offline library now."
-                          : (controller.networkAvailable ? @"Online now." : @"No connection right now.");
+            NSString *now = [self connectionStatusText];
+            self.shownConnectionStatus = now;
             return [NSString stringWithFormat:@"Automatic uses the library only when you have no connection. "
                     "Always shows it even online, which helps on plane Wi-Fi that's connected but doesn't load "
                     "anything. Anything you didn't download loads from the internet as usual.\n\n%@", now];
@@ -139,7 +154,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                     "sort you pick.";
         case ApolloOfflineSectionContent:
             return @"Skipping read posts means a new batch is all posts you haven't seen. The download stops once "
-                    "it reaches the data limit. Images are saved at your screen's size. Videos from Reddit, imgur, "
+                    "it reaches the data limit. Images are saved at your screen's size, along with the profile pictures of the people in each thread. Videos from Reddit, imgur, "
                     "Streamable and RedGIFs are saved at up to 720p with sound (over 5 minutes are skipped); they "
                     "use the most data, so turn Videos off to fit more posts in the same limit. Linked Web Pages "
                     "keeps the article behind each link post, so it opens offline too.";

@@ -418,6 +418,118 @@ static void TestDownloaderHonorsRateLimitHeaders(void) {
     [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
 }
 
+static NSDictionary *FakeComment(NSString *author, NSArray *replies) {
+    NSMutableDictionary *data = [@{ @"author_fullname": author, @"body": @"x" } mutableCopy];
+    data[@"replies"] = replies.count > 0 ? @{ @"kind": @"Listing", @"data": @{ @"children": replies } } : @"";
+    return @{ @"kind": @"t1", @"data": data };
+}
+
+static NSData *CommentsData(NSArray *topLevel) {
+    return JSON(@[ @{ @"kind": @"Listing", @"data": @{ @"children": @[] } },
+                   @{ @"kind": @"Listing", @"data": @{ @"children": topLevel } } ]);
+}
+
+static void TestUserDataHelpers(void) {
+    NSArray *ids = ApolloOfflineUserDataIDsForURL([NSURL URLWithString:@"https://oauth.reddit.com/api/user_data_by_account_ids.json?ids=t2_AA,%20t2_bb,junk,&raw_json=1"]);
+    CHECK([ids isEqualToArray:(@[ @"t2_aa", @"t2_bb" ])], "ids parsed: %s", ids.description.UTF8String);
+    CHECK(ApolloOfflineUserDataIDsForURL([NSURL URLWithString:@"https://www.reddit.com/api/user_data_by_account_ids?ids=t2_x"]).count == 1, "www, no .json");
+    CHECK(ApolloOfflineUserDataIDsForURL([NSURL URLWithString:@"https://oauth.reddit.com/api/me"]) == nil, "other API paths aren't it");
+    CHECK(ApolloOfflineUserDataIDsForURL([NSURL URLWithString:@"https://example.com/api/user_data_by_account_ids?ids=t2_x"]) == nil, "Reddit only");
+
+    // Reading order: a1, its reply a2 (and a2's reply a3), then b1; the post's author first.
+    NSData *comments = CommentsData(@[ FakeComment(@"t2_a1", @[ FakeComment(@"t2_a2", @[ FakeComment(@"t2_a3", nil) ]) ]),
+                                       FakeComment(@"t2_b1", nil), FakeComment(@"t2_a1", nil) ]);
+    NSArray *authors = ApolloOfflineAuthorFullNames(@{ @"author_fullname": @"t2_op" }, comments, 10);
+    CHECK([authors isEqualToArray:(@[ @"t2_op", @"t2_a1", @"t2_a2", @"t2_a3", @"t2_b1" ])], "authors in reading order: %s", authors.description.UTF8String);
+    authors = ApolloOfflineAuthorFullNames(@{ @"author_fullname": @"t2_op" }, comments, 2);
+    CHECK([authors isEqualToArray:(@[ @"t2_op", @"t2_a1", @"t2_a2" ])], "first two commenters: %s", authors.description.UTF8String);
+    CHECK(ApolloOfflineAuthorFullNames(@{}, nil, 5).count == 0, "nothing to look up");
+
+    // Saved records answer any mix of ids; unknown ids are left out.
+    NSURL *dir = TempDirectory();
+    ApolloOfflineLibraryWriter *writer = [[ApolloOfflineLibraryWriter alloc] initWithLibraryDirectory:dir error:nil];
+    [writer storeData:JSON(@{ @"t2_aa": @{ @"name": @"alice", @"profile_img": @"https://styles.redditmedia.com/a.png" },
+                             @"t2_bb": @{ @"name": @"bob", @"profile_img": @"https://www.redditstatic.com/avatars/b.png" } })
+          contentType:@"application/json" forKey:@"users:0"];
+    [writer storeData:JSON(@{ @"t2_cc": @{ @"name": @"carol", @"profile_img": @"https://styles.redditmedia.com/c.png" } })
+          contentType:@"application/json" forKey:@"users:1"];
+    [writer storeData:[NSMutableData dataWithLength:10] contentType:@"text/plain" forKey:@"comments:x"];
+    [writer noteFeedTitle:@"Home" posts:1];
+    CHECK([writer commit:nil], "committed");
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    NSURL *ask = [NSURL URLWithString:@"https://oauth.reddit.com/api/user_data_by_account_ids.json?ids=t2_cc,t2_zz,t2_aa&raw_json=1"];
+    CHECK([library hasUserDataForURL:ask], "has some of them");
+    NSDictionary *answer = [NSJSONSerialization JSONObjectWithData:[library userDataResponseForURL:ask] options:0 error:nil];
+    CHECK(answer.count == 2 && [answer[@"t2_cc"][@"name"] isEqual:@"carol"] && [answer[@"t2_aa"][@"name"] isEqual:@"alice"] && !answer[@"t2_zz"],
+          "answers the saved ones: %s", answer.description.UTF8String);
+    CHECK(![library hasUserDataForURL:[NSURL URLWithString:@"https://oauth.reddit.com/api/user_data_by_account_ids?ids=t2_zz"]], "none saved: not ours");
+
+    // Reborn's per-user avatar lookup gets a small profile from the same records.
+    CHECK([ApolloOfflineProfileUsernameForURL([NSURL URLWithString:@"https://www.reddit.com/user/Alice/about.json?raw_json=1"]) isEqual:@"alice"], "profile URL");
+    CHECK([ApolloOfflineProfileUsernameForURL([NSURL URLWithString:@"https://oauth.reddit.com/u/bob/about"]) isEqual:@"bob"], "u/ form");
+    CHECK(ApolloOfflineProfileUsernameForURL([NSURL URLWithString:@"https://oauth.reddit.com/user/bob/submitted"]) == nil, "only about");
+    CHECK(ApolloOfflineProfileUsernameForURL([NSURL URLWithString:@"https://oauth.reddit.com/r/bob/about"]) == nil, "not a subreddit");
+    NSURL *aliceURL = [NSURL URLWithString:@"https://www.reddit.com/user/ALICE/about.json?raw_json=1"];
+    CHECK([library hasProfileForURL:aliceURL], "alice saved");
+    NSDictionary *profile = [NSJSONSerialization JSONObjectWithData:[library profileResponseForURL:aliceURL] options:0 error:nil];
+    CHECK([profile[@"kind"] isEqual:@"t2"] && [profile[@"data"][@"name"] isEqual:@"alice"] &&
+          [profile[@"data"][@"icon_img"] isEqual:@"https://styles.redditmedia.com/a.png"] && [profile[@"data"][@"apollo_offline_lightweight"] boolValue],
+          "small profile: %s", profile.description.UTF8String);
+    CHECK(![library hasProfileForURL:[NSURL URLWithString:@"https://www.reddit.com/user/zed/about.json"]], "unknown user");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+}
+
+static void TestDownloaderAvatars(void) {
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    NSMutableDictionary *responses = [NSMutableDictionary dictionary];
+    NSMutableDictionary *p1 = [PostData(@"p1") mutableCopy], *p2 = [PostData(@"p2") mutableCopy];
+    p1[@"author_fullname"] = @"t2_op1";
+    p2[@"author_fullname"] = @"t2_op2";
+    responses[@"/best"] = JSON(@{ @"kind": @"Listing", @"data": @{ @"after": [NSNull null], @"dist": @2, @"children": @[
+        @{ @"kind": @"t3", @"data": p1 }, @{ @"kind": @"t3", @"data": p2 } ] } });
+    responses[@"/comments/p1"] = CommentsData(@[ FakeComment(@"t2_c1", @[ FakeComment(@"t2_c2", nil) ]), FakeComment(@"t2_c3", nil) ]);
+    responses[@"/comments/p2"] = CommentsData(@[ FakeComment(@"t2_c1", nil) ]);
+    responses[@"preview.redd.it"] = [NSMutableData dataWithLength:1000];
+    responses[@"b.thumbs.redditmedia.com"] = [NSMutableData dataWithLength:100];
+    NSMutableDictionary *records = [NSMutableDictionary dictionary];
+    for (NSString *fn in @[ @"t2_op1", @"t2_op2", @"t2_c1", @"t2_c2", @"t2_c3" ]) {
+        // Everyone but c3 has a custom picture; c3 has the shared default one.
+        NSString *picture = [fn isEqualToString:@"t2_c3"] ? @"https://www.redditstatic.com/avatars/defaults/v2/avatar_default_3.png"
+                                                          : [NSString stringWithFormat:@"https://styles.redditmedia.com/t5_%@/styles/profileIcon_x.png?width=256&s=sig", fn];
+        records[fn] = @{ @"name": [fn substringFromIndex:3], @"profile_img": picture };
+    }
+    responses[@"/api/user_data_by_account_ids"] = JSON(records);
+    responses[@"styles.redditmedia.com"] = [NSMutableData dataWithLength:300];
+    responses[@"www.redditstatic.com/avatars/defaults/v2/avatar_default_3.png"] = [NSMutableData dataWithLength:200];
+
+    ApolloOfflineDownloadOptions *options = Options(100ull * 1024 * 1024);
+    options.avatarAuthorsPerPost = 2; // p1: op1, c1, c2 (c3 is the third commenter)
+    RunResult result = RunDownload(dir, options, responses, requested);
+    CHECK(result.committed && result.posts == 2, "posts saved");
+    NSUInteger lookups = 0;
+    for (NSString *r in requested) if ([r isEqualToString:@"/api/user_data_by_account_ids"]) lookups++;
+    CHECK(lookups == 1, "one lookup for every author: %lu", (unsigned long)lookups);
+
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    NSURL *ask = [NSURL URLWithString:@"https://oauth.reddit.com/api/user_data_by_account_ids.json?ids=t2_c1,t2_op2&raw_json=1"];
+    NSDictionary *answer = [NSJSONSerialization JSONObjectWithData:[library userDataResponseForURL:ask] ?: [NSData data] options:0 error:nil];
+    CHECK(answer.count == 2, "offline answer for two authors: %s", answer.description.UTF8String);
+    CHECK([library hasEntryForKey:Key(@"https://styles.redditmedia.com/t5_t2_c1/styles/profileIcon_x.png?width=256&s=other")], "picture saved, any size asked");
+    CHECK(![library hasEntryForKey:Key(@"https://www.redditstatic.com/avatars/defaults/v2/avatar_default_3.png")],
+          "beyond the per-post limit: c3 not looked up");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+
+    // Images off: no lookups at all.
+    NSURL *dir2 = TempDirectory();
+    [requested removeAllObjects];
+    options = Options(100ull * 1024 * 1024);
+    options.includeImages = NO;
+    RunDownload(dir2, options, responses, requested);
+    CHECK(![requested containsObject:@"/api/user_data_by_account_ids"], "no avatar lookups without Images");
+    [NSFileManager.defaultManager removeItemAtURL:dir2.URLByDeletingLastPathComponent error:nil];
+}
+
 static void TestRemovingReadPosts(void) {
     NSUInteger removed = 0;
     NSData *filtered = ApolloOfflineListingRemovingPosts(ListingData(@[ @"a", @"b", @"c" ], @"t3_c"), [NSSet setWithArray:@[ @"b", @"zz" ]], &removed);
@@ -827,6 +939,8 @@ int main(void) {
         TestDownloaderFailureKeepsOldLibrary();
         TestRemovingReadPosts();
         TestAPISpacing();
+        TestUserDataHelpers();
+        TestDownloaderAvatars();
         TestDownloaderRunsPostsTogether();
         TestDownloaderCancelWithPostsInFlight();
         TestDownloaderHonorsRateLimitHeaders();

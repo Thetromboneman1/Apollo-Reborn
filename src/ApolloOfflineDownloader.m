@@ -37,6 +37,10 @@ NSErrorDomain const ApolloOfflineErrorDomain = @"ApolloOfflineErrorDomain";
         _includePages = YES;
         _accountPaths = @[];
         _maxPageBytes = 5ull * 1000 * 1000;
+        _includeAvatars = YES;
+        _avatarAuthorsPerPost = 30;
+        _avatarShare = 0.08;
+        _maxAvatarBytes = 15ull * 1000 * 1000;
     }
     return self;
 }
@@ -100,6 +104,12 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     NSUInteger _skippedRead;
     NSString *_redgifsToken;
     BOOL _accountDone;
+    NSMutableArray<NSArray<NSString *> *> *_avatarLists; // each saved post's authors, in reading order
+    NSMutableOrderedSet<NSString *> *_avatarIDs;          // all of them, interleaved (see -startFeed)
+    BOOL _avatarsDone;
+    unsigned long long _avatarBudgetEnd;
+    NSUInteger _avatarAuthors;
+    NSUInteger _avatarImages;
 }
 
 - (instancetype)initWithLibraryDirectory:(NSURL *)directory fetcher:(ApolloOfflineFetcher)fetcher requestBuilder:(ApolloOfflineRequestBuilder)requestBuilder {
@@ -135,9 +145,36 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         self->_skippedRead = 0;
         self->_redgifsToken = nil;
         self->_accountDone = NO;
+        self->_avatarLists = [NSMutableArray array];
+        self->_avatarIDs = [NSMutableOrderedSet orderedSet];
+        self->_avatarsDone = NO;
+        self->_avatarAuthors = 0;
+        self->_avatarImages = 0;
         self->_feedIndex = 0;
         [self startFeed];
     });
+}
+
+- (NSUInteger)avatarAuthorCount {
+    __block NSUInteger count = 0;
+    dispatch_sync(_queue, ^{ count = self->_avatarAuthors; });
+    return count;
+}
+
+- (NSUInteger)avatarImageCount {
+    __block NSUInteger count = 0;
+    dispatch_sync(_queue, ^{ count = self->_avatarImages; });
+    return count;
+}
+
+- (BOOL)savesAvatars {
+    return _options.includeAvatars && _options.includeImages && _options.avatarShare > 0;
+}
+
+// What profile pictures may use, set aside from the feeds' share.
+- (unsigned long long)avatarAllowance {
+    if (![self savesAvatars]) return 0;
+    return MIN(_options.maxAvatarBytes, (unsigned long long)(_options.byteBudget * _options.avatarShare));
 }
 
 - (NSUInteger)skippedPostCount {
@@ -234,6 +271,27 @@ static double ApolloOfflineHeaderNumber(NSHTTPURLResponse *response, NSString *n
 - (void)startFeed {
     if ([self stopIfCancelled]) return;
     NSArray<ApolloOfflineFeedSource *> *sources = _options.sources;
+    if (_feedIndex >= sources.count && !_avatarsDone) {
+        _avatarsDone = YES;
+        // Every post's author first, then each thread's first commenter, then
+        // its second, and so on: if the allowance runs out, it's the deep
+        // replies that go without pictures, not whole threads.
+        for (NSUInteger depth = 0;; depth++) {
+            BOOL any = NO;
+            for (NSArray<NSString *> *list in _avatarLists) {
+                if (depth < list.count) {
+                    [_avatarIDs addObject:list[depth]];
+                    any = YES;
+                }
+            }
+            if (!any) break;
+        }
+        if (_writer.postCount > 0 && _avatarIDs.count > 0 && [self savesAvatars]) {
+            _avatarBudgetEnd = MIN(_options.byteBudget, _writer.bytesWritten + [self avatarAllowance]);
+            [self saveAvatarChunkAtIndex:0];
+            return;
+        }
+    }
     if (_feedIndex >= sources.count && !_accountDone) {
         _accountDone = YES;
         if (_writer.postCount > 0) {
@@ -256,7 +314,8 @@ static double ApolloOfflineHeaderNumber(NSHTTPURLResponse *response, NSString *n
     // Each feed gets an equal share of what's left, so a later feed still
     // gets its turn when an earlier one runs out of posts early.
     unsigned long long used = _writer.bytesWritten;
-    unsigned long long left = _options.byteBudget > used ? _options.byteBudget - used : 0;
+    unsigned long long feedsBudget = _options.byteBudget - MIN(_options.byteBudget, [self avatarAllowance]);
+    unsigned long long left = feedsBudget > used ? feedsBudget - used : 0;
     _feedBudgetEnd = used + left / (sources.count - _feedIndex);
     _keptInFeed = 0;
     _after = nil;
@@ -342,8 +401,13 @@ static double ApolloOfflineHeaderNumber(NSHTTPURLResponse *response, NSString *n
     return YES;
 }
 
+// Posts still being saved will add about as much as the average post so far,
+// so new ones stop starting a little before the line instead of all the posts
+// in flight running past it.
 - (BOOL)budgetSpent {
-    return _writer.bytesWritten + _reservedBytes >= _feedBudgetEnd ||
+    NSUInteger postsDone = _writer.postCount + _keptInFeed;
+    unsigned long long perPost = postsDone > 0 ? _writer.bytesWritten / postsDone : 0;
+    return _writer.bytesWritten + _reservedBytes + perPost * _postsInFlight >= _feedBudgetEnd ||
            _keptInFeed + _postsInFlight >= _options.maxPostsPerFeed;
 }
 
@@ -406,6 +470,7 @@ static double ApolloOfflineHeaderNumber(NSHTTPURLResponse *response, NSString *n
 - (void)saveCommentsForPost:(NSDictionary *)post then:(void (^)(void))then {
     NSString *postID = [post[@"id"] isKindOfClass:[NSString class]] ? post[@"id"] : nil;
     if (!_options.includeComments || postID.length == 0) {
+        if ([self savesAvatars]) [_avatarLists addObject:ApolloOfflineAuthorFullNames(post, nil, 0)];
         then();
         return;
     }
@@ -421,8 +486,13 @@ static double ApolloOfflineHeaderNumber(NSHTTPURLResponse *response, NSString *n
         // Apollo indexes the comments response as an array; never store anything else.
         if (key && [root isKindOfClass:[NSArray class]]) {
             [self->_writer storeData:data contentType:@"application/json; charset=UTF-8" forKey:key];
-        } else if (error) {
-            self->_lastError = error;
+            if ([self savesAvatars]) {
+                [self->_avatarLists addObject:ApolloOfflineAuthorFullNames(post, data, self->_options.avatarAuthorsPerPost)];
+            }
+        } else {
+            if (error) self->_lastError = error;
+            // No comments saved: the post's author still gets a picture.
+            if ([self savesAvatars]) [self->_avatarLists addObject:ApolloOfflineAuthorFullNames(post, nil, 0)];
         }
         then();
     }];
@@ -715,6 +785,68 @@ static NSURL *ApolloOfflineHTTPSURL(id value) {
         }
         lookup();
     }];
+}
+
+// MARK: - Profile pictures
+
+- (void)saveAvatarChunkAtIndex:(NSUInteger)index {
+    if ([self stopIfCancelled]) return;
+    NSUInteger start = index * 100;
+    if (start >= _avatarIDs.count || _writer.bytesWritten >= _avatarBudgetEnd) {
+        [self startFeed];
+        return;
+    }
+    if (index == 0) [self report:@"Saving profile pictures"];
+    NSArray<NSString *> *chunk = [_avatarIDs.array subarrayWithRange:NSMakeRange(start, MIN((NSUInteger)100, _avatarIDs.count - start))];
+    NSArray *query = @[
+        [NSURLQueryItem queryItemWithName:@"ids" value:[chunk componentsJoinedByString:@","]],
+        [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"],
+    ];
+    [self fetchAPI:@"/api/user_data_by_account_ids" query:query completion:^(__unused NSURLRequest *request, NSData *data, NSHTTPURLResponse *response, NSError *error) {
+        if ([self stopIfCancelled]) return;
+        NSDictionary *root = ApolloOfflineIsSuccess(response, data, error) ? ApolloOfflineJSONObject(data) : nil;
+        NSMutableArray<NSURL *> *pictures = [NSMutableArray array];
+        if (root.count > 0) {
+            [self->_writer storeData:data contentType:@"application/json; charset=UTF-8"
+                              forKey:[NSString stringWithFormat:@"users:%lu", (unsigned long)index]];
+            for (NSString *fullName in chunk) {
+                NSDictionary *record = [root[fullName] isKindOfClass:[NSDictionary class]] ? root[fullName] : nil;
+                if (!record) continue;
+                self->_avatarAuthors++;
+                NSURL *picture = ApolloOfflineHTTPSURL(record[@"profile_img"]);
+                if (picture && [self claimKey:ApolloOfflineKeyForURL(picture)]) [pictures addObject:picture];
+            }
+        } else if (error) {
+            self->_lastError = error;
+        }
+        [self saveAvatarPictures:pictures then:^{ [self saveAvatarChunkAtIndex:index + 1]; }];
+    }];
+}
+
+// Several pictures at a time (CDN, not the Reddit API), until the allowance is used.
+- (void)saveAvatarPictures:(NSArray<NSURL *> *)urls then:(void (^)(void))then {
+    __block NSUInteger next = 0, active = 0;
+    __block BOOL finished = NO;
+    __block void (^pump)(void) = nil;
+    pump = ^{
+        while (active < 8 && next < urls.count && !self->_cancelled && self->_writer.bytesWritten < self->_avatarBudgetEnd) {
+            NSURL *url = urls[next++];
+            NSString *key = ApolloOfflineKeyForURL(url);
+            active++;
+            [self saveImage:url then:^{
+                if ([self->_writer hasKey:key]) self->_avatarImages++;
+                active--;
+                pump();
+            }];
+        }
+        if (active == 0 && !finished) {
+            finished = YES;
+            // Let the block go once this call returns (it refers to itself).
+            dispatch_async(self->_queue, ^{ pump = nil; });
+            then();
+        }
+    };
+    pump();
 }
 
 // MARK: - Account reads

@@ -223,6 +223,49 @@ static NSArray *ApolloOfflineArray(id value) {
     return [value isKindOfClass:[NSArray class]] ? value : nil;
 }
 
+NSString *ApolloOfflineProfileUsernameForURL(NSURL *url) {
+    if (!ApolloOfflineURLIsRedditAPI(url)) return nil;
+    NSArray<NSString *> *c = ApolloOfflinePathComponents(url.path ?: @"");
+    if (c.count != 3 || ![c[2] isEqualToString:@"about"]) return nil;
+    if (![c[0] isEqualToString:@"user"] && ![c[0] isEqualToString:@"u"]) return nil;
+    return c[1].length > 0 ? c[1] : nil;
+}
+
+NSArray<NSString *> *ApolloOfflineUserDataIDsForURL(NSURL *url) {
+    if (!ApolloOfflineURLIsRedditAPI(url)) return nil;
+    NSArray<NSString *> *c = ApolloOfflinePathComponents(url.path ?: @"");
+    if (c.count != 2 || ![c[0] isEqualToString:@"api"] || ![c[1] isEqualToString:@"user_data_by_account_ids"]) return nil;
+    NSMutableArray<NSString *> *ids = [NSMutableArray array];
+    for (NSString *raw in [(ApolloOfflineQueryValue(url, @"ids") ?: @"") componentsSeparatedByString:@","]) {
+        NSString *fullName = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet].lowercaseString;
+        if ([fullName hasPrefix:@"t2_"] && fullName.length > 3) [ids addObject:fullName];
+    }
+    return ids;
+}
+
+static void ApolloOfflineCollectCommentAuthors(id listing, NSMutableOrderedSet<NSString *> *authors, NSUInteger limit) {
+    NSArray *children = ApolloOfflineArray(ApolloOfflineDict(ApolloOfflineDict(listing)[@"data"])[@"children"]);
+    for (id child in children) {
+        if (authors.count >= limit) return;
+        NSDictionary *data = ApolloOfflineDict(ApolloOfflineDict(child)[@"data"]);
+        if (![ApolloOfflineDict(child)[@"kind"] isEqual:@"t1"] || !data) continue;
+        NSString *author = ApolloOfflineString(data[@"author_fullname"]);
+        if ([author hasPrefix:@"t2_"]) [authors addObject:author.lowercaseString];
+        ApolloOfflineCollectCommentAuthors(data[@"replies"], authors, limit);
+    }
+}
+
+NSArray<NSString *> *ApolloOfflineAuthorFullNames(NSDictionary *post, NSData *comments, NSUInteger limit) {
+    NSMutableOrderedSet<NSString *> *authors = [NSMutableOrderedSet orderedSet];
+    NSString *postAuthor = ApolloOfflineString(post[@"author_fullname"]);
+    if ([postAuthor hasPrefix:@"t2_"]) [authors addObject:postAuthor.lowercaseString];
+    id root = comments.length > 0 ? [NSJSONSerialization JSONObjectWithData:comments options:0 error:nil] : nil;
+    NSArray *parts = ApolloOfflineArray(root);
+    if (parts.count >= 2) ApolloOfflineCollectCommentAuthors(parts[1], authors, authors.count + limit);
+    return authors.array;
+}
+
+
 static NSURL *ApolloOfflineMediaURL(NSString *string) {
     if (string.length == 0) return nil;
     // raw_json=1 responses are already unescaped; older shapes aren't.
@@ -659,6 +702,10 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     NSUInteger _videoCount;
     NSTimeInterval _videoSeconds;
     NSUInteger _pageCount;
+    // t2_ id -> saved user_data record, read from the "users:" entries on first
+    // use, and lowercased username -> record.
+    NSDictionary<NSString *, NSDictionary *> *_userRecords;
+    NSDictionary<NSString *, NSDictionary *> *_userRecordsByName;
 }
 
 + (NSURL *)defaultDirectory {
@@ -714,7 +761,80 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     _videoCount = [index[@"videos"] unsignedIntegerValue];
     _videoSeconds = [index[@"videoSeconds"] doubleValue];
     _pageCount = [index[@"pages"] unsignedIntegerValue];
+    _userRecords = nil;
+    _userRecordsByName = nil;
     [_lock unlock];
+}
+
+- (NSDictionary<NSString *, NSDictionary *> *)userRecords {
+    [_lock lock];
+    NSDictionary *records = _userRecords;
+    NSDictionary *entries = _entries;
+    [_lock unlock];
+    if (records) return records;
+    NSMutableDictionary<NSString *, NSDictionary *> *built = [NSMutableDictionary dictionary];
+    for (NSString *key in entries) {
+        if (![key hasPrefix:@"users:"]) continue;
+        NSData *data = [self storedDataForKey:key contentType:NULL];
+        NSDictionary *root = ApolloOfflineDict(data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil);
+        [root enumerateKeysAndObjectsUsingBlock:^(id fullName, id record, __unused BOOL *stop) {
+            if ([fullName isKindOfClass:[NSString class]] && ApolloOfflineDict(record)) built[[fullName lowercaseString]] = record;
+        }];
+    }
+    NSMutableDictionary<NSString *, NSDictionary *> *byName = [NSMutableDictionary dictionary];
+    [built enumerateKeysAndObjectsUsingBlock:^(__unused NSString *fullName, NSDictionary *record, __unused BOOL *stop) {
+        NSString *name = ApolloOfflineString(record[@"name"]).lowercaseString;
+        if (name.length > 0) byName[name] = record;
+    }];
+    [_lock lock];
+    if (_entries == entries) {
+        _userRecords = built;
+        _userRecordsByName = byName;
+    }
+    [_lock unlock];
+    return built;
+}
+
+- (NSDictionary *)userRecordForProfileURL:(NSURL *)url {
+    NSString *name = ApolloOfflineProfileUsernameForURL(url);
+    if (!name) return nil;
+    [self userRecords];
+    [_lock lock];
+    NSDictionary *record = _userRecordsByName[name];
+    [_lock unlock];
+    return record;
+}
+
+- (BOOL)hasProfileForURL:(NSURL *)url {
+    return [self userRecordForProfileURL:url] != nil;
+}
+
+- (NSData *)profileResponseForURL:(NSURL *)url {
+    NSDictionary *record = [self userRecordForProfileURL:url];
+    if (!record) return nil;
+    NSMutableDictionary *data = [@{ @"name": ApolloOfflineString(record[@"name"]) ?: @"", @"apollo_offline_lightweight": @YES } mutableCopy];
+    if (ApolloOfflineString(record[@"profile_img"])) data[@"icon_img"] = record[@"profile_img"];
+    for (NSString *field in @[ @"link_karma", @"comment_karma", @"created_utc" ]) {
+        if ([record[field] isKindOfClass:[NSNumber class]]) data[field] = record[field];
+    }
+    return [NSJSONSerialization dataWithJSONObject:@{ @"kind": @"t2", @"data": data } options:0 error:nil];
+}
+
+- (BOOL)hasUserDataForURL:(NSURL *)url {
+    NSArray<NSString *> *ids = ApolloOfflineUserDataIDsForURL(url);
+    if (ids.count == 0) return NO;
+    NSDictionary *records = [self userRecords];
+    for (NSString *fullName in ids) if (records[fullName]) return YES;
+    return NO;
+}
+
+- (NSData *)userDataResponseForURL:(NSURL *)url {
+    NSArray<NSString *> *ids = ApolloOfflineUserDataIDsForURL(url);
+    if (ids.count == 0) return nil;
+    NSDictionary *records = [self userRecords];
+    NSMutableDictionary *answer = [NSMutableDictionary dictionary];
+    for (NSString *fullName in ids) if (records[fullName]) answer[fullName] = records[fullName];
+    return answer.count > 0 ? [NSJSONSerialization dataWithJSONObject:answer options:0 error:nil] : nil;
 }
 
 - (BOOL)hasContent {

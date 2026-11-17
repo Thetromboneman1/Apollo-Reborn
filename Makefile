@@ -67,7 +67,11 @@ KSCRASH_FILES := \
 # scrollViewShouldScrollToTop: and tab-reselect hooks are outermost: ScrollToTop
 # returns NO without %orig when it runs its own jump, which would skip ending
 # the landing hold.
+# ApolloOfflineSessionHook.xm must stay first: its %ctor adds Offline Mode's URL
+# protocol to every NSURLSession as it's created, so it has to be installed
+# before any other module's %ctor builds a session.
 ApolloReborn_FILES = \
+    $(SRC_DIR)/ApolloOfflineSessionHook.xm \
     $(SRC_DIR)/ApolloClasses.m \
     $(SRC_DIR)/ApolloFoundationModels.swift \
     $(SRC_DIR)/ApolloAISummary.xm \

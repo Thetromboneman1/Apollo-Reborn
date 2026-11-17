@@ -162,6 +162,24 @@ extern const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval; // 15 minutes
 
 BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
 
+// Profile pictures. Apollo and Reborn's avatars look authors up in batches with
+// /api/user_data_by_account_ids?ids=t2_a,t2_b (any mix of ids, so no fixed
+// key). Downloads save Reddit's answers under "users:<n>"; offline the library
+// answers any such request with the saved records it has.
+// Reborn's own avatar lookups (/user/<name>/about, see ApolloUserProfileCache)
+// carry this NSURLProtocol property; offline, the library answers them from the
+// same saved records with a small profile ("apollo_offline_lightweight": just
+// the name, picture and karma). Apollo's own profile reads don't carry it and
+// are never answered that way.
+static NSString *const ApolloOfflineProfileLookupProperty = @"ApolloOfflineProfileLookup";
+// The lowercased username a /user/<name>/about URL is for, or nil.
+NSString * _Nullable ApolloOfflineProfileUsernameForURL(NSURL *url);
+// The t2_ ids a user_data_by_account_ids URL asks for, or nil for any other URL.
+NSArray<NSString *> * _Nullable ApolloOfflineUserDataIDsForURL(NSURL *url);
+// Authors to look up for a post: its own author, then the first `limit`
+// distinct commenters in reading order (from the comments response).
+NSArray<NSString *> *ApolloOfflineAuthorFullNames(NSDictionary *post, NSData * _Nullable comments, NSUInteger limit);
+
 // Seconds to wait before the next Reddit API call, from the rate-limit headers
 // Reddit sends with every reply (x-ratelimit-remaining / -used / -reset; pass
 // -1 for a missing one). While more than `reserveFraction` of the window's
@@ -220,6 +238,13 @@ NSTimeInterval ApolloOfflineAPISpacing(double remaining, double used, double res
 - (nullable NSData *)pageDocumentForURL:(NSURL *)url contentType:(NSString * _Nullable * _Nullable)contentType;
 // Pages saved in this batch.
 @property (nonatomic, readonly) NSUInteger pageCount;
+// Saved author records for a user_data_by_account_ids request: YES when any of
+// its ids was saved, and the answer (only the saved ones) as Reddit's JSON.
+- (BOOL)hasUserDataForURL:(NSURL *)url;
+- (nullable NSData *)userDataResponseForURL:(NSURL *)url;
+// A small /user/<name>/about answer for a saved author, for Reborn's avatar lookups.
+- (BOOL)hasProfileForURL:(NSURL *)url;
+- (nullable NSData *)profileResponseForURL:(NSURL *)url;
 
 // Re-reads the index from disk (after a download commits).
 - (void)reload;
