@@ -56,6 +56,28 @@ NSString *ApolloOfflineFeedKeyForPath(NSString *path) {
     return nil;
 }
 
+// The account reads Apollo makes on most screens, saved with each batch so
+// the Subreddits list, inbox and profile load offline too. Paths as
+// ApolloOfflinePathComponents gives them (lowercased, no ".json").
+static NSSet<NSString *> *ApolloOfflineAccountPaths(void) {
+    static NSSet *paths;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        paths = [NSSet setWithArray:@[
+            @"api/me", @"api/v1/me", @"api/v1/me/prefs", @"api/v1/me/karma",
+            @"subreddits/mine", @"subreddits/mine/subscriber",
+            @"api/multi/mine", @"api/multi",
+            @"message/inbox", @"message/messages", @"message/unread", @"message/sent",
+            @"prefs/friends", @"prefs/blocked", @"api/v1/me/friends", @"api/v1/me/blocked",
+        ]];
+    });
+    return paths;
+}
+
+static NSString *ApolloOfflineHostWithoutWWW(NSString *host) {
+    return [host hasPrefix:@"www."] ? [host substringFromIndex:4] : host;
+}
+
 BOOL ApolloOfflineURLIsRedditAPI(NSURL *url) {
     NSString *host = url.host.lowercaseString;
     if (!host) return NO;
@@ -93,10 +115,25 @@ NSString *ApolloOfflineKeyForURL(NSURL *url) {
         if ((commentsAtRoot || commentsInSub) && commentsIndex + 1 < c.count) {
             return [@"comments:" stringByAppendingString:c[commentsIndex + 1]];
         }
+        NSString *after = (ApolloOfflineQueryValue(url, @"after") ?: @"").lowercaseString;
         NSString *feed = ApolloOfflineFeedKeyForPath(url.path ?: @"");
-        if (!feed) return nil;
-        NSString *after = ApolloOfflineQueryValue(url, @"after") ?: @"";
-        return [NSString stringWithFormat:@"feed:%@|%@", feed, after.lowercaseString];
+        if (feed) return [NSString stringWithFormat:@"feed:%@|%@", feed, after];
+        // A subreddit's info (icon, description, subscriber count).
+        if (c.count == 3 && [c[0] isEqualToString:@"r"] && [c[2] isEqualToString:@"about"]) {
+            return [@"about:" stringByAppendingString:c[1]];
+        }
+        NSString *joined = [c componentsJoinedByString:@"/"];
+        if ([ApolloOfflineAccountPaths() containsObject:joined]) {
+            return [NSString stringWithFormat:@"api:%@|%@", joined, after];
+        }
+        return nil;
+    }
+
+    if ([host isEqualToString:@"www.google.com"] && [url.path isEqualToString:@"/s2/favicons"]) {
+        NSString *domain = ApolloOfflineQueryValue(url, @"domain") ?: ApolloOfflineQueryValue(url, @"domain_url");
+        if ([domain containsString:@"://"]) domain = [NSURL URLWithString:domain].host;
+        domain = ApolloOfflineHostWithoutWWW(domain.lowercaseString);
+        return domain.length > 0 ? [@"favicon:" stringByAppendingString:domain] : nil;
     }
 
     if ([host isEqualToString:@"i.redd.it"] || [host isEqualToString:@"preview.redd.it"]) {
@@ -427,6 +464,82 @@ NSTimeInterval ApolloOfflineEstimatedBrowseTime(NSUInteger posts, NSTimeInterval
     return posts * 12.0 + MAX(0, videoSeconds);
 }
 
+// MARK: - Outside videos and web pages
+
+static NSString *ApolloOfflinePostLink(NSDictionary *post) {
+    return ApolloOfflineString(post[@"url_overridden_by_dest"]) ?: ApolloOfflineString(post[@"url"]);
+}
+
+static NSString *ApolloOfflineFirstMatch(NSString *pattern, NSString *string) {
+    if (string.length == 0) return nil;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *match = [regex firstMatchInString:string options:0 range:NSMakeRange(0, string.length)];
+    if (!match || match.numberOfRanges < 2 || [match rangeAtIndex:1].location == NSNotFound) return nil;
+    return [string substringWithRange:[match rangeAtIndex:1]];
+}
+
+static NSDictionary *ApolloOfflineHostedVideoOf(NSDictionary *post) {
+    NSString *link = [ApolloOfflinePostLink(post) stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    if (link.length == 0) return nil;
+    // The same URL shapes Apollo's own resolvers accept.
+    NSString *imgur = ApolloOfflineFirstMatch(@"^https?://(?:(?:i|m|www)\\.)?imgur\\.com/(?!gallery|a/)([a-zA-Z0-9]{5,7})\\.(?:gifv|mp4)(?:[?#].*)?$", link);
+    if (imgur) return @{ @"host": @"imgur", @"id": imgur };
+    NSString *streamable = ApolloOfflineFirstMatch(@"^https?://(?:www\\.)?streamable\\.com/(?:e/|edit/|o/)?(\\w+)/?(?:[?#].*)?$", link);
+    if (streamable) return @{ @"host": @"streamable", @"id": streamable };
+    NSString *redgifs = ApolloOfflineFirstMatch(@"^https?://(?:www\\.|v3\\.)?(?:(?:giant|fat|thumbs|zippy)\\d*\\.)?redgifs\\.com/(?:(?:\\w{2}|ifr|gifs/detail|watch|i)/)?(\\w+)", link);
+    if (redgifs) return @{ @"host": @"redgifs", @"id": redgifs.lowercaseString };
+    return nil;
+}
+
+NSDictionary *ApolloOfflineHostedVideoForPost(NSDictionary *post) {
+    if (![post isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *video = ApolloOfflineHostedVideoOf(post);
+    if (video) return video;
+    NSDictionary *parent = ApolloOfflineDict(ApolloOfflineArray(post[@"crosspost_parent_list"]).firstObject);
+    return parent ? ApolloOfflineHostedVideoOf(parent) : nil;
+}
+
+// Hosts whose links Apollo shows as media (or that are Reddit itself), so
+// there's no web page to keep.
+static BOOL ApolloOfflineIsMediaOrRedditHost(NSString *host) {
+    static NSArray<NSString *> *suffixes;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        suffixes = @[ @"reddit.com", @"redd.it", @"redditmedia.com", @"reddituploads.com", @"imgur.com", @"redgifs.com",
+                      @"streamable.com", @"gfycat.com", @"giphy.com", @"youtube.com", @"youtu.be", @"youtube-nocookie.com",
+                      @"twitch.tv", @"vimeo.com", @"tiktok.com" ];
+    });
+    for (NSString *suffix in suffixes) {
+        if ([host isEqualToString:suffix] || [host hasSuffix:[@"." stringByAppendingString:suffix]]) return YES;
+    }
+    return NO;
+}
+
+NSURL *ApolloOfflineArticleURLForPost(NSDictionary *post) {
+    if (![post isKindOfClass:[NSDictionary class]]) return nil;
+    if ([post[@"is_self"] boolValue] || [post[@"is_video"] boolValue] || [post[@"is_gallery"] boolValue]) return nil;
+    NSString *hint = ApolloOfflineString(post[@"post_hint"]);
+    if ([hint isEqualToString:@"image"] || [hint hasSuffix:@":video"]) return nil;
+    NSURL *url = ApolloOfflineMediaURL(ApolloOfflinePostLink(post));
+    NSString *host = url.host.lowercaseString;
+    if (host.length == 0 || ApolloOfflineIsMediaOrRedditHost(host)) return nil;
+    NSString *ext = url.pathExtension.lowercaseString;
+    if ([@[ @"jpg", @"jpeg", @"png", @"gif", @"webp", @"mp4", @"mov", @"m4v", @"gifv", @"pdf" ] containsObject:ext]) return nil;
+    return url;
+}
+
+NSString *ApolloOfflinePageKey(NSURL *url) {
+    NSString *scheme = url.scheme.lowercaseString;
+    if (![scheme isEqualToString:@"https"] && ![scheme isEqualToString:@"http"]) return nil;
+    NSString *host = ApolloOfflineHostWithoutWWW(url.host.lowercaseString);
+    if (host.length == 0) return nil;
+    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSString *path = components.percentEncodedPath.length > 0 ? components.percentEncodedPath : @"/";
+    if (path.length > 1 && [path hasSuffix:@"/"]) path = [path substringToIndex:path.length - 1];
+    NSString *query = components.percentEncodedQuery;
+    return [NSString stringWithFormat:@"page:%@%@%@", host, path, query.length > 0 ? [@"?" stringByAppendingString:query] : @""];
+}
+
 NSData *ApolloOfflineTruncatedListing(NSData *listing, NSUInteger keep, BOOL endHere) {
     if (listing.length == 0) return nil;
     id root = [NSJSONSerialization JSONObjectWithData:listing options:NSJSONReadingMutableContainers error:nil];
@@ -440,6 +553,69 @@ NSData *ApolloOfflineTruncatedListing(NSData *listing, NSUInteger keep, BOOL end
     data[@"dist"] = @(children.count);
     if (endHere) data[@"after"] = [NSNull null];
     return [NSJSONSerialization dataWithJSONObject:object options:0 error:nil];
+}
+
+NSData *ApolloOfflineWebArchiveMainResource(NSData *archive, NSString **mimeType, NSString **encoding) {
+    if (archive.length == 0) return nil;
+    id plist = [NSPropertyListSerialization propertyListWithData:archive options:NSPropertyListImmutable format:NULL error:nil];
+    NSDictionary *main = ApolloOfflineDict(ApolloOfflineDict(plist)[@"WebMainResource"]);
+    NSData *data = [main[@"WebResourceData"] isKindOfClass:[NSData class]] ? main[@"WebResourceData"] : nil;
+    if (mimeType) *mimeType = ApolloOfflineString(main[@"WebResourceMIMEType"]);
+    if (encoding) *encoding = ApolloOfflineString(main[@"WebResourceTextEncodingName"]);
+    return data;
+}
+
+NSURL *ApolloOfflineWebArchiveShareImageURL(NSData *archive, NSURL *pageURL) {
+    NSString *encoding = nil;
+    NSData *html = ApolloOfflineWebArchiveMainResource(archive, NULL, &encoding);
+    if (html.length == 0) return nil;
+    NSString *text = [[NSString alloc] initWithData:html encoding:NSUTF8StringEncoding]
+                     ?: [[NSString alloc] initWithData:html encoding:NSISOLatin1StringEncoding];
+    // Only the head matters (share tags can sit 200 KB in, after inline
+    // styles), and pages can be megabytes.
+    NSRange headEnd = [text rangeOfString:@"</head>" options:NSCaseInsensitiveSearch range:NSMakeRange(0, MIN(text.length, (NSUInteger)3000000))];
+    NSUInteger limit = headEnd.location != NSNotFound ? headEnd.location : MIN(text.length, (NSUInteger)400000);
+    text = [text substringToIndex:limit];
+    for (NSString *name in @[ @"og:image", @"twitter:image" ]) {
+        for (NSString *pattern in @[
+            [NSString stringWithFormat:@"<meta[^>]+(?:property|name)=[\"']%@[\"'][^>]*content=[\"']([^\"']+)[\"']", name],
+            [NSString stringWithFormat:@"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]*(?:property|name)=[\"']%@[\"']", name],
+        ]) {
+            NSString *value = ApolloOfflineFirstMatch(pattern, text);
+            value = [value stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+            NSURL *url = value.length > 0 ? [NSURL URLWithString:value relativeToURL:pageURL].absoluteURL : nil;
+            if ([url.scheme.lowercaseString hasPrefix:@"http"]) return url;
+        }
+    }
+    return nil;
+}
+
+static NSString *ApolloOfflineHTMLEscape(NSString *text) {
+    NSMutableString *escaped = [NSMutableString stringWithString:text ?: @""];
+    for (NSArray *pair in @[ @[ @"&", @"&amp;" ], @[ @"<", @"&lt;" ], @[ @">", @"&gt;" ], @[ @"\"", @"&quot;" ] ]) {
+        [escaped replaceOccurrencesOfString:pair[0] withString:pair[1] options:0 range:NSMakeRange(0, escaped.length)];
+    }
+    return escaped;
+}
+
+NSData *ApolloOfflineLinkCardHTML(NSDictionary *post, NSInteger maxWidth) {
+    NSString *title = ApolloOfflineString(post[@"title"]);
+    if (title.length == 0) return nil;
+    NSDictionary *image = ApolloOfflineDict(ApolloOfflineArray(ApolloOfflineDict(post[@"preview"])[@"images"]).firstObject);
+    NSString *source = ApolloOfflineString(ApolloOfflineDict(image[@"source"])[@"url"]);
+    NSString *picked = ApolloOfflinePickResolution(ApolloOfflineArray(image[@"resolutions"]), @"url", @"width", maxWidth, source);
+    NSURL *imageURL = ApolloOfflineMediaURL(picked);
+    NSMutableString *html = [NSMutableString stringWithFormat:@"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>%@</title>"
+                             "<meta property=\"og:title\" content=\"%@\">", ApolloOfflineHTMLEscape(title), ApolloOfflineHTMLEscape(title)];
+    if (imageURL) [html appendFormat:@"<meta property=\"og:image\" content=\"%@\">", ApolloOfflineHTMLEscape(imageURL.absoluteString)];
+    [html appendString:@"</head><body></body></html>"];
+    return [html dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+NSURL *ApolloOfflineFaviconURL(NSURL *pageURL) {
+    NSString *host = pageURL.host.lowercaseString;
+    if (host.length == 0) return nil;
+    return [NSURL URLWithString:[NSString stringWithFormat:@"https://www.google.com/s2/favicons?domain=%@&sz=64", host]];
 }
 
 // MARK: - Library
@@ -469,6 +645,7 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     NSArray<NSString *> *_feedTitles;
     NSUInteger _videoCount;
     NSTimeInterval _videoSeconds;
+    NSUInteger _pageCount;
 }
 
 + (NSURL *)defaultDirectory {
@@ -523,6 +700,7 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     _feedTitles = titles;
     _videoCount = [index[@"videos"] unsignedIntegerValue];
     _videoSeconds = [index[@"videoSeconds"] doubleValue];
+    _pageCount = [index[@"pages"] unsignedIntegerValue];
     [_lock unlock];
 }
 
@@ -539,6 +717,52 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
 - (NSArray<NSString *> *)feedTitles { [_lock lock]; NSArray *v = _feedTitles; [_lock unlock]; return v; }
 - (NSUInteger)videoCount { [_lock lock]; NSUInteger v = _videoCount; [_lock unlock]; return v; }
 - (NSTimeInterval)videoSeconds { [_lock lock]; NSTimeInterval v = _videoSeconds; [_lock unlock]; return v; }
+
+- (NSUInteger)pageCount { [_lock lock]; NSUInteger v = _pageCount; [_lock unlock]; return v; }
+
+- (NSURL *)videoFileURLForURL:(NSURL *)url {
+    NSString *videoID = ApolloOfflineRedditVideoIDForURL(url);
+    if (videoID) return [self fileURLForKey:ApolloOfflineVideoKey(videoID)];
+    NSString *key = ApolloOfflineKeyForURL(url);
+    if (!key) return nil;
+    [_lock lock];
+    NSString *type = ApolloOfflineString(ApolloOfflineDict(_entries[key])[@"type"]);
+    [_lock unlock];
+    return [type hasPrefix:@"video/"] ? [self fileURLForKey:key] : nil;
+}
+
+- (NSData *)pageArchiveForURL:(NSURL *)url {
+    NSString *key = ApolloOfflinePageKey(url);
+    return key ? [self storedDataForKey:key contentType:nil] : nil;
+}
+
+static NSString *ApolloOfflineCardKey(NSString *pageKey) {
+    return pageKey ? [@"card:" stringByAppendingString:[pageKey substringFromIndex:5]] : nil;
+}
+
+- (BOOL)hasPageForURL:(NSURL *)url {
+    NSString *key = ApolloOfflinePageKey(url);
+    if (!key) return NO;
+    [_lock lock];
+    BOOL has = _entries[key] != nil || _entries[ApolloOfflineCardKey(key)] != nil;
+    [_lock unlock];
+    return has;
+}
+
+- (NSData *)pageDocumentForURL:(NSURL *)url contentType:(NSString **)contentType {
+    NSData *archive = [self pageArchiveForURL:url];
+    NSString *mime = nil, *encoding = nil;
+    NSData *document = archive ? ApolloOfflineWebArchiveMainResource(archive, &mime, &encoding) : nil;
+    if (!document) {
+        document = [self storedDataForKey:ApolloOfflineCardKey(ApolloOfflinePageKey(url)) contentType:nil];
+        mime = @"text/html";
+        encoding = @"utf-8";
+    }
+    if (document && contentType) {
+        *contentType = [NSString stringWithFormat:@"%@; charset=%@", mime ?: @"text/html", encoding ?: @"utf-8"];
+    }
+    return document;
+}
 
 - (NSURL *)fileURLForKey:(NSString *)key {
     if (key.length == 0) return nil;
@@ -641,6 +865,7 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     NSUInteger _nextFile;
     NSUInteger _videoCount;
     NSTimeInterval _videoSeconds;
+    NSUInteger _pageCount;
     BOOL _finished;
 }
 
@@ -672,7 +897,9 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     NSDictionary *previous = _entries[key];
     if (previous) {
         _bytesWritten -= [previous[@"bytes"] unsignedLongLongValue];
-        [NSFileManager.defaultManager removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:previous[@"file"]] error:nil];
+        if (![previous[@"alias"] boolValue]) {
+            [NSFileManager.defaultManager removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:previous[@"file"]] error:nil];
+        }
     }
     _entries[key] = @{ @"file": file, @"type": contentType ?: @"application/octet-stream", @"bytes": @(data.length) };
     _bytesWritten += data.length;
@@ -701,7 +928,7 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     NSDictionary *previous = _entries[key];
     if (previous) {
         _bytesWritten -= [previous[@"bytes"] unsignedLongLongValue];
-        [fm removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:previous[@"file"]] error:nil];
+        if (![previous[@"alias"] boolValue]) [fm removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:previous[@"file"]] error:nil];
     } else {
         _videoCount++;
         _videoSeconds += MAX(0, duration);
@@ -709,6 +936,31 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
     _entries[key] = @{ @"file": name, @"type": @"video/mp4", @"bytes": @(bytes) };
     _bytesWritten += bytes;
     return YES;
+}
+
+- (BOOL)storeAlias:(NSString *)alias forKey:(NSString *)key {
+    NSDictionary *entry = _entries[key];
+    if (_finished || !entry || alias.length == 0 || [alias isEqualToString:key] || _entries[alias]) return NO;
+    NSMutableDictionary *copy = [entry mutableCopy];
+    copy[@"bytes"] = @0;     // the file is counted once, under `key`
+    copy[@"alias"] = @YES;   // never delete the shared file through this key
+    [copy removeObjectForKey:@"names"];
+    _entries[alias] = copy;
+    return YES;
+}
+
+- (BOOL)storePageArchive:(NSData *)archive forURL:(NSURL *)url {
+    NSString *key = ApolloOfflinePageKey(url);
+    if (!key || _entries[key]) return NO;
+    if (![self storeData:archive contentType:@"application/x-webarchive" forKey:key]) return NO;
+    _pageCount++;
+    return YES;
+}
+
+- (BOOL)storeLinkCard:(NSData *)html forURL:(NSURL *)url {
+    NSString *key = ApolloOfflinePageKey(url);
+    if (!key || html.length == 0 || _entries[key]) return NO;
+    return [self storeData:html contentType:@"text/html; charset=utf-8" forKey:ApolloOfflineCardKey(key)];
 }
 
 - (NSURL *)scratchFileURLWithExtension:(NSString *)pathExtension {
@@ -736,6 +988,7 @@ static NSString *ApolloOfflineFeedOfKey(NSString *key) {
         @"feeds": _feedTitles,
         @"videos": @(_videoCount),
         @"videoSeconds": @(_videoSeconds),
+        @"pages": @(_pageCount),
         @"entries": _entries,
     };
     [NSFileManager.defaultManager removeItemAtURL:[_stagingDirectory URLByAppendingPathComponent:@"scratch" isDirectory:YES] error:nil];

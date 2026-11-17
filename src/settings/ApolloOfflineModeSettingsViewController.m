@@ -28,6 +28,7 @@ typedef NS_ENUM(NSInteger, ApolloOfflineContentRow) {
     ApolloOfflineContentRowComments = 0,
     ApolloOfflineContentRowImages,
     ApolloOfflineContentRowVideos,
+    ApolloOfflineContentRowPages,
     ApolloOfflineContentRowSkipRead,
     ApolloOfflineContentRowBudget,
 };
@@ -93,7 +94,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         return canDelete ? 3 : 2;
     }
     if (section == ApolloOfflineSectionAutomatic) return 1;
-    if (section == ApolloOfflineSectionContent) return 5;
+    if (section == ApolloOfflineSectionContent) return 6;
     if (section == ApolloOfflineSectionFeeds) return 4;
     return 3;
 }
@@ -115,7 +116,8 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         case ApolloOfflineSectionLibrary:
             return @"Download a batch of posts while you have a connection, then scroll it on a flight or "
                     "anywhere without signal. Each download replaces the last one. Keep Apollo open until it "
-                    "finishes. Videos play offline with sound, in the same player as always.";
+                    "finishes. Videos play offline with sound in the same player as always, and links to articles "
+                    "open the saved page.";
         case ApolloOfflineSectionUse: {
             NSString *now = controller.serving ? @"Showing your offline library now."
                           : (controller.networkAvailable ? @"Online now." : @"No connection right now.");
@@ -134,9 +136,10 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                     "sort you pick.";
         case ApolloOfflineSectionContent:
             return @"Skipping read posts means a new batch is all posts you haven't seen. The download stops once "
-                    "it reaches the data limit. Images are saved at your screen's size. Reddit videos are saved "
-                    "at up to 720p with sound (videos over 5 minutes are skipped); they use the most data, so "
-                    "turn Videos off to fit more posts in the same limit.";
+                    "it reaches the data limit. Images are saved at your screen's size. Videos from Reddit, imgur, "
+                    "Streamable and RedGIFs are saved at up to 720p with sound (over 5 minutes are skipped); they "
+                    "use the most data, so turn Videos off to fit more posts in the same limit. Linked Web Pages "
+                    "keeps the article behind each link post, so it opens offline too.";
     }
     return nil;
 }
@@ -223,6 +226,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
             if (indexPath.row == ApolloOfflineContentRowComments) return [self switchCellWithTitle:@"Comments" key:UDKeyOfflineIncludeComments];
             if (indexPath.row == ApolloOfflineContentRowImages) return [self switchCellWithTitle:@"Images" key:UDKeyOfflineIncludeImages];
             if (indexPath.row == ApolloOfflineContentRowVideos) return [self switchCellWithTitle:@"Videos" key:UDKeyOfflineIncludeVideos];
+            if (indexPath.row == ApolloOfflineContentRowPages) return [self switchCellWithTitle:@"Linked Web Pages" key:UDKeyOfflineIncludePages];
             if (indexPath.row == ApolloOfflineContentRowSkipRead) return [self switchCellWithTitle:@"Skip Posts I've Read" key:UDKeyOfflineSkipRead];
             UITableViewCell *cell = [self valueCellWithTitle:@"Data Limit"
                                                       detail:ApolloOfflineBudgetText((NSInteger)(controller.budgetBytes / (1000 * 1000)))];

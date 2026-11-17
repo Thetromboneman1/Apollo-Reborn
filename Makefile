@@ -320,6 +320,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloOfflineLibrary.m \
     $(SRC_DIR)/ApolloOfflineDownloader.m \
     $(SRC_DIR)/ApolloOfflineMode.xm \
+    $(SRC_DIR)/ApolloOfflinePages.xm \
     $(SRC_DIR)/ApolloRedgifsTokenRefresh.m \
     $(SRC_DIR)/ApolloSportsClipResolver.m \
     $(SRC_DIR)/ApolloSportsClips.xm \

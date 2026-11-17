@@ -31,6 +31,9 @@ NSErrorDomain const ApolloOfflineErrorDomain = @"ApolloOfflineErrorDomain";
         _maxVideoHeight = 720;
         _maxVideoBytes = 60ull * 1000 * 1000;
         _maxVideoDuration = 5 * 60;
+        _includePages = YES;
+        _accountPaths = @[];
+        _maxPageBytes = 5ull * 1000 * 1000;
     }
     return self;
 }
@@ -83,6 +86,8 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     NSString *_pageKeyOverride;
     NSUInteger _emptyPagesSkipped;
     NSUInteger _skippedRead;
+    NSString *_redgifsToken;
+    BOOL _accountDone;
 }
 
 - (instancetype)initWithLibraryDirectory:(NSURL *)directory fetcher:(ApolloOfflineFetcher)fetcher requestBuilder:(ApolloOfflineRequestBuilder)requestBuilder {
@@ -113,6 +118,8 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
         self->_lastError = nil;
         self->_lastAPICall = 0;
         self->_skippedRead = 0;
+        self->_redgifsToken = nil;
+        self->_accountDone = NO;
         self->_feedIndex = 0;
         [self startFeed];
     });
@@ -194,6 +201,13 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
 - (void)startFeed {
     if ([self stopIfCancelled]) return;
     NSArray<ApolloOfflineFeedSource *> *sources = _options.sources;
+    if (_feedIndex >= sources.count && !_accountDone) {
+        _accountDone = YES;
+        if (_writer.postCount > 0) {
+            [self saveAccountPathAtIndex:0 after:nil page:0];
+            return;
+        }
+    }
     if (_feedIndex >= sources.count) {
         if (_writer.postCount == 0) {
             NSMutableDictionary *info = [@{
@@ -309,7 +323,11 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
     };
     [self saveCommentsForPost:post then:^{
         [self saveImagesForPost:post then:^{
-            [self saveVideoForPost:post then:next];
+            [self saveVideoForPost:post then:^{
+                [self saveHostedVideoForPost:post then:^{
+                    [self savePageForPost:post then:next];
+                }];
+            }];
         }];
     }];
 }
@@ -465,6 +483,266 @@ static BOOL ApolloOfflineIsSuccess(NSHTTPURLResponse *response, NSData *data, NS
             }
         }];
     }];
+}
+
+// MARK: - Outside videos
+
+static NSDictionary *ApolloOfflineJSONObject(NSData *data) {
+    id root = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    return [root isKindOfClass:[NSDictionary class]] ? root : nil;
+}
+
+static NSURL *ApolloOfflineHTTPSURL(id value) {
+    if (![value isKindOfClass:[NSString class]] || [value length] == 0) return nil;
+    NSString *string = value;
+    if ([string hasPrefix:@"//"]) string = [@"https:" stringByAppendingString:string];
+    NSURL *url = [NSURL URLWithString:string];
+    return [url.scheme.lowercaseString hasPrefix:@"http"] ? url : nil;
+}
+
+// Saves an API answer under the key Apollo's own request will have.
+- (void)storeAPIAnswer:(NSData *)data forURL:(NSURL *)url {
+    NSString *key = ApolloOfflineKeyForURL(url);
+    if (key && data.length > 0) [_writer storeData:data contentType:@"application/json; charset=utf-8" forKey:key];
+}
+
+// Downloads a progressive mp4 and stores it under its URL's key, plus aliases
+// for the other URLs Apollo might ask for. Skipped when it won't fit.
+- (void)saveProgressiveVideo:(NSURL *)url aliases:(NSArray<NSURL *> *)aliases duration:(NSTimeInterval)duration
+                        then:(void (^)(void))then {
+    NSString *key = ApolloOfflineKeyForURL(url);
+    if (!key || [_writer hasKey:key] || duration > _options.maxVideoDuration) {
+        then();
+        return;
+    }
+    [self report:@"Saving videos"];
+    [self fetchMedia:url maxBytes:_options.maxVideoBytes then:^(NSData *data) {
+        ApolloOfflineLibraryWriter *writer = self->_writer;
+        if (data.length > 0 && writer && writer.bytesWritten + data.length <= self->_feedBudgetEnd) {
+            NSURL *file = [writer scratchFileURLWithExtension:@"mp4"];
+            if ([data writeToURL:file atomically:NO] &&
+                [writer storeVideoFile:file forKey:key pathExtension:@"mp4" duration:duration]) {
+                for (NSURL *alias in aliases) {
+                    NSString *aliasKey = ApolloOfflineKeyForURL(alias);
+                    if (aliasKey) [writer storeAlias:aliasKey forKey:key];
+                }
+            }
+            [NSFileManager.defaultManager removeItemAtURL:file error:nil];
+        }
+        then();
+    }];
+}
+
+- (void)saveHostedVideoForPost:(NSDictionary *)post then:(void (^)(void))then {
+    NSDictionary *video = ApolloOfflineHostedVideoForPost(post);
+    if (!_options.includeVideos || !video || !_writer) {
+        then();
+        return;
+    }
+    NSString *host = video[@"host"], *videoID = video[@"id"];
+    if ([host isEqualToString:@"imgur"]) {
+        NSURL *mp4 = [NSURL URLWithString:[NSString stringWithFormat:@"https://i.imgur.com/%@.mp4", videoID]];
+        NSURL *gifv = [NSURL URLWithString:[NSString stringWithFormat:@"https://i.imgur.com/%@.gifv", videoID]];
+        [self saveProgressiveVideo:mp4 aliases:@[ gifv ] duration:0 then:then];
+    } else if ([host isEqualToString:@"streamable"]) {
+        [self saveStreamable:videoID then:then];
+    } else if ([host isEqualToString:@"redgifs"]) {
+        [self saveRedgifs:videoID then:then];
+    } else {
+        then();
+    }
+}
+
+// Apollo: GET api.streamable.com/videos/<code> (no auth), then plays files.mp4.url.
+- (void)saveStreamable:(NSString *)code then:(void (^)(void))then {
+    NSURL *api = [NSURL URLWithString:[@"https://api.streamable.com/videos/" stringByAppendingString:code]];
+    if ([_writer hasKey:ApolloOfflineKeyForURL(api)]) {
+        then();
+        return;
+    }
+    [self fetchMedia:api maxBytes:256 * 1024 then:^(NSData *data) {
+        NSDictionary *files = ApolloOfflineJSONObject(data)[@"files"];
+        if (![files isKindOfClass:[NSDictionary class]]) {
+            then();
+            return;
+        }
+        NSDictionary *full = [files[@"mp4"] isKindOfClass:[NSDictionary class]] ? files[@"mp4"] : nil;
+        NSDictionary *mobile = [files[@"mp4-mobile"] isKindOfClass:[NSDictionary class]] ? files[@"mp4-mobile"] : nil;
+        NSURL *fullURL = ApolloOfflineHTTPSURL(full[@"url"]), *mobileURL = ApolloOfflineHTTPSURL(mobile[@"url"]);
+        // The full file only when it's within the video height cap.
+        BOOL fullFits = fullURL && [full[@"height"] integerValue] <= self->_options.maxVideoHeight;
+        NSURL *chosen = (fullFits || !mobileURL) ? fullURL : mobileURL;
+        if (!chosen) {
+            then();
+            return;
+        }
+        NSDictionary *picked = chosen == fullURL ? full : mobile;
+        NSMutableArray<NSURL *> *aliases = [NSMutableArray array];
+        for (NSURL *other in @[ fullURL ?: chosen, mobileURL ?: chosen ]) if (other != chosen) [aliases addObject:other];
+        [self saveProgressiveVideo:chosen aliases:aliases duration:[picked[@"duration"] doubleValue] then:^{
+            if ([self->_writer hasKey:ApolloOfflineKeyForURL(chosen)]) [self storeAPIAnswer:data forURL:api];
+            then();
+        }];
+    }];
+}
+
+// Apollo: a temporary token (the tweak turns its /v2/oauth/client call into
+// GET /v2/auth/temporary), then GET /v2/gifs/<id> with it, then plays urls.hd
+// or urls.sd. All three are saved, so the same calls succeed offline.
+- (void)saveRedgifs:(NSString *)gifID then:(void (^)(void))then {
+    NSURL *tokenURL = [NSURL URLWithString:@"https://api.redgifs.com/v2/auth/temporary"];
+    NSURL *gifURL = [NSURL URLWithString:[@"https://api.redgifs.com/v2/gifs/" stringByAppendingString:gifID]];
+    if ([_writer hasKey:ApolloOfflineKeyForURL(gifURL)]) {
+        then();
+        return;
+    }
+    void (^lookup)(void) = ^{
+        if (self->_redgifsToken.length == 0) {
+            then();
+            return;
+        }
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:gifURL];
+        request.timeoutInterval = 30;
+        [request setValue:[@"Bearer " stringByAppendingString:self->_redgifsToken] forHTTPHeaderField:@"Authorization"];
+        self->_fetcher(request, ^(NSData *data, NSHTTPURLResponse *response, NSError *error) {
+            dispatch_async(self->_queue, ^{
+                NSDictionary *gif = ApolloOfflineIsSuccess(response, data, error) ? ApolloOfflineJSONObject(data)[@"gif"] : nil;
+                NSDictionary *urls = [gif isKindOfClass:[NSDictionary class]] && [gif[@"urls"] isKindOfClass:[NSDictionary class]] ? gif[@"urls"] : nil;
+                NSURL *sd = ApolloOfflineHTTPSURL(urls[@"sd"]), *hd = ApolloOfflineHTTPSURL(urls[@"hd"]);
+                NSURL *chosen = sd ?: hd;
+                if (!chosen) {
+                    then();
+                    return;
+                }
+                NSArray *aliases = (hd && chosen != hd) ? @[ hd ] : @[];
+                [self saveProgressiveVideo:chosen aliases:aliases duration:[gif[@"duration"] doubleValue] then:^{
+                    if ([self->_writer hasKey:ApolloOfflineKeyForURL(chosen)]) [self storeAPIAnswer:data forURL:gifURL];
+                    then();
+                }];
+            });
+        });
+    };
+    if (_redgifsToken.length > 0) {
+        lookup();
+        return;
+    }
+    [self fetchMedia:tokenURL maxBytes:64 * 1024 then:^(NSData *data) {
+        NSString *token = ApolloOfflineJSONObject(data)[@"token"];
+        if ([token isKindOfClass:[NSString class]] && token.length > 0) {
+            self->_redgifsToken = token;
+            // Apollo mints its own token offline: answer it from here too.
+            [self storeAPIAnswer:data forURL:tokenURL];
+        }
+        lookup();
+    }];
+}
+
+// MARK: - Account reads
+
+- (void)saveAccountPathAtIndex:(NSUInteger)index after:(NSString *)after page:(NSUInteger)page {
+    if ([self stopIfCancelled]) return;
+    NSArray<NSString *> *paths = _options.accountPaths;
+    if (index >= paths.count) {
+        [self startFeed];
+        return;
+    }
+    if (page == 0) [self report:@"Saving your inbox and subscriptions"];
+    NSMutableArray *query = [NSMutableArray arrayWithObjects:[NSURLQueryItem queryItemWithName:@"limit" value:@"100"],
+                                                             [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"], nil];
+    if (after.length > 0) [query addObject:[NSURLQueryItem queryItemWithName:@"after" value:after]];
+    [self fetchAPI:paths[index] query:query completion:^(NSURLRequest *request, NSData *data, NSHTTPURLResponse *response, NSError *error) {
+        NSString *key = ApolloOfflineKeyForURL(request.URL);
+        NSDictionary *root = ApolloOfflineIsSuccess(response, data, error) ? ApolloOfflineJSONObject(data) : nil;
+        BOOL ok = ApolloOfflineIsSuccess(response, data, error) && key;
+        if (ok) [self->_writer storeData:data contentType:@"application/json; charset=UTF-8" forKey:key];
+        void (^nextPath)(void) = ^{ [self saveAccountPathAtIndex:index + 1 after:nil page:0]; };
+        // A subreddit's icon, for its header and the Subreddits list.
+        if (ok && [root[@"kind"] isEqual:@"t5"]) {
+            NSDictionary *about = [root[@"data"] isKindOfClass:[NSDictionary class]] ? root[@"data"] : nil;
+            NSString *icon = [about[@"community_icon"] isKindOfClass:[NSString class]] && [about[@"community_icon"] length] > 0
+                ? about[@"community_icon"] : about[@"icon_img"];
+            NSURL *iconURL = ApolloOfflineHTTPSURL([icon isKindOfClass:[NSString class]] ? [icon stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"] : nil);
+            if (iconURL) {
+                [self saveImage:iconURL then:nextPath];
+                return;
+            }
+        }
+        NSDictionary *listing = [root[@"data"] isKindOfClass:[NSDictionary class]] ? root[@"data"] : nil;
+        NSString *nextAfter = [listing[@"after"] isKindOfClass:[NSString class]] ? listing[@"after"] : nil;
+        if (ok && nextAfter.length > 0 && page + 1 < 10) {
+            [self saveAccountPathAtIndex:index after:nextAfter page:page + 1];
+            return;
+        }
+        nextPath();
+    }];
+}
+
+// One image under its own key (skipped if already saved or too big).
+- (void)saveImage:(NSURL *)url then:(void (^)(void))then {
+    NSString *key = ApolloOfflineKeyForURL(url);
+    if (!key || [_writer hasKey:key]) {
+        then();
+        return;
+    }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.timeoutInterval = 30;
+    unsigned long long maxBytes = _options.maxImageBytes;
+    _fetcher(request, ^(NSData *data, NSHTTPURLResponse *response, NSError *error) {
+        dispatch_async(self->_queue, ^{
+            NSString *type = response.MIMEType.length > 0 ? response.MIMEType : @"image/png";
+            if (self->_writer && ApolloOfflineIsSuccess(response, data, error) && data.length <= maxBytes && [type hasPrefix:@"image/"]) {
+                [self->_writer storeData:data contentType:type forKey:key];
+            }
+            then();
+        });
+    });
+}
+
+// MARK: - Web pages
+
+- (void)savePageForPost:(NSDictionary *)post then:(void (^)(void))then {
+    NSURL *url = ApolloOfflineArticleURLForPost(post);
+    ApolloOfflinePageSaver saver = self.pageSaver;
+    NSString *key = ApolloOfflinePageKey(url);
+    if (!url || !key || [_writer hasKey:key]) {
+        then();
+        return;
+    }
+    // Whatever happens to the page, the link card gets the site's icon and,
+    // failing the real page, a stand-in with the post's title and image.
+    NSInteger maxWidth = _options.maxImageWidth;
+    NSURL *favicon = ApolloOfflineFaviconURL(url);
+    void (^finish)(void) = ^{
+        if (![self->_writer hasKey:key]) [self->_writer storeLinkCard:ApolloOfflineLinkCardHTML(post, maxWidth) forURL:url];
+        if (favicon) [self saveImage:favicon then:then];
+        else then();
+    };
+    // Pages are the last thing a post saves; leave room for what follows.
+    BOOL roomLeft = _writer.bytesWritten + 512 * 1000 < _feedBudgetEnd;
+    if (!_options.includePages || !saver || !roomLeft) {
+        finish();
+        return;
+    }
+    [self report:@"Saving web pages"];
+    unsigned long long maxBytes = _options.maxPageBytes;
+    saver(url, ^(NSData *archive) {
+        dispatch_async(self->_queue, ^{
+            ApolloOfflineLibraryWriter *writer = self->_writer;
+            // Under 10 KB is a bot wall or an error page, not the article;
+            // and the page's own HTML has to be there, not just its images.
+            BOOL hasDocument = ApolloOfflineWebArchiveMainResource(archive, NULL, NULL).length >= 2048;
+            if (archive.length >= 10 * 1024 && hasDocument && archive.length <= maxBytes && writer &&
+                writer.bytesWritten + archive.length <= self->_feedBudgetEnd &&
+                [writer storePageArchive:archive forURL:url]) {
+                // Apollo's link card for this post: the page's share image.
+                NSURL *shareImage = ApolloOfflineWebArchiveShareImageURL(archive, url);
+                if (shareImage) [self saveImage:shareImage then:finish];
+                else finish();
+                return;
+            }
+            finish();
+        });
+    });
 }
 
 // Like -stopIfCancelled, for the middle of a post: lets the post finish its

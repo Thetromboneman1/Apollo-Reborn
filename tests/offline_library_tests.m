@@ -35,7 +35,14 @@ static void TestURLKeys(void) {
     CHECK([Key(@"https://oauth.reddit.com/comments/abc12?sort=top&limit=200") isEqualToString:@"comments:abc12"], "comments");
     CHECK([Key(@"https://www.reddit.com/r/pics/comments/abc12/a_title/.json") isEqualToString:@"comments:abc12"], "sub comments");
     CHECK(Key(@"https://oauth.reddit.com/r/pics/comments") == nil, "comment stream isn't a post");
-    CHECK(Key(@"https://oauth.reddit.com/api/v1/me") == nil, "api");
+    CHECK([Key(@"https://oauth.reddit.com/api/v1/me") isEqualToString:@"api:api/v1/me|"], "account read");
+    CHECK([Key(@"https://www.reddit.com/message/inbox.json?limit=25&after=t1_AB") isEqualToString:@"api:message/inbox|t1_ab"], "inbox page");
+    CHECK([Key(@"https://www.reddit.com/subreddits/mine/subscriber.json?limit=100") isEqualToString:@"api:subreddits/mine/subscriber|"], "subscriptions");
+    CHECK([Key(@"https://www.reddit.com/r/News/about.json") isEqualToString:@"about:news"], "subreddit about");
+    CHECK(Key(@"https://oauth.reddit.com/api/info.json?id=t3_x") == nil, "lookups by id aren't saved");
+    CHECK(Key(@"https://oauth.reddit.com/api/mod/conversations") == nil, "mod tools aren't saved");
+    CHECK([Key(@"https://www.google.com/s2/favicons?sz=64&domain=www.BBC.com") isEqualToString:@"favicon:bbc.com"], "favicon by domain");
+    CHECK([Key(@"https://www.google.com/s2/favicons?domain_url=https://bbc.com/news") isEqualToString:@"favicon:bbc.com"], "favicon by url");
     CHECK([Key(@"https://preview.redd.it/xyz98.jpg?width=640&format=pjpg&s=1") isEqualToString:@"reddimg:xyz98"], "preview");
     CHECK([Key(@"https://i.redd.it/xyz98.jpeg") isEqualToString:@"reddimg:xyz98"], "same image direct");
     CHECK([Key(@"https://external-preview.redd.it/Ab-Cd.png?auto=webp&s=2") isEqualToString:@"extimg:Ab-Cd"], "external preview");
@@ -164,6 +171,7 @@ typedef struct {
 
 // Set by a test to give the downloader a (fake) remuxer.
 static ApolloOfflineVideoMuxer sTestMuxer = nil;
+static ApolloOfflinePageSaver sTestPageSaver = nil;
 
 static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, NSDictionary<NSString *, NSData *> *responses,
                              NSMutableArray<NSString *> *requested) {
@@ -174,6 +182,11 @@ static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, 
         NSString *lookup = after ? [NSString stringWithFormat:@"%@?after=%@", c.path, after] : (c.path ?: @"");
         if ([request.URL.host isEqualToString:@"v.redd.it"]) lookup = [request.URL.host stringByAppendingString:request.URL.path];
         else if ([request.URL.host hasSuffix:@"redd.it"] || [request.URL.host hasSuffix:@"redditmedia.com"]) lookup = request.URL.host;
+        else if (![request.URL.host isEqualToString:@"oauth.reddit.com"]) lookup = [request.URL.host stringByAppendingString:request.URL.path];
+        NSString *auth = [request valueForHTTPHeaderField:@"Authorization"];
+        if ([request.URL.host isEqualToString:@"api.redgifs.com"] && [request.URL.path hasPrefix:@"/v2/gifs/"] && ![auth isEqualToString:@"Bearer tok123"]) {
+            lookup = @"(unauthorized)";
+        }
         @synchronized (requested) { [requested addObject:lookup]; }
         NSData *body = responses[lookup];
         NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:request.URL statusCode:body ? 200 : 404 HTTPVersion:@"HTTP/1.1"
@@ -187,6 +200,7 @@ static RunResult RunDownload(NSURL *dir, ApolloOfflineDownloadOptions *options, 
     };
     ApolloOfflineDownloader *downloader = [[ApolloOfflineDownloader alloc] initWithLibraryDirectory:dir fetcher:fetcher requestBuilder:builder];
     downloader.videoMuxer = sTestMuxer;
+    downloader.pageSaver = sTestPageSaver;
     __block RunResult result = { NO, NO, 0 };
     [downloader startWithOptions:options progress:nil completion:^(BOOL committed, NSUInteger posts, __unused unsigned long long bytes, __unused NSError *error) {
         result.done = YES;
@@ -485,6 +499,187 @@ static void TestSavedSourceKeepsReadPosts(void) {
     [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
 }
 
+static NSMutableDictionary *LinkPost(NSString *postID, NSString *link) {
+    NSMutableDictionary *post = [PostData(postID) mutableCopy];
+    post[@"url"] = link;
+    post[@"post_hint"] = @"link";
+    post[@"title"] = [@"Title of " stringByAppendingString:postID];
+    return post;
+}
+
+static void TestHostedAndArticles(void) {
+    NSDictionary *imgur = ApolloOfflineHostedVideoForPost(LinkPost(@"h1", @"https://i.imgur.com/AbC12dE.gifv"));
+    CHECK([imgur[@"host"] isEqualToString:@"imgur"] && [imgur[@"id"] isEqualToString:@"AbC12dE"], "imgur gifv");
+    CHECK(ApolloOfflineHostedVideoForPost(LinkPost(@"h2", @"https://i.imgur.com/AbC12dE.jpg")) == nil, "imgur image isn't video");
+    CHECK([ApolloOfflineHostedVideoForPost(LinkPost(@"h3", @"https://streamable.com/xyz98"))[@"id"] isEqualToString:@"xyz98"], "streamable");
+    NSDictionary *red = ApolloOfflineHostedVideoForPost(LinkPost(@"h4", @"https://www.redgifs.com/watch/SomeFunnyName"));
+    CHECK([red[@"host"] isEqualToString:@"redgifs"] && [red[@"id"] isEqualToString:@"somefunnyname"], "redgifs watch");
+    CHECK([ApolloOfflineHostedVideoForPost(@{ @"crosspost_parent_list": @[ LinkPost(@"h5", @"https://streamable.com/e/qq11") ] })[@"id"] isEqualToString:@"qq11"], "crosspost");
+
+    CHECK([[ApolloOfflineArticleURLForPost(LinkPost(@"a1", @"https://www.example.com/news/story-1?ref=rss")) host] isEqualToString:@"www.example.com"], "article");
+    CHECK(ApolloOfflineArticleURLForPost(LinkPost(@"a2", @"https://www.youtube.com/watch?v=abc")) == nil, "youtube isn't an article");
+    CHECK(ApolloOfflineArticleURLForPost(LinkPost(@"a3", @"https://i.redd.it/x.jpg")) == nil, "image isn't an article");
+    NSMutableDictionary *selfPost = LinkPost(@"a4", @"https://www.reddit.com/r/x/comments/a4/t/");
+    selfPost[@"is_self"] = @YES;
+    CHECK(ApolloOfflineArticleURLForPost(selfPost) == nil, "self post");
+    CHECK(ApolloOfflineArticleURLForPost(LinkPost(@"a5", @"https://example.com/report.pdf")) == nil, "pdf skipped");
+
+    CHECK([ApolloOfflinePageKey([NSURL URLWithString:@"https://WWW.Example.com/news/story-1/?ref=rss#top"]) isEqualToString:@"page:example.com/news/story-1?ref=rss"], "page key: %s",
+          ApolloOfflinePageKey([NSURL URLWithString:@"https://WWW.Example.com/news/story-1/?ref=rss#top"]).UTF8String);
+    CHECK([ApolloOfflinePageKey([NSURL URLWithString:@"https://example.com"]) isEqualToString:@"page:example.com/"], "bare host");
+}
+
+static NSData *Bytes(NSUInteger n) { return [NSMutableData dataWithLength:n]; }
+
+// A web archive like WebKit's: the page HTML (with a share image) as the main resource.
+static NSData *Archive(NSURL *url) {
+    NSMutableString *html = [NSMutableString stringWithString:@"<html><head><title>Story</title>"
+        "<meta property=\"og:image\" content=\"https://cdn.example.com/share.jpg?w=1200&amp;h=630\"></head><body>"];
+    while (html.length < 20000) [html appendString:@"<p>Paragraph of the story.</p>"];
+    [html appendString:@"</body></html>"];
+    NSDictionary *plist = @{ @"WebMainResource": @{
+        @"WebResourceData": [html dataUsingEncoding:NSUTF8StringEncoding], @"WebResourceMIMEType": @"text/html",
+        @"WebResourceTextEncodingName": @"UTF-8", @"WebResourceURL": url.absoluteString } };
+    return [NSPropertyListSerialization dataWithPropertyList:plist format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+}
+
+static void TestWebArchiveHelpers(void) {
+    NSURL *page = [NSURL URLWithString:@"https://www.example.com/news/story-1"];
+    NSData *archive = Archive(page);
+    NSString *mime = nil;
+    NSData *html = ApolloOfflineWebArchiveMainResource(archive, &mime, NULL);
+    CHECK(html.length > 20000 && [mime isEqualToString:@"text/html"], "main resource");
+    CHECK([[ApolloOfflineWebArchiveShareImageURL(archive, page) absoluteString] isEqualToString:@"https://cdn.example.com/share.jpg?w=1200&h=630"], "og:image");
+    CHECK(ApolloOfflineWebArchiveMainResource([@"junk" dataUsingEncoding:NSUTF8StringEncoding], NULL, NULL) == nil, "not an archive");
+    CHECK([Key(ApolloOfflineFaviconURL(page).absoluteString) isEqualToString:@"favicon:example.com"], "favicon key");
+}
+
+static void TestDownloaderAccountReads(void) {
+    NSMutableDictionary *responses = [ResponsesForTwoPages() mutableCopy];
+    responses[@"/message/inbox"] = JSON(@{ @"kind": @"Listing", @"data": @{ @"after": @"t1_x", @"children": @[] } });
+    responses[@"/message/inbox?after=t1_x"] = JSON(@{ @"kind": @"Listing", @"data": @{ @"after": [NSNull null], @"children": @[] } });
+    responses[@"/r/pics/about"] = JSON(@{ @"kind": @"t5", @"data": @{ @"display_name": @"pics",
+        @"community_icon": @"https://styles.redditmedia.com/t5_1/styles/communityIcon_x.png?width=256&amp;s=1" } });
+    responses[@"styles.redditmedia.com"] = Bytes(800);
+    ApolloOfflineDownloadOptions *options = Options(100ull * 1024 * 1024);
+    options.accountPaths = @[ @"/message/inbox", @"/r/pics/about", @"/prefs/blocked" ];
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    RunResult result = RunDownload(dir, options, responses, requested);
+    CHECK(result.committed && result.posts == 6, "feed still saved");
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+    CHECK([library hasEntryForKey:Key(@"https://www.reddit.com/message/inbox.json?limit=25")], "inbox page one");
+    CHECK([library hasEntryForKey:Key(@"https://www.reddit.com/message/inbox.json?after=t1_x")], "inbox page two");
+    CHECK([library hasEntryForKey:Key(@"https://oauth.reddit.com/r/Pics/about")], "subreddit about");
+    CHECK([library hasEntryForKey:Key(@"https://styles.redditmedia.com/t5_1/styles/communityIcon_x.png?width=64")], "subreddit icon");
+    CHECK(![library hasEntryForKey:Key(@"https://oauth.reddit.com/prefs/blocked")], "a failed read is just skipped");
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+}
+
+static void TestDownloaderHostedAndPages(void) {
+    NSMutableDictionary *responses = [NSMutableDictionary dictionary];
+    NSDictionary *listing = @{ @"kind": @"Listing", @"data": @{ @"after": [NSNull null], @"children": @[
+        @{ @"kind": @"t3", @"data": LinkPost(@"p1", @"https://i.imgur.com/AbC12dE.gifv") },
+        @{ @"kind": @"t3", @"data": LinkPost(@"p2", @"https://streamable.com/xyz98") },
+        @{ @"kind": @"t3", @"data": LinkPost(@"p3", @"https://www.redgifs.com/watch/somefunnyname") },
+        @{ @"kind": @"t3", @"data": LinkPost(@"p4", @"https://www.example.com/news/story-1") },
+    ] } };
+    responses[@"/best"] = JSON(listing);
+    for (NSString *postID in @[ @"p1", @"p2", @"p3", @"p4" ]) {
+        responses[[@"/comments/" stringByAppendingString:postID]] = JSON(@[ @{ @"kind": @"Listing" }, @{ @"kind": @"Listing" } ]);
+    }
+    responses[@"preview.redd.it"] = Bytes(1000);
+    responses[@"b.thumbs.redditmedia.com"] = Bytes(100);
+    responses[@"i.imgur.com/AbC12dE.mp4"] = Bytes(3000);
+    responses[@"api.streamable.com/videos/xyz98"] = JSON(@{ @"files": @{
+        @"mp4": @{ @"url": @"//cdn.streamable.com/video/mp4/xyz98.mp4?token=a", @"height": @1080, @"duration": @9 },
+        @"mp4-mobile": @{ @"url": @"https://cdn.streamable.com/video/mp4-mobile/xyz98.mp4?token=b", @"height": @480, @"duration": @9 },
+    } });
+    responses[@"cdn.streamable.com/video/mp4-mobile/xyz98.mp4"] = Bytes(2000);
+    responses[@"api.redgifs.com/v2/auth/temporary"] = JSON(@{ @"token": @"tok123" });
+    responses[@"api.redgifs.com/v2/gifs/somefunnyname"] = JSON(@{ @"gif": @{ @"duration": @6, @"urls": @{
+        @"hd": @"https://media.redgifs.com/SomeFunnyName.mp4", @"sd": @"https://media.redgifs.com/SomeFunnyName-mobile.mp4" } } });
+    responses[@"media.redgifs.com/SomeFunnyName-mobile.mp4"] = Bytes(1500);
+    responses[@"cdn.example.com/share.jpg"] = Bytes(700);
+    responses[@"www.google.com/s2/favicons"] = Bytes(300);
+
+    __block NSMutableArray<NSURL *> *pagesAsked = [NSMutableArray array];
+    sTestPageSaver = ^(NSURL *url, void (^done)(NSData *)) {
+        @synchronized (pagesAsked) { [pagesAsked addObject:url]; }
+        // A real page's archive; a few hundred bytes would be a bot wall.
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{ done(Archive(url)); });
+    };
+    NSURL *dir = TempDirectory();
+    NSMutableArray *requested = [NSMutableArray array];
+    RunResult result = RunDownload(dir, Options(100ull * 1000 * 1000), responses, requested);
+    CHECK(result.committed && result.posts == 4, "four posts: %lu", (unsigned long)result.posts);
+    ApolloOfflineLibrary *library = [[ApolloOfflineLibrary alloc] initWithDirectory:dir];
+
+    // What Apollo's player will ask for resolves to the saved files.
+    NSURL *(^video)(NSString *) = ^NSURL *(NSString *u) { return [library videoFileURLForURL:[NSURL URLWithString:u]]; };
+    CHECK(video(@"https://i.imgur.com/AbC12dE.mp4") != nil, "imgur mp4");
+    CHECK([video(@"https://i.imgur.com/AbC12dE.gifv") isEqual:video(@"https://i.imgur.com/AbC12dE.mp4")], "imgur gifv alias");
+    CHECK(video(@"https://cdn.streamable.com/video/mp4-mobile/xyz98.mp4?token=zz") != nil, "streamable mobile");
+    CHECK([video(@"https://cdn.streamable.com/video/mp4/xyz98.mp4?token=a") isEqual:video(@"https://cdn.streamable.com/video/mp4-mobile/xyz98.mp4")],
+          "streamable full URL is an alias (1080p over the cap)");
+    CHECK(![requested containsObject:@"cdn.streamable.com/video/mp4/xyz98.mp4"], "1080p never fetched");
+    CHECK(video(@"https://media.redgifs.com/SomeFunnyName.mp4") != nil && video(@"https://media.redgifs.com/SomeFunnyName-mobile.mp4") != nil, "redgifs hd + sd");
+    CHECK(video(@"https://example.com/other.mp4") == nil, "unsaved");
+    // And the API answers Apollo asks for first.
+    CHECK([library hasEntryForKey:Key(@"https://api.streamable.com/videos/xyz98")], "streamable info");
+    CHECK([library hasEntryForKey:Key(@"https://api.redgifs.com/v2/auth/temporary")], "redgifs token");
+    CHECK([library hasEntryForKey:Key(@"https://api.redgifs.com/v2/gifs/somefunnyname")], "redgifs gif info");
+    CHECK(library.videoCount == 3, "three outside videos: %lu", (unsigned long)library.videoCount);
+
+    CHECK(pagesAsked.count == 1 && [pagesAsked.firstObject.host isEqualToString:@"www.example.com"], "only the article page: %lu", (unsigned long)pagesAsked.count);
+    CHECK([library pageArchiveForURL:[NSURL URLWithString:@"https://www.example.com/news/story-1/"]] != nil, "page saved");
+    CHECK(library.pageCount == 1, "page count");
+    // Apollo's own GET of the article (no www.) gets the page HTML for its link card.
+    NSString *type = nil;
+    NSData *document = [library pageDocumentForURL:[NSURL URLWithString:@"https://example.com/news/story-1"] contentType:&type];
+    CHECK(document.length > 20000 && [type hasPrefix:@"text/html"], "article HTML for the link card: %s", type.UTF8String);
+    CHECK([library hasEntryForKey:Key(@"https://cdn.example.com/share.jpg?w=600")], "share image saved");
+    CHECK([library hasEntryForKey:@"favicon:example.com"], "favicon saved");
+    // Each file counted once: 3000 + 2000 + 1500 of video, aliases add nothing.
+    NSUInteger videoBytes = 0;
+    for (NSString *u in @[ @"https://i.imgur.com/AbC12dE.mp4", @"https://cdn.streamable.com/video/mp4-mobile/xyz98.mp4", @"https://media.redgifs.com/SomeFunnyName-mobile.mp4" ]) {
+        videoBytes += (NSUInteger)[[NSFileManager.defaultManager attributesOfItemAtPath:video(u).path error:nil] fileSize];
+    }
+    CHECK(videoBytes == 6500, "video bytes %lu", (unsigned long)videoBytes);
+
+    // Pages off: nothing asked.
+    [pagesAsked removeAllObjects];
+    NSURL *dir2 = TempDirectory();
+    ApolloOfflineDownloadOptions *options = Options(100ull * 1000 * 1000);
+    options.includePages = NO;
+    RunDownload(dir2, options, responses, requested);
+    CHECK(pagesAsked.count == 0, "pages off");
+    // ...but the link card still gets a stand-in page and the site icon.
+    ApolloOfflineLibrary *noPages = [[ApolloOfflineLibrary alloc] initWithDirectory:dir2];
+    NSURL *article = [NSURL URLWithString:@"https://www.example.com/news/story-1"];
+    NSString *cardType = nil;
+    NSString *card = [[NSString alloc] initWithData:[noPages pageDocumentForURL:article contentType:&cardType] encoding:NSUTF8StringEncoding];
+    CHECK([card containsString:@"og:image"] && [card containsString:@"preview.redd.it/p4.jpg"] && [card containsString:@"<title>"],
+          "stand-in card: %s", card.UTF8String);
+    CHECK([noPages pageArchiveForURL:article] == nil && noPages.pageCount == 0, "no reader page without an archive");
+    CHECK([noPages hasEntryForKey:@"favicon:example.com"], "favicon saved without the page");
+
+    // An archive whose page HTML is empty (just images) isn't kept.
+    NSURL *dir3 = TempDirectory();
+    sTestPageSaver = ^(NSURL *url, void (^done)(NSData *)) {
+        NSDictionary *plist = @{ @"WebMainResource": @{ @"WebResourceData": [@"<!DOCTYPE html>" dataUsingEncoding:NSUTF8StringEncoding],
+                                                        @"WebResourceMIMEType": @"text/html", @"WebResourceURL": url.absoluteString },
+                                 @"WebSubresources": @[ @{ @"WebResourceData": Bytes(50000), @"WebResourceURL": @"https://x/y.jpg" } ] };
+        done([NSPropertyListSerialization dataWithPropertyList:plist format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil]);
+    };
+    RunDownload(dir3, Options(100ull * 1000 * 1000), responses, requested);
+    CHECK([[ApolloOfflineLibrary alloc] initWithDirectory:dir3].pageCount == 0, "empty page rejected");
+    [NSFileManager.defaultManager removeItemAtURL:dir3.URLByDeletingLastPathComponent error:nil];
+    sTestPageSaver = nil;
+    [NSFileManager.defaultManager removeItemAtURL:dir.URLByDeletingLastPathComponent error:nil];
+    [NSFileManager.defaultManager removeItemAtURL:dir2.URLByDeletingLastPathComponent error:nil];
+}
+
 int main(void) {
     @autoreleasepool {
         TestFeedKeys();
@@ -504,6 +699,10 @@ int main(void) {
         TestRenditions();
         TestDownloaderVideo();
         TestSavedSourceKeepsReadPosts();
+        TestHostedAndArticles();
+        TestDownloaderHostedAndPages();
+        TestWebArchiveHelpers();
+        TestDownloaderAccountReads();
     }
     if (sFailures) {
         fprintf(stderr, "%d failure(s)\n", sFailures);

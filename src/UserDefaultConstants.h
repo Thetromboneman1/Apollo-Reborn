@@ -759,6 +759,8 @@ static NSString *const UDKeyOfflineIncludeComments = @"OfflineIncludeComments";
 static NSString *const UDKeyOfflineIncludeImages = @"OfflineIncludeImages";
 // Reddit-hosted videos, saved as one mp4 with sound at up to 720p (default on).
 static NSString *const UDKeyOfflineIncludeVideos = @"OfflineIncludeVideos";
+// The web page behind each link post, kept as a web archive (default on).
+static NSString *const UDKeyOfflineIncludePages = @"OfflineIncludePages";
 // The account's Saved posts as an offline archive (default on): save a post in
 // Apollo and the next download keeps it, read or not; unsave to drop it.
 static NSString *const UDKeyOfflineIncludeSaved = @"OfflineIncludeSaved";

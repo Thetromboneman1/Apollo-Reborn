@@ -23,6 +23,12 @@
 // remuxed, no re-encode), and while serving, -[AVURLAsset initWithURL:options:]
 // swaps any URL naming that v.redd.it id (Apollo's player URL included) for
 // the file. Apollo's player, controls and "has sound" check run unchanged.
+// imgur, Streamable and RedGIFs clips are progressive mp4s: the download keeps
+// the file and the API answers Apollo asks for first (Streamable's video info,
+// RedGIFs' token and gif info), and the same swap finds the file by URL.
+//
+// Link posts: see ApolloOfflinePages.xm (saved web archives, read in place of
+// Safari's view while serving).
 
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
@@ -38,6 +44,7 @@
 #import "UserDefaultConstants.h"
 #import "ApolloPostReadState.h"
 #import "ApolloAccountCredentials.h"
+#import "ApolloOfflinePages.h"
 
 NSNotificationName const ApolloOfflineModeDidChangeNotification = @"ApolloOfflineModeDidChangeNotification";
 
@@ -78,7 +85,10 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
     if (![request.HTTPMethod ?: @"GET" isEqualToString:@"GET"]) return NO;
     if ([NSURLProtocol propertyForKey:kApolloOfflineBypassKey inRequest:request]) return NO;
     NSString *key = ApolloOfflineKeyForURL(request.URL);
-    if (key && [[ApolloOfflineLibrary sharedLibrary] hasEntryForKey:key]) return YES;
+    ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
+    if (key && [library hasEntryForKey:key]) return YES;
+    // A saved article: Apollo reads the page itself to title its link card.
+    if ([library hasPageForURL:request.URL]) return YES;
 #if APOLLO_SIM_BUILD
     NSString *scheme = request.URL.scheme.lowercaseString;
     if (sApolloOfflineSimulateNoNetwork && ([scheme isEqualToString:@"https"] || [scheme isEqualToString:@"http"])) return YES;
@@ -99,7 +109,9 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *type = nil;
-        NSData *data = key ? [[ApolloOfflineLibrary sharedLibrary] dataForKey:key contentType:&type] : nil;
+        ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
+        NSData *data = key ? [library dataForKey:key contentType:&type] : nil;
+        if (!data) data = [library pageDocumentForURL:request.URL contentType:&type];
         if (!data) {
             // Only the first two path segments: later ones can be usernames.
             NSArray *segments = [request.URL.path componentsSeparatedByString:@"/"];
@@ -146,15 +158,18 @@ static BOOL sApolloOfflineSimulateNoNetwork = NO;
 
 // MARK: - Video
 
-// The saved mp4 for whatever v.redd.it video `url` names, while serving.
+// The saved mp4 for the video `url` names, while serving: a v.redd.it id
+// anywhere in it (Apollo's player URL), or an imgur, Streamable or RedGIFs
+// media URL saved under its own key.
 static NSURL *ApolloOfflineLocalVideoURL(NSURL *url) {
     if (!url || url.isFileURL) return nil;
     if (!atomic_load_explicit(&sApolloOfflineServing, memory_order_relaxed)) return nil;
-    NSString *videoID = ApolloOfflineRedditVideoIDForURL(url);
-    if (!videoID) return nil;
-    NSURL *file = [[ApolloOfflineLibrary sharedLibrary] fileURLForKey:ApolloOfflineVideoKey(videoID)];
-    ApolloLog(@"[Offline] video %@ (%@://%@): %@", videoID, url.scheme ?: @"?", url.host ?: @"?",
-              file ? @"playing the saved copy" : @"not saved");
+    NSURL *file = [[ApolloOfflineLibrary sharedLibrary] videoFileURLForURL:url];
+    if (file || ApolloOfflineRedditVideoIDForURL(url)) {
+        ApolloLog(@"[Offline] video %@%@: %@", url.host ?: @"?",
+                  ApolloOfflineRedditVideoIDForURL(url) ? [@" " stringByAppendingString:ApolloOfflineRedditVideoIDForURL(url)] : @"",
+                  file ? @"playing the saved copy" : @"not saved");
+    }
     return file;
 }
 
@@ -333,6 +348,7 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
             UDKeyOfflineIncludeComments: @YES,
             UDKeyOfflineIncludeImages: @YES,
             UDKeyOfflineIncludeVideos: @YES,
+            UDKeyOfflineIncludePages: @YES,
             UDKeyOfflineIncludeSaved: @YES,
             UDKeyOfflineBudgetMB: @100,
             UDKeyOfflineAutoRefresh: @YES,
@@ -542,6 +558,20 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
     options.includeComments = [defaults boolForKey:UDKeyOfflineIncludeComments];
     options.includeImages = [defaults boolForKey:UDKeyOfflineIncludeImages];
     options.includeVideos = [defaults boolForKey:UDKeyOfflineIncludeVideos];
+    options.includePages = [defaults boolForKey:UDKeyOfflineIncludePages];
+    // Your account, inbox, subscriptions and each subreddit's header, so
+    // those screens load offline too (a few small reads per batch).
+    NSMutableArray<NSString *> *accountPaths = [NSMutableArray arrayWithArray:@[
+        @"/api/v1/me", @"/api/me", @"/subreddits/mine/subscriber", @"/api/multi/mine",
+        @"/message/inbox", @"/message/messages", @"/message/unread", @"/prefs/friends", @"/prefs/blocked",
+    ]];
+    for (ApolloOfflineFeedSource *source in sources) {
+        NSArray<NSString *> *parts = [source.path componentsSeparatedByString:@"/"];
+        if (parts.count >= 3 && [parts[1] isEqualToString:@"r"] && ![parts[2] isEqualToString:@"popular"]) {
+            [accountPaths addObject:[NSString stringWithFormat:@"/r/%@/about", parts[2]]];
+        }
+    }
+    options.accountPaths = accountPaths;
     CGFloat screenPixels = UIScreen.mainScreen.nativeBounds.size.width;
     options.maxImageWidth = (NSInteger)MIN(1440, MAX(640, screenPixels));
     if ([defaults boolForKey:UDKeyOfflineSkipRead]) {
@@ -577,6 +607,9 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
     _downloader.videoMuxer = ^(NSURL *video, NSURL *audio, NSURL *output, void (^done)(BOOL, NSTimeInterval)) {
         ApolloOfflineMuxVideo(video, audio, output, done);
     };
+    _downloader.pageSaver = ^(NSURL *url, void (^done)(NSData *)) {
+        ApolloOfflineSaveWebPage(url, done);
+    };
     _downloading = YES;
     _downloadingAutomatically = automatic;
     _progressBytes = 0;
@@ -591,9 +624,10 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
         ApolloLog(@"[Offline] background time ran out; cancelling download");
         [weakSelf cancelDownload];
     }];
-    ApolloLog(@"[Offline] download start: %@, budget %llu MB, comments=%d images=%d videos=%d, %lu read posts to skip",
+    ApolloLog(@"[Offline] download start: %@, budget %llu MB, comments=%d images=%d videos=%d pages=%d, %lu read posts to skip",
               [[sources valueForKey:@"title"] componentsJoinedByString:@", "], options.byteBudget / (1000 * 1000),
-              options.includeComments, options.includeImages, options.includeVideos, (unsigned long)options.skipPostIDs.count);
+              options.includeComments, options.includeImages, options.includeVideos, options.includePages,
+              (unsigned long)options.skipPostIDs.count);
     [self recompute];
 
     [_downloader startWithOptions:options progress:^(unsigned long long bytes, __unused NSUInteger posts, NSString *status) {
@@ -618,9 +652,9 @@ static NSURLSession *ApolloOfflineDownloadSession(void) {
             message = [NSString stringWithFormat:@"Saved %lu posts (%@) for offline reading.", (unsigned long)posts,
                        [NSByteCountFormatter stringFromByteCount:(long long)bytes countStyle:NSByteCountFormatterCountStyleFile]];
             ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
-            ApolloLog(@"[Offline] download done%@: %lu posts, %lu videos (%.0f s), %llu bytes, %lu already-read posts skipped",
+            ApolloLog(@"[Offline] download done%@: %lu posts, %lu videos (%.0f s), %lu pages, %llu bytes, %lu already-read posts skipped",
                       automatic ? @" (Keep Fresh)" : @"", (unsigned long)posts, (unsigned long)library.videoCount,
-                      library.videoSeconds, bytes, (unsigned long)skipped);
+                      library.videoSeconds, (unsigned long)library.pageCount, bytes, (unsigned long)skipped);
         } else {
             message = error.localizedDescription ?: @"The download didn't finish.";
             ApolloLog(@"[Offline] download ended without saving: %@ (%@ %ld)", message, error.domain, (long)error.code);
@@ -666,6 +700,9 @@ static NSString *ApolloOfflineDurationText(NSTimeInterval seconds) {
     }
     NSString *videos = library.videoCount > 0
         ? [NSString stringWithFormat:@" · %lu video%@", (unsigned long)library.videoCount, library.videoCount == 1 ? @"" : @"s"] : @"";
+    if (library.pageCount > 0) {
+        videos = [videos stringByAppendingFormat:@" · %lu page%@", (unsigned long)library.pageCount, library.pageCount == 1 ? @"" : @"s"];
+    }
     NSTimeInterval browse = ApolloOfflineEstimatedBrowseTime(library.postCount, library.videoSeconds);
     return [NSString stringWithFormat:@"%lu posts%@ · %@\nAbout %@ of scrolling%@", (unsigned long)library.postCount,
             videos, size, ApolloOfflineDurationText(browse), when];

@@ -36,6 +36,10 @@ NSString * _Nullable ApolloOfflineFeedKeyForPath(NSString *path);
 //   comments:<id>         a post's comments (/comments/<id>, /r/x/comments/<id>/slug)
 //   reddimg:<stem>        i.redd.it / preview.redd.it image (any resolution)
 //   extimg:<stem>         external-preview.redd.it image (any resolution)
+//   api:<path>|<after>    account reads Apollo makes on most screens (me,
+//                         subscriptions, multis, inbox, messages, friends,
+//                         blocked) and about:<sub> for a subreddit's info
+//   favicon:<domain>      Google's site-icon service, by domain
 //   url:<host><path>      any other host (query dropped)
 NSString * _Nullable ApolloOfflineKeyForURL(NSURL *url);
 
@@ -81,6 +85,37 @@ NSDictionary * _Nullable ApolloOfflineRedditVideoRenditions(NSData *manifest, NS
 // time of its saved videos. Shown next to the size so "how much is this?" can
 // be read in minutes as well as megabytes.
 NSTimeInterval ApolloOfflineEstimatedBrowseTime(NSUInteger posts, NSTimeInterval videoSeconds);
+
+// Videos on the outside hosts Apollo plays in its own player, where the link
+// is the post's URL: @{ "host": "imgur" | "streamable" | "redgifs", "id" }.
+// Apollo resolves these itself (redgifs and Streamable through their APIs),
+// so the downloader saves those API answers plus the mp4 they point at, and
+// the player swap finds the file by its URL. nil for anything else.
+NSDictionary * _Nullable ApolloOfflineHostedVideoForPost(NSDictionary *post);
+
+// The web page a link post points at (an article, a blog, a store page), or
+// nil for self posts and anything that's media Apollo shows itself. Saved as a
+// complete web archive so it opens offline.
+NSURL * _Nullable ApolloOfflineArticleURLForPost(NSDictionary *post);
+// "page:<host><path>[?query]", the key for a saved web page (fragment, a
+// trailing slash and a leading "www." ignored, host lowercased): Apollo asks
+// for "bbc.com/…" when the post links "www.bbc.com/…".
+NSString * _Nullable ApolloOfflinePageKey(NSURL * _Nullable url);
+
+// From a web archive: the main document's bytes, MIME type and encoding.
+// Apollo fetches a link post's page itself to title its link card, so the
+// saved page answers that request too.
+NSData * _Nullable ApolloOfflineWebArchiveMainResource(NSData *archive, NSString * _Nullable * _Nullable mimeType,
+                                                       NSString * _Nullable * _Nullable encoding);
+// The page's share image (og:image, else twitter:image), resolved against
+// the page URL: what Apollo's link card shows.
+NSURL * _Nullable ApolloOfflineWebArchiveShareImageURL(NSData *archive, NSURL *pageURL);
+// Google's favicon URL for a page's site (what Apollo shows on link cards).
+NSURL * _Nullable ApolloOfflineFaviconURL(NSURL *pageURL);
+// A tiny stand-in page for a link post whose page couldn't be saved (a bot
+// wall, too big, Linked Web Pages off): the post's title and its saved
+// preview image as og:image, so Apollo's link card still has both.
+NSData * _Nullable ApolloOfflineLinkCardHTML(NSDictionary *post, NSInteger maxWidth);
 
 // The listing JSON with only its first `keep` children and, when `endHere`,
 // data.after set to null so Apollo treats it as the last page. nil when the
@@ -163,6 +198,17 @@ BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
 
 // The file behind a stored entry (videos are played straight from disk).
 - (nullable NSURL *)fileURLForKey:(NSString *)key;
+// The saved video for a player URL: a v.redd.it id anywhere in it, or an
+// outside host's media URL saved under its own key.
+- (nullable NSURL *)videoFileURLForURL:(NSURL *)url;
+// The saved web archive for a page URL, if any.
+- (nullable NSData *)pageArchiveForURL:(NSURL *)url;
+- (BOOL)hasPageForURL:(NSURL *)url;
+// The saved page's own HTML (or its stand-in card), for a plain GET of its
+// URL (Apollo's link card).
+- (nullable NSData *)pageDocumentForURL:(NSURL *)url contentType:(NSString * _Nullable * _Nullable)contentType;
+// Pages saved in this batch.
+@property (nonatomic, readonly) NSUInteger pageCount;
 
 // Re-reads the index from disk (after a download commits).
 - (void)reload;
@@ -195,6 +241,13 @@ BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState state);
               duration:(NSTimeInterval)duration;
 // A fresh scratch file path inside the staging folder (gone after commit).
 - (NSURL *)scratchFileURLWithExtension:(NSString *)pathExtension;
+// Another key for an already-stored entry, sharing its file (no extra bytes):
+// redgifs and Streamable each offer an HD and a mobile URL for one saved mp4.
+- (BOOL)storeAlias:(NSString *)alias forKey:(NSString *)key;
+// A web archive of the page at `url` (counted as one saved page).
+- (BOOL)storePageArchive:(NSData *)archive forURL:(NSURL *)url;
+// The stand-in from ApolloOfflineLinkCardHTML, when there's no archive.
+- (BOOL)storeLinkCard:(NSData *)html forURL:(NSURL *)url;
 - (void)noteFeedTitle:(NSString *)title posts:(NSUInteger)posts;
 - (BOOL)commit:(NSError **)error;
 - (void)discard;

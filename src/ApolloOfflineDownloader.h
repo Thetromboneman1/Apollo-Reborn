@@ -12,7 +12,9 @@
 //     ends cleanly instead of failing on a page that was never fetched;
 //   • a page is cut to the posts whose comments and images were saved, so
 //     every post you can scroll to opens offline;
-//   • a post's Reddit video plays offline with sound when it fit the limits.
+//   • a post's video plays offline with sound when it fit the limits: Reddit's
+//     own (v.redd.it) and imgur, Streamable and RedGIFs clips;
+//   • a link post's web page opens offline from a saved web archive.
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -45,6 +47,13 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 @property (nonatomic) NSInteger maxVideoHeight;        // default 720 px
 @property (nonatomic) unsigned long long maxVideoBytes; // default 60 MB per video
 @property (nonatomic) NSTimeInterval maxVideoDuration; // default 5 minutes
+// The web page behind each link post, as a complete web archive (needs a pageSaver).
+@property (nonatomic) BOOL includePages;               // default YES
+@property (nonatomic) unsigned long long maxPageBytes; // default 5 MB per page
+// Account reads saved once per batch after the feeds ("/api/me",
+// "/message/inbox", "/r/pics/about", ...), so profile, inbox, Subreddits and
+// subreddit headers load offline. Listings follow `after` up to 10 pages.
+@property (nonatomic, copy) NSArray<NSString *> *accountPaths;
 // Gap between Reddit API calls, to stay well under Reddit's ~100/minute limit.
 @property (nonatomic) NSTimeInterval apiSpacing;       // default 0.75 s
 // Bare post ids ("abc123") to leave out: posts the user has already read.
@@ -59,6 +68,10 @@ typedef NSURLRequest * _Nonnull (^ApolloOfflineRequestBuilder)(NSString *path, N
 // result's running time. Supplied by the app (AVFoundation); tests fake it.
 typedef void (^ApolloOfflineVideoMuxer)(NSURL *video, NSURL * _Nullable audio, NSURL *output,
                                         void (^done)(BOOL ok, NSTimeInterval duration));
+
+// Loads `url` in a browser and calls `done` (any queue) with a web archive of
+// the finished page, or nil. Supplied by the app (WebKit); tests fake it.
+typedef void (^ApolloOfflinePageSaver)(NSURL *url, void (^done)(NSData * _Nullable archive));
 
 typedef void (^ApolloOfflineProgress)(unsigned long long bytes, NSUInteger posts, NSString *status);
 typedef void (^ApolloOfflineCompletion)(BOOL committed, NSUInteger posts, unsigned long long bytes, NSError * _Nullable error);
@@ -80,6 +93,8 @@ typedef NS_ENUM(NSInteger, ApolloOfflineErrorCode) {
 @property (nonatomic, readonly) BOOL running;
 // Set before starting; without it videos are skipped (posters still save).
 @property (nonatomic, copy, nullable) ApolloOfflineVideoMuxer videoMuxer;
+// Set before starting; without it link posts keep only their preview image.
+@property (nonatomic, copy, nullable) ApolloOfflinePageSaver pageSaver;
 // Posts left out of the last run because they were already read.
 @property (nonatomic, readonly) NSUInteger skippedPostCount;
 
