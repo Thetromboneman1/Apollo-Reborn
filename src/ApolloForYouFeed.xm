@@ -53,6 +53,7 @@
 #import "ApolloClasses.h"
 #import "ApolloCommon.h"
 #import "ApolloForYouFeedModel.h"
+#import "ApolloOfflineMode.h"
 #import "ApolloNativeActionMenus.h"
 #import "ApolloSwiftRuntime.h"
 #import "ApolloWebJSON.h"
@@ -663,6 +664,11 @@ static void ApolloFYWrapNativeSortActions(NSArray<UIMenuElement *> *elements) {
     // Pages of a For You feed already on screen keep coming from it even if the
     // mode was switched off mid-scroll; Home's own pages pass through.
     if (!isTokenPage && !(isFirstPage && ApolloForYouFeedEnabled())) return %orig;
+    if (isFirstPage && ApolloOfflineModeIsServing()) {
+        // For You needs the web; the Offline Mode batch answers Home's own listing.
+        ApolloLog(@"[ForYou] offline library is serving; showing the saved Home feed");
+        return %orig;
+    }
 
     NSString *username = ApolloActiveAccountUsername().lowercaseString;
     ApolloWebSessionEntry *webSession = username.length ? ApolloWebSessionPollFor(username) : nil;

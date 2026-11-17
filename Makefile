@@ -67,7 +67,11 @@ KSCRASH_FILES := \
 # scrollViewShouldScrollToTop: and tab-reselect hooks are outermost: ScrollToTop
 # returns NO without %orig when it runs its own jump, which would skip ending
 # the landing hold.
+# ApolloOfflineSessionHook.xm must stay first: its %ctor adds Offline Mode's URL
+# protocol to every NSURLSession as it's created, so it has to be installed
+# before any other module's %ctor builds a session.
 ApolloReborn_FILES = \
+    $(SRC_DIR)/ApolloOfflineSessionHook.xm \
     $(SRC_DIR)/ApolloClasses.m \
     $(SRC_DIR)/ApolloFoundationModels.swift \
     $(SRC_DIR)/ApolloAISummary.xm \
@@ -317,6 +321,10 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloHostedVideo.m \
     $(SRC_DIR)/ApolloRedditVideoPlaylist.m \
     $(SRC_DIR)/ApolloRedditVideoPlaylistProtocol.xm \
+    $(SRC_DIR)/ApolloOfflineLibrary.m \
+    $(SRC_DIR)/ApolloOfflineDownloader.m \
+    $(SRC_DIR)/ApolloOfflineMode.xm \
+    $(SRC_DIR)/ApolloOfflinePages.xm \
     $(SRC_DIR)/ApolloRedgifsTokenRefresh.m \
     $(SRC_DIR)/ApolloSportsClipResolver.m \
     $(SRC_DIR)/ApolloSportsClips.xm \
@@ -437,6 +445,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloPollVoting.xm \
     $(SRC_DIR)/ApolloPollCompose.xm \
     $(SRC_DIR)/settings/ApolloPollSettingsViewController.m \
+    $(SRC_DIR)/settings/ApolloOfflineModeSettingsViewController.m \
     $(SRC_DIR)/settings/ApolloPalHomeSettingsViewController.m \
     $(SRC_DIR)/ApolloSimDebugTap.xm \
     $(SRC_DIR)/ApolloManualSignInViewController.m \
@@ -513,7 +522,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/crash/ApolloCrashBugsnagNeutralize.xm \
     $(KSCRASH_FILES) \
     $(SSZIPARCHIVE_FILES)
-ApolloReborn_FRAMEWORKS = UIKit Security LocalAuthentication AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion SpriteKit CoreText CoreHaptics
+ApolloReborn_FRAMEWORKS = UIKit Security LocalAuthentication AVFoundation AVKit OSLog NaturalLanguage ImageIO StoreKit Photos PhotosUI SafariServices SystemConfiguration Network WebKit AuthenticationServices CoreImage Vision LinkPresentation SwiftUI UniformTypeIdentifiers Metal QuartzCore CoreMotion SpriteKit CoreText CoreHaptics
 # The YouTube caption guard reads the per-app subtitle setting (ApolloYouTubeCaptions.xm).
 ApolloReborn_FRAMEWORKS += MediaAccessibility
 ApolloReborn_WEAK_FRAMEWORKS += Symbols

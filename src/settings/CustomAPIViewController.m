@@ -19,6 +19,7 @@
 #import "ApolloUpdateChecker.h"
 #import "InlineMediaSettingsViewController.h"
 #import "settings/ApolloPollSettingsViewController.h"
+#import "ApolloOfflineMode.h"
 #import "settings/ApolloSettingsRouter.h"
 #import "InfoRowSettingsViewController.h"
 #import "ApolloWebSessionLoginViewController.h"
@@ -1468,6 +1469,14 @@ typedef NS_ENUM(NSInteger, Tag) {
         push:^UIViewController * { return ApolloSettingsRouteInstantiate(@"pal-home-settings"); }];
     palHome.iconSystemName = @"house.fill";
     palHome.iconTileColor = [UIColor systemBrownColor];
+    ApolloSettingsRow *offline = [self hubDisclosureRowWithID:@"feat.offline" title:@"Offline Mode"
+        subtitle:^NSString * {
+            // First line only: what's saved ("42 posts · 3 videos · 87 MB").
+            return [[[ApolloOfflineModeController sharedController] librarySummary] componentsSeparatedByString:@"\n"].firstObject;
+        }
+        push:^UIViewController * { return ApolloSettingsRouteInstantiate(@"offline-mode"); }];
+    offline.iconSystemName = @"airplane";
+    offline.iconTileColor = [UIColor systemCyanColor];
 
     posts.iconSystemName        = @"newspaper.fill";              posts.iconTileColor        = [UIColor systemOrangeColor];
     comments.iconSystemName     = @"text.bubble.fill";            comments.iconTileColor     = [UIColor systemGreenColor];
@@ -1482,7 +1491,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     return [ApolloSettingsSection sectionWithTitle:@"Features"
                                             footer:@"Fine-tune posts, comments, media, subreddits, profile layout and the interface."
                                               rows:@[ posts, comments, media, subreddits, profileLayout, interface_, duo,
-                                                      linkPreviews, polls, apolloAI, palHome ]];
+                                                      linkPreviews, polls, apolloAI, palHome, offline ]];
 }
 
 - (ApolloSettingsSection *)buildAdvancedSection {
