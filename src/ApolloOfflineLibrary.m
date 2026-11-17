@@ -165,7 +165,9 @@ const NSTimeInterval ApolloOfflineAutoRefreshRetryInterval = 15 * 60;
 
 BOOL ApolloOfflineShouldAutoRefresh(ApolloOfflineAutoRefreshState s) {
     if (!s.enabled || !s.hasLibrary) return NO;
-    if (!s.networkAvailable || !s.onWiFi || s.lowPowerMode) return NO;
+    if (!s.networkAvailable || s.lowPowerMode || s.lowDataMode) return NO;
+    // Wi-Fi only unless the user said cellular is fine too.
+    if (!s.onWiFi && !s.allowCellular) return NO;
     // Serving means the user is browsing the batch (Always mode, or no
     // connection): replacing it under them would change what they're reading.
     if (s.serving || s.downloading) return NO;

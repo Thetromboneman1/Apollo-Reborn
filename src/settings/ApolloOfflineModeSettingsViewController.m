@@ -93,7 +93,7 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
         BOOL canDelete = [ApolloOfflineLibrary sharedLibrary].hasContent && !self.controller.downloading;
         return canDelete ? 3 : 2;
     }
-    if (section == ApolloOfflineSectionAutomatic) return 1;
+    if (section == ApolloOfflineSectionAutomatic) return 2;
     if (section == ApolloOfflineSectionContent) return 6;
     if (section == ApolloOfflineSectionFeeds) return 4;
     return 3;
@@ -126,9 +126,12 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
                     "anything. Anything you didn't download loads from the internet as usual.\n\n%@", now];
         }
         case ApolloOfflineSectionAutomatic:
-            return @"While Apollo is open on Wi-Fi, your offline posts top themselves up: a fresh batch every hour, "
-                    "or sooner once you've read half of them. Never on cellular or in Low Power Mode, and only "
-                    "after you've downloaded once yourself.";
+            return [NSString stringWithFormat:@"While Apollo is open, your offline posts top themselves up: a fresh "
+                    "batch every hour, or sooner once you've read half of them. Wi-Fi only, unless you turn on Use "
+                    "Cellular Data. On cellular each batch can use up to your data limit (%@), so it counts against "
+                    "your plan. Never in Low Power Mode or Low Data Mode, and only after you've downloaded once "
+                    "yourself. Download Now works on any connection.",
+                    ApolloOfflineBudgetText((NSInteger)(controller.budgetBytes / (1000 * 1000)))];
         case ApolloOfflineSectionFeeds:
             return @"Saved Posts works as your offline archive: save a post in Apollo (swipe or the post menu) and "
                     "every download keeps it, with its comments, images and video, even after you've read it. "
@@ -210,8 +213,15 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
             cell.accessoryType = (NSInteger)controller.useMode == indexPath.row ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
             return cell;
         }
-        case ApolloOfflineSectionAutomatic:
-            return [self switchCellWithTitle:@"Keep Fresh on Wi-Fi" key:UDKeyOfflineAutoRefresh];
+        case ApolloOfflineSectionAutomatic: {
+            if (indexPath.row == 0) return [self switchCellWithTitle:@"Keep Fresh" key:UDKeyOfflineAutoRefresh];
+            // Only matters while Keep Fresh is on.
+            UITableViewCell *cell = [self switchCellWithTitle:@"Use Cellular Data" key:UDKeyOfflineAutoRefreshCellular];
+            BOOL keepFresh = [self.defaults boolForKey:UDKeyOfflineAutoRefresh];
+            ((UISwitch *)cell.accessoryView).enabled = keepFresh;
+            cell.textLabel.enabled = keepFresh;
+            return cell;
+        }
         case ApolloOfflineSectionFeeds: {
             if (indexPath.row == ApolloOfflineFeedRowSaved) return [self switchCellWithTitle:@"Saved Posts" key:UDKeyOfflineIncludeSaved];
             if (indexPath.row == ApolloOfflineFeedRowHome) return [self switchCellWithTitle:@"Home" key:UDKeyOfflineIncludeHome];
@@ -240,7 +250,15 @@ static NSString *ApolloOfflineBudgetText(NSInteger mb) {
 #pragma mark - Actions
 
 - (void)switchChanged:(UISwitch *)toggle {
-    [self.defaults setBool:toggle.on forKey:toggle.accessibilityIdentifier];
+    NSString *key = toggle.accessibilityIdentifier;
+    [self.defaults setBool:toggle.on forKey:key];
+    if ([key isEqualToString:UDKeyOfflineAutoRefresh] || [key isEqualToString:UDKeyOfflineAutoRefreshCellular]) {
+        if ([key isEqualToString:UDKeyOfflineAutoRefresh]) {
+            [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:ApolloOfflineSectionAutomatic]
+                          withRowAnimation:UITableViewRowAnimationNone];
+        }
+        [self.controller considerKeepFresh:@"setting"];
+    }
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {

@@ -313,7 +313,15 @@ static void TestAutoRefreshPolicy(void) {
     t = s; t.hasLibrary = NO;
     CHECK(!ApolloOfflineShouldAutoRefresh(t), "never before a first manual download");
     t = s; t.onWiFi = NO;
-    CHECK(!ApolloOfflineShouldAutoRefresh(t), "never on cellular");
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "not on cellular by default");
+    t.allowCellular = YES;
+    CHECK(ApolloOfflineShouldAutoRefresh(t), "on cellular once Use Cellular Data is on");
+    t.lowDataMode = YES;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "never in Low Data Mode, even with cellular allowed");
+    t = s; t.lowDataMode = YES;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "never on a Low Data Mode Wi-Fi network");
+    t = s; t.networkAvailable = NO; t.onWiFi = NO; t.allowCellular = YES;
+    CHECK(!ApolloOfflineShouldAutoRefresh(t), "cellular allowed but no connection");
     t = s; t.lowPowerMode = YES;
     CHECK(!ApolloOfflineShouldAutoRefresh(t), "never in Low Power Mode");
     t = s; t.serving = YES;

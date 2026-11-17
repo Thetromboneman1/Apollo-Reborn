@@ -31,6 +31,7 @@
 // Safari's view while serving).
 
 #import <AVFoundation/AVFoundation.h>
+#import <Network/Network.h>
 #import <Foundation/Foundation.h>
 #import <SystemConfiguration/SystemConfiguration.h>
 #import <UIKit/UIKit.h>
@@ -325,6 +326,8 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
     ApolloOfflineDownloader *_downloader;
     UIBackgroundTaskIdentifier _backgroundTask;
     NSTimer *_keepFreshTimer;
+    nw_path_monitor_t _pathMonitor; // Low Data Mode, which reachability can't see
+    BOOL _lowDataMode;
     CFAbsoluteTime _lastAutoAttempt;
     BOOL _restoreIdleTimer;
 }
@@ -352,6 +355,7 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
             UDKeyOfflineIncludeSaved: @YES,
             UDKeyOfflineBudgetMB: @100,
             UDKeyOfflineAutoRefresh: @YES,
+            UDKeyOfflineAutoRefreshCellular: @NO,
             UDKeyOfflineSkipRead: @YES,
         }];
     }
@@ -396,6 +400,12 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
         [weakSelf considerKeepFresh:@"timer"];
     }];
     _keepFreshTimer.tolerance = 60;
+    _pathMonitor = nw_path_monitor_create();
+    nw_path_monitor_set_queue(_pathMonitor, dispatch_get_main_queue());
+    nw_path_monitor_set_update_handler(_pathMonitor, ^(nw_path_t path) {
+        [weakSelf lowDataModeChanged:nw_path_is_constrained(path)];
+    });
+    nw_path_monitor_start(_pathMonitor);
     [self considerKeepFresh:@"launch"];
 }
 
@@ -413,11 +423,21 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
     [self considerKeepFresh:@"connectivity"];
 }
 
+- (void)lowDataModeChanged:(BOOL)constrained {
+    if (constrained == _lowDataMode) return;
+    _lowDataMode = constrained;
+    ApolloLog(@"[Offline] Low Data Mode %@", constrained ? @"on" : @"off");
+    [self considerKeepFresh:@"low data mode"];
+}
+
 // MARK: Keep Fresh
 
 - (void)considerKeepFresh:(NSString *)reason {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
-    if (_downloading || !_onWiFi) return; // cheap early outs before reading the read history
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL allowCellular = [defaults boolForKey:UDKeyOfflineAutoRefreshCellular];
+    // Cheap early outs before reading the read history.
+    if (_downloading || !_networkAvailable || _lowDataMode || (!_onWiFi && !allowCellular)) return;
     ApolloOfflineLibrary *library = [ApolloOfflineLibrary sharedLibrary];
     NSArray<NSString *> *saved = library.savedPostIDs;
     double readFraction = 0;
@@ -427,21 +447,23 @@ static NSSet<NSString *> *ApolloOfflineReadPostIDs(void) {
         readFraction = (double)readSaved.count / saved.count;
     }
     ApolloOfflineAutoRefreshState state = {
-        .enabled = [NSUserDefaults.standardUserDefaults boolForKey:UDKeyOfflineAutoRefresh],
+        .enabled = [defaults boolForKey:UDKeyOfflineAutoRefresh],
         .hasLibrary = library.hasContent,
         .libraryAge = library.downloadedAt ? -library.downloadedAt.timeIntervalSinceNow : DBL_MAX,
         .readFraction = readFraction,
         .networkAvailable = _networkAvailable,
         .onWiFi = _onWiFi,
+        .allowCellular = allowCellular,
         .lowPowerMode = NSProcessInfo.processInfo.lowPowerModeEnabled,
+        .lowDataMode = _lowDataMode,
         .serving = _serving,
         .downloading = _downloading,
         .sinceLastAttempt = _lastAutoAttempt > 0 ? CFAbsoluteTimeGetCurrent() - _lastAutoAttempt : DBL_MAX,
     };
     if (!ApolloOfflineShouldAutoRefresh(state)) return;
     _lastAutoAttempt = CFAbsoluteTimeGetCurrent();
-    ApolloLog(@"[Offline] Keep Fresh: batch is %.0f min old, %.0f%% read, on Wi-Fi (%@); refreshing",
-              state.libraryAge / 60, readFraction * 100, reason);
+    ApolloLog(@"[Offline] Keep Fresh: batch is %.0f min old, %.0f%% read, on %@ (%@); refreshing",
+              state.libraryAge / 60, readFraction * 100, _onWiFi ? @"Wi-Fi" : @"cellular", reason);
     [self startDownloadAutomatically:YES completion:nil];
 }
 

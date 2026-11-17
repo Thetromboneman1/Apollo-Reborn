@@ -29,6 +29,8 @@ BOOL ApolloOfflineModeIsServing(void);
 // The running download was started by Keep Fresh, not by the user.
 @property (nonatomic, readonly) BOOL downloadingAutomatically;
 @property (nonatomic, readonly) BOOL onWiFi;
+// Re-checks whether Keep Fresh should refresh now (after a setting changes).
+- (void)considerKeepFresh:(NSString *)reason;
 @property (nonatomic, readonly) BOOL networkAvailable;
 // YES while saved entries are answering requests.
 @property (nonatomic, readonly) BOOL serving;

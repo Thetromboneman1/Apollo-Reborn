@@ -143,8 +143,10 @@ typedef struct {
     NSTimeInterval libraryAge;      // seconds since the last batch
     double readFraction;            // share of the batch's posts already read (0...1)
     BOOL networkAvailable;
-    BOOL onWiFi;                    // never on cellular
+    BOOL onWiFi;
+    BOOL allowCellular;             // the user's "Use Cellular Data" setting
     BOOL lowPowerMode;
+    BOOL lowDataMode;               // the current network is in Low Data Mode
     BOOL serving;                   // the library is answering requests
     BOOL downloading;
     NSTimeInterval sinceLastAttempt; // seconds since the last automatic try

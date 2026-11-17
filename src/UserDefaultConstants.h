@@ -769,6 +769,8 @@ static NSString *const UDKeyOfflineBudgetMB = @"OfflineBudgetMB";
 // Keep Fresh: re-download the batch on its own while Apollo is open on Wi-Fi,
 // hourly or once half of it is read (default on; only after a first download).
 static NSString *const UDKeyOfflineAutoRefresh = @"OfflineAutoRefresh";
+// Let Keep Fresh run on cellular too, not just Wi-Fi (default off).
+static NSString *const UDKeyOfflineAutoRefreshCellular = @"OfflineAutoRefreshCellular";
 // Leave posts the user has already read out of downloads (default on).
 static NSString *const UDKeyOfflineSkipRead = @"OfflineSkipRead";
 // Legacy NSUserDefaults location of the harvested "name=value; ..." Cookie
