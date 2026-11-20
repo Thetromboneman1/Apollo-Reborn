@@ -1,0 +1,85 @@
+#import <UIKit/UIKit.h>
+
+__BEGIN_DECLS
+
+/// YES when UIKit visibly presents Apollo's tab bar as a trailing side rail.
+BOOL ApolloDuoRailHasVisibleSideBar(void);
+
+/// Live Duo mode for the app window: Phone / Closed / Open.
+int ApolloDuoCurrentMode(void);
+
+/// Device capability independent of pose, visible bars, and Liquid Glass.
+/// Main-thread callers update it; background callers only read the last result.
+BOOL ApolloDuoDeviceDetected(void);
+
+/// Stable Duo capability, independent of whether its rail is currently hidden
+/// or detached during a fold. Legacy (non-glass) app scenes return NO.
+BOOL ApolloDuoUsesAdaptiveBars(void);
+
+/// Scroll hiding/swipe navigation applies only to Duo's bottom tab bar in
+/// unfolded portrait. Other devices keep their existing policy.
+BOOL ApolloDuoAllowsTabBarScrollHiding(void);
+
+/// The active vertical division (book-posture fold) reserved region, converted
+/// into `view`'s coordinates, or CGRectNull when there is none. Use this for
+/// layout decisions: Apple's guidance is to lay out from the arrangement and
+/// reserved-region APIs, keeping hinge readings for live effects only.
+CGRect ApolloDuoActiveVerticalDivision(UIView *view);
+
+/// Active tabletop division in this view's coordinates; CGRectNull when flat.
+CGRect ApolloDuoActiveHorizontalDivision(UIView *view);
+
+/// The vertical division in `view`'s coordinates, read from the app window
+/// while `view` is off screen (an unselected tab).
+CGRect ApolloDuoLayoutVerticalDivision(UIView *view);
+
+/// Posted (object: the window) when that window's division region changes.
+/// Fold-dependent layout listens for this instead of the hinge.
+FOUNDATION_EXTERN NSNotificationName const ApolloDuoFoldDidChangeNotification;
+
+/// Starts `window`'s fold tracker, once per window (no-op before iOS 27.1).
+void ApolloDuoTrackFold(UIWindow *window);
+
+/// Refresh the cached window mode without changing UIKit's tab bar.
+void ApolloDuoRailSync(void);
+
+/// Moves Apollo's tab bar pan back beside the Liquid Lens after the Duo moves
+/// its bars. Defined in ApolloLiquidGlass.xm.
+void ApolloTabBarSwipeScheduleLensCheck(UITabBarController *tabBarController);
+
+/// Mark Apollo's Texture feed tables before a navigation push measures them.
+void ApolloDuoRailPrepareFeedContent(UIViewController *controller);
+CGFloat ApolloDuoRailFeedContentWidth(UITableView *table);
+
+/// Commit Texture node widths and row heights after a column safe-area change,
+/// retaining the top visible row. No-op when the usable width has not changed.
+void ApolloDuoRailPrepareTableForTransition(UITableView *table);
+
+/// Refresh native tab layout after Apollo replaces or retints its glyphs.
+void ApolloDuoRailRefreshGlyphs(void);
+
+/// Keep the feed scroll indicator at the physical trailing screen edge.
+void ApolloDuoRailAlignFeedScrollIndicator(UIScrollView *scrollView);
+
+/// Pin the closed-display alphabet index beside the native trailing rail.
+void ApolloDuoRailPinSectionIndex(UITableView *tableView);
+
+/// YES on the compact Duo cover display. Regular iPhones return NO.
+BOOL ApolloDuoCoverChromeIsActive(void);
+
+/// Cover content geometry, including when UIKit reports a regular width or
+/// exposes only the active UIScreen. Uses Duo capability and live fold size.
+BOOL ApolloDuoUsesCoverContentInsets(void);
+
+/// YES for views in the account sheet while it sits below the trailing rail
+/// (not the large detent). The sheet clears the rail from their safe area, so
+/// title centering must not reserve it either. Defined in the account switcher.
+BOOL ApolloIsAccountSheetContent(UIView *view);
+
+/// Keep the comments jump button clear of Duo's system chrome and tab rail.
+void ApolloDuoCoverAdjustJumpButton(UIViewController *comments);
+
+/// Keep Hide Read Posts inside its feed pane and clear of the trailing rail.
+void ApolloDuoRailAdjustHideReadButton(UIViewController *posts);
+
+__END_DECLS

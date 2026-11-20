@@ -1,0 +1,5336 @@
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <math.h>
+#import <stdint.h>
+#import <stdlib.h>
+#import "ApolloAppIcon.h"
+#import "ApolloCommon.h"
+#import "ApolloMemoryDiagnostics.h"
+#import "ApolloDuoUIKitCompatibility.h"
+#import "ApolloDuoSplitView.h"
+#import "ApolloBarkNotifications.h"
+#import "ApolloLiquidGlassIconIDs.h"
+#import "ApolloLiquidGlassIconSelectionState.h"
+#import "ApolloLiquidGlassSpotlight.h"
+#import "ApolloThemeRuntime.h"
+#import "settings/ApolloSettingsTableViewController.h"
+
+// MARK: - Liquid Glass App Icon Picker
+//
+// Reorganizes Apollo's App Icon picker
+// (_TtC6Apollo29SettingsAppIconViewController). Liquid Glass content is driven
+// by liquid-glass/icons.json via the generated `kLGIconGroups[]` table:
+//
+//   • A "Featured" section — six compact icon cards selected from the full
+//     Liquid Glass registry by a deterministic daily shuffle. The choices stay
+//     stable for the local calendar day and require no network connection.
+//     During a holiday window from icons.json "seasons" (Halloween, Christmas,
+//     ...), its icons take 2, then 3, then all five cards in the final week,
+//     and the header names the holiday. See ApolloLiquidGlassSpotlight.m.
+//   • An adaptive grid of tappable "icon pack" cards (fanned sample artwork +
+//     title + icon count) — one card per group in icons.json. Tapping a card
+//     pushes LGGroupIconsViewController, a 2-up (adaptive on wider screens)
+//     grid of every icon in that group, optionally headed by the group's
+//     description. See LGPackGridRowCell / LGGroupIconsViewController.
+//   • A matching "Standard Icon Packs" card grid for Apollo Originals,
+//     Community, Ultra, and Sekrit. The retired SPCA support row is removed;
+//     its icon now lives in Ultra with the other selectable icons.
+//
+// Featured cards preview the light and dark renditions as an overlapping fan.
+// Pack cards use three of the group's cover icons so each pack remains easy to
+// recognize before opening it.
+//
+// Adding/reordering a group, cover art, description, or an icon's designer
+// only requires editing icons.json and running `make lg-previews`
+// (+ `rebuild_assets.py` for new icon assets) — no source changes needed.
+//
+// The hook self-disables on un-patched IPAs by checking CFBundleAlternateIcons
+// and looking for the entry for the `primaryIconID` key from icons.json.
+
+static NSString *const kLGGridCellReuseID       = @"ApolloLGIconGridCell";
+static NSString *const kLGPackGridRowReuseID    = @"ApolloLGPackGridRow";
+static NSString *const kLGStandardPackGridRowReuseID = @"ApolloLGStandardPackGridRow";
+static NSString *const kLGFeaturedStripReuseID  = @"ApolloLGFeaturedStrip";
+static NSString *const kLGDescriptionHeaderReuseID = @"ApolloLGDescriptionHeader";
+static NSString *const kLGSectionBrandTitle   = @"Liquid Glass Icon Packs";
+static NSString *const kLGStandardSectionTitle = @"Standard Icon Packs";
+static NSString *const kLGFeaturedSectionTitle = @"Daily Spotlight";
+static NSString *const kLGChangedIconNotification = @"com.christianselig.ChangedAppIcon";
+static NSString *const kLGLightIconSuffix = @"__apollo_light";
+static NSString *const kLGDarkIconSuffix  = @"__apollo_dark";
+static NSString *const kLGAppearancePreferenceDefaultsKey = @"ApolloLGPreferredIconAppearance";
+static NSString *const kLGActiveStandardPackDefaultsKey = @"ApolloLGActiveStandardPack";
+static NSString *const kLGActiveStandardPackRowDefaultsKey = @"ApolloLGActiveStandardPackRow";
+static NSString *const kLGActiveStandardAddedIconIDDefaultsKey = @"ApolloLGActiveStandardAddedIconID";
+static NSString *const kLGConfirmedDefaultIconMarker = @"__apollo_confirmed_default";
+static NSString *const kLGLegacyClassicsMigrationDefaultsKey = @"ApolloLGLegacyClassicsMigrationV1";
+static NSString *const kLGDailyFeaturedDayDefaultsKey = @"ApolloLGDailyFeaturedDay";
+static NSString *const kLGDailyFeaturedIDsDefaultsKey = @"ApolloLGDailyFeaturedIDs";
+static const NSInteger kLGAppearanceBarButtonTag = 0x4C474150; // "LGAP"
+static char kLGAppearanceBarButtonKey;
+
+// Featured strip (main screen, above the pack cards). One horizontal row
+// replaces several full-width table rows while keeping every icon directly
+// selectable.
+static const CGFloat kLGFeaturedStripHeight = 130.0;
+static const CGFloat kLGFeaturedCardWidth   = 128.0;
+static const CGFloat kLGFeaturedCardHeight  = 112.0;
+static const CGFloat kLGFeaturedFanSide     = 64.0;
+static const NSInteger kLGDailyFeaturedCount = 6;
+
+// Rendition fan (per-icon, two renditions of one appearance overlapped into
+// one square — e.g. Default's light+dark, or Clear's light+dark). The host
+// square's side is NOT fixed here — it's driven by the parent stack view's
+// FillEqually distribution (see LGIconFanView) so it adapts to card width;
+// the two thumbnails inside are sized as a fraction of that host square.
+static const CGFloat kLGRenditionFanThumbFraction = 0.72;   // thumb side, as a fraction of the host square
+static const CGFloat kLGRenditionFanCornerRatio   = 0.2237; // squircle corner radius, as a fraction of thumb side
+static const CGFloat kLGRenditionFanFrontRotation = -0.09;  // radians
+static const CGFloat kLGRenditionFanBackRotation  =  0.13;  // radians
+static const CGFloat kLGSingleRenditionThumbFraction = 0.86; // one-rendition (Standard-pack) icons
+
+// Icon grid cell (pushed pack screen).
+static const CGFloat kLGGridFanPairSpacing = 8.0;
+static const CGFloat kLGCardCorner          = 14.0;
+static const CGFloat kLGGridSpacing             = 12.0;
+static const CGFloat kLGGridWideThresholdMedium = 500.0;
+static const CGFloat kLGGridWideThresholdLarge  = 800.0;
+
+// Pack cards (two to four per main-screen table row). The larger thumbnails
+// and wider offsets expose substantially more of the rear cover icons than the
+// old compact list-row fan.
+static const CGFloat   kLGMainGridSpacing = 12.0;
+static const CGFloat   kLGPackCardHeight  = 160.0;
+static const NSInteger kLGFanCount        = 3;
+static const CGFloat   kLGFanThumbSide    = 58.0;
+static const CGFloat   kLGFanCorner       = 13.0;
+static const CGFloat   kLGFanOffsetX      = 29.0;
+static const CGFloat   kLGFanOffsetY      = 5.0;
+static const CGFloat   kLGFanRotationStep = 0.08;
+static const CGFloat   kLGMainGridThreeColumnWidth = 650.0;
+static const CGFloat   kLGMainGridFourColumnWidth  = 900.0;
+static const NSTimeInterval kLGIconHapticWarmupDelay = 0.03;
+static const NSTimeInterval kLGIconTransitionDelay = 0.06;
+
+typedef struct {
+    CFTimeInterval beganAt;
+    NSUInteger generation;
+} LGPressAnimationState;
+
+static char kLGIconSelectionFeedbackKey;
+static char kLGAppearanceSelectionFeedbackKey;
+static char kLGCommunitySelectionReplayKey;
+static char kLGCommunityCardBackgroundColorKey;
+static char kLGPickerCardBackgroundColorKey;
+static char kLGNativeIconCellSelectedKey;
+static char kLGNativeIconCellCheckBadgeKey;
+static char kLGNativeIconCellPressAnimationKey;
+static char kLGNativeIconCellCardFillKey;
+// UIKit invokes every entry point below on the main thread, and the setter's
+// callback is explicitly marshalled back there. One process-wide operation is
+// therefore enough to prevent delayed, appearance, Default, and native-row
+// selections from racing each other's persisted state.
+static BOOL sLGIconChangeInProgress;
+static NSUInteger sLGIconChangeGeneration;
+
+static BOOL LGIconChangeHostIsReady(UIView *hostView) {
+    return hostView.window != nil &&
+        UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+}
+
+static NSUInteger LGBeginIconChange(UIView *hostView) {
+    if (sLGIconChangeInProgress || !LGIconChangeHostIsReady(hostView)) return 0;
+    sLGIconChangeInProgress = YES;
+    sLGIconChangeGeneration++;
+    if (sLGIconChangeGeneration == 0) sLGIconChangeGeneration++;
+    return sLGIconChangeGeneration;
+}
+
+static BOOL LGIconChangeIsCurrent(NSUInteger generation) {
+    return generation != 0 && sLGIconChangeInProgress && generation == sLGIconChangeGeneration;
+}
+
+static void LGFinishIconChange(NSUInteger generation) {
+    if (!LGIconChangeIsCurrent(generation)) return;
+    sLGIconChangeInProgress = NO;
+}
+
+static UIImpactFeedbackGenerator *LGIconSelectionFeedback(UIView *hostView) {
+    if (!hostView) return nil;
+    UIImpactFeedbackGenerator *feedback = objc_getAssociatedObject(hostView, &kLGIconSelectionFeedbackKey);
+    if (feedback) return feedback;
+
+    if (@available(iOS 17.5, *)) {
+        feedback = [UIImpactFeedbackGenerator feedbackGeneratorWithStyle:UIImpactFeedbackStyleMedium
+                                                                  forView:hostView];
+    } else {
+        feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    }
+    objc_setAssociatedObject(hostView, &kLGIconSelectionFeedbackKey, feedback, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return feedback;
+}
+
+static UISelectionFeedbackGenerator *LGAppearanceSelectionFeedback(UIView *hostView) {
+    if (!hostView) return nil;
+    UISelectionFeedbackGenerator *feedback = objc_getAssociatedObject(hostView, &kLGAppearanceSelectionFeedbackKey);
+    if (feedback) return feedback;
+
+    if (@available(iOS 17.5, *)) {
+        feedback = [UISelectionFeedbackGenerator feedbackGeneratorForView:hostView];
+    } else {
+        feedback = [[UISelectionFeedbackGenerator alloc] init];
+    }
+    objc_setAssociatedObject(hostView, &kLGAppearanceSelectionFeedbackKey, feedback, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return feedback;
+}
+
+static UIView *LGIconSelectionHapticHost(UIView *view) {
+    for (UIView *candidate = view; candidate; candidate = candidate.superview) {
+        if ([candidate isKindOfClass:UICollectionView.class] ||
+            [candidate isKindOfClass:UITableView.class]) {
+            return candidate;
+        }
+    }
+    return view;
+}
+
+static void LGPrepareIconSelectionHaptic(UIView *sourceView) {
+    [LGIconSelectionFeedback(LGIconSelectionHapticHost(sourceView)) prepare];
+}
+
+// Apollo's native icon rows perform their own icon-setting work, so they
+// cannot use LGApplyIconUsingPreferredAppearance below. Keep their feedback
+// on the same timing as our Liquid Glass cards: wake the engine, play the
+// completed-tap impact, then allow the native icon transition to begin.
+static void LGPerformNativeIconSelectionWithFeedback(UIView *hostView,
+                                                       dispatch_block_t selection) {
+    NSUInteger generation = LGBeginIconChange(hostView);
+    if (!generation) {
+        ApolloLog(@"[LGIconPicker] ignoring overlapping or inactive native icon selection");
+        return;
+    }
+
+    UIImpactFeedbackGenerator *feedback = LGIconSelectionFeedback(hostView);
+    [feedback prepare];
+    __weak UIView *weakHost = hostView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(kLGIconHapticWarmupDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!LGIconChangeIsCurrent(generation)) return;
+        [feedback impactOccurred];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(kLGIconTransitionDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIView *strongHost = weakHost;
+            if (!LGIconChangeIsCurrent(generation) || !LGIconChangeHostIsReady(strongHost)) {
+                LGFinishIconChange(generation);
+                return;
+            }
+            // Release our short feedback gate before entering Apollo's native
+            // setter. The hooked source controller uses the same gate to
+            // reject genuinely overlapping icon changes.
+            LGFinishIconChange(generation);
+            if (selection) selection();
+            [feedback prepare];
+        });
+    });
+}
+
+static void LGSetPressAnimationHighlighted(UIView *view, LGPressAnimationState *state, BOOL highlighted) {
+    if (!view || !state) return;
+    state->generation++;
+    if (highlighted) {
+        state->beganAt = CACurrentMediaTime();
+        [view.layer removeAllAnimations];
+        view.transform = CGAffineTransformMakeScale(0.97, 0.97);
+        return;
+    }
+
+    // A quick tap can begin and end within one display frame. Hold the
+    // compressed state just long enough to render before springing back;
+    // longer presses still release immediately.
+    CFTimeInterval elapsed = CACurrentMediaTime() - state->beganAt;
+    NSTimeInterval delay = MAX(0.0, 0.08 - elapsed);
+    NSUInteger generation = state->generation;
+    __weak UIView *weakView = view;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *strongView = weakView;
+        if (!strongView || generation != state->generation) return;
+        [UIView animateWithDuration:0.32
+                              delay:0
+             usingSpringWithDamping:0.72
+              initialSpringVelocity:0.6
+                            options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                         animations:^{ strongView.transform = CGAffineTransformIdentity; }
+                         completion:nil];
+    });
+}
+
+static void LGResetPressAnimation(UIView *view, LGPressAnimationState *state) {
+    if (!view || !state) return;
+    state->generation++;
+    [view.layer removeAllAnimations];
+    view.transform = CGAffineTransformIdentity;
+}
+
+@interface LGPressAnimationBox : NSObject {
+@public
+    LGPressAnimationState _state;
+}
+@end
+
+@implementation LGPressAnimationBox
+@end
+
+static LGPressAnimationState *LGNativeIconCellPressAnimation(UITableViewCell *cell) {
+    LGPressAnimationBox *box = objc_getAssociatedObject(cell, &kLGNativeIconCellPressAnimationKey);
+    if (!box) {
+        box = [[LGPressAnimationBox alloc] init];
+        objc_setAssociatedObject(cell, &kLGNativeIconCellPressAnimationKey, box,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return &box->_state;
+}
+
+static UIFont *LGPackTitleFont(void) {
+    UIFont *base = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    return [[UIFontMetrics metricsForTextStyle:UIFontTextStyleHeadline]
+        scaledFontForFont:base maximumPointSize:22.0];
+}
+
+static UIFont *LGPackCountFont(void) {
+    UIFont *base = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    return [[UIFontMetrics metricsForTextStyle:UIFontTextStyleCaption1]
+        scaledFontForFont:base maximumPointSize:16.0];
+}
+
+static CGFloat LGPackGridRowHeight(void) {
+    UIFont *title = LGPackTitleFont();
+    UIFont *count = LGPackCountFont();
+    CGFloat extra = MAX(0.0, title.lineHeight - [UIFont systemFontOfSize:16].lineHeight)
+                  + MAX(0.0, count.lineHeight - [UIFont systemFontOfSize:11].lineHeight);
+    // At larger text sizes a long pack title may wrap onto its second line.
+    if (title.pointSize > 16.5) extra += title.lineHeight;
+    return ceil(kLGPackCardHeight + extra + kLGMainGridSpacing);
+}
+
+static CGFloat LGPackFanTopInset(void) {
+    return 24.0;
+}
+
+#pragma mark - Generated group/icon data
+
+#include "LiquidGlassIconPreviews.gen.h"
+#import "ApolloClasses.h"
+
+static NSString *LGPrimaryIconID(void) {
+    static NSString *s;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = @(kLGPrimaryIconIDCString); });
+    return s;
+}
+
+// Grid/featured cells reconfigure with the same handful of icons repeatedly
+// as they're recycled during scrolling. UIImage's own asset-catalog cache
+// keeps the compressed source around, but the actual pixel decode normally
+// happens lazily the first time each recycled cell draws it — on the main
+// thread, during scroll. Caching the *decoded* bitmap here means only the
+// very first appearance of a given icon+variant pays that cost; every
+// re-appearance (the common case while scrolling back and forth) is a plain
+// cache hit.
+static UIImage *LGPreviewImage(NSString *iconID, NSString *variant) {
+    if (!iconID || !variant) return nil;
+    // Preview imagesets are compiled into the app's Assets.car by rebuild_assets.py
+    // as named imagesets (lg-preview-{iconID}-{variant}).
+    NSString *name = [NSString stringWithFormat:@"lg-preview-%@-%@", iconID, variant];
+
+    static NSCache<NSString *, UIImage *> *sDecodedCache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // 52pt previews, one picker screenful at a time.
+        sDecodedCache = [[NSCache alloc] init];
+        sDecodedCache.countLimit = 60;
+        sDecodedCache.totalCostLimit = 4 * 1024 * 1024;
+        ApolloMemoryRegisterPurgableCache(@"icon-picker-previews", sDecodedCache);
+    });
+
+    UIImage *cached = [sDecodedCache objectForKey:name];
+    if (cached) return cached;
+
+    UIImage *image = ApolloAppIconPreview(iconID, variant);
+    if (!image) return nil;
+
+    UIGraphicsImageRendererFormat *format = UIGraphicsImageRendererFormat.preferredFormat;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:image.size format:format];
+    UIImage *decoded = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [image drawAtPoint:CGPointZero];
+    }];
+
+    [sDecodedCache setObject:decoded forKey:name cost:ApolloImageByteCost(decoded)];
+    return decoded;
+}
+
+#pragma mark - Appearance helper
+
+// A view's own -traitCollection can lag or go stale across repeated
+// appearance toggles (observed: fine on the first toggle, inverted on every
+// toggle after — a per-view trait-resolution caching/propagation-timing
+// quirk, not something we can fix by tweaking when we reload). The window
+// is the root of the trait-propagation cascade — traits flow FROM it DOWN
+// to subviews — so it's always updated first and reading from it directly
+// sidesteps the whole class of timing bugs. Falls back to the view's own
+// trait collection only when it isn't in a window yet (e.g. first configure
+// of a cell before insertion, where there's no "previous" state to race).
+static BOOL LGIsDarkAppearance(UIView *view) {
+    UITraitCollection *tc = view.window.traitCollection ?: view.traitCollection;
+    return tc.userInterfaceStyle == UIUserInterfaceStyleDark;
+}
+
+#pragma mark - Theme background helpers
+
+// objc_getClass: these two classes are declared later in this file.
+
+// Sample an already-themed native cell, same trick as
+// apollo_themeCellBackgroundColor in ApolloSettingsTableViewController.m.
+// Only used while sourceTable is live — see LGThemedCardBackgroundColor.
+static UIColor *LGNativeCellBackgroundColor(UITableView *sourceTable) {
+    if (ApolloThemeSourceTableIsStale(sourceTable)) return nil;
+
+    Class packCardClass = ApolloClassLGPackGridRowCell;
+    Class featuredClass = ApolloClassLGFeaturedStripCell;
+    for (UITableViewCell *cell in sourceTable.visibleCells) {
+        if ((packCardClass && [cell isKindOfClass:packCardClass]) ||
+            (featuredClass && [cell isKindOfClass:featuredClass])) continue;
+        UIColor *color = cell.backgroundColor ?: cell.contentView.backgroundColor;
+        if (color) return color;
+    }
+    return nil;
+}
+
+// A table's backgroundColor is set once for the whole table, so it's
+// already correct as soon as sourceTable exists.
+static UIColor *LGThemedPageBackgroundColor(UITableView *sourceTable) {
+    return sourceTable.backgroundColor
+        ?: ApolloThemeRuntimeColor(ApolloThemeTokenBackground)
+        ?: UIColor.systemGroupedBackgroundColor;
+}
+
+// sourceTable should be an already-rendered table one level up the nav
+// stack (see ApolloInheritedSettingsThemeSourceTableView), not the table
+// currently being built — otherwise there's no native cell yet to sample.
+// ApolloThemeCardBackgroundColor() handles the stale/no-sample case,
+// including stock themes and Pure Black Dark Mode.
+static UIColor *LGThemedCardBackgroundColor(UITableView *sourceTable) {
+    return LGNativeCellBackgroundColor(sourceTable)
+        ?: ApolloThemeCardBackgroundColor()
+        ?: UIColor.secondarySystemGroupedBackgroundColor;
+}
+
+// UIApplication.alternateIconName is unreliable on some sideloading
+// distributions (certain ad-hoc/free-developer-signed installs, Apollo
+// Reborn's main distribution path) — it can permanently report the default
+// icon even right after a successful setAlternateIconName: call. We can't
+// fix the OS API, so we track the ground truth ourselves: persist the iconID
+// every time we successfully apply one, and treat that as a fallback whenever
+// the system reports nothing.
+static NSString *const kLGActiveIconDefaultsKey = @"ApolloLGActiveIconID";
+
+// The exact CFBundleAlternateIcons name last applied successfully: an icon's
+// own name or its refresh twin (see ApolloLGRefreshIconSuffix). The choice
+// above never carries the twin suffix; this records which of the two
+// registrations iOS holds, since alternateIconName can't say on every install.
+static NSString *const kLGAppliedIconNameDefaultsKey = @"ApolloLGAppliedIconName";
+
+typedef NS_ENUM(NSInteger, LGIconAppearanceMode) {
+    LGIconAppearanceModeLight,
+    LGIconAppearanceModeDark,
+    LGIconAppearanceModeDynamic,
+};
+
+static NSString *LGBaseIconIDFromAlternateIconName(NSString *name) {
+    name = ApolloLGCanonicalAlternateIconName(name);
+    if ([name hasSuffix:kLGLightIconSuffix]) {
+        return [name substringToIndex:name.length - kLGLightIconSuffix.length];
+    }
+    if ([name hasSuffix:kLGDarkIconSuffix]) {
+        return [name substringToIndex:name.length - kLGDarkIconSuffix.length];
+    }
+    return name;
+}
+
+static LGIconAppearanceMode LGAppearanceModeFromAlternateIconName(NSString *name) {
+    name = ApolloLGCanonicalAlternateIconName(name);
+    if ([name hasSuffix:kLGLightIconSuffix]) return LGIconAppearanceModeLight;
+    if ([name hasSuffix:kLGDarkIconSuffix]) return LGIconAppearanceModeDark;
+    return LGIconAppearanceModeDynamic;
+}
+
+static NSString *LGAlternateIconNameForMode(NSString *iconID, LGIconAppearanceMode mode) {
+    switch (mode) {
+        case LGIconAppearanceModeLight:
+            return [iconID stringByAppendingString:kLGLightIconSuffix];
+        case LGIconAppearanceModeDark:
+            return [iconID stringByAppendingString:kLGDarkIconSuffix];
+        case LGIconAppearanceModeDynamic:
+            return iconID;
+    }
+    return iconID;
+}
+
+// Translate an old Classics alternate-icon name while retaining its static
+// Light/Dark suffix. Returns nil for IDs outside the renamed Classics group.
+static NSString *LGMigratedClassicsAlternateIconName(NSString *name) {
+    if (!name.length) return nil;
+    NSString *base = LGBaseIconIDFromAlternateIconName(name);
+    NSString *migratedBase = ApolloLGMigratedClassicsIconID(base);
+    if (!migratedBase) return nil;
+    return LGAlternateIconNameForMode(migratedBase, LGAppearanceModeFromAlternateIconName(name));
+}
+
+static void LGPersistActiveIconID(NSString *iconID) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (iconID.length) {
+        [defaults setObject:iconID forKey:kLGActiveIconDefaultsKey];
+    } else {
+        // nil from a successful setter means Default. Keep an explicit marker
+        // because a missing value is ambiguous when alternateIconName itself
+        // intermittently returns nil for an alternate icon.
+        [defaults setObject:kLGConfirmedDefaultIconMarker forKey:kLGActiveIconDefaultsKey];
+    }
+    // Belt-and-suspenders flush — confirmed via a forced-kill test that the
+    // write reaches cfprefsd well before this point in practice, but there's
+    // no downside to asking explicitly.
+    [defaults synchronize];
+}
+
+static void LGClearPersistedActiveIconID(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults removeObjectForKey:kLGActiveIconDefaultsKey];
+    [defaults synchronize];
+}
+
+// nil (Default) clears the record.
+static void LGPersistAppliedIconName(NSString *name) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (name.length) {
+        [defaults setObject:name forKey:kLGAppliedIconNameDefaultsKey];
+    } else {
+        [defaults removeObjectForKey:kLGAppliedIconNameDefaultsKey];
+    }
+}
+
+// The iconID of the currently-applied alternate icon, or nil if Apollo's
+// (non-glass) default is active. Trusts the system when it reports a real
+// value; otherwise falls back to the iconID we last applied ourselves — see
+// note above on why the system API can't always be trusted here.
+//
+// Deliberately gated on .length rather than a plain `?:` against nil: if
+// alternateIconName ever reports a non-nil-but-empty string instead of a
+// clean nil (observed intermittently, not just "always nil", on some
+// sideloaded distributions), a bare `?:` would treat that empty answer as
+// authoritative and skip the persisted fallback — which reads exactly like
+// the active icon's checkmark silently reverting to Default with no
+// consistent timing, since it depends on whichever moment the flaky system
+// value happens to get read.
+static NSString *LGActiveAlternateIconName(void) {
+    // Standard-pack choices use Apollo's own icon IDs. Several overlap the
+    // pre-prefix Classics IDs (for example `morty`), so interpreting the
+    // system name while a Standard choice is saved can misclassify that icon
+    // as `LG-morty`. The explicit Standard selection is authoritative until a
+    // successful Liquid Glass/Default selection clears it.
+    if ([NSUserDefaults.standardUserDefaults objectForKey:kLGActiveStandardPackDefaultsKey]) {
+        return nil;
+    }
+    NSString *stored = [NSUserDefaults.standardUserDefaults stringForKey:kLGActiveIconDefaultsKey];
+    NSString *system = ApolloLGCanonicalAlternateIconName(UIApplication.sharedApplication.alternateIconName);
+    // Once our setter confirms a choice, that saved value is the ground truth.
+    // UIApplication can later return nil, an empty string, or even a stale
+    // non-empty icon name while the Home Screen still displays the saved icon.
+    // Only seed from the system for users who have no picker-owned state yet.
+    if (!stored.length && system.length) {
+        LGPersistActiveIconID(system);
+        stored = system;
+    }
+    NSString *active = stored.length ? stored : system;
+
+    // Translate for display immediately, but leave persistence to the
+    // launch-time migration. That migration applies the new catalog key to
+    // iOS first and only saves it after the setter confirms success.
+    return LGMigratedClassicsAlternateIconName(active) ?: active;
+}
+
+static NSString *LGActiveIconID(void) {
+    NSString *active = LGActiveAlternateIconName();
+    if ([active isEqualToString:kLGConfirmedDefaultIconMarker]) return nil;
+    return LGBaseIconIDFromAlternateIconName(active);
+}
+
+static BOOL LGDefaultIconIsConfirmed(void) {
+    if (UIApplication.sharedApplication.alternateIconName.length) return NO;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if ([defaults objectForKey:kLGActiveStandardPackDefaultsKey]) return NO;
+    return [[defaults stringForKey:kLGActiveIconDefaultsKey]
+        isEqualToString:kLGConfirmedDefaultIconMarker];
+}
+
+static LGIconAppearanceMode LGPreferredAppearanceMode(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSNumber *stored = [defaults objectForKey:kLGAppearancePreferenceDefaultsKey];
+    if ([stored isKindOfClass:[NSNumber class]]) {
+        NSInteger value = stored.integerValue;
+        if (value >= LGIconAppearanceModeLight && value <= LGIconAppearanceModeDynamic) {
+            return (LGIconAppearanceMode)value;
+        }
+    }
+
+    // Until a preference is saved, mirror the active icon's appearance.
+    NSString *activeName = LGActiveAlternateIconName();
+    return activeName.length
+        ? LGAppearanceModeFromAlternateIconName(activeName)
+        : LGIconAppearanceModeDynamic;
+}
+
+static void LGPersistPreferredAppearanceMode(LGIconAppearanceMode mode) {
+    [NSUserDefaults.standardUserDefaults setInteger:mode forKey:kLGAppearancePreferenceDefaultsKey];
+}
+
+static NSString *LGAppearanceModeTitle(LGIconAppearanceMode mode) {
+    switch (mode) {
+        case LGIconAppearanceModeLight:   return @"Light";
+        case LGIconAppearanceModeDark:    return @"Dark";
+        case LGIconAppearanceModeDynamic: return @"System";
+    }
+    return @"System";
+}
+
+static UIImage *LGAppearanceModeImage(LGIconAppearanceMode mode) {
+    switch (mode) {
+        case LGIconAppearanceModeLight:   return [UIImage systemImageNamed:@"sun.max"];
+        case LGIconAppearanceModeDark:    return [UIImage systemImageNamed:@"moon"];
+        case LGIconAppearanceModeDynamic: return [UIImage systemImageNamed:@"circle.lefthalf.filled"];
+    }
+    return nil;
+}
+
+#pragma mark - Runtime icon model
+
+typedef struct {
+    __unsafe_unretained NSString *iconID;
+    __unsafe_unretained NSString *displayName;
+    __unsafe_unretained NSString *designer;
+} LGIconRow;
+
+static NSDictionary *LGAlternateIconsForKey(NSString *key) {
+    NSDictionary *icons = NSBundle.mainBundle.infoDictionary[key];
+    if (![icons isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *alts = icons[@"CFBundleAlternateIcons"];
+    return [alts isKindOfClass:[NSDictionary class]] ? alts : nil;
+}
+
+static BOOL LGAlternateIconRegisteredInInfoPlist(NSString *iconID) {
+    if (!iconID.length) return NO;
+    return LGAlternateIconsForKey(@"CFBundleIcons")[iconID] != nil
+        || LGAlternateIconsForKey(@"CFBundleIcons~ipad")[iconID] != nil;
+}
+
+// Builds a heap-allocated LGIconRow array from a generated entry table,
+// filtering out icons not registered in the IPA's Info.plist.
+static LGIconRow *LGBuildRows(const LGIconRowEntry *entries, NSInteger entryCount,
+                              NSInteger *outCount, NSArray<NSString *> **outStorage) {
+    if (entryCount <= 0) { *outCount = 0; *outStorage = @[]; return NULL; }
+    LGIconRow *rows = (LGIconRow *)calloc((size_t)entryCount, sizeof(LGIconRow));
+    NSMutableArray<NSString *> *storage = [NSMutableArray arrayWithCapacity:(NSUInteger)(entryCount * 3)];
+    NSInteger count = 0;
+    for (NSInteger i = 0; i < entryCount; i++) {
+        NSString *iconID = @(entries[i].iconID);
+        if (!LGAlternateIconRegisteredInInfoPlist(iconID)) {
+            ApolloLog(@"[LGIconPicker] omitting icon not in Info.plist: %@", iconID);
+            continue;
+        }
+        NSString *dn = @(entries[i].displayName);
+        NSString *ds = @(entries[i].designer);
+        [storage addObject:iconID]; [storage addObject:dn]; [storage addObject:ds];
+        rows[count++] = (LGIconRow){ iconID, dn, ds };
+    }
+    *outCount   = count;
+    *outStorage = [storage copy];
+    return rows;
+}
+
+#pragma mark - Runtime group table
+
+typedef struct {
+    __unsafe_unretained NSString *groupID;
+    __unsafe_unretained NSString *title;
+    __unsafe_unretained NSString *groupDescription;
+    LGIconRow *rows;
+    NSInteger count;
+    __unsafe_unretained NSArray<NSString *> *coverIconIDs; // resolved, capped to kLGFanCount
+} LGRuntimeGroup;
+
+// Forward declaration needed by LGAlternateIconsAvailable (defined below),
+// which is called before LGInitRuntimeGroups in some paths.
+static void LGInitRuntimeGroups(void);
+
+static LGRuntimeGroup *sGroups     = NULL;
+static NSInteger        sGroupCount = 0;
+static NSArray         *sGroupStringStorage = nil;  // keeps NSStrings/NSArrays alive
+
+// Cross-group shortcuts selected from all registered Liquid Glass icons. The
+// structs borrow strings retained by sGroupStringStorage.
+static LGIconRow *sFeaturedRows  = NULL;
+static NSInteger   sFeaturedCount = 0;
+static NSInteger   sFeaturedDayIdentifier = NSNotFound;
+
+// Standard-pack icons a holiday can feature: Apollo's own icons from
+// icons.json "nativeIcons" and the tweak's Ultra additions. They are only ever
+// holiday picks, never everyday ones. `pack` is an LGStandardPack; `nativeRow`
+// is the row the Standard pack screens persist when the icon is chosen
+// (NSNotFound for the tweak's Ultra additions, which persist their icon ID).
+typedef struct {
+    LGIconRow row;
+    NSInteger pack;
+    NSInteger nativeRow;
+} LGSpotlightStandardIcon;
+
+static LGSpotlightStandardIcon *sSpotlightStandardIcons = NULL;
+static NSInteger sSpotlightStandardIconCount = 0;
+static NSArray *sSpotlightStandardStorage = nil;  // keeps the rows' NSStrings alive
+static void LGInitSpotlightStandardIcons(void);   // defined after LGStandardPack
+static NSString *LGActiveSpotlightIconID(void);   // defined after the Standard-pack state
+
+static const LGSpotlightStandardIcon *LGSpotlightStandardIconForID(NSString *iconID) {
+    if (!iconID.length) return NULL;
+    for (NSInteger i = 0; i < sSpotlightStandardIconCount; i++) {
+        if ([sSpotlightStandardIcons[i].row.iconID isEqualToString:iconID]) {
+            return &sSpotlightStandardIcons[i];
+        }
+    }
+    return NULL;
+}
+
+// The date the Spotlight is built for. Simulator builds accept a fixed date
+// (`-ApolloLGSpotlightDate 2026-10-28` launch argument) so the seasonal
+// lineups can be checked without changing the Mac's clock.
+static NSDate *LGSpotlightDate(void) {
+#if APOLLO_SIM_BUILD
+    NSString *override = [NSUserDefaults.standardUserDefaults stringForKey:@"ApolloLGSpotlightDate"];
+    if (override.length) {
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.dateFormat = @"yyyy-MM-dd";
+        NSDate *date = [formatter dateFromString:override];
+        if (date) return [date dateByAddingTimeInterval:12 * 60 * 60];
+    }
+#endif
+    return NSDate.date;
+}
+
+static NSInteger LGCurrentCalendarDayIdentifier(void) {
+    NSDateComponents *parts = [NSCalendar.currentCalendar
+        components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay
+          fromDate:LGSpotlightDate()];
+    return parts.year * 10000 + parts.month * 100 + parts.day;
+}
+
+// Holiday windows are Gregorian month/days. Read the date in the Gregorian
+// calendar explicitly: NSCalendar.currentCalendar can be Buddhist, Hebrew,
+// Japanese, etc., whose month numbers would put a window on the wrong days.
+static const LGSeasonDef *LGActiveSeason(NSInteger *outDaysUntilEnd) {
+    NSCalendar *gregorian = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
+    NSDateComponents *parts = [gregorian
+        components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay
+          fromDate:LGSpotlightDate()];
+    for (size_t i = 0; i < kLGSeasonCount; i++) {
+        const LGSeasonDef *season = &kLGSeasons[i];
+        NSInteger daysUntilEnd = ApolloLGSeasonDaysUntilEnd(parts.year, parts.month, parts.day,
+                                                            season->startMonth, season->startDay,
+                                                            season->endMonth, season->endDay);
+        if (daysUntilEnd == NSNotFound) continue;
+        if (outDaysUntilEnd) *outDaysUntilEnd = daysUntilEnd;
+        return season;
+    }
+    return NULL;
+}
+
+static NSArray<NSString *> *LGSeasonIconIDs(const char *const *iconIDs, size_t count) {
+    NSMutableArray<NSString *> *result = [NSMutableArray arrayWithCapacity:count];
+    for (size_t i = 0; i < count; i++) [result addObject:@(iconIDs[i])];
+    return result;
+}
+
+static NSSet<NSString *> *LGSeasonAllIconIDs(const LGSeasonDef *season) {
+    if (!season) return [NSSet set];
+    NSMutableSet<NSString *> *result = [NSMutableSet setWithArray:
+        LGSeasonIconIDs(season->iconIDs, season->iconIDCount)];
+    [result addObjectsFromArray:LGSeasonIconIDs(season->colorMatchIconIDs, season->colorMatchIconIDCount)];
+    return result;
+}
+
+static LGIconRow *LGFeaturedRowForID(NSString *iconID, NSInteger *groupIndex) {
+    for (NSInteger gi = 0; gi < sGroupCount; gi++) {
+        for (NSInteger ri = 0; ri < sGroups[gi].count; ri++) {
+            LGIconRow *row = &sGroups[gi].rows[ri];
+            if ([row->iconID isEqualToString:iconID]) {
+                if (groupIndex) *groupIndex = gi;
+                return row;
+            }
+        }
+    }
+    return NULL;
+}
+
+static BOOL LGApplyStoredFeaturedIDs(NSArray<NSString *> *iconIDs) {
+    if (iconIDs.count != kLGDailyFeaturedCount) return NO;
+    NSMutableSet<NSString *> *uniqueIDs = [NSMutableSet set];
+    NSMutableIndexSet *groups = [NSMutableIndexSet indexSet];
+    LGIconRow resolved[kLGDailyFeaturedCount];
+    for (NSInteger i = 0; i < kLGDailyFeaturedCount; i++) {
+        NSString *iconID = iconIDs[i];
+        NSInteger groupIndex = NSNotFound;
+        LGIconRow *row = [iconID isKindOfClass:NSString.class]
+            ? LGFeaturedRowForID(iconID, &groupIndex)
+            : NULL;
+        if (!row && [iconID isKindOfClass:NSString.class]) {
+            // A Standard-pack holiday pick counts as a pack of its own.
+            const LGSpotlightStandardIcon *standard = LGSpotlightStandardIconForID(iconID);
+            if (standard) {
+                row = (LGIconRow *)&standard->row;
+                groupIndex = sGroupCount + standard->pack;
+            }
+        }
+        if (!row || [uniqueIDs containsObject:iconID]) return NO;
+        [uniqueIDs addObject:iconID];
+        [groups addIndex:(NSUInteger)groupIndex];
+        resolved[i] = *row;
+    }
+    // Holiday picks can fill the lineup from one pack (Christmas week is all
+    // Ultra), so the three-pack rule only applies to lineups without them.
+    BOOL hasHolidayPick = [LGSeasonAllIconIDs(LGActiveSeason(NULL)) intersectsSet:uniqueIDs];
+    if (!hasHolidayPick && groups.count < MIN(3, sGroupCount)) return NO;
+    if (!sFeaturedRows) {
+        sFeaturedRows = (LGIconRow *)calloc((size_t)kLGDailyFeaturedCount, sizeof(LGIconRow));
+    }
+    memcpy(sFeaturedRows, resolved, sizeof(resolved));
+    sFeaturedCount = kLGDailyFeaturedCount;
+    return YES;
+}
+
+static NSArray<NSString *> *LGGenerateDailyFeaturedIDs(NSInteger dayIdentifier,
+                                                        NSArray<NSString *> *previousLineup,
+                                                        NSString *activeIconID) {
+    NSMutableArray<NSString *> *iconIDs = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *groupIndexes = [NSMutableArray array];
+    for (NSInteger gi = 0; gi < sGroupCount; gi++) {
+        for (NSInteger ri = 0; ri < sGroups[gi].count; ri++) {
+            [iconIDs addObject:sGroups[gi].rows[ri].iconID];
+            [groupIndexes addObject:@(gi)];
+        }
+    }
+
+    NSInteger daysUntilEnd = NSNotFound;
+    const LGSeasonDef *season = LGActiveSeason(&daysUntilEnd);
+    NSArray<NSArray<NSString *> *> *tiers = season
+        ? @[ LGSeasonIconIDs(season->iconIDs, season->iconIDCount),
+             LGSeasonIconIDs(season->colorMatchIconIDs, season->colorMatchIconIDCount) ]
+        : @[];
+    NSInteger seasonalSlots = ApolloLGSeasonalSlotCount(daysUntilEnd, kLGDailyFeaturedCount);
+    // While one holiday is on, the everyday picks skip every other holiday's
+    // own icons (no Witching Hour under "Daily Spotlight · Christmas").
+    NSMutableSet<NSString *> *otherHolidayIcons = [NSMutableSet set];
+    if (season) {
+        for (size_t i = 0; i < kLGSeasonCount; i++) {
+            if (&kLGSeasons[i] == season) continue;
+            [otherHolidayIcons addObjectsFromArray:LGSeasonIconIDs(kLGSeasons[i].iconIDs, kLGSeasons[i].iconIDCount)];
+        }
+    }
+    NSMutableDictionary<NSString *, NSNumber *> *standardGroups = [NSMutableDictionary dictionary];
+    for (NSInteger i = 0; i < sSpotlightStandardIconCount; i++) {
+        standardGroups[sSpotlightStandardIcons[i].row.iconID] = @(sGroupCount + sSpotlightStandardIcons[i].pack);
+    }
+    NSArray<NSString *> *lineup = ApolloLGSpotlightLineup(iconIDs, groupIndexes, sGroupCount,
+                                                          kLGDailyFeaturedCount, dayIdentifier,
+                                                          previousLineup ?: @[], activeIconID,
+                                                          tiers, standardGroups, otherHolidayIcons,
+                                                          seasonalSlots);
+    ApolloLog(@"[LGIconPicker] Daily Spotlight %ld: season=%s (%ld day(s) left, %ld slot(s)) lineup=%@",
+              (long)dayIdentifier, season ? season->seasonID : "none",
+              (long)(season ? daysUntilEnd : 0), (long)seasonalSlots,
+              [lineup componentsJoinedByString:@","]);
+    return lineup;
+}
+
+// The header names the holiday only when today's lineup actually features
+// its icons (a lineup stored before an update, or one whose holiday icons are
+// all unregistered on this IPA, keeps the plain title).
+static NSString *sFeaturedSeasonTitle = nil;
+
+static void LGUpdateFeaturedSeasonTitle(NSArray<NSString *> *lineup) {
+    const LGSeasonDef *season = LGActiveSeason(NULL);
+    NSSet<NSString *> *seasonIconIDs = LGSeasonAllIconIDs(season);
+    BOOL featuresSeason = NO;
+    for (NSString *iconID in lineup) {
+        if ([seasonIconIDs containsObject:iconID]) { featuresSeason = YES; break; }
+    }
+    sFeaturedSeasonTitle = featuresSeason ? @(season->title) : nil;
+}
+
+static NSString *LGFeaturedSectionTitle(void) {
+    return sFeaturedSeasonTitle.length
+        ? [NSString stringWithFormat:@"%@ · %@", kLGFeaturedSectionTitle, sFeaturedSeasonTitle]
+        : kLGFeaturedSectionTitle;
+}
+
+// Returns YES when the visible set changed. Persisting the IDs keeps the row
+// stable for the entire day. On a new day the previous lineup and the active
+// icon are excluded (holiday icons may repeat, see ApolloLGSpotlightLineup),
+// then the selection deliberately spans at least 3 packs.
+static BOOL LGPopulateDailyFeaturedRows(NSInteger dayIdentifier) {
+    if (sFeaturedDayIdentifier == dayIdentifier) return NO;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSNumber *storedDay = [defaults objectForKey:kLGDailyFeaturedDayDefaultsKey];
+    NSArray<NSString *> *storedIDs = [defaults arrayForKey:kLGDailyFeaturedIDsDefaultsKey];
+    if (storedDay.integerValue == dayIdentifier && LGApplyStoredFeaturedIDs(storedIDs)) {
+        LGUpdateFeaturedSeasonTitle(storedIDs);
+        sFeaturedDayIdentifier = dayIdentifier;
+        return YES;
+    }
+
+    NSArray<NSString *> *previousLineup = [storedIDs filteredArrayUsingPredicate:
+        [NSPredicate predicateWithBlock:^BOOL(id iconID, __unused NSDictionary *bindings) {
+            return [iconID isKindOfClass:NSString.class];
+        }]];
+    NSArray<NSString *> *newIDs = LGGenerateDailyFeaturedIDs(dayIdentifier, previousLineup,
+                                                             LGActiveSpotlightIconID());
+    if (!LGApplyStoredFeaturedIDs(newIDs)) return NO;
+    LGUpdateFeaturedSeasonTitle(newIDs);
+    [defaults setInteger:dayIdentifier forKey:kLGDailyFeaturedDayDefaultsKey];
+    [defaults setObject:newIDs forKey:kLGDailyFeaturedIDsDefaultsKey];
+    sFeaturedDayIdentifier = dayIdentifier;
+    return YES;
+}
+
+// Resolves a group's JSON-specified coverIconIDs against its own
+// already-filtered `rows` (so a typo'd or unregistered-on-this-IPA ID is
+// dropped rather than shown broken), capped to kLGFanCount. Falls back to
+// the first kLGFanCount rows when nothing usable was specified.
+static NSArray<NSString *> *LGResolveCoverIconIDs(const LGIconGroupDef *def, LGIconRow *rows, NSInteger count) {
+    NSMutableArray<NSString *> *cover = [NSMutableArray arrayWithCapacity:(NSUInteger)kLGFanCount];
+    for (size_t ci = 0; ci < def->coverIconIDCount && (NSInteger)cover.count < kLGFanCount; ci++) {
+        NSString *wantID = @(def->coverIconIDs[ci]);
+        for (NSInteger ri = 0; ri < count; ri++) {
+            if ([rows[ri].iconID isEqualToString:wantID]) { [cover addObject:wantID]; break; }
+        }
+    }
+    if (cover.count == 0) {
+        for (NSInteger ri = 0; ri < count && ri < kLGFanCount; ri++) [cover addObject:rows[ri].iconID];
+    }
+    return [cover copy];
+}
+
+static void LGInitRuntimeGroups(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSInteger cap = (NSInteger)kLGIconGroupCount;
+        sGroups = (LGRuntimeGroup *)calloc((size_t)cap, sizeof(LGRuntimeGroup));
+        NSMutableArray *storage = [NSMutableArray array];
+        for (NSInteger gi = 0; gi < cap; gi++) {
+            const LGIconGroupDef *def = &kLGIconGroups[gi];
+            NSString *groupID     = @(def->groupID);
+            NSString *title       = @(def->title);
+            NSString *description = @(def->description);
+            [storage addObjectsFromArray:@[groupID, title, description]];
+            NSArray<NSString *> *rowStorage = nil;
+            NSInteger count = 0;
+            LGIconRow *rows = LGBuildRows(def->entries, (NSInteger)def->entryCount, &count, &rowStorage);
+            [storage addObjectsFromArray:rowStorage];
+            NSArray<NSString *> *coverIconIDs = LGResolveCoverIconIDs(def, rows, count);
+            [storage addObject:coverIconIDs];
+            sGroups[sGroupCount++] = (LGRuntimeGroup){
+                groupID, title, description, rows, count, coverIconIDs
+            };
+        }
+        sGroupStringStorage = [storage copy];
+        LGInitSpotlightStandardIcons();
+        LGPopulateDailyFeaturedRows(LGCurrentCalendarDayIdentifier());
+        (void)sGroupStringStorage;
+    });
+}
+
+static BOOL LGRefreshDailyFeaturedRowsIfNeeded(void) {
+    LGInitRuntimeGroups();
+    return LGPopulateDailyFeaturedRows(LGCurrentCalendarDayIdentifier());
+}
+
+static const LGRuntimeGroup *LGGroupAt(NSInteger gi) {
+    LGInitRuntimeGroups();
+    if (gi < 0 || gi >= sGroupCount) return NULL;
+    return &sGroups[gi];
+}
+
+// Finds the LGIconRow for an arbitrary iconID by scanning every group's rows,
+// or NULL if it isn't one of ours (e.g. a stock Apollo alternate icon). Every
+// icon in icons.json declares exactly one "group" (enforced by the generator,
+// with no default/fallback group), so scanning sGroups is a complete search.
+static const LGIconRow *LGRowForIconID(NSString *iconID) {
+    if (!iconID.length) return NULL;
+    LGInitRuntimeGroups();
+    for (NSInteger gi = 0; gi < sGroupCount; gi++) {
+        const LGRuntimeGroup *g = &sGroups[gi];
+        for (NSInteger ri = 0; ri < g->count; ri++) {
+            if ([g->rows[ri].iconID isEqualToString:iconID]) return &g->rows[ri];
+        }
+    }
+    return NULL;
+}
+
+static NSInteger LGGroupIndexForIconID(NSString *iconID) {
+    if (!iconID.length) return NSNotFound;
+    LGInitRuntimeGroups();
+    for (NSInteger gi = 0; gi < sGroupCount; gi++) {
+        const LGRuntimeGroup *group = &sGroups[gi];
+        for (NSInteger ri = 0; ri < group->count; ri++) {
+            if ([group->rows[ri].iconID isEqualToString:iconID]) return gi;
+        }
+    }
+    return NSNotFound;
+}
+
+// ── Main section helpers ───────────────────────────────────────────────────
+//
+// Every non-empty group renders as one card. Each pack section keeps its cards
+// in one persistent table cell so changing columns can move the existing views.
+
+static NSInteger LGNonEmptyGroupCount(void) {
+    LGInitRuntimeGroups();
+    NSInteger n = 0;
+    for (NSInteger i = 0; i < sGroupCount; i++) {
+        if (sGroups[i].count > 0) n++;
+    }
+    return n;
+}
+
+static char kLGPackColumnsKey, kLGPackColumnsUpdateKey, kLGPreparedPackCellsKey;
+
+static NSInteger LGMeasuredPackColumnCount(UITableView *table) {
+    // UIKit's secondary table may extend beneath both the sidebar and the
+    // Duo rail. Count columns in the same usable width as its cell content.
+    UIEdgeInsets safe = table.safeAreaInsets;
+    UIEdgeInsets adjusted = table.adjustedContentInset;
+    CGFloat width = CGRectGetWidth(table.bounds)
+        - MAX(safe.left, adjusted.left) - MAX(safe.right, adjusted.right);
+    // On the Duo the full landscape canvas has room for all four packs.
+    // Portrait and the split detail pane keep a balanced two-by-two grid,
+    // rather than leaving the fourth pack alone beneath a three-card row.
+    if (ApolloDuoSplitIsUnfolded()) return width >= 800.0 ? 4 : 2;
+    if (width >= kLGMainGridFourColumnWidth) return 4;
+    if (width >= kLGMainGridThreeColumnWidth) return 3;
+    return 2;
+}
+
+static NSInteger LGMainPackColumnCount(UITableView *table) {
+    NSNumber *columns = objc_getAssociatedObject(table, &kLGPackColumnsKey);
+    if (!columns) {
+        columns = @(LGMeasuredPackColumnCount(table));
+        objc_setAssociatedObject(table, &kLGPackColumnsKey, columns, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Card constraints and the section cell's height must use the same count.
+    return columns.integerValue;
+}
+
+static NSInteger LGCardRowCount(NSInteger cardCount, NSInteger columnCount) {
+    return (cardCount + columnCount - 1) / columnCount;
+}
+
+static NSInteger LGPacksSectionRowCount(NSInteger columnCount) {
+    return LGCardRowCount(LGNonEmptyGroupCount(), columnCount);
+}
+
+typedef NS_ENUM(NSInteger, LGStandardPack) {
+    LGStandardPackApolloOriginals,
+    LGStandardPackCommunity,
+    LGStandardPackUltra,
+    LGStandardPackSekrit,
+    LGStandardPackCount,
+};
+
+static void LGPersistActiveStandardPack(LGStandardPack pack) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (pack >= 0 && pack < LGStandardPackCount) {
+        [defaults setInteger:pack forKey:kLGActiveStandardPackDefaultsKey];
+    } else {
+        [defaults removeObjectForKey:kLGActiveStandardPackDefaultsKey];
+        [defaults removeObjectForKey:kLGActiveStandardAddedIconIDDefaultsKey];
+    }
+}
+
+static LGStandardPack LGActiveStandardPack(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSNumber *stored = [defaults objectForKey:kLGActiveStandardPackDefaultsKey];
+    NSInteger value = stored.integerValue;
+    // This value records the most recent explicit picker-owned selection.
+    // Do not second-guess it with alternateIconName: that API can briefly
+    // return the previous Liquid Glass icon after a Standard icon is applied,
+    // especially while the app moves through the background. Every Liquid
+    // Glass selection explicitly clears this value in LGApplyAlternateIcon.
+    return stored && value >= 0 && value < LGStandardPackCount
+        ? (LGStandardPack)value
+        : LGStandardPackCount;
+}
+
+static void LGPersistActiveStandardPackRow(LGStandardPack pack, NSInteger row) {
+    LGPersistActiveStandardPack(pack);
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:kLGActiveStandardAddedIconIDDefaultsKey];
+    if (pack >= 0 && pack < LGStandardPackCount && row >= 0) {
+        [NSUserDefaults.standardUserDefaults setInteger:row
+                                                 forKey:kLGActiveStandardPackRowDefaultsKey];
+    } else {
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:kLGActiveStandardPackRowDefaultsKey];
+    }
+}
+
+// Apollo owns the setter for Standard icons, so a tap only tells us what the
+// user intends to select. Keep that intent in memory until UIApplication's
+// completion confirms success. This prevents a stray forwarded selection or
+// a failed request from erasing a still-active Liquid Glass icon.
+static LGStandardPack sLGPendingStandardPack = LGStandardPackCount;
+static NSInteger sLGPendingStandardPackRow = NSNotFound;
+static NSUInteger sLGPendingStandardSelectionGeneration = 0;
+
+static void LGBeginPendingStandardPackSelection(LGStandardPack pack, NSInteger row) {
+    if (pack < 0 || pack >= LGStandardPackCount || row < 0) return;
+    sLGPendingStandardPack = pack;
+    sLGPendingStandardPackRow = row;
+    NSUInteger generation = ++sLGPendingStandardSelectionGeneration;
+
+    // Do not let an Apollo path that never reaches the icon setter leave an
+    // intent around for an unrelated icon change later in the session.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (sLGPendingStandardSelectionGeneration != generation) return;
+        ApolloLog(@"[LGIconPicker] pending Standard icon selection expired");
+        sLGPendingStandardPack = LGStandardPackCount;
+        sLGPendingStandardPackRow = NSNotFound;
+    });
+}
+
+void ApolloLGConfirmSuccessfulSystemIconChange(NSString *iconName) {
+    void (^commit)(void) = ^{
+        // Apollo's own setter changes which registration iOS holds too.
+        LGPersistAppliedIconName(iconName);
+        LGStandardPack pack = sLGPendingStandardPack;
+        NSInteger row = sLGPendingStandardPackRow;
+        if (pack < 0 || pack >= LGStandardPackCount || row < 0) return;
+
+        ++sLGPendingStandardSelectionGeneration;
+        sLGPendingStandardPack = LGStandardPackCount;
+        sLGPendingStandardPackRow = NSNotFound;
+        LGClearPersistedActiveIconID();
+        LGPersistActiveStandardPackRow(pack, row);
+        ApolloLog(@"[LGIconPicker] confirmed Standard pack=%ld row=%ld",
+                  (long)pack, (long)row);
+    };
+
+    // Persist before Apollo's original completion handler redraws its cells.
+    // UIApplication normally completes on the main thread, but preserve that
+    // ordering if a future iOS version invokes the callback elsewhere.
+    if (NSThread.isMainThread) {
+        commit();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), commit);
+    }
+}
+
+static NSInteger LGActiveStandardPackRow(LGStandardPack pack) {
+    if (LGActiveStandardPack() != pack) return NSNotFound;
+    NSNumber *stored = [NSUserDefaults.standardUserDefaults objectForKey:kLGActiveStandardPackRowDefaultsKey];
+    return stored ? stored.integerValue : NSNotFound;
+}
+
+typedef struct {
+    BOOL isAdded;
+    NSInteger nativeRow;
+    const LGIconRowEntry *addedEntry;
+} LGUltraDisplayedRow;
+
+static LGUltraDisplayedRow LGUltraRowAtDisplayedRow(NSInteger displayedRow,
+                                                     NSInteger nativeRowCount);
+static const LGIconRowEntry *LGStandardPackAddedEntryForIconID(NSString *iconID);
+
+static NSString *LGActiveStandardAddedIconID(void) {
+    if (LGActiveStandardPack() != LGStandardPackUltra) return nil;
+    NSString *iconID = [NSUserDefaults.standardUserDefaults
+        stringForKey:kLGActiveStandardAddedIconIDDefaultsKey];
+    if (iconID.length) return iconID;
+
+    // The system's current alternate name can recover the selected added icon
+    // if a previous test build did not persist this tweak-owned identifier.
+    NSString *systemID = LGBaseIconIDFromAlternateIconName(
+        UIApplication.sharedApplication.alternateIconName);
+    return LGStandardPackAddedEntryForIconID(systemID) ? systemID : nil;
+}
+
+static BOOL LGStandardPackRowIsActive(LGStandardPack pack, NSInteger row,
+                                      NSInteger nativeRowCount) {
+    if (row < 0) return NO;
+    if (pack == LGStandardPackUltra) {
+        LGUltraDisplayedRow mapped = LGUltraRowAtDisplayedRow(row, nativeRowCount);
+        NSString *addedID = LGActiveStandardAddedIconID();
+        if (mapped.isAdded) {
+            return addedID.length && [addedID isEqualToString:@(mapped.addedEntry->iconID)];
+        }
+        if (mapped.nativeRow != NSNotFound && !addedID.length &&
+            LGActiveStandardPackRow(pack) == mapped.nativeRow) return YES;
+    } else if (LGActiveStandardPackRow(pack) == row) {
+        return YES;
+    }
+    // Only a successful Default selection is authoritative. A missing saved
+    // icon is not: iOS can report nil while an alternate icon remains active.
+    return pack == LGStandardPackApolloOriginals && row == 0 &&
+        LGActiveStandardPack() == LGStandardPackCount && LGDefaultIconIsConfirmed();
+}
+
+static LGStandardPack LGDisplayedActiveStandardPack(void) {
+    LGStandardPack activePack = LGActiveStandardPack();
+    if (activePack == LGStandardPackCount && LGDefaultIconIsConfirmed()) {
+        return LGStandardPackApolloOriginals;
+    }
+    return activePack;
+}
+
+static NSString *LGStandardPackTitle(LGStandardPack pack) {
+    switch (pack) {
+        case LGStandardPackApolloOriginals: return @"Originals";
+        case LGStandardPackCommunity:       return @"Community";
+        case LGStandardPackUltra:           return @"Ultra";
+        case LGStandardPackSekrit:          return @"Sekrit";
+        case LGStandardPackCount:           return @"";
+    }
+}
+
+static NSInteger LGStandardPackIconCount(LGStandardPack pack) {
+    switch (pack) {
+        case LGStandardPackApolloOriginals: return 32;
+        case LGStandardPackCommunity:       return 19;
+        case LGStandardPackUltra:           return 81 + (NSInteger)kLGStandardPackEntries_ultraCount;
+        case LGStandardPackSekrit:          return 22;
+        case LGStandardPackCount:           return 0;
+    }
+}
+
+// SPCA is already a complete native alternate icon in Apollo's bundle. Keep
+// its original file-based registration intact and expose it through the same
+// added-row bridge as the tweak-supplied Ultra additions.
+static const LGIconRowEntry kLGSPCAUltraEntry = { "spca", "SPCA", "David Lanham" };
+
+static LGUltraDisplayedRow LGUltraRowAtDisplayedRow(NSInteger displayedRow,
+                                                     NSInteger nativeRowCount) {
+    LGUltraDisplayedRow missing = { NO, NSNotFound, NULL };
+    if (displayedRow < 0 || nativeRowCount < 0) return missing;
+
+    NSInteger outputRow = 0;
+    for (NSInteger nativeRow = 0; nativeRow < nativeRowCount; nativeRow++) {
+        if (outputRow++ == displayedRow) {
+            return (LGUltraDisplayedRow){ NO, nativeRow, NULL };
+        }
+
+        for (NSInteger i = 0; i < (NSInteger)kLGStandardPackEntries_ultraCount; i++) {
+            const LGIconRowEntry *entry = &kLGStandardPackEntries_ultra[i];
+            if (entry->nativeAnchorRow != nativeRow) continue;
+            if (outputRow++ == displayedRow) {
+                return (LGUltraDisplayedRow){ YES, NSNotFound, entry };
+            }
+        }
+    }
+
+    // Entries without an anchor, plus any whose native counterpart is absent
+    // from this Apollo build, remain available at the end of Ultra.
+    for (NSInteger i = 0; i < (NSInteger)kLGStandardPackEntries_ultraCount; i++) {
+        const LGIconRowEntry *entry = &kLGStandardPackEntries_ultra[i];
+        if (entry->nativeAnchorRow >= 0 && entry->nativeAnchorRow < nativeRowCount) continue;
+        if (outputRow++ == displayedRow) {
+            return (LGUltraDisplayedRow){ YES, NSNotFound, entry };
+        }
+    }
+
+    if (outputRow == displayedRow) {
+        return (LGUltraDisplayedRow){ YES, NSNotFound, &kLGSPCAUltraEntry };
+    }
+    return missing;
+}
+
+static const LGIconRowEntry *LGStandardPackAddedEntryForIconID(NSString *iconID) {
+    if (!iconID.length) return NULL;
+    for (NSInteger i = 0; i < (NSInteger)kLGStandardPackEntries_ultraCount; i++) {
+        if ([iconID isEqualToString:@(kLGStandardPackEntries_ultra[i].iconID)]) {
+            return &kLGStandardPackEntries_ultra[i];
+        }
+    }
+    if ([iconID isEqualToString:@(kLGSPCAUltraEntry.iconID)]) return &kLGSPCAUltraEntry;
+    return NULL;
+}
+
+static LGStandardPack LGStandardPackFromName(const char *name) {
+    if (!name) return LGStandardPackCount;
+    if (strcmp(name, "originals") == 0) return LGStandardPackApolloOriginals;
+    if (strcmp(name, "community") == 0) return LGStandardPackCommunity;
+    if (strcmp(name, "ultra") == 0)     return LGStandardPackUltra;
+    if (strcmp(name, "sekrit") == 0)    return LGStandardPackSekrit;
+    return LGStandardPackCount;
+}
+
+static void LGInitSpotlightStandardIcons(void) {
+    size_t capacity = kLGNativeIconCount + kLGStandardPackEntries_ultraCount;
+    sSpotlightStandardIcons = capacity
+        ? (LGSpotlightStandardIcon *)calloc(capacity, sizeof(LGSpotlightStandardIcon))
+        : NULL;
+    NSMutableArray *storage = [NSMutableArray arrayWithCapacity:capacity * 3];
+    void (^add)(const char *, const char *, const char *, LGStandardPack, NSInteger) =
+        ^(const char *cIconID, const char *cName, const char *cDesigner, LGStandardPack pack, NSInteger nativeRow) {
+        NSString *iconID = @(cIconID);
+        if (pack == LGStandardPackCount || !LGAlternateIconRegisteredInInfoPlist(iconID)) {
+            ApolloLog(@"[LGIconPicker] omitting holiday icon not in Info.plist: %@", iconID);
+            return;
+        }
+        NSString *name = @(cName);
+        NSString *designer = @(cDesigner ?: "");
+        [storage addObjectsFromArray:@[ iconID, name, designer ]];
+        sSpotlightStandardIcons[sSpotlightStandardIconCount++] =
+            (LGSpotlightStandardIcon){ { iconID, name, designer }, pack, nativeRow };
+    };
+    for (size_t i = 0; i < kLGNativeIconCount; i++) {
+        const LGNativeIconEntry *entry = &kLGNativeIcons[i];
+        add(entry->iconID, entry->displayName, entry->designer,
+            LGStandardPackFromName(entry->standardPack), entry->nativeRow);
+    }
+    for (size_t i = 0; i < kLGStandardPackEntries_ultraCount; i++) {
+        const LGIconRowEntry *entry = &kLGStandardPackEntries_ultra[i];
+        add(entry->iconID, entry->displayName, entry->designer, LGStandardPackUltra, NSNotFound);
+    }
+    sSpotlightStandardStorage = [storage copy];
+}
+
+// The icon the Spotlight treats as active: the Liquid Glass or Default choice,
+// or a Standard-pack choice it can feature. LGActiveIconID() is nil while a
+// Standard pack is selected, so map the persisted pack/row (or the Ultra
+// addition's ID) back to the holiday icon it belongs to.
+static NSString *LGActiveSpotlightIconID(void) {
+    LGStandardPack pack = LGActiveStandardPack();
+    if (pack == LGStandardPackCount) return LGActiveIconID();
+    NSString *addedID = LGActiveStandardAddedIconID();
+    if (addedID.length) return addedID;
+    NSInteger row = LGActiveStandardPackRow(pack);
+    if (row == NSNotFound) return nil;
+    for (NSInteger i = 0; i < sSpotlightStandardIconCount; i++) {
+        const LGSpotlightStandardIcon *icon = &sSpotlightStandardIcons[i];
+        if (icon->pack == pack && icon->nativeRow == row) return icon->row.iconID;
+    }
+    return nil;
+}
+
+static NSInteger LGNativeSectionForStandardPack(LGStandardPack pack) {
+    switch (pack) {
+        case LGStandardPackApolloOriginals: return 0;
+        case LGStandardPackUltra:           return 3;
+        case LGStandardPackSekrit:          return 4;
+        case LGStandardPackCommunity:
+        case LGStandardPackCount:           return NSNotFound;
+    }
+}
+
+static NSArray<NSString *> *LGStandardPackCoverIconIDs(LGStandardPack pack) {
+    switch (pack) {
+        case LGStandardPackApolloOriginals: return @[ @"gold", @"calico", @"teal" ];
+        case LGStandardPackCommunity:       return @[ @"apollo-san", @"rimuru", @"surprised" ];
+        case LGStandardPackUltra:           return @[ @"wish-maker", @"in-the-jungle", @"space-paws" ];
+        case LGStandardPackSekrit:          return @[ @"beans", @"sus", @"apollobook-pro" ];
+        case LGStandardPackCount:           return @[];
+    }
+}
+
+static UIImage *LGStandardIconPreview(NSString *iconID) {
+    NSDictionary *icons = NSBundle.mainBundle.infoDictionary[@"CFBundleIcons"][@"CFBundleAlternateIcons"];
+    NSDictionary *entry = icons[iconID];
+    NSString *filename = [entry[@"CFBundleIconFiles"] firstObject];
+    return filename.length ? [UIImage imageNamed:filename] : nil;
+}
+
+static NSArray<UIImage *> *LGStandardPackCoverImages(LGStandardPack pack) {
+    NSMutableArray<UIImage *> *images = [NSMutableArray arrayWithCapacity:kLGFanCount];
+    for (NSString *iconID in LGStandardPackCoverIconIDs(pack)) {
+        UIImage *image = LGStandardIconPreview(iconID);
+        if (!image) image = LGPreviewImage(iconID, @"default");
+        if (image) [images addObject:image];
+    }
+    return images;
+}
+
+// Maps a flattened card index in the packs grid to the owning non-empty group.
+static NSInteger LGNonEmptyGroupIndexAt(NSInteger cardIndex) {
+    LGInitRuntimeGroups();
+    NSInteger cursor = 0;
+    for (NSInteger gi = 0; gi < sGroupCount; gi++) {
+        if (sGroups[gi].count == 0) continue;
+        if (cursor == cardIndex) return gi;
+        cursor++;
+    }
+    return -1;
+}
+
+#pragma mark - Eligibility
+
+static BOOL LGHasFeaturedSection(void) {
+    LGInitRuntimeGroups();
+    return sFeaturedCount > 0;
+}
+
+// Featured is optional; the Liquid Glass and standard pack grids are always
+// present when the patched icon catalog is available.
+static NSInteger LGInjectedSectionCount(void) {
+    return LGHasFeaturedSection() ? 3 : 2;
+}
+
+static NSInteger LGFeaturedSectionIndex(void) { return 0; } // only meaningful when LGHasFeaturedSection()
+static NSInteger LGPacksSectionIndex(void) { return LGHasFeaturedSection() ? 1 : 0; }
+static NSInteger LGStandardPacksSectionIndex(void) { return LGPacksSectionIndex() + 1; }
+
+static BOOL LGAlternateIconsAvailable(void) {
+    // patch.sh registers every icon ID from icons.json into CFBundleAlternateIcons
+    // (including the primary). We're patched iff the primary appears as an alternate.
+    // Avoid gating on supportsAlternateIcons here: %ctor runs before UIApplication
+    // exists, so sharedApplication == nil at that point.
+    if (!LGAlternateIconRegisteredInInfoPlist(LGPrimaryIconID())) return NO;
+    LGInitRuntimeGroups();
+    if (sFeaturedCount > 0) return YES;
+    for (NSInteger i = 0; i < sGroupCount; i++) {
+        if (sGroups[i].count > 0) return YES;
+    }
+    return NO;
+}
+
+#pragma mark - Section remap helpers
+
+static BOOL LGSectionIsOurs(NSInteger section) { return section < LGInjectedSectionCount(); }
+
+static NSInteger LGRemapSectionToOriginal(NSInteger section) {
+    // The native icon collections move into the standard pack cards, and the
+    // old SPCA purchase/support row is intentionally no longer forwarded.
+    return section - LGInjectedSectionCount() + 2;
+}
+
+static NSIndexPath *LGRemapIndexPathToOriginal(NSIndexPath *indexPath) {
+    if (!indexPath) return indexPath;
+    NSInteger remapped = LGRemapSectionToOriginal(indexPath.section);
+    if (remapped == indexPath.section) return indexPath;
+    return [NSIndexPath indexPathForRow:indexPath.row inSection:remapped];
+}
+
+static char kLGForwardedNativeSectionKey;
+static char kLGForwardedUIKitRowKey;
+static char kLGNativeDetailTableSectionKey;
+static char kLGNativeDetailRegisteredIdentifiersKey;
+
+static NSInteger LGForwardedNativeSection(id controller) {
+    NSNumber *value = objc_getAssociatedObject(controller, &kLGForwardedNativeSectionKey);
+    return value ? value.integerValue : NSNotFound;
+}
+
+static void LGSetForwardedNativeSection(id controller, NSInteger section) {
+    objc_setAssociatedObject(controller, &kLGForwardedNativeSectionKey,
+                             section == NSNotFound ? nil : @(section),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static NSInteger LGForwardedUIKitRow(id controller) {
+    NSNumber *value = objc_getAssociatedObject(controller, &kLGForwardedUIKitRowKey);
+    return value ? value.integerValue : NSNotFound;
+}
+
+static void LGSetForwardedUIKitRow(id controller, NSInteger row) {
+    objc_setAssociatedObject(controller, &kLGForwardedUIKitRowKey,
+                             row == NSNotFound ? nil : @(row),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+#pragma mark - TLS remap scope
+//
+// Apollo's data-source/delegate methods call back into the table view using
+// the Apollo-perspective indexPath we hand them. Hooks on UITableView rewrite
+// those indexPaths back to UIKit-visible ones while the remap is active.
+
+static __thread BOOL       sLGRemapActive       = NO;
+static __thread NSInteger  sLGRemapApolloSection = -1;
+static __thread NSInteger  sLGRemapUIKitSection  = -1;
+static __thread NSInteger  sLGRemapApolloRow = -1;
+static __thread NSInteger  sLGRemapUIKitRow  = -1;
+static __thread __unsafe_unretained UITableView *sLGRemapActiveTable = nil;
+
+typedef struct {
+    BOOL prevActive; NSInteger prevApollo; NSInteger prevUIKit;
+    NSInteger prevApolloRow; NSInteger prevUIKitRow;
+    __unsafe_unretained UITableView *prevTable;
+} LGRemapScope;
+
+static inline void LGRemapScopeEnter(LGRemapScope *s, UITableView *tv,
+                                     NSInteger apollo, NSInteger uikit,
+                                     NSInteger apolloRow, NSInteger uikitRow) {
+    s->prevActive = sLGRemapActive; s->prevApollo = sLGRemapApolloSection;
+    s->prevUIKit = sLGRemapUIKitSection; s->prevTable = sLGRemapActiveTable;
+    s->prevApolloRow = sLGRemapApolloRow; s->prevUIKitRow = sLGRemapUIKitRow;
+    sLGRemapActive = YES; sLGRemapApolloSection = apollo;
+    sLGRemapUIKitSection = uikit; sLGRemapApolloRow = apolloRow;
+    sLGRemapUIKitRow = uikitRow; sLGRemapActiveTable = tv;
+}
+
+static inline void LGRemapScopeExit(LGRemapScope *s) {
+    sLGRemapActive = s->prevActive; sLGRemapApolloSection = s->prevApollo;
+    sLGRemapUIKitSection = s->prevUIKit; sLGRemapActiveTable = s->prevTable;
+    sLGRemapApolloRow = s->prevApolloRow; sLGRemapUIKitRow = s->prevUIKitRow;
+}
+
+#define LG_REMAP_SCOPE(tv, apollo, uikit) \
+    __attribute__((cleanup(LGRemapScopeExit))) LGRemapScope _lgScope; \
+    LGRemapScopeEnter(&_lgScope, (tv), (apollo), (uikit), NSNotFound, NSNotFound)
+
+#define LG_REMAP_ROW_SCOPE(tv, apollo, uikit, apolloRow, uikitRow) \
+    __attribute__((cleanup(LGRemapScopeExit))) LGRemapScope _lgScope; \
+    LGRemapScopeEnter(&_lgScope, (tv), (apollo), (uikit), (apolloRow), (uikitRow))
+
+static inline NSIndexPath *LGRewriteForActiveScope(UITableView *tv, NSIndexPath *ip) {
+    if (!sLGRemapActive || (sLGRemapActiveTable && tv != sLGRemapActiveTable)) return ip;
+    if (!ip || ip.section != sLGRemapApolloSection) return ip;
+    NSInteger row = ip.row == sLGRemapApolloRow ? sLGRemapUIKitRow : ip.row;
+    return [NSIndexPath indexPathForRow:row inSection:sLGRemapUIKitSection];
+}
+
+#pragma mark - Rendition fan (one square host, two renditions overlapped as a small fanned stack)
+
+// Shows two renditions of the same appearance (e.g. Default's light + dark)
+// as a small overlapping fan, front-most rendition on top — rather than
+// splitting a single square, which read poorly for previewing the icon as a
+// whole (per design feedback).
+@interface LGIconFanView : UIView
+- (instancetype)initWithAccessibilityLabel:(NSString *)label;
+// frontImage is drawn on top and positioned top-left (most visible);
+// backImage sits behind, offset toward the bottom-right.
+- (void)configureWithFrontImage:(UIImage *)frontImage backImage:(UIImage *)backImage;
+// Standard-pack icons have one rendition: show it alone, centered and upright.
+- (void)configureWithSingleImage:(UIImage *)image;
+@end
+
+@implementation LGIconFanView {
+    UIImageView *_backIV;
+    UIImageView *_frontIV;
+    CGSize _laidOutSize;
+    BOOL _single;
+}
+
+- (instancetype)initWithAccessibilityLabel:(NSString *)label {
+    self = [super initWithFrame:CGRectZero];
+    if (!self) return nil;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    self.isAccessibilityElement = YES;
+    self.accessibilityLabel = label;
+    // Not clipped: a small rotation on the thumbnails can peek a hair past
+    // the nominal host square, which is fine for a decorative fan.
+    self.clipsToBounds = NO;
+
+    _backIV = [self lg_makeThumbImageView];
+    [self addSubview:_backIV];
+
+    _frontIV = [self lg_makeThumbImageView];
+    [self addSubview:_frontIV]; // added after _backIV, so it renders on top
+
+    // Square, but the actual side length comes from whatever the parent
+    // UIStackView (FillEqually) allocates — NOT a fixed constant. A fixed
+    // width/height here would fight the stack's own required-priority
+    // sizing constraints and silently break one of them (see git history:
+    // this bit us with the previous diagonal-split-tile design).
+    [NSLayoutConstraint activateConstraints:@[
+        [self.widthAnchor constraintEqualToAnchor:self.heightAnchor],
+    ]];
+    return self;
+}
+
+- (UIImageView *)lg_makeThumbImageView {
+    UIImageView *iv = [[UIImageView alloc] init];
+    iv.contentMode = UIViewContentModeScaleAspectFill;
+    iv.clipsToBounds = YES;
+    iv.layer.cornerCurve = kCACornerCurveContinuous;
+    iv.layer.borderWidth = 1.0 / iv.traitCollection.displayScale;
+    // Hairline border is cached on the layer; recompute it when the display
+    // scale changes (e.g. the view lands on a different screen).
+    if (@available(iOS 17.0, *)) {
+        [iv registerForTraitChanges:@[UITraitDisplayScale.class] withHandler:^(__kindof UIView *v, UITraitCollection *previous) {
+            v.layer.borderWidth = 1.0 / v.traitCollection.displayScale;
+        }];
+    }
+    iv.layer.borderColor = [UIColor.separatorColor colorWithAlphaComponent:0.5].CGColor;
+    iv.backgroundColor = UIColor.secondarySystemBackgroundColor;
+    return iv;
+}
+
+- (void)configureWithFrontImage:(UIImage *)frontImage backImage:(UIImage *)backImage {
+    _frontIV.image = frontImage;
+    _backIV.image = backImage;
+    _backIV.hidden = NO;
+    _single = NO;
+    _laidOutSize = CGSizeZero;
+    [self setNeedsLayout];
+}
+
+- (void)configureWithSingleImage:(UIImage *)image {
+    _frontIV.image = image;
+    _backIV.image = nil;
+    _backIV.hidden = YES;
+    _single = YES;
+    _laidOutSize = CGSizeZero;
+    [self setNeedsLayout];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    // The fan geometry only depends on the host's own bounds (not on any
+    // Auto Layout input), so recomputing it here is a plain visual
+    // repositioning, not the layout-driving-write pattern AGENTS.md warns
+    // against. Guard on size to avoid redundant work once layout settles.
+    if (CGSizeEqualToSize(self.bounds.size, _laidOutSize)) return;
+    _laidOutSize = self.bounds.size;
+
+    CGFloat side = self.bounds.size.width;
+    if (_single) {
+        CGFloat thumb = side * kLGSingleRenditionThumbFraction;
+        _frontIV.transform = CGAffineTransformIdentity;
+        _frontIV.frame = CGRectMake((side - thumb) / 2.0, (side - thumb) / 2.0, thumb, thumb);
+        _frontIV.layer.cornerRadius = thumb * kLGRenditionFanCornerRatio;
+        return;
+    }
+    CGFloat thumb = side * kLGRenditionFanThumbFraction;
+    CGFloat corner = thumb * kLGRenditionFanCornerRatio;
+
+    _backIV.transform = CGAffineTransformIdentity;
+    _backIV.frame = CGRectMake(side - thumb, side - thumb, thumb, thumb);
+    _backIV.layer.cornerRadius = corner;
+    _backIV.transform = CGAffineTransformMakeRotation(kLGRenditionFanBackRotation);
+
+    _frontIV.transform = CGAffineTransformIdentity;
+    _frontIV.frame = CGRectMake(0, 0, thumb, thumb);
+    _frontIV.layer.cornerRadius = corner;
+    _frontIV.transform = CGAffineTransformMakeRotation(kLGRenditionFanFrontRotation);
+}
+
+@end
+
+#pragma mark - Name/author label pair (fixed-height, no wrapping)
+
+// Two separate single-line labels — name (semibold) then designer (secondary,
+// hidden when absent, no "by" prefix) — stacked vertically. Truncating tail
+// instead of wrapping a single combined string keeps every cell/row that
+// uses this a fixed, predictable height regardless of content length —
+// matches Apollo's own original community-icon rows, which use the same
+// two-line, no-"by" convention.
+@interface LGNameAuthorLabelStack : UIStackView
+@property (nonatomic, readonly) UILabel *nameLabel;
+@property (nonatomic, readonly) UILabel *authorLabel;
+- (instancetype)initWithNameFont:(UIFont *)nameFont authorFont:(UIFont *)authorFont;
+- (void)configureWithRow:(const LGIconRow *)row;
+@end
+
+@implementation LGNameAuthorLabelStack
+
+- (instancetype)initWithNameFont:(UIFont *)nameFont authorFont:(UIFont *)authorFont {
+    self = [super initWithFrame:CGRectZero];
+    if (!self) return nil;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    self.axis = UILayoutConstraintAxisVertical;
+    self.spacing = 1.0;
+    // Default (Fill) alignment: each label's width tracks the stack's own
+    // width, which is what lets numberOfLines=1 + truncating tail actually
+    // truncate instead of just growing to fit the untruncated text.
+
+    _nameLabel = [[UILabel alloc] init];
+    _nameLabel.font = nameFont;
+    _nameLabel.textColor = UIColor.labelColor;
+    _nameLabel.numberOfLines = 1;
+    _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+
+    _authorLabel = [[UILabel alloc] init];
+    _authorLabel.font = authorFont;
+    _authorLabel.textColor = UIColor.secondaryLabelColor;
+    _authorLabel.numberOfLines = 1;
+    _authorLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+
+    [self addArrangedSubview:_nameLabel];
+    [self addArrangedSubview:_authorLabel];
+    return self;
+}
+
+- (void)configureWithRow:(const LGIconRow *)row {
+    _nameLabel.text = row->displayName;
+    BOOL hasAuthor = row->designer.length > 0;
+    _authorLabel.text = hasAuthor ? row->designer : nil;
+    _authorLabel.hidden = !hasAuthor;
+}
+
+@end
+
+#pragma mark - Icon grid cell (pack contents screen)
+
+static void LGSetAnimatedSelectionVisuals(UIView *selectionRing,
+                                          UIImageView *checkBadge,
+                                          BOOL selected,
+                                          BOOL animated) {
+    if (!selectionRing || !checkBadge) return;
+    [selectionRing.layer removeAllAnimations];
+    [checkBadge.layer removeAllAnimations];
+
+    if (!animated || UIAccessibilityIsReduceMotionEnabled()) {
+        selectionRing.hidden = !selected;
+        checkBadge.hidden = !selected;
+        selectionRing.alpha = 1.0;
+        checkBadge.alpha = 1.0;
+        selectionRing.transform = CGAffineTransformIdentity;
+        checkBadge.transform = CGAffineTransformIdentity;
+        return;
+    }
+
+    if (!selected) {
+        selectionRing.hidden = YES;
+        checkBadge.hidden = YES;
+        selectionRing.alpha = 1.0;
+        checkBadge.alpha = 1.0;
+        selectionRing.transform = CGAffineTransformIdentity;
+        checkBadge.transform = CGAffineTransformIdentity;
+        return;
+    }
+
+    selectionRing.hidden = NO;
+    checkBadge.hidden = NO;
+    selectionRing.alpha = 0.0;
+    selectionRing.transform = CGAffineTransformMakeScale(0.985, 0.985);
+    checkBadge.alpha = 0.0;
+    checkBadge.transform = CGAffineTransformMakeScale(0.55, 0.55);
+
+    [UIView animateWithDuration:0.22
+                          delay:0.0
+                        options:UIViewAnimationOptionCurveEaseOut |
+                                UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        selectionRing.alpha = 1.0;
+        selectionRing.transform = CGAffineTransformIdentity;
+    } completion:nil];
+    [UIView animateWithDuration:0.34
+                          delay:0.035
+         usingSpringWithDamping:0.68
+          initialSpringVelocity:0.45
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        checkBadge.alpha = 1.0;
+        checkBadge.transform = CGAffineTransformIdentity;
+    } completion:nil];
+}
+
+@interface LGIconGridCell : UICollectionViewCell
+- (void)configureWithRow:(const LGIconRow *)row selected:(BOOL)selected accentColor:(UIColor *)accentColor cardBackgroundColor:(UIColor *)cardBackgroundColor;
+@end
+
+@implementation LGIconGridCell {
+    LGIconFanView *_defaultFan;
+    LGIconFanView *_clearFan;
+    UILabel *_nameLabel;
+    UILabel *_authorLabel;
+    UIView *_selectionRing;
+    UIImageView *_checkBadge;
+    LGPressAnimationState _pressAnimation;
+    NSString *_representedIconID;
+    BOOL _hasSelectionState;
+    BOOL _selectionState;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+
+    self.contentView.layer.cornerRadius = kLGCardCorner;
+    self.contentView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.contentView.backgroundColor = LGThemedCardBackgroundColor(nil); // placeholder, overwritten by configureWithRow:
+    self.contentView.clipsToBounds = YES;
+
+    _defaultFan = [[LGIconFanView alloc] initWithAccessibilityLabel:@"Default appearance"];
+    _clearFan   = [[LGIconFanView alloc] initWithAccessibilityLabel:@"Clear appearance"];
+
+    UIStackView *fanStack = [[UIStackView alloc] initWithArrangedSubviews:@[_defaultFan, _clearFan]];
+    fanStack.translatesAutoresizingMaskIntoConstraints = NO;
+    fanStack.axis = UILayoutConstraintAxisHorizontal;
+    fanStack.spacing = kLGGridFanPairSpacing;
+    fanStack.distribution = UIStackViewDistributionFillEqually;
+    [self.contentView addSubview:fanStack];
+
+    _nameLabel = [[UILabel alloc] init];
+    _nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _nameLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    _nameLabel.textColor = UIColor.labelColor;
+    _nameLabel.textAlignment = NSTextAlignmentLeft;
+    _nameLabel.numberOfLines = 1;
+    _nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _nameLabel.adjustsFontSizeToFitWidth = YES;
+    _nameLabel.minimumScaleFactor = 0.85;
+    [self.contentView addSubview:_nameLabel];
+
+    _authorLabel = [[UILabel alloc] init];
+    _authorLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _authorLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    _authorLabel.textColor = UIColor.secondaryLabelColor;
+    _authorLabel.textAlignment = NSTextAlignmentLeft;
+    _authorLabel.numberOfLines = 1;
+    _authorLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.contentView addSubview:_authorLabel];
+
+    _checkBadge = [[UIImageView alloc] initWithImage:[[UIImage systemImageNamed:@"checkmark.circle.fill"]
+                                                       imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]];
+    _checkBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    _checkBadge.contentMode = UIViewContentModeScaleAspectFit;
+    _checkBadge.hidden = YES;
+    _checkBadge.layer.shadowColor = UIColor.blackColor.CGColor;
+    _checkBadge.layer.shadowOpacity = 0.35;
+    _checkBadge.layer.shadowRadius = 1.5;
+    _checkBadge.layer.shadowOffset = CGSizeMake(0, 0.5);
+    [self.contentView addSubview:_checkBadge];
+
+    _selectionRing = [[UIView alloc] init];
+    _selectionRing.translatesAutoresizingMaskIntoConstraints = NO;
+    _selectionRing.userInteractionEnabled = NO;
+    _selectionRing.layer.cornerRadius = kLGCardCorner;
+    _selectionRing.layer.cornerCurve = kCACornerCurveContinuous;
+    _selectionRing.layer.borderWidth = 2.0;
+    _selectionRing.backgroundColor = UIColor.clearColor;
+    _selectionRing.hidden = YES;
+    [self.contentView addSubview:_selectionRing];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [fanStack.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:12],
+        [fanStack.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:12],
+        [fanStack.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-12],
+
+        [_nameLabel.topAnchor constraintEqualToAnchor:fanStack.bottomAnchor constant:8],
+        [_nameLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:12],
+        [_nameLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-12],
+
+        [_authorLabel.topAnchor constraintEqualToAnchor:_nameLabel.bottomAnchor constant:1],
+        [_authorLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:12],
+        [_authorLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-12],
+        [_authorLabel.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-10],
+
+        [_checkBadge.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:6],
+        [_checkBadge.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-6],
+        [_checkBadge.widthAnchor constraintEqualToConstant:18],
+        [_checkBadge.heightAnchor constraintEqualToConstant:18],
+
+        [_selectionRing.topAnchor constraintEqualToAnchor:self.contentView.topAnchor],
+        [_selectionRing.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor],
+        [_selectionRing.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor],
+        [_selectionRing.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor],
+    ]];
+
+    return self;
+}
+
+- (void)configureWithRow:(const LGIconRow *)row selected:(BOOL)selected accentColor:(UIColor *)accentColor cardBackgroundColor:(UIColor *)cardBackgroundColor {
+    if (!row) return;
+    self.contentView.backgroundColor = cardBackgroundColor ?: LGThemedCardBackgroundColor(nil);
+    NSString *iconID = row->iconID;
+    UIImage *defaultLight = LGPreviewImage(iconID, @"default");
+    UIImage *defaultDark  = LGPreviewImage(iconID, @"dark");
+    UIImage *clearLight   = LGPreviewImage(iconID, @"clear-light");
+    UIImage *clearDark    = LGPreviewImage(iconID, @"clear-dark");
+
+    // Preview ordering follows the phone's current appearance, independently
+    // of which icon variant the user chooses from the appearance menu.
+    if (LGIsDarkAppearance(self)) {
+        [_defaultFan configureWithFrontImage:defaultDark backImage:defaultLight];
+        [_clearFan configureWithFrontImage:clearDark backImage:clearLight];
+    } else {
+        [_defaultFan configureWithFrontImage:defaultLight backImage:defaultDark];
+        [_clearFan configureWithFrontImage:clearLight backImage:clearDark];
+    }
+
+    _nameLabel.text = row->displayName;
+    _authorLabel.text = row->designer.length ? row->designer : nil;
+    _authorLabel.hidden = row->designer.length == 0;
+
+    self.accessibilityLabel = row->designer.length
+        ? [NSString stringWithFormat:@"%@, by %@%@", row->displayName, row->designer, selected ? @", selected" : @""]
+        : [NSString stringWithFormat:@"%@%@", row->displayName, selected ? @", selected" : @""];
+
+    UIColor *accent = accentColor ?: UIColor.systemBlueColor;
+    _checkBadge.tintColor = accent;
+    // Selection ring border needs a resolved snapshot — .CGColor on a dynamic
+    // provider color (custom theme accent) doesn't repaint itself later.
+    UIColor *resolvedAccent = [accent resolvedColorWithTraitCollection:self.traitCollection];
+    _selectionRing.layer.borderColor = resolvedAccent.CGColor;
+    BOOL animateSelection = _hasSelectionState &&
+        [_representedIconID isEqualToString:iconID] && _selectionState != selected;
+    LGSetAnimatedSelectionVisuals(_selectionRing, _checkBadge, selected, animateSelection);
+    _representedIconID = [iconID copy];
+    _hasSelectionState = YES;
+    _selectionState = selected;
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    if (highlighted == self.highlighted) return;
+    [super setHighlighted:highlighted];
+    if (highlighted) LGPrepareIconSelectionHaptic(self);
+    LGSetPressAnimationHighlighted(self, &_pressAnimation, highlighted);
+}
+
+- (void)prepareForReuse {
+    [super prepareForReuse];
+    LGResetPressAnimation(self, &_pressAnimation);
+    _representedIconID = nil;
+    _hasSelectionState = NO;
+    LGSetAnimatedSelectionVisuals(_selectionRing, _checkBadge, NO, NO);
+}
+
+@end
+
+// Compositional layout with `.estimated` height makes UICollectionView run
+// an extra Auto Layout self-sizing pass for every cell as it appears — real
+// overhead during a fast scroll through a large group. Cell height is
+// provably constant now (LGNameAuthorLabelStack truncates instead of
+// wrapping), so measure it once per column width via a throwaway template
+// cell and hand the layout an exact `.absolute` height instead, skipping
+// that per-cell measurement entirely.
+static NSMutableDictionary<NSNumber *, NSNumber *> *sLGMeasuredCellHeights;
+
+static CGFloat LGMeasuredGridCellHeight(CGFloat columnWidth) {
+    if (!sLGMeasuredCellHeights) sLGMeasuredCellHeights = [NSMutableDictionary dictionary];
+    NSNumber *key = @(round(columnWidth));
+    NSNumber *cachedHeight = sLGMeasuredCellHeights[key];
+    if (cachedHeight) return cachedHeight.doubleValue;
+
+    static LGIconGridCell *sTemplateCell;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sTemplateCell = [[LGIconGridCell alloc] initWithFrame:CGRectZero]; });
+
+    // Representative content — both labels populated, same as any real row.
+    LGIconRow templateRow = (LGIconRow){ @"template", @"Template Name", @"Template Author" };
+    [sTemplateCell configureWithRow:&templateRow selected:NO accentColor:UIColor.systemBlueColor cardBackgroundColor:nil];
+
+    CGSize fitting = [sTemplateCell systemLayoutSizeFittingSize:CGSizeMake(columnWidth, UILayoutFittingCompressedSize.height)
+                                   withHorizontalFittingPriority:UILayoutPriorityRequired
+                                         verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
+    CGFloat height = ceil(fitting.height);
+    sLGMeasuredCellHeights[key] = @(height);
+    return height;
+}
+
+#pragma mark - Pack card grid (main screen)
+
+typedef void (^LGGroupCardTapHandler)(NSInteger groupIndex);
+
+@interface LGPackCardView : UIControl
+- (void)configureWithGroup:(const LGRuntimeGroup *)group
+                groupIndex:(NSInteger)groupIndex
+                  selected:(BOOL)selected
+               accentColor:(UIColor *)accentColor
+       cardBackgroundColor:(UIColor *)cardBackgroundColor
+                tapHandler:(LGGroupCardTapHandler)tapHandler;
+- (void)configureWithTitle:(NSString *)title
+                 iconCount:(NSInteger)iconCount
+             previewImages:(NSArray<UIImage *> *)previewImages
+                cardIndex:(NSInteger)cardIndex
+                 selected:(BOOL)selected
+              accentColor:(UIColor *)accentColor
+      cardBackgroundColor:(UIColor *)cardBackgroundColor
+     pressAnimationEnabled:(BOOL)pressAnimationEnabled
+               tapHandler:(LGGroupCardTapHandler)tapHandler;
+- (void)updateForSelectedCardIndex:(NSInteger)selectedCardIndex animated:(BOOL)animated;
+@end
+
+@implementation LGPackCardView {
+    UIView *_fanContainer;
+    NSArray<UIImageView *> *_fanImageViews;
+    UILabel *_titleLabel;
+    UILabel *_countLabel;
+    NSLayoutConstraint *_fanTopConstraint;
+    UIView *_selectionRing;
+    UIImageView *_checkBadge;
+    NSInteger _groupIndex;
+    LGGroupCardTapHandler _tapHandler;
+    LGPressAnimationState _pressAnimation;
+    BOOL _pressAnimationEnabled;
+    UIColor *_selectionAccentColor;
+    BOOL _hasSelectionState;
+    BOOL _selectionState;
+    NSInteger _selectionCardIndex;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    self.layer.cornerRadius = kLGCardCorner;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.clipsToBounds = YES;
+    self.isAccessibilityElement = YES;
+    [self addTarget:self action:@selector(lg_tapped) forControlEvents:UIControlEventTouchUpInside];
+
+    _fanContainer = [[UIView alloc] init];
+    _fanContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    _fanContainer.userInteractionEnabled = NO;
+    [self addSubview:_fanContainer];
+
+    NSMutableArray<UIImageView *> *fanViews = [NSMutableArray arrayWithCapacity:kLGFanCount];
+    for (NSInteger i = 0; i < kLGFanCount; i++) {
+        UIImageView *iv = [[UIImageView alloc] init];
+        iv.translatesAutoresizingMaskIntoConstraints = NO;
+        iv.contentMode = UIViewContentModeScaleAspectFill;
+        iv.clipsToBounds = YES;
+        iv.layer.cornerRadius = kLGFanCorner;
+        iv.layer.cornerCurve = kCACornerCurveContinuous;
+        iv.layer.borderWidth = 1.0 / iv.traitCollection.displayScale;
+        // Hairline border is cached on the layer; recompute it when the
+        // display scale changes (e.g. the view lands on a different screen).
+        if (@available(iOS 17.0, *)) {
+            [iv registerForTraitChanges:@[UITraitDisplayScale.class] withHandler:^(__kindof UIView *v, UITraitCollection *previous) {
+                v.layer.borderWidth = 1.0 / v.traitCollection.displayScale;
+            }];
+        }
+        iv.layer.borderColor = [UIColor.separatorColor colorWithAlphaComponent:0.5].CGColor;
+        iv.backgroundColor = UIColor.secondarySystemBackgroundColor;
+        [_fanContainer addSubview:iv];
+        [fanViews addObject:iv];
+    }
+    _fanImageViews = [fanViews copy];
+
+    CGFloat fanWidth = kLGFanThumbSide + (kLGFanCount - 1) * kLGFanOffsetX;
+    CGFloat fanHeight = kLGFanThumbSide + (kLGFanCount - 1) * kLGFanOffsetY;
+    NSMutableArray<NSLayoutConstraint *> *constraints = [NSMutableArray arrayWithArray:@[
+        [_fanContainer.widthAnchor constraintEqualToConstant:fanWidth],
+        [_fanContainer.heightAnchor constraintEqualToConstant:fanHeight],
+    ]];
+    for (NSInteger i = 0; i < (NSInteger)_fanImageViews.count; i++) {
+        UIImageView *iv = _fanImageViews[i];
+        [constraints addObjectsFromArray:@[
+            [iv.widthAnchor constraintEqualToConstant:kLGFanThumbSide],
+            [iv.heightAnchor constraintEqualToConstant:kLGFanThumbSide],
+            [iv.leadingAnchor constraintEqualToAnchor:_fanContainer.leadingAnchor constant:i * kLGFanOffsetX],
+            [iv.topAnchor constraintEqualToAnchor:_fanContainer.topAnchor constant:i * kLGFanOffsetY],
+        ]];
+        iv.transform = CGAffineTransformMakeRotation(((CGFloat)i - (kLGFanCount - 1) / 2.0) * kLGFanRotationStep);
+    }
+
+    _titleLabel = [[UILabel alloc] init];
+    _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _titleLabel.font = LGPackTitleFont();
+    _titleLabel.adjustsFontForContentSizeCategory = YES;
+    _titleLabel.textColor = UIColor.labelColor;
+    _titleLabel.textAlignment = NSTextAlignmentCenter;
+    _titleLabel.numberOfLines = 2;
+    _titleLabel.adjustsFontSizeToFitWidth = YES;
+    _titleLabel.minimumScaleFactor = 0.82;
+    [self addSubview:_titleLabel];
+
+    _countLabel = [[UILabel alloc] init];
+    _countLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _countLabel.font = LGPackCountFont();
+    _countLabel.adjustsFontForContentSizeCategory = YES;
+    _countLabel.textColor = UIColor.secondaryLabelColor;
+    _countLabel.textAlignment = NSTextAlignmentCenter;
+    _countLabel.numberOfLines = 1;
+    [self addSubview:_countLabel];
+
+    _checkBadge = [[UIImageView alloc] initWithImage:[[UIImage systemImageNamed:@"checkmark.circle.fill"]
+                                                       imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]];
+    _checkBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    _checkBadge.contentMode = UIViewContentModeScaleAspectFit;
+    _checkBadge.hidden = YES;
+    [self addSubview:_checkBadge];
+
+    _selectionRing = [[UIView alloc] init];
+    _selectionRing.translatesAutoresizingMaskIntoConstraints = NO;
+    _selectionRing.userInteractionEnabled = NO;
+    _selectionRing.layer.cornerRadius = kLGCardCorner;
+    _selectionRing.layer.cornerCurve = kCACornerCurveContinuous;
+    _selectionRing.layer.borderWidth = 2.0;
+    _selectionRing.hidden = YES;
+    [self addSubview:_selectionRing];
+
+    _fanTopConstraint = [_fanContainer.topAnchor constraintEqualToAnchor:self.topAnchor
+                                                                 constant:LGPackFanTopInset()];
+    [constraints addObjectsFromArray:@[
+        _fanTopConstraint,
+        [_fanContainer.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+
+        [_titleLabel.topAnchor constraintEqualToAnchor:_fanContainer.bottomAnchor constant:10],
+        [_titleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:10],
+        [_titleLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-10],
+
+        [_countLabel.topAnchor constraintEqualToAnchor:_titleLabel.bottomAnchor constant:2],
+        [_countLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
+        [_countLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
+
+        [_checkBadge.topAnchor constraintEqualToAnchor:self.topAnchor constant:7],
+        [_checkBadge.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-7],
+        [_checkBadge.widthAnchor constraintEqualToConstant:19],
+        [_checkBadge.heightAnchor constraintEqualToConstant:19],
+
+        [_selectionRing.topAnchor constraintEqualToAnchor:self.topAnchor],
+        [_selectionRing.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [_selectionRing.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+        [_selectionRing.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+    ]];
+    [NSLayoutConstraint activateConstraints:constraints];
+    return self;
+}
+
+- (void)configureWithGroup:(const LGRuntimeGroup *)group
+                groupIndex:(NSInteger)groupIndex
+                  selected:(BOOL)selected
+               accentColor:(UIColor *)accentColor
+       cardBackgroundColor:(UIColor *)cardBackgroundColor
+                tapHandler:(LGGroupCardTapHandler)tapHandler {
+    if (!group) return;
+    NSMutableArray<UIImage *> *images = [NSMutableArray arrayWithCapacity:group->coverIconIDs.count];
+    NSString *previewVariant = LGIsDarkAppearance(self) ? @"dark" : @"default";
+    for (NSString *iconID in group->coverIconIDs) {
+        UIImage *image = LGPreviewImage(iconID, previewVariant);
+        if (image) [images addObject:image];
+    }
+    [self configureWithTitle:group->title
+                   iconCount:group->count
+               previewImages:images
+                   cardIndex:groupIndex
+                    selected:selected
+                 accentColor:accentColor
+         cardBackgroundColor:cardBackgroundColor
+        pressAnimationEnabled:YES
+                  tapHandler:tapHandler];
+}
+
+- (void)configureWithTitle:(NSString *)title
+                 iconCount:(NSInteger)iconCount
+             previewImages:(NSArray<UIImage *> *)previewImages
+                 cardIndex:(NSInteger)cardIndex
+                  selected:(BOOL)selected
+               accentColor:(UIColor *)accentColor
+       cardBackgroundColor:(UIColor *)cardBackgroundColor
+      pressAnimationEnabled:(BOOL)pressAnimationEnabled
+                tapHandler:(LGGroupCardTapHandler)tapHandler {
+    BOOL animateSelection = _hasSelectionState && _selectionCardIndex == cardIndex &&
+        _selectionState != selected;
+    _groupIndex = cardIndex;
+    _tapHandler = [tapHandler copy];
+    _pressAnimationEnabled = pressAnimationEnabled;
+    if (!pressAnimationEnabled) LGResetPressAnimation(self, &_pressAnimation);
+    self.backgroundColor = cardBackgroundColor ?: LGThemedCardBackgroundColor(nil);
+    _titleLabel.text = title;
+
+    NSString *countText = [NSString stringWithFormat:@"%ld icon%@", (long)iconCount, iconCount == 1 ? @"" : @"s"];
+    _countLabel.text = countText;
+    _fanTopConstraint.constant = LGPackFanTopInset();
+    self.accessibilityLabel = [NSString stringWithFormat:@"%@, %@", title, countText];
+    self.accessibilityTraits = UIAccessibilityTraitButton | (selected ? UIAccessibilityTraitSelected : 0);
+
+    UIColor *accent = accentColor ?: UIColor.systemBlueColor;
+    _selectionAccentColor = accent;
+    _checkBadge.tintColor = accent;
+    _selectionRing.layer.borderColor = [[accent resolvedColorWithTraitCollection:self.traitCollection] CGColor];
+    LGSetAnimatedSelectionVisuals(_selectionRing, _checkBadge, selected, animateSelection);
+    _hasSelectionState = YES;
+    _selectionState = selected;
+    _selectionCardIndex = cardIndex;
+    if (selected) self.accessibilityLabel = [self.accessibilityLabel stringByAppendingString:@", selected"];
+
+    NSInteger sampleCount = MIN((NSInteger)_fanImageViews.count, (NSInteger)previewImages.count);
+    for (NSInteger i = 0; i < (NSInteger)_fanImageViews.count; i++) {
+        UIImageView *iv = _fanImageViews[i];
+        iv.image = i < sampleCount ? previewImages[i] : nil;
+        iv.hidden = i >= sampleCount;
+    }
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    if (highlighted == self.highlighted) return;
+    [super setHighlighted:highlighted];
+    if (_pressAnimationEnabled) LGSetPressAnimationHighlighted(self, &_pressAnimation, highlighted);
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    if (previousTraitCollection.userInterfaceStyle == self.traitCollection.userInterfaceStyle ||
+        !_selectionAccentColor) return;
+
+    CALayer *presentationLayer = (CALayer *)_selectionRing.layer.presentationLayer;
+    CGColorRef oldColor = presentationLayer.borderColor ?: _selectionRing.layer.borderColor;
+    id oldValue = oldColor ? (__bridge id)oldColor : nil;
+    CGColorRef newColor = [_selectionAccentColor resolvedColorWithTraitCollection:self.traitCollection].CGColor;
+    id newValue = newColor ? (__bridge id)newColor : nil;
+    _selectionRing.layer.borderColor = newColor;
+    if (!_selectionRing.hidden && oldValue && newValue) {
+        CABasicAnimation *transition = [CABasicAnimation animationWithKeyPath:@"borderColor"];
+        transition.fromValue = oldValue;
+        transition.toValue = newValue;
+        transition.duration = 0.30;
+        transition.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [_selectionRing.layer addAnimation:transition forKey:@"LGAppearanceBorderColor"];
+    }
+}
+
+- (void)lg_tapped {
+    if (_tapHandler) _tapHandler(_groupIndex);
+}
+
+- (void)updateForSelectedCardIndex:(NSInteger)selectedCardIndex animated:(BOOL)animated {
+    BOOL selected = _groupIndex == selectedCardIndex;
+    // Changing an alternate icon can make UIKit rebuild the surrounding table
+    // before the setter's completion runs. In that case this cover has already
+    // been configured as selected, but that initial configuration correctly
+    // avoided animating. Replay only the active cover here so a deliberate
+    // selection still gets the same visible confirmation as its icon card.
+    if (_hasSelectionState && _selectionState == selected && !(animated && selected)) return;
+    LGSetAnimatedSelectionVisuals(_selectionRing, _checkBadge, selected, animated && _hasSelectionState);
+    _hasSelectionState = YES;
+    _selectionState = selected;
+    _selectionCardIndex = _groupIndex;
+    self.accessibilityLabel = [NSString stringWithFormat:@"%@, %@%@",
+        _titleLabel.text ?: @"", _countLabel.text ?: @"", selected ? @", selected" : @""];
+    self.accessibilityTraits = UIAccessibilityTraitButton | (selected ? UIAccessibilityTraitSelected : 0);
+}
+
+@end
+
+@interface LGPackGridRowCell : UITableViewCell
+- (void)configureWithGroupColumnCount:(NSInteger)columnCount
+                 selectedGroupIndex:(NSInteger)selectedGroupIndex
+                        accentColor:(UIColor *)accentColor
+                cardBackgroundColor:(UIColor *)cardBackgroundColor
+                         tapHandler:(LGGroupCardTapHandler)tapHandler;
+- (void)configureWithStandardColumnCount:(NSInteger)columnCount
+                  selectedStandardPack:(LGStandardPack)selectedStandardPack
+                           accentColor:(UIColor *)accentColor
+                   cardBackgroundColor:(UIColor *)cardBackgroundColor
+                            tapHandler:(LGGroupCardTapHandler)tapHandler;
+- (void)updateSelectedCardIndex:(NSInteger)selectedCardIndex animated:(BOOL)animated;
+- (void)setColumnCount:(NSInteger)columnCount;
+@end
+
+@implementation LGPackGridRowCell {
+    NSMutableArray<LGPackCardView *> *_cards;
+    NSArray<NSLayoutConstraint *> *_gridConstraints;
+    NSInteger _columnCount;
+    CGFloat _rowHeight;
+}
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
+    self = [super initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseIdentifier];
+    if (!self) return nil;
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+    self.backgroundColor = UIColor.clearColor;
+    self.contentView.backgroundColor = UIColor.clearColor;
+    self.separatorInset = UIEdgeInsetsMake(0, CGFLOAT_MAX, 0, 0);
+
+    _cards = [NSMutableArray array];
+    return self;
+}
+
+- (void)prepareForCardCount:(NSInteger)cardCount columnCount:(NSInteger)columnCount {
+    if ((NSInteger)_cards.count != cardCount) {
+        [NSLayoutConstraint deactivateConstraints:_gridConstraints];
+        _gridConstraints = nil;
+        while ((NSInteger)_cards.count > cardCount) {
+            [_cards.lastObject removeFromSuperview];
+            [_cards removeLastObject];
+        }
+        while ((NSInteger)_cards.count < cardCount) {
+            LGPackCardView *card = [[LGPackCardView alloc] initWithFrame:CGRectZero];
+            card.translatesAutoresizingMaskIntoConstraints = NO;
+            [self.contentView addSubview:card];
+            [_cards addObject:card];
+        }
+    }
+    [self setColumnCount:columnCount];
+}
+
+- (void)setColumnCount:(NSInteger)columnCount {
+    CGFloat rowHeight = LGPackGridRowHeight();
+    if (_columnCount == columnCount && _rowHeight == rowHeight && _gridConstraints) return;
+    _columnCount = MAX(1, columnCount);
+    _rowHeight = rowHeight;
+    [NSLayoutConstraint deactivateConstraints:_gridConstraints];
+
+    // One persistent cell owns each complete pack section. Keeping every card
+    // in the same parent lets Auto Layout move it between rows without cell
+    // replacement, snapshots, or two sets of icons crossfading over each other.
+    NSMutableArray *constraints = [NSMutableArray array];
+    CGFloat gap = kLGMainGridSpacing;
+    CGFloat widthOffset = -(2.0 * gap + (_columnCount - 1) * gap) / _columnCount;
+    for (NSInteger i = 0; i < (NSInteger)_cards.count; i++) {
+        LGPackCardView *card = _cards[i];
+        [constraints addObjectsFromArray:@[
+            [card.widthAnchor constraintEqualToAnchor:self.contentView.widthAnchor
+                                           multiplier:1.0 / _columnCount constant:widthOffset],
+            [card.heightAnchor constraintEqualToConstant:rowHeight - gap],
+            [card.topAnchor constraintEqualToAnchor:self.contentView.topAnchor
+                                          constant:gap / 2.0 + (i / _columnCount) * rowHeight],
+        ]];
+        [constraints addObject:i % _columnCount == 0
+            ? [card.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:gap]
+            : [card.leadingAnchor constraintEqualToAnchor:_cards[i - 1].trailingAnchor constant:gap]];
+    }
+    _gridConstraints = constraints;
+    [NSLayoutConstraint activateConstraints:_gridConstraints];
+}
+
+- (void)configureWithGroupColumnCount:(NSInteger)columnCount
+                 selectedGroupIndex:(NSInteger)selectedGroupIndex
+                        accentColor:(UIColor *)accentColor
+                cardBackgroundColor:(UIColor *)cardBackgroundColor
+                         tapHandler:(LGGroupCardTapHandler)tapHandler {
+    [self prepareForCardCount:LGNonEmptyGroupCount() columnCount:columnCount];
+    for (NSInteger i = 0; i < (NSInteger)_cards.count; i++) {
+        NSInteger groupIndex = LGNonEmptyGroupIndexAt(i);
+        const LGRuntimeGroup *group = LGGroupAt(groupIndex);
+        if (!group) continue;
+        LGPackCardView *card = _cards[i];
+        [card configureWithGroup:group
+                      groupIndex:groupIndex
+                        selected:groupIndex == selectedGroupIndex
+                     accentColor:accentColor
+             cardBackgroundColor:cardBackgroundColor
+                      tapHandler:tapHandler];
+    }
+}
+
+- (void)configureWithStandardColumnCount:(NSInteger)columnCount
+                  selectedStandardPack:(LGStandardPack)selectedStandardPack
+                           accentColor:(UIColor *)accentColor
+                   cardBackgroundColor:(UIColor *)cardBackgroundColor
+                            tapHandler:(LGGroupCardTapHandler)tapHandler {
+    [self prepareForCardCount:LGStandardPackCount columnCount:columnCount];
+    for (NSInteger i = 0; i < (NSInteger)_cards.count; i++) {
+        LGStandardPack pack = (LGStandardPack)i;
+        LGPackCardView *card = _cards[i];
+        [card configureWithTitle:LGStandardPackTitle(pack)
+                       iconCount:LGStandardPackIconCount(pack)
+                   previewImages:LGStandardPackCoverImages(pack)
+                       cardIndex:pack
+                        selected:pack == selectedStandardPack
+                     accentColor:accentColor
+             cardBackgroundColor:cardBackgroundColor
+            pressAnimationEnabled:YES
+                      tapHandler:tapHandler];
+    }
+}
+
+- (void)updateSelectedCardIndex:(NSInteger)selectedCardIndex animated:(BOOL)animated {
+    for (LGPackCardView *card in _cards) {
+        if (!card.hidden) [card updateForSelectedCardIndex:selectedCardIndex animated:animated];
+    }
+}
+
+@end
+
+static void LGRememberPreparedPackCell(UITableView *table, LGPackGridRowCell *cell) {
+    NSHashTable *cells = objc_getAssociatedObject(table, &kLGPreparedPackCellsKey);
+    if (!cells) {
+        cells = [NSHashTable weakObjectsHashTable];
+        objc_setAssociatedObject(table, &kLGPreparedPackCellsKey, cells, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [cells addObject:cell];
+}
+
+#pragma mark - Featured icon strip (main screen, above pack cards)
+
+typedef void (^LGFeaturedCardTapHandler)(const LGIconRow *row);
+
+@interface LGFeaturedCardView : UIControl
+- (void)configureWithRow:(const LGIconRow *)row
+                 selected:(BOOL)selected
+              accentColor:(UIColor *)accentColor
+      cardBackgroundColor:(UIColor *)cardBackgroundColor
+               tapHandler:(LGFeaturedCardTapHandler)tapHandler;
+- (void)updateForSelectedIconID:(NSString *)selectedIconID animated:(BOOL)animated;
+@end
+
+@implementation LGFeaturedCardView {
+    LGIconFanView *_fan;
+    LGNameAuthorLabelStack *_labels;
+    UIView *_selectionRing;
+    UIImageView *_checkBadge;
+    const LGIconRow *_row;
+    LGFeaturedCardTapHandler _tapHandler;
+    LGPressAnimationState _pressAnimation;
+    UIColor *_selectionAccentColor;
+    NSString *_representedIconID;
+    BOOL _hasSelectionState;
+    BOOL _selectionState;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+    self.layer.cornerRadius = kLGCardCorner;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.clipsToBounds = YES;
+    self.isAccessibilityElement = YES;
+    [self addTarget:self action:@selector(lg_tapped) forControlEvents:UIControlEventTouchUpInside];
+
+    _fan = [[LGIconFanView alloc] initWithAccessibilityLabel:@"Default appearance"];
+    _fan.userInteractionEnabled = NO;
+    [self addSubview:_fan];
+
+    _labels = [[LGNameAuthorLabelStack alloc] initWithNameFont:[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]
+                                                     authorFont:[UIFont systemFontOfSize:10 weight:UIFontWeightRegular]];
+    _labels.nameLabel.textAlignment = NSTextAlignmentCenter;
+    _labels.authorLabel.textAlignment = NSTextAlignmentCenter;
+    _labels.userInteractionEnabled = NO;
+    [self addSubview:_labels];
+
+    _checkBadge = [[UIImageView alloc] initWithImage:[[UIImage systemImageNamed:@"checkmark.circle.fill"]
+                                                       imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate]];
+    _checkBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    _checkBadge.contentMode = UIViewContentModeScaleAspectFit;
+    _checkBadge.hidden = YES;
+    [self addSubview:_checkBadge];
+
+    _selectionRing = [[UIView alloc] init];
+    _selectionRing.translatesAutoresizingMaskIntoConstraints = NO;
+    _selectionRing.userInteractionEnabled = NO;
+    _selectionRing.layer.cornerRadius = kLGCardCorner;
+    _selectionRing.layer.cornerCurve = kCACornerCurveContinuous;
+    _selectionRing.layer.borderWidth = 2.0;
+    _selectionRing.hidden = YES;
+    [self addSubview:_selectionRing];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_fan.widthAnchor constraintEqualToConstant:kLGFeaturedFanSide],
+        [_fan.topAnchor constraintEqualToAnchor:self.topAnchor constant:10],
+        [_fan.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+
+        [_labels.topAnchor constraintEqualToAnchor:_fan.bottomAnchor constant:7],
+        [_labels.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:6],
+        [_labels.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-6],
+        [_labels.bottomAnchor constraintLessThanOrEqualToAnchor:self.bottomAnchor constant:-3],
+
+        [_checkBadge.topAnchor constraintEqualToAnchor:self.topAnchor constant:5],
+        [_checkBadge.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-5],
+        [_checkBadge.widthAnchor constraintEqualToConstant:17],
+        [_checkBadge.heightAnchor constraintEqualToConstant:17],
+
+        [_selectionRing.topAnchor constraintEqualToAnchor:self.topAnchor],
+        [_selectionRing.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [_selectionRing.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+        [_selectionRing.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+    ]];
+    return self;
+}
+
+- (void)configureWithRow:(const LGIconRow *)row
+                 selected:(BOOL)selected
+              accentColor:(UIColor *)accentColor
+      cardBackgroundColor:(UIColor *)cardBackgroundColor
+               tapHandler:(LGFeaturedCardTapHandler)tapHandler {
+    if (!row) return;
+    _row = row;
+    _tapHandler = [tapHandler copy];
+    self.backgroundColor = cardBackgroundColor ?: LGThemedCardBackgroundColor(nil);
+
+    const LGSpotlightStandardIcon *standard = LGSpotlightStandardIconForID(row->iconID);
+    if (standard) {
+        // Apollo's own icons load from the bundle's icon files; the tweak's
+        // Ultra additions have a single "default" preview.
+        [_fan configureWithSingleImage:standard->nativeRow != NSNotFound
+            ? LGStandardIconPreview(row->iconID)
+            : LGPreviewImage(row->iconID, @"default")];
+    } else {
+        UIImage *light = LGPreviewImage(row->iconID, @"default");
+        UIImage *dark = LGPreviewImage(row->iconID, @"dark");
+        if (LGIsDarkAppearance(self)) {
+            [_fan configureWithFrontImage:dark backImage:light];
+        } else {
+            [_fan configureWithFrontImage:light backImage:dark];
+        }
+    }
+    [_labels configureWithRow:row];
+
+    UIColor *accent = accentColor ?: UIColor.systemBlueColor;
+    _selectionAccentColor = accent;
+    UIColor *resolvedAccent = [accent resolvedColorWithTraitCollection:self.traitCollection];
+    _checkBadge.tintColor = accent;
+    _selectionRing.layer.borderColor = resolvedAccent.CGColor;
+    BOOL animateSelection = _hasSelectionState &&
+        [_representedIconID isEqualToString:row->iconID] && _selectionState != selected;
+    LGSetAnimatedSelectionVisuals(_selectionRing, _checkBadge, selected, animateSelection);
+    _representedIconID = [row->iconID copy];
+    _hasSelectionState = YES;
+    _selectionState = selected;
+
+    self.accessibilityLabel = row->designer.length
+        ? [NSString stringWithFormat:@"%@, by %@%@", row->displayName, row->designer, selected ? @", selected" : @""]
+        : [NSString stringWithFormat:@"%@%@", row->displayName, selected ? @", selected" : @""];
+    self.accessibilityTraits = UIAccessibilityTraitButton | (selected ? UIAccessibilityTraitSelected : 0);
+}
+
+- (void)setHighlighted:(BOOL)highlighted {
+    if (highlighted == self.highlighted) return;
+    [super setHighlighted:highlighted];
+    if (highlighted) LGPrepareIconSelectionHaptic(self);
+    LGSetPressAnimationHighlighted(self, &_pressAnimation, highlighted);
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    if (previousTraitCollection.userInterfaceStyle == self.traitCollection.userInterfaceStyle ||
+        !_selectionAccentColor) return;
+
+    CALayer *presentationLayer = (CALayer *)_selectionRing.layer.presentationLayer;
+    CGColorRef oldColor = presentationLayer.borderColor ?: _selectionRing.layer.borderColor;
+    id oldValue = oldColor ? (__bridge id)oldColor : nil;
+    CGColorRef newColor = [_selectionAccentColor resolvedColorWithTraitCollection:self.traitCollection].CGColor;
+    id newValue = newColor ? (__bridge id)newColor : nil;
+    _selectionRing.layer.borderColor = newColor;
+    if (!_selectionRing.hidden && oldValue && newValue) {
+        CABasicAnimation *transition = [CABasicAnimation animationWithKeyPath:@"borderColor"];
+        transition.fromValue = oldValue;
+        transition.toValue = newValue;
+        transition.duration = 0.30;
+        transition.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [_selectionRing.layer addAnimation:transition forKey:@"LGAppearanceBorderColor"];
+    }
+}
+
+- (void)lg_tapped {
+    if (_tapHandler && _row) _tapHandler(_row);
+}
+
+- (void)updateForSelectedIconID:(NSString *)selectedIconID animated:(BOOL)animated {
+    if (!_row) return;
+    BOOL selected = selectedIconID.length && [_row->iconID isEqualToString:selectedIconID];
+    if (_hasSelectionState && _selectionState == selected) return;
+    LGSetAnimatedSelectionVisuals(_selectionRing, _checkBadge, selected, animated && _hasSelectionState);
+    _hasSelectionState = YES;
+    _selectionState = selected;
+    self.accessibilityLabel = _row->designer.length
+        ? [NSString stringWithFormat:@"%@, by %@%@", _row->displayName, _row->designer,
+                                             selected ? @", selected" : @""]
+        : [NSString stringWithFormat:@"%@%@", _row->displayName, selected ? @", selected" : @""];
+    self.accessibilityTraits = UIAccessibilityTraitButton | (selected ? UIAccessibilityTraitSelected : 0);
+}
+
+@end
+
+// Daily Spotlight sits inside Apollo's vertically scrolling icon table and
+// beneath its full-width swipe-to-go-back gesture. UIScrollView owns its pan
+// gesture's delegate, so these conflicts must be resolved by the scroll view
+// subclass itself rather than by replacing panGestureRecognizer.delegate.
+@interface LGSpotlightScrollView : UIScrollView <UIGestureRecognizerDelegate, UIScrollViewDelegate>
+@property (nonatomic, copy) void (^didScrollHandler)(void);
+- (UIScrollView *)lg_enclosingOuterScrollView;
+@end
+
+@implementation LGSpotlightScrollView
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    if (self.didScrollHandler) self.didScrollHandler();
+}
+
+- (void)setContentSize:(CGSize)contentSize {
+    [super setContentSize:contentSize];
+    if (self.didScrollHandler) self.didScrollHandler();
+}
+
+// Featured cards are UIControls. Let a drag that begins on one cancel its press
+// and become a horizontal scroll.
+- (BOOL)touchesShouldCancelInContentView:(UIView *)view {
+    return YES;
+}
+
+// Decide the axis before either nested scroll view begins moving. A vertical
+// drag fails this inner pan immediately and falls through to Apollo's table;
+// a horizontal drag belongs exclusively to the Spotlight row.
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer != self.panGestureRecognizer) return YES;
+    CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
+    if (fabs(velocity.x) < fabs(velocity.y)) return NO;
+    // A new touch that interrupts horizontal deceleration can initially report
+    // zero velocity. Keep that undecided touch with Spotlight instead of
+    // failing the pan and handing a rightward follow-up swipe to navigation.
+    return YES;
+}
+
+// Give a horizontal Spotlight drag priority over Apollo's full-width back
+// gesture. The back gesture remains available when Spotlight's pan fails.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+        shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    if (gestureRecognizer != self.panGestureRecognizer) return NO;
+    if (![otherGestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
+    if ([otherGestureRecognizer.view isKindOfClass:[UIScrollView class]]) return NO;
+    return YES;
+}
+
+// A daily rollover reloads this row and can install a new scroll view. Restore
+// the failure relationship whenever this instance joins a window.
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    if (!self.window) return;
+
+    // The enclosing table waits for this row's axis decision. Without this
+    // relationship both pans begin together and a slightly diagonal sideways
+    // swipe visibly bounces the page before the horizontal lock takes effect.
+    UIScrollView *outerScrollView = [self lg_enclosingOuterScrollView];
+    if (outerScrollView)
+        [outerScrollView.panGestureRecognizer requireGestureRecognizerToFail:self.panGestureRecognizer];
+
+    for (UIView *view = self.superview; view != nil; view = view.superview) {
+        for (UIGestureRecognizer *gestureRecognizer in view.gestureRecognizers) {
+            if (gestureRecognizer == self.panGestureRecognizer) continue;
+            if ([gestureRecognizer isKindOfClass:[UIPanGestureRecognizer class]] &&
+                ![gestureRecognizer.view isKindOfClass:[UIScrollView class]]) {
+                [gestureRecognizer requireGestureRecognizerToFail:self.panGestureRecognizer];
+            }
+        }
+    }
+}
+
+- (UIScrollView *)lg_enclosingOuterScrollView {
+    for (UIView *view = self.superview; view != nil; view = view.superview) {
+        if ([view isKindOfClass:[UIScrollView class]]) return (UIScrollView *)view;
+    }
+    return nil;
+}
+
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+    if (scrollView == self && self.didScrollHandler) self.didScrollHandler();
+}
+
+@end
+
+@interface LGFeaturedStripCell : UITableViewCell
+- (void)configureWithRows:(const LGIconRow *)rows
+                     count:(NSInteger)count
+            selectedIconID:(NSString *)selectedIconID
+               accentColor:(UIColor *)accentColor
+       cardBackgroundColor:(UIColor *)cardBackgroundColor
+                tapHandler:(LGFeaturedCardTapHandler)tapHandler;
+- (void)updateSelectedIconID:(NSString *)selectedIconID animated:(BOOL)animated;
+@end
+
+@implementation LGFeaturedStripCell {
+    LGSpotlightScrollView *_scrollView;
+    UIStackView *_stack;
+    CAGradientLayer *_edgeFadeMask;
+}
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
+    self = [super initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseIdentifier];
+    if (!self) return nil;
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+    self.backgroundColor = UIColor.clearColor;
+    self.contentView.backgroundColor = UIColor.clearColor;
+    self.separatorInset = UIEdgeInsetsMake(0, CGFLOAT_MAX, 0, 0);
+
+    _scrollView = [[LGSpotlightScrollView alloc] init];
+    _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    _scrollView.showsHorizontalScrollIndicator = NO;
+    _scrollView.alwaysBounceHorizontal = YES;
+    _scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    _scrollView.delaysContentTouches = NO;
+    _scrollView.directionalLockEnabled = YES;
+    _scrollView.delegate = _scrollView;
+    __weak LGFeaturedStripCell *weakSelf = self;
+    _scrollView.didScrollHandler = ^{
+        [weakSelf lg_updateEdgeFade];
+    };
+    [self.contentView addSubview:_scrollView];
+
+    _edgeFadeMask = [CAGradientLayer layer];
+    _edgeFadeMask.startPoint = CGPointMake(0.0, 0.5);
+    _edgeFadeMask.endPoint = CGPointMake(1.0, 0.5);
+
+    _stack = [[UIStackView alloc] init];
+    _stack.translatesAutoresizingMaskIntoConstraints = NO;
+    _stack.axis = UILayoutConstraintAxisHorizontal;
+    _stack.spacing = kLGMainGridSpacing;
+    [_scrollView addSubview:_stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_scrollView.topAnchor constraintEqualToAnchor:self.contentView.topAnchor],
+        [_scrollView.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor],
+        [_scrollView.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor],
+        [_scrollView.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor],
+
+        [_stack.leadingAnchor constraintEqualToAnchor:_scrollView.contentLayoutGuide.leadingAnchor constant:kLGMainGridSpacing],
+        [_stack.trailingAnchor constraintEqualToAnchor:_scrollView.contentLayoutGuide.trailingAnchor constant:-kLGMainGridSpacing],
+        [_stack.centerYAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.centerYAnchor],
+        [_stack.heightAnchor constraintEqualToConstant:kLGFeaturedCardHeight],
+        [_scrollView.contentLayoutGuide.heightAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.heightAnchor],
+    ]];
+    return self;
+}
+
+- (void)lg_updateEdgeFade {
+    CGFloat maximumOffset = MAX(0.0, _scrollView.contentSize.width - CGRectGetWidth(_scrollView.bounds));
+    BOOL canScrollLeft = _scrollView.contentOffset.x > 1.0;
+    BOOL canScrollRight = maximumOffset > 1.0 && _scrollView.contentOffset.x < maximumOffset - 1.0;
+    // Gradient-layer property changes animate implicitly by default. During a
+    // fast swipe that makes the mask trail the content and briefly cover an
+    // icon after it has moved away from the edge. Keep mask updates locked to
+    // the scroll view's current presentation frame instead.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    if (!canScrollLeft && !canScrollRight) {
+        _scrollView.layer.mask = nil;
+        [CATransaction commit];
+        return;
+    }
+
+    CGColorRef opaque = UIColor.blackColor.CGColor;
+    CGColorRef clear = UIColor.clearColor.CGColor;
+    if (canScrollLeft && canScrollRight) {
+        _edgeFadeMask.colors = @[(__bridge id)clear, (__bridge id)opaque, (__bridge id)opaque, (__bridge id)clear];
+        _edgeFadeMask.locations = @[@0.0, @0.06, @0.94, @1.0];
+    } else if (canScrollLeft) {
+        _edgeFadeMask.colors = @[(__bridge id)clear, (__bridge id)opaque, (__bridge id)opaque];
+        _edgeFadeMask.locations = @[@0.0, @0.06, @1.0];
+    } else {
+        _edgeFadeMask.colors = @[(__bridge id)opaque, (__bridge id)opaque, (__bridge id)clear];
+        _edgeFadeMask.locations = @[@0.0, @0.94, @1.0];
+    }
+    _edgeFadeMask.frame = _scrollView.bounds;
+    _scrollView.layer.mask = _edgeFadeMask;
+    [CATransaction commit];
+}
+
+- (void)configureWithRows:(const LGIconRow *)rows
+                     count:(NSInteger)count
+            selectedIconID:(NSString *)selectedIconID
+               accentColor:(UIColor *)accentColor
+       cardBackgroundColor:(UIColor *)cardBackgroundColor
+                tapHandler:(LGFeaturedCardTapHandler)tapHandler {
+    while (_stack.arrangedSubviews.count > count) {
+        UIView *view = _stack.arrangedSubviews.lastObject;
+        [_stack removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+    while (_stack.arrangedSubviews.count < count) {
+        LGFeaturedCardView *card = [[LGFeaturedCardView alloc] initWithFrame:CGRectZero];
+        [NSLayoutConstraint activateConstraints:@[
+            [card.widthAnchor constraintEqualToConstant:kLGFeaturedCardWidth],
+            [card.heightAnchor constraintEqualToConstant:kLGFeaturedCardHeight],
+        ]];
+        [_stack addArrangedSubview:card];
+    }
+
+    for (NSInteger i = 0; i < count; i++) {
+        const LGIconRow *row = &rows[i];
+        LGFeaturedCardView *card = (LGFeaturedCardView *)_stack.arrangedSubviews[i];
+        BOOL selected = selectedIconID.length && [row->iconID isEqualToString:selectedIconID];
+        [card configureWithRow:row selected:selected accentColor:accentColor cardBackgroundColor:cardBackgroundColor tapHandler:tapHandler];
+    }
+    [self setNeedsLayout];
+}
+
+- (void)updateSelectedIconID:(NSString *)selectedIconID animated:(BOOL)animated {
+    for (UIView *view in _stack.arrangedSubviews) {
+        if ([view isKindOfClass:[LGFeaturedCardView class]])
+            [(LGFeaturedCardView *)view updateForSelectedIconID:selectedIconID animated:animated];
+    }
+}
+
+@end
+
+static void LGRefreshVisiblePickerSelection(UITableView *tableView, BOOL animated) {
+    if (!tableView) return;
+    NSString *activeIconID = LGActiveIconID();
+    LGStandardPack activeStandardPack = LGActiveStandardPack();
+    NSInteger selectedGroupIndex = activeStandardPack == LGStandardPackCount
+        ? LGGroupIndexForIconID(activeIconID) : NSNotFound;
+    NSInteger selectedStandardPack = activeStandardPack == LGStandardPackCount
+        ? NSNotFound : activeStandardPack;
+
+    for (NSIndexPath *indexPath in tableView.indexPathsForVisibleRows) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+        if (LGHasFeaturedSection() && indexPath.section == LGFeaturedSectionIndex() &&
+            [cell isKindOfClass:[LGFeaturedStripCell class]]) {
+            [(LGFeaturedStripCell *)cell updateSelectedIconID:LGActiveSpotlightIconID() animated:animated];
+        } else if (indexPath.section == LGPacksSectionIndex() &&
+                   [cell isKindOfClass:[LGPackGridRowCell class]]) {
+            [(LGPackGridRowCell *)cell updateSelectedCardIndex:selectedGroupIndex animated:animated];
+        } else if (indexPath.section == LGStandardPacksSectionIndex() &&
+                   [cell isKindOfClass:[LGPackGridRowCell class]]) {
+            [(LGPackGridRowCell *)cell updateSelectedCardIndex:selectedStandardPack animated:animated];
+        }
+    }
+}
+
+#pragma mark - Alternate icon application
+
+static UIViewController *LGTopViewControllerForView(UIView *view) {
+    UIViewController *controller = view.window.rootViewController;
+    while (controller.presentedViewController) controller = controller.presentedViewController;
+    return controller;
+}
+
+// Prefer UIKit's underlying setter where available. Some newer runtimes
+// still present a system-owned confirmation through LaunchServices; this
+// selector does not guarantee that selection is quiet. The public setter
+// remains the compatibility path when the selector is absent.
+static void LGSetAlternateIconName(NSString *name, void (^completion)(NSError *error)) {
+    UIApplication *application = UIApplication.sharedApplication;
+    SEL quietSelector = @selector(_setAlternateIconName:completionHandler:);
+    if ([application respondsToSelector:quietSelector]) {
+        typedef void (*LGQuietIconSetter)(id, SEL, NSString *, void (^)(NSError *));
+        ((LGQuietIconSetter)objc_msgSend)(application, quietSelector, name, completion);
+        return;
+    }
+    [application setAlternateIconName:name completionHandler:completion];
+}
+
+// The picker's saved choice: a Liquid Glass icon, or an Ultra addition, which
+// is saved with its Standard pack. Never carries the refresh suffix.
+static NSString *LGSavedIconChoice(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if ([defaults objectForKey:kLGActiveStandardPackDefaultsKey]) {
+        return [defaults stringForKey:kLGActiveStandardAddedIconIDDefaultsKey];
+    }
+    return [defaults stringForKey:kLGActiveIconDefaultsKey];
+}
+
+// The registration iOS holds by our records. Builds before the twin keys
+// only applied plain names, which the saved choice records for them.
+static NSString *LGHeldIconName(void) {
+    return [NSUserDefaults.standardUserDefaults stringForKey:kLGAppliedIconNameDefaultsKey]
+        ?: LGSavedIconChoice();
+}
+
+static BOOL LGIsHeldIcon(NSString *name) {
+    return name.length && [ApolloLGCanonicalAlternateIconName(LGHeldIconName()) isEqualToString:name];
+}
+
+// The CFBundleAlternateIcons name to apply for an icon choice. Re-applying the
+// name iOS already holds succeeds but doesn't redraw the home-screen icon, so
+// it can't repair one stuck on the generic grid. Re-applying the active icon
+// switches to its other registration instead (same artwork, see
+// ApolloLGRefreshIconSuffix).
+static NSString *LGRegistrationForIconName(NSString *name) {
+    if (!LGIsHeldIcon(name)) return name;
+    NSString *held = LGHeldIconName();
+    NSString *twin = [name stringByAppendingString:ApolloLGRefreshIconSuffix];
+    if (!LGAlternateIconRegisteredInInfoPlist(twin)) return name;
+    return [held isEqualToString:twin] ? name : twin;
+}
+
+// Finish the one-time Classics migration only after the namespaced catalog
+// key is known to be active. This keeps the picker preference and Home Screen
+// icon from disagreeing when the setter fails.
+static void LGFinishLegacyClassicsMigration(NSString *alternateName) {
+    LGPersistActiveIconID(alternateName);
+    LGPersistAppliedIconName(alternateName);
+    LGPersistActiveStandardPack(LGStandardPackCount);
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setBool:YES forKey:kLGLegacyClassicsMigrationDefaultsKey];
+    [defaults synchronize];
+
+    BOOL barkChanged = ApolloBarkNoteSelectedIconName(alternateName);
+    if (barkChanged && ApolloBarkModeActive()) ApolloBarkSyncBackendDeviceTransport();
+    [[NSNotificationCenter defaultCenter] postNotificationName:kLGChangedIconNotification object:nil];
+}
+
+// Older catalogs registered Classics without the LG- namespace. Merely
+// rewriting ApolloLGActiveIconID is insufficient: after that old key vanishes,
+// iOS can fall back to the primary icon while the picker shows the migrated
+// checkmark. Reapply once on the first active launch, silently, and retry on a
+// later process launch if the setter reports an error. Returns YES when it
+// asked iOS for an icon change.
+static BOOL LGMigrateLegacyClassicsSelectionIfNeeded(void) {
+    static BOOL attemptedThisProcess = NO;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (attemptedThisProcess) return NO;
+
+    // A confirmed Standard-pack choice is authoritative. Several Standard
+    // IDs overlap the old Classics names and must never be rewritten as LG.
+    if ([defaults objectForKey:kLGActiveStandardPackDefaultsKey]) {
+        [defaults setBool:YES forKey:kLGLegacyClassicsMigrationDefaultsKey];
+        return NO;
+    }
+
+    NSString *stored = [defaults stringForKey:kLGActiveIconDefaultsKey];
+    NSString *system = ApolloLGCanonicalAlternateIconName(UIApplication.sharedApplication.alternateIconName);
+    NSString *source = stored.length ? stored : system;
+    NSString *target = LGMigratedClassicsAlternateIconName(source);
+    BOOL migrationCompleted = [defaults boolForKey:kLGLegacyClassicsMigrationDefaultsKey];
+
+    // A backup restore or temporary downgrade can reintroduce a genuinely old
+    // ID after the marker was set. Always repair that explicit legacy state;
+    // otherwise a completed migration needs no further system reconciliation.
+    if (migrationCompleted && !target.length) return NO;
+
+    // An earlier build of this branch may already have rewritten the saved
+    // preference without applying it. Recognize that state and reconcile it
+    // through the same one-time path.
+    if (!target.length) {
+        NSString *base = LGBaseIconIDFromAlternateIconName(source);
+        if (ApolloLGLegacyClassicsIconID(base)) target = source;
+    }
+
+    if (!target.length) {
+        [defaults setBool:YES forKey:kLGLegacyClassicsMigrationDefaultsKey];
+        return NO;
+    }
+    if (![UIApplication.sharedApplication supportsAlternateIcons]) return NO;
+
+    attemptedThisProcess = YES;
+    if ([system isEqualToString:target]) {
+        ApolloLog(@"[LGIconPicker] Classics migration already applied: %@", target);
+        LGFinishLegacyClassicsMigration(target);
+        return NO;
+    }
+
+    ApolloLog(@"[LGIconPicker] migrating Classics icon %@ -> %@", source, target);
+    LGSetAlternateIconName(target, ^(NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error) {
+                ApolloLog(@"[LGIconPicker] Classics migration failed; will retry next launch: %@", error);
+                return;
+            }
+            ApolloLog(@"[LGIconPicker] Classics migration applied: %@", target);
+            LGFinishLegacyClassicsMigration(target);
+        });
+    });
+    return YES;
+}
+
+// The app's bundle path as of the last icon check. Every install or update
+// lands in a new container, so the path changes even for sideloaded builds
+// that keep the same version strings.
+static NSString *const kLGIconCheckedInstallDefaultsKey = @"ApolloLGIconCheckedInstallPath";
+
+static void LGMarkIconCheckedForThisInstall(void) {
+    [NSUserDefaults.standardUserDefaults setObject:NSBundle.mainBundle.bundlePath
+                                            forKey:kLGIconCheckedInstallDefaultsKey];
+}
+
+// After an install or update, some devices come back with the home-screen
+// icon showing iOS's generic grid. The real art only flashes while the icon
+// is touched or the app opens and closes, re-picking the same icon doesn't
+// redraw it, and UIApplication reports no alternate icon even though one was
+// picked. When the first launch of a new install sees that, apply the saved
+// choice once under its other registration: a real icon change, so iOS draws
+// the icon again (with its usual "You have changed the icon" confirmation).
+static void LGRepairHomeScreenIconAfterUpdateIfNeeded(void) {
+    static BOOL attemptedThisProcess = NO;
+    if (attemptedThisProcess) return;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *installPath = NSBundle.mainBundle.bundlePath;
+    if ([[defaults stringForKey:kLGIconCheckedInstallDefaultsKey] isEqualToString:installPath]) return;
+    attemptedThisProcess = YES;
+
+    UIApplication *application = UIApplication.sharedApplication;
+    // LGActiveAlternateIconName() is nil while a Standard pack is saved, which
+    // covers the Ultra additions; they're catalog icons with twins too.
+    NSString *choice = LGActiveAlternateIconName() ?: LGSavedIconChoice();
+    NSString *system = application.alternateIconName;
+    // A name from iOS means its record is intact, or the icon was changed
+    // outside the picker; either way there is nothing to repair. When it is
+    // the saved choice, take iOS's word for which registration it holds: a
+    // repair whose confirmation was never answered left no record of it.
+    if (!choice.length || [choice isEqualToString:kLGConfirmedDefaultIconMarker] ||
+        system.length || ![application supportsAlternateIcons]) {
+        if ([ApolloLGCanonicalAlternateIconName(system) isEqualToString:choice]) {
+            LGPersistAppliedIconName(system);
+        }
+        LGMarkIconCheckedForThisInstall();
+        return;
+    }
+
+    // Let the launch transition finish before iOS shows its confirmation.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // The setter only works while active; try again on the next activation.
+        // A picker change in flight must not race this one either.
+        if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive ||
+            sLGIconChangeInProgress) {
+            attemptedThisProcess = NO;
+            return;
+        }
+        // An icon picked during the delay, or iOS reporting one after all,
+        // leaves nothing to repair.
+        if (![(LGActiveAlternateIconName() ?: LGSavedIconChoice()) isEqualToString:choice] ||
+            UIApplication.sharedApplication.alternateIconName.length) {
+            LGMarkIconCheckedForThisInstall();
+            return;
+        }
+        NSString *registration = LGRegistrationForIconName(choice);
+        // Re-applying the name iOS holds doesn't redraw the icon, and an IPA
+        // patched before the refresh twins has no other name to switch to.
+        if ([registration isEqualToString:LGHeldIconName()]) {
+            ApolloLog(@"[LGIconPicker] no refresh registration for %@; leaving the icon as is", choice);
+            LGMarkIconCheckedForThisInstall();
+            return;
+        }
+        ApolloLog(@"[LGIconPicker] new install reports no alternate icon; re-applying %@ as %@",
+                  choice, registration);
+        LGSetAlternateIconName(registration, ^(NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (error) {
+                    ApolloLog(@"[LGIconPicker] icon repair failed; will retry next launch: %@", error);
+                    return;
+                }
+                LGPersistAppliedIconName(registration);
+                LGMarkIconCheckedForThisInstall();
+                ApolloLog(@"[LGIconPicker] icon repair applied: %@", registration);
+                [[NSNotificationCenter defaultCenter] postNotificationName:kLGChangedIconNotification object:nil];
+            });
+        });
+    });
+}
+
+// hostView is used to find a presentation context for an error alert (works
+// for either a UITableView or UICollectionView, since both are UIViews).
+static void LGApplyAlternateIcon(UIView *hostView, NSString *iconID, void (^completion)(BOOL success)) {
+    if (![UIApplication.sharedApplication supportsAlternateIcons]) {
+        ApolloLog(@"[LGIconPicker] alternate icons are not supported");
+        if (completion) completion(NO);
+        return;
+    }
+    NSString *registration = LGRegistrationForIconName(iconID);
+    if (LGIsHeldIcon(iconID)) {
+        ApolloLog(@"[LGIconPicker] re-applying active icon=%@ as %@", iconID, registration);
+    } else {
+        ApolloLog(@"[LGIconPicker] requesting alternate icon=%@", iconID ?: @"(default)");
+    }
+    __weak UIView *weakHost = hostView;
+    LGSetAlternateIconName(registration, ^(NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error) {
+                ApolloLogError(@"[LGIconPicker] setAlternateIconName failed: %@", error);
+                UIAlertController *alert = [UIAlertController
+                    alertControllerWithTitle:@"Couldn't Change Icon"
+                                     message:error.localizedDescription ?: @"Unknown error."
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [LGTopViewControllerForView(weakHost) presentViewController:alert animated:YES completion:nil];
+                if (completion) completion(NO);
+                return;
+            }
+            LGPersistActiveIconID(iconID);
+            LGPersistAppliedIconName(registration);
+            if (!iconID.length || LGGroupIndexForIconID(LGBaseIconIDFromAlternateIconName(iconID)) != NSNotFound) {
+                LGPersistActiveStandardPack(LGStandardPackCount);
+            }
+            // The quiet private setter bypasses Tweak.xm's public UIApplication
+            // hook, so mirror the base icon name for Bark notifications here.
+            BOOL barkChanged = ApolloBarkNoteSelectedIconName(iconID);
+            if (barkChanged && ApolloBarkModeActive()) ApolloBarkSyncBackendDeviceTransport();
+            [[NSNotificationCenter defaultCenter] postNotificationName:kLGChangedIconNotification object:nil];
+            if (completion) completion(YES);
+        });
+    });
+}
+
+static void LGApplyAlternateIconSerialized(UIView *hostView, NSString *iconID,
+                                           void (^completion)(BOOL success)) {
+    NSUInteger generation = LGBeginIconChange(hostView);
+    if (!generation) {
+        ApolloLog(@"[LGIconPicker] ignoring overlapping or inactive icon request");
+        if (completion) completion(NO);
+        return;
+    }
+
+    LGApplyAlternateIcon(hostView, iconID, ^(BOOL success) {
+        LGFinishIconChange(generation);
+        if (completion) completion(success);
+    });
+}
+
+static void LGApplyIconUsingPreferredAppearance(UIView *hostView, const LGIconRow *row,
+                                                void (^completion)(BOOL success)) {
+    if (!hostView || !row) {
+        if (completion) completion(NO);
+        return;
+    }
+
+    NSUInteger generation = LGBeginIconChange(hostView);
+    if (!generation) {
+        ApolloLog(@"[LGIconPicker] ignoring overlapping or inactive icon selection");
+        if (completion) completion(NO);
+        return;
+    }
+
+    NSString *alternateName = LGAlternateIconNameForMode(row->iconID, LGPreferredAppearanceMode());
+    if (!LGAlternateIconRegisteredInInfoPlist(alternateName)) {
+        ApolloLog(@"[LGIconPicker] appearance asset is not registered: %@", alternateName);
+    }
+
+    // A completed tap is the only event that plays feedback. Give the
+    // prepared engine one frame to wake, then let the Medium impact begin
+    // before UIKit starts another icon-change transition. Without this small
+    // separation, a rapid selection after dismissing the system confirmation
+    // can cancel the haptic while UIKit moves the app between active states.
+    UIImpactFeedbackGenerator *feedback = LGIconSelectionFeedback(hostView);
+    [feedback prepare];
+    __weak UIView *weakHost = hostView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kLGIconHapticWarmupDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!LGIconChangeIsCurrent(generation)) {
+            if (completion) completion(NO);
+            return;
+        }
+        [feedback impactOccurred];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kLGIconTransitionDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIView *strongHost = weakHost;
+            if (!LGIconChangeIsCurrent(generation) || !LGIconChangeHostIsReady(strongHost)) {
+                LGFinishIconChange(generation);
+                if (completion) completion(NO);
+                return;
+            }
+            LGApplyAlternateIcon(strongHost, alternateName, ^(BOOL success) {
+                // Re-prime after the transition as well, ready for a selection
+                // made immediately after the confirmation is dismissed.
+                [feedback prepare];
+                LGFinishIconChange(generation);
+                if (completion) completion(success);
+            });
+        });
+    });
+}
+
+// A Standard-pack holiday icon tapped in the Spotlight. Same steps as its own
+// pack screen: Ultra additions save their icon ID, Apollo's icons save their
+// pack and native row, so the pack card and the row inside show the checkmark.
+// Apollo's icons are set directly (as Default and EAP already are) because its
+// row handler expects the pack screen's table, not this one.
+static void LGApplySpotlightStandardIcon(UITableView *tableView, const LGSpotlightStandardIcon *icon) {
+    if (!tableView || !icon) return;
+    NSString *iconID = icon->row.iconID;
+    LGStandardPack pack = (LGStandardPack)icon->pack;
+    NSInteger nativeRow = icon->nativeRow;
+    __weak UITableView *weakTable = tableView;
+    LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+        UITableView *strongTable = weakTable;
+        if (!strongTable) return;
+        LGApplyAlternateIcon(strongTable, iconID, ^(BOOL success) {
+            if (!success) return;
+            LGClearPersistedActiveIconID();
+            if (nativeRow == NSNotFound) {
+                LGPersistActiveStandardPackRow(LGStandardPackUltra, NSNotFound);
+                [NSUserDefaults.standardUserDefaults setObject:iconID
+                                                        forKey:kLGActiveStandardAddedIconIDDefaultsKey];
+            } else {
+                LGPersistActiveStandardPackRow(pack, nativeRow);
+            }
+            ApolloLog(@"[LGIconPicker] Spotlight applied Standard icon %@ (pack=%ld row=%@)",
+                      iconID, (long)pack, nativeRow == NSNotFound ? @"addition" : @(nativeRow));
+            LGRefreshVisiblePickerSelection(strongTable, YES);
+        });
+    });
+}
+
+static void LGSelectPreferredAppearance(UIView *hostView, LGIconAppearanceMode mode,
+                                        void (^completion)(BOOL success)) {
+    // Changing the menu updates the currently-selected Liquid Glass icon
+    // immediately. For Default or one of Apollo's native icons, remember the
+    // preference and use it on the next Liquid Glass icon tap.
+    BOOL appearanceChanged = LGPreferredAppearanceMode() != mode;
+    if (!appearanceChanged) {
+        if (completion) completion(YES);
+        return;
+    }
+
+    NSUInteger generation = LGBeginIconChange(hostView);
+    if (!generation) {
+        ApolloLog(@"[LGIconPicker] ignoring overlapping or inactive appearance request");
+        if (completion) completion(NO);
+        return;
+    }
+
+    UISelectionFeedbackGenerator *feedback = LGAppearanceSelectionFeedback(hostView);
+    [feedback selectionChanged];
+
+    NSString *activeID = LGActiveIconID();
+    const LGIconRow *activeRow = LGRowForIconID(activeID);
+    if (!activeRow) {
+        LGPersistPreferredAppearanceMode(mode);
+        [feedback prepare];
+        LGFinishIconChange(generation);
+        if (completion) completion(YES);
+        return;
+    }
+
+    NSString *alternateName = LGAlternateIconNameForMode(activeRow->iconID, mode);
+    LGApplyAlternateIcon(hostView, alternateName, ^(BOOL success) {
+        if (success) {
+            LGPersistPreferredAppearanceMode(mode);
+        }
+        // Prepare after the icon transition rather than before it. The menu
+        // tick already played when the new appearance was deliberately chosen.
+        [feedback prepare];
+        LGFinishIconChange(generation);
+        if (completion) completion(success);
+    });
+}
+
+static BOOL LGAppearanceUsesVerticalRail(void) {
+    if (!IsLiquidGlass()) return NO;
+    // The native tab bar briefly has horizontal/intermediate bounds while
+    // UIKit reparents the split columns. Use the destination geometry for the
+    // whole resize; otherwise a cover-to-landscape transition publishes a
+    // "System" title item between two layouts that both use the rail icon.
+    if (ApolloDuoSplitIsResizing()) return !ApolloDuoSplitIsUnfoldedPortrait();
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    UITabBar *bar = [tabs isKindOfClass:UITabBarController.class] ? tabs.tabBar : nil;
+    return bar.window && !bar.hidden && CGRectGetWidth(bar.bounds) < 100.0
+        && CGRectGetHeight(bar.bounds) > CGRectGetWidth(bar.bounds);
+}
+
+static void LGUpdateAppearancePlacement(UIViewController *controller) {
+    UIBarButtonItem *appearanceItem = objc_getAssociatedObject(controller, &kLGAppearanceBarButtonKey);
+    if (!appearanceItem) return;
+    LGIconAppearanceMode selectedMode = LGPreferredAppearanceMode();
+    NSString *buttonTitle = [NSString stringWithFormat:@"%@ ▾", LGAppearanceModeTitle(selectedMode)];
+    BOOL verticalDuoRail = LGAppearanceUsesVerticalRail();
+
+    NSMutableArray<UIBarButtonItem *> *leftItems =
+        [controller.navigationItem.leftBarButtonItems mutableCopy] ?: [NSMutableArray array];
+    NSIndexSet *oldAppearanceItems = [leftItems indexesOfObjectsPassingTest:
+        ^BOOL(UIBarButtonItem *item, NSUInteger index, BOOL *stop) {
+            return item.tag == kLGAppearanceBarButtonTag;
+        }];
+    [leftItems removeObjectsAtIndexes:oldAppearanceItems];
+
+    NSMutableArray<UIBarButtonItem *> *items = [NSMutableArray array];
+    for (UIBarButtonItem *item in controller.navigationItem.rightBarButtonItems ?: @[]) {
+        if (item.tag != kLGAppearanceBarButtonTag) [items addObject:item];
+    }
+    if (verticalDuoRail) {
+        appearanceItem.title = nil;
+        appearanceItem.image = LGAppearanceModeImage(selectedMode);
+        appearanceItem.accessibilityLabel = [NSString stringWithFormat:@"%@ icon appearance",
+                                               LGAppearanceModeTitle(selectedMode)];
+        if (@available(iOS 27.1, *)) {
+            appearanceItem.axisBehavior = UIBarButtonItemAxisBehaviorVerticalPreferred;
+        }
+        if (!controller.navigationItem.leftItemsSupplementBackButton) {
+            controller.navigationItem.leftItemsSupplementBackButton = YES;
+        }
+        [leftItems addObject:appearanceItem];
+    } else {
+        appearanceItem.image = nil;
+        appearanceItem.title = buttonTitle;
+        appearanceItem.accessibilityLabel = @"Icon appearance";
+        if (@available(iOS 27.1, *)) {
+            appearanceItem.axisBehavior = UIBarButtonItemAxisBehaviorAutomatic;
+        }
+        [items insertObject:appearanceItem atIndex:0];
+    }
+    // Moving between phone and Duo is a membership change; choosing another
+    // appearance isn't. Leave both arrays alone in the latter case.
+    if (![leftItems isEqualToArray:controller.navigationItem.leftBarButtonItems ?: @[]]) {
+        controller.navigationItem.leftBarButtonItems = leftItems;
+    }
+    if (![items isEqualToArray:controller.navigationItem.rightBarButtonItems ?: @[]]) {
+        controller.navigationItem.rightBarButtonItems = items;
+    }
+}
+
+static char kLGAppearancePlacementScheduledKey;
+static void LGScheduleAppearancePlacement(UIViewController *controller) {
+    UIBarButtonItem *item = objc_getAssociatedObject(controller, &kLGAppearanceBarButtonKey);
+    if (!item || [objc_getAssociatedObject(controller, &kLGAppearancePlacementScheduledKey) boolValue]) return;
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    UITabBar *bar = [tabs isKindOfClass:UITabBarController.class] ? tabs.tabBar : nil;
+    if (!bar.window || bar.hidden) return;
+    BOOL vertical = LGAppearanceUsesVerticalRail();
+    BOOL inLeft = [controller.navigationItem.leftBarButtonItems containsObject:item];
+    BOOL inRight = [controller.navigationItem.rightBarButtonItems containsObject:item];
+    if (vertical ? (inLeft && !inRight && item.title == nil)
+                 : (inRight && !inLeft && item.image == nil)) return;
+    // The item is created before a reparented controller has its final tab-bar
+    // geometry. Reconcile after layout, without rebuilding its menu or changing
+    // navigation inputs from inside UIKit's layout traversal.
+    objc_setAssociatedObject(controller, &kLGAppearancePlacementScheduledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIViewController *weakController = controller;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *owner = weakController;
+        if (!owner) return;
+        objc_setAssociatedObject(owner, &kLGAppearancePlacementScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (owner.viewIfLoaded.window) LGUpdateAppearancePlacement(owner);
+    });
+}
+
+static void LGInstallAppearanceMenu(UIViewController *controller, UIView *hostView,
+                                    void (^reloadHandler)(void)) {
+    if (!controller) return;
+
+    LGIconAppearanceMode selectedMode = LGPreferredAppearanceMode();
+    __weak UIViewController *weakController = controller;
+    __weak UIView *weakHost = hostView ?: controller.view;
+    void (^reloadCopy)(void) = [reloadHandler copy];
+
+    NSArray<NSNumber *> *modes = @[
+        @(LGIconAppearanceModeLight),
+        @(LGIconAppearanceModeDark),
+        @(LGIconAppearanceModeDynamic),
+    ];
+    NSMutableArray<UIMenuElement *> *actions = [NSMutableArray arrayWithCapacity:modes.count];
+    for (NSNumber *modeNumber in modes) {
+        LGIconAppearanceMode mode = (LGIconAppearanceMode)modeNumber.integerValue;
+        UIAction *action = [UIAction actionWithTitle:LGAppearanceModeTitle(mode)
+                                              image:LGAppearanceModeImage(mode)
+                                         identifier:nil
+                                            handler:^(__kindof UIAction *menuAction) {
+            UIViewController *strongController = weakController;
+            UIView *strongHost = weakHost ?: strongController.view;
+            if (!strongController || !strongHost) return;
+            LGSelectPreferredAppearance(strongHost, mode, ^(BOOL success) {
+                if (reloadCopy) reloadCopy();
+                LGInstallAppearanceMenu(strongController, strongHost, reloadCopy);
+            });
+        }];
+        action.state = mode == selectedMode ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [actions addObject:action];
+    }
+
+    UIMenu *menu = [UIMenu menuWithTitle:@"Icon Appearance" children:actions];
+    NSString *buttonTitle = [NSString stringWithFormat:@"%@ ▾", LGAppearanceModeTitle(selectedMode)];
+    // Keep the native item identity when a menu selection changes its image
+    // and checkmark. Replacing it rebuilds Duo's shared vertical chrome even
+    // though no navigation took place.
+    UIBarButtonItem *appearanceItem = objc_getAssociatedObject(controller, &kLGAppearanceBarButtonKey);
+    if (!appearanceItem) {
+        appearanceItem = [[UIBarButtonItem alloc] initWithTitle:buttonTitle menu:menu];
+        appearanceItem.tag = kLGAppearanceBarButtonTag;
+        objc_setAssociatedObject(controller, &kLGAppearanceBarButtonKey, appearanceItem,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        appearanceItem.menu = menu;
+    }
+
+    LGUpdateAppearancePlacement(controller);
+}
+
+#pragma mark - Standard icon pack contents
+
+static const NSInteger kLGUltraLowBatteryRow = 63;
+static const NSInteger kLGUltraPaletteRow = 70;
+static const NSInteger kLGNativeSekritSection = 4;
+static const NSInteger kLGNativeSekritIconCount = 21;
+static NSString *const kLGEAPIconID = @"eap";
+static char kLGEAPRowAppendedKey;
+
+// Only append to Apollo's known 21-row Sekrit list; a future native row wins.
+static BOOL LGShouldAppendEAPRow(NSInteger section, NSInteger nativeRowCount) {
+    if (section != kLGNativeSekritSection || nativeRowCount != kLGNativeSekritIconCount) return NO;
+    NSDictionary *alternates = NSBundle.mainBundle.infoDictionary[@"CFBundleIcons"][@"CFBundleAlternateIcons"];
+    return alternates[kLGEAPIconID] != nil;
+}
+
+static void LGRememberEAPAppendDecision(id controller, NSInteger section, NSInteger nativeRowCount) {
+    if (section != kLGNativeSekritSection) return;
+    objc_setAssociatedObject(controller, &kLGEAPRowAppendedKey,
+                             @(LGShouldAppendEAPRow(section, nativeRowCount)),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL LGIsAppendedEAPRow(id controller, NSInteger section, NSInteger row) {
+    return section == kLGNativeSekritSection &&
+        [objc_getAssociatedObject(controller, &kLGEAPRowAppendedKey) boolValue] &&
+        row == kLGNativeSekritIconCount;
+}
+
+static void LGSetApolloCellNativeCheckmark(UITableViewCell *cell, BOOL selected) {
+    if (!cell) return;
+    cell.accessoryView = nil;
+    cell.accessoryType = selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    Ivar ivar = class_getInstanceVariable([cell class], "apolloAccessoryType");
+    if (ivar) {
+        uint8_t *field = (uint8_t *)(__bridge void *)cell + ivar_getOffset(ivar);
+        *field = selected ? 0 : 2;
+    }
+}
+
+// TODO: Modernization - the thumbnail is rendered once (dispatch_once) at the
+// first caller's display scale and reused for every later caller, so a cell on
+// a screen with a different scale gets a resampled bitmap. Cache per scale if
+// multi-display support ever needs it.
+static UIImage *LGNormalizedEAPThumbnail(UITraitCollection *traitCollection) {
+    static UIImage *thumbnail;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        UIImage *source = LGStandardIconPreview(kLGEAPIconID);
+        if (!source) return;
+
+        // Render onto the native 76-point canvas so the raw icon is not cropped.
+        CGSize size = CGSizeMake(76.0, 76.0);
+        UIGraphicsBeginImageContextWithOptions(size, NO, traitCollection.displayScale);
+        CGRect bounds = (CGRect){ CGPointZero, size };
+        [[UIBezierPath bezierPathWithRoundedRect:bounds cornerRadius:17.0] addClip];
+        [source drawInRect:bounds];
+        thumbnail = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+    });
+    return thumbnail;
+}
+
+static UITableViewCell *LGConfigureEAPCell(UITableViewCell *cell) {
+    cell.textLabel.text = @"Icons Drop Test";
+    cell.detailTextLabel.text = nil;
+    cell.imageView.image = LGNormalizedEAPThumbnail(cell.traitCollection);
+    cell.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    cell.imageView.clipsToBounds = NO;
+    BOOL selected = [UIApplication.sharedApplication.alternateIconName isEqualToString:kLGEAPIconID];
+    LGSetApolloCellNativeCheckmark(cell, selected);
+    cell.accessibilityLabel = @"Icons Drop Test";
+    return cell;
+}
+
+static UITableViewCell *LGCreateEAPCell(void) {
+    Class cellClass = ApolloClassApolloSubtitleTableViewCell;
+    UITableViewCell *cell = [[cellClass ?: UITableViewCell.class alloc]
+        initWithStyle:UITableViewCellStyleSubtitle
+       reuseIdentifier:@"ApolloEAPIconCell"];
+    return LGConfigureEAPCell(cell);
+}
+
+static void LGSetNativeIconCellCheckmark(UITableViewCell *cell, BOOL selected);
+
+// A tweak-owned cell avoids dequeuing twice for one index path, which UIKit rejects.
+@interface LGAddedSekritIconCell : UITableViewCell
+@end
+
+@implementation LGAddedSekritIconCell
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    [super setHighlighted:highlighted animated:animated];
+    self.selectedBackgroundView = nil;
+    LGSetPressAnimationHighlighted(self, LGNativeIconCellPressAnimation(self), highlighted);
+    NSNumber *selected = objc_getAssociatedObject(self, &kLGNativeIconCellSelectedKey);
+    if (selected) LGSetNativeIconCellCheckmark(self, selected.boolValue);
+}
+
+- (void)prepareForReuse {
+    LGPressAnimationBox *box = objc_getAssociatedObject(self, &kLGNativeIconCellPressAnimationKey);
+    if (box) LGResetPressAnimation(self, &box->_state);
+    self.selectedBackgroundView = nil;
+    [super prepareForReuse];
+}
+
+@end
+
+// TODO: Modernization - the cache is keyed by baseName only, so the bitmap is
+// rendered at the first caller's display scale and reused for later callers on
+// a screen with a different scale. Key by scale if multi-display matters.
+static UIImage *LGNormalizedUltraThumbnail(NSString *baseName, UITraitCollection *traitCollection) {
+    static NSMutableDictionary<NSString *, UIImage *> *cache;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ cache = [NSMutableDictionary dictionary]; });
+
+    UIImage *cached = cache[baseName];
+    if (cached) return cached;
+
+    NSString *path = ApolloBundledResourcePath(baseName, @"png");
+    UIImage *source = path.length ? [UIImage imageWithContentsOfFile:path] : nil;
+    if (!source) {
+        NSString *filename = [baseName stringByAppendingString:@"-thumb.png"];
+        NSString *relativePath = [@"PlugIns/ApolloIntentions.appex" stringByAppendingPathComponent:filename];
+        source = [UIImage imageWithContentsOfFile:
+            [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:relativePath]];
+    }
+    if (!source) return nil;
+
+    CGSize size = CGSizeMake(76.0, 76.0);
+    UIGraphicsBeginImageContextWithOptions(size, NO, traitCollection.displayScale);
+    CGRect bounds = (CGRect){ CGPointZero, size };
+    [[UIBezierPath bezierPathWithRoundedRect:bounds cornerRadius:17.0] addClip];
+    if ([baseName isEqualToString:@"palette"]) {
+        [UIColor.whiteColor setFill];
+        UIRectFill(bounds);
+    }
+    [source drawInRect:bounds];
+    UIImage *thumbnail = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    if (thumbnail) cache[baseName] = thumbnail;
+    return thumbnail;
+}
+
+static UIImage *LGAddedUltraThumbnail(NSString *iconID) {
+    static NSCache<NSString *, UIImage *> *cache;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 60;
+        cache.totalCostLimit = 2 * 1024 * 1024;
+        ApolloMemoryRegisterPurgableCache(@"icon-picker-ultra-thumbs", cache);
+    });
+
+    UIImage *cached = [cache objectForKey:iconID];
+    if (cached) return cached;
+    UIImage *source = LGPreviewImage(iconID, @"default") ?: LGStandardIconPreview(iconID);
+    if (!source) return nil;
+
+    // Apollo's native Ultra cells use 76-point thumbnails. Generated picker
+    // previews are 52 points, so render a matching cell-sized copy rather
+    // than allowing UITableViewCell to display them visibly undersized.
+    CGSize size = CGSizeMake(76.0, 76.0);
+    UIGraphicsImageRendererFormat *format = UIGraphicsImageRendererFormat.preferredFormat;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+    UIImage *thumbnail = [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        [source drawInRect:(CGRect){ CGPointZero, size }];
+    }];
+    if (thumbnail) [cache setObject:thumbnail forKey:iconID cost:ApolloImageByteCost(thumbnail)];
+    return thumbnail;
+}
+
+static void LGFixLegacyUltraPreview(UITableViewCell *cell, NSInteger row) {
+    NSString *baseName = nil;
+    if (row == kLGUltraLowBatteryRow)
+        baseName = @"low-battery";
+    else if (row == kLGUltraPaletteRow)
+        baseName = @"palette";
+
+    UIImage *thumbnail = baseName ? LGNormalizedUltraThumbnail(baseName, cell.traitCollection) : nil;
+    if (thumbnail) cell.imageView.image = thumbnail;
+}
+
+static void LGNormalizeNativeIconCellBackground(UITableViewCell *cell,
+                                                UIColor *cardBackgroundColor,
+                                                BOOL firstRow,
+                                                BOOL lastRow) {
+    if (!cell) return;
+    UIColor *color = cardBackgroundColor ?: LGThemedCardBackgroundColor(nil);
+    // Apollo can replace its cell-level background after willDisplay, so keep
+    // a picker-owned fill inside contentView instead of relying on it.
+    cell.backgroundColor = UIColor.clearColor;
+    cell.contentView.backgroundColor = UIColor.clearColor;
+    UIView *fill = objc_getAssociatedObject(cell, &kLGNativeIconCellCardFillKey);
+    if (!fill) {
+        fill = [[UIView alloc] initWithFrame:CGRectZero];
+        fill.translatesAutoresizingMaskIntoConstraints = NO;
+        fill.userInteractionEnabled = NO;
+        cell.contentView.clipsToBounds = NO;
+        [cell.contentView insertSubview:fill atIndex:0];
+        [NSLayoutConstraint activateConstraints:@[
+            [fill.topAnchor constraintEqualToAnchor:cell.topAnchor],
+            [fill.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor],
+            [fill.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor],
+            [fill.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor],
+        ]];
+        objc_setAssociatedObject(cell, &kLGNativeIconCellCardFillKey, fill,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    fill.backgroundColor = color;
+    fill.layer.cornerRadius = (firstRow || lastRow) ? 20.0 : 0.0;
+    fill.layer.cornerCurve = kCACornerCurveContinuous;
+    CACornerMask corners = 0;
+    if (firstRow) corners |= kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    if (lastRow) corners |= kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
+    fill.layer.maskedCorners = corners;
+}
+
+// The additional Ultra rows are plain UITableViewCells rather than
+// ApolloTableViewCell instances, so Apollo's hooked Standard-row press path
+// does not reach them. Mirror that path here: the same 0.97 scale/spring,
+// stable circular checkmark, and no custom-theme full-row selection wash.
+@interface LGAddedUltraIconCell : UITableViewCell
+@end
+
+@implementation LGAddedUltraIconCell
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    [super setHighlighted:highlighted animated:animated];
+    self.selectedBackgroundView = nil;
+    LGSetPressAnimationHighlighted(self, LGNativeIconCellPressAnimation(self), highlighted);
+    NSNumber *selected = objc_getAssociatedObject(self, &kLGNativeIconCellSelectedKey);
+    if (selected) LGSetNativeIconCellCheckmark(self, selected.boolValue);
+}
+
+- (void)prepareForReuse {
+    LGPressAnimationBox *box = objc_getAssociatedObject(self, &kLGNativeIconCellPressAnimationKey);
+    if (box) LGResetPressAnimation(self, &box->_state);
+    self.selectedBackgroundView = nil;
+    [super prepareForReuse];
+}
+
+@end
+
+// Keep the Standard packs on a tweak-owned table controller. Apollo's private
+// Swift table-controller base cannot safely be constructed outside Apollo's
+// own initialization path and crashes as soon as these packs are opened.
+@interface LGNativeIconPackViewController : ApolloSettingsTableViewController
+- (instancetype)initWithSourceController:(id)sourceController
+                              sourceTable:(UITableView *)sourceTable
+                     cardBackgroundColor:(UIColor *)cardBackgroundColor
+                                     pack:(LGStandardPack)pack;
+@end
+
+@implementation LGNativeIconPackViewController {
+    __weak id _sourceController;
+    __weak UITableView *_sourceTable;
+    UIColor *_cardBackgroundColor;
+    LGStandardPack _pack;
+    NSInteger _nativeSection;
+    id _changedIconObserver;
+    id _didBecomeActiveObserver;
+    UIFont *_nativeTitleFont;
+    UIFont *_nativeDesignerFont;
+    UIColor *_nativeTitleColor;
+    UIColor *_nativeDesignerColor;
+}
+
+- (UIColor *)lg_pageBackgroundColor {
+    UITableView *liveSource = ApolloThemeSourceTableIsStale(_sourceTable) ? nil : _sourceTable;
+    return LGThemedPageBackgroundColor(liveSource);
+}
+
+- (NSInteger)lg_nativeRowCountForTableView:(UITableView *)tableView {
+    id source = _sourceController;
+    if (!source) return 0;
+    LGSetForwardedNativeSection(source, _nativeSection);
+    NSInteger count = ((NSInteger (*)(id, SEL, UITableView *, NSInteger))objc_msgSend)(
+        source, @selector(tableView:numberOfRowsInSection:), tableView, 0);
+    LGSetForwardedNativeSection(source, NSNotFound);
+    return count;
+}
+
+- (BOOL)lg_shouldAppendEAPForNativeCount:(NSInteger)nativeCount {
+    return _pack == LGStandardPackSekrit &&
+        LGShouldAppendEAPRow(_nativeSection, nativeCount);
+}
+
+- (BOOL)lg_isEAPRow:(NSInteger)row tableView:(UITableView *)tableView {
+    NSInteger nativeCount = [self lg_nativeRowCountForTableView:tableView];
+    return [self lg_shouldAppendEAPForNativeCount:nativeCount] && row == nativeCount;
+}
+
+- (void)lg_styleEAPCell:(UITableViewCell *)cell
+              tableView:(UITableView *)tableView
+            atIndexPath:(NSIndexPath *)indexPath {
+    [self apollo_applyPrimaryTextColorToCell:cell];
+    if (_nativeTitleFont) cell.textLabel.font = _nativeTitleFont;
+    cell.tintColor = ApolloThemeAccentColor() ?: tableView.tintColor;
+    cell.selectedBackgroundView = nil;
+    NSInteger rowCount = [self tableView:tableView numberOfRowsInSection:indexPath.section];
+    LGNormalizeNativeIconCellBackground(cell, _cardBackgroundColor,
+                                        indexPath.row == 0, indexPath.row == rowCount - 1);
+    LGSetNativeIconCellCheckmark(cell,
+        [self lg_rowIsActive:indexPath.row tableView:tableView]);
+}
+
+- (BOOL)lg_rowIsActive:(NSInteger)row tableView:(UITableView *)tableView {
+    NSInteger nativeRowCount = _pack == LGStandardPackUltra
+        ? [self lg_nativeRowCountForTableView:tableView] : NSNotFound;
+    return LGStandardPackRowIsActive(_pack, row, nativeRowCount);
+}
+
+- (const LGIconRowEntry *)lg_addedEntryForRow:(NSInteger)row
+                                    tableView:(UITableView *)tableView {
+    if (_pack != LGStandardPackUltra) return NULL;
+    NSInteger nativeRowCount = [self lg_nativeRowCountForTableView:tableView];
+    LGUltraDisplayedRow mapped = LGUltraRowAtDisplayedRow(row, nativeRowCount);
+    return mapped.isAdded ? mapped.addedEntry : NULL;
+}
+
+- (NSIndexPath *)lg_nativeIndexPathForDisplayedIndexPath:(NSIndexPath *)indexPath {
+    if (_pack != LGStandardPackUltra) return indexPath;
+    NSInteger nativeRowCount = [self lg_nativeRowCountForTableView:self.tableView];
+    LGUltraDisplayedRow mapped = LGUltraRowAtDisplayedRow(indexPath.row, nativeRowCount);
+    if (mapped.isAdded || mapped.nativeRow == NSNotFound) return nil;
+    return [NSIndexPath indexPathForRow:mapped.nativeRow inSection:0];
+}
+
+- (void)lg_styleAddedUltraCell:(UITableViewCell *)cell
+                     tableView:(UITableView *)tableView
+                   atIndexPath:(NSIndexPath *)indexPath {
+    if (!cell || !indexPath) return;
+    // Apollo applies the final Ultra typography while configuring each native
+    // row; constructing its cell class directly does not run that path. Copy
+    // the resolved values from a real native row so additions match exactly,
+    // including custom-theme colors and any Dynamic Type sizing.
+    if (_nativeTitleFont) cell.textLabel.font = _nativeTitleFont;
+    if (_nativeDesignerFont) cell.detailTextLabel.font = _nativeDesignerFont;
+    if (_nativeTitleColor) cell.textLabel.textColor = _nativeTitleColor;
+    if (_nativeDesignerColor) cell.detailTextLabel.textColor = _nativeDesignerColor;
+    cell.tintColor = ApolloThemeAccentColor() ?: tableView.tintColor;
+    cell.selectedBackgroundView = nil;
+
+    NSInteger rowCount = [self tableView:tableView numberOfRowsInSection:indexPath.section];
+    // Use the pack card fill, not the page background. Using the page token
+    // made only these four rows disappear into the surrounding table.
+    LGNormalizeNativeIconCellBackground(cell, _cardBackgroundColor,
+                                        indexPath.row == 0,
+                                        indexPath.row == rowCount - 1);
+    LGSetNativeIconCellCheckmark(cell,
+        [self lg_rowIsActive:indexPath.row tableView:tableView]);
+}
+
+- (void)lg_captureNativeTypographyFromCell:(UITableViewCell *)cell {
+    if (!cell.textLabel.font || !cell.detailTextLabel.font) return;
+    BOOL changed = ![_nativeTitleFont isEqual:cell.textLabel.font] ||
+        ![_nativeDesignerFont isEqual:cell.detailTextLabel.font] ||
+        ![_nativeTitleColor isEqual:cell.textLabel.textColor] ||
+        ![_nativeDesignerColor isEqual:cell.detailTextLabel.textColor];
+    if (!changed) return;
+
+    _nativeTitleFont = cell.textLabel.font;
+    _nativeDesignerFont = cell.detailTextLabel.font;
+    _nativeTitleColor = cell.textLabel.textColor;
+    _nativeDesignerColor = cell.detailTextLabel.textColor;
+
+    // A native row can be configured after an added row during a reload.
+    // Refresh any already-visible additions as soon as the native values are
+    // known rather than waiting for them to scroll offscreen and back.
+    UITableView *tableView = self.tableView;
+    for (NSIndexPath *visiblePath in tableView.indexPathsForVisibleRows) {
+        if (![self lg_addedEntryForRow:visiblePath.row tableView:tableView]) continue;
+        UITableViewCell *visibleCell = [tableView cellForRowAtIndexPath:visiblePath];
+        if (visibleCell) {
+            [self lg_styleAddedUltraCell:visibleCell tableView:tableView atIndexPath:visiblePath];
+        }
+    }
+}
+
+- (void)lg_reassertVisibleNativeRows {
+    UITableView *tableView = self.tableView;
+    NSInteger rowCount = [self tableView:tableView numberOfRowsInSection:0];
+    for (NSIndexPath *indexPath in tableView.indexPathsForVisibleRows) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+        if (!cell) continue;
+        if ([self lg_addedEntryForRow:indexPath.row tableView:tableView]) {
+            [self lg_styleAddedUltraCell:cell tableView:tableView atIndexPath:indexPath];
+            continue;
+        }
+        LGNormalizeNativeIconCellBackground(cell, _cardBackgroundColor,
+                                            indexPath.row == 0,
+                                            indexPath.row == rowCount - 1);
+        LGSetNativeIconCellCheckmark(cell,
+            [self lg_rowIsActive:indexPath.row tableView:tableView]);
+    }
+}
+
+- (void)lg_reloadAndReassertAfterNativeRefresh {
+    [self.tableView reloadData];
+    __weak LGNativeIconPackViewController *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf lg_reassertVisibleNativeRows];
+    });
+}
+
+- (instancetype)initWithSourceController:(id)sourceController
+                              sourceTable:(UITableView *)sourceTable
+                     cardBackgroundColor:(UIColor *)cardBackgroundColor
+                                     pack:(LGStandardPack)pack {
+    // Community uses an inset-grouped table, which draws the icon rows as one
+    // rounded card. Match that native geometry without constructing Apollo's
+    // private Swift table-controller class.
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (!self) return nil;
+    _sourceController = sourceController;
+    _sourceTable = sourceTable;
+    _cardBackgroundColor = cardBackgroundColor ?: LGThemedCardBackgroundColor(sourceTable);
+    _pack = pack;
+    _nativeSection = LGNativeSectionForStandardPack(pack);
+    self.title = LGStandardPackTitle(pack);
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    UITableView *tableView = self.tableView;
+    objc_setAssociatedObject(tableView, &kLGNativeDetailTableSectionKey,
+                             @(_nativeSection), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    tableView.backgroundColor = [self lg_pageBackgroundColor];
+    __weak LGNativeIconPackViewController *weakSelf = self;
+    _changedIconObserver = [NSNotificationCenter.defaultCenter
+        addObserverForName:kLGChangedIconNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(__unused NSNotification *note) {
+        // Apollo updates the source controller's currentAppIcon from this same
+        // notification. Reload on the next main-queue turn so its native cell
+        // builder sees the new value and draws the selected-row checkmark.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf lg_reloadAndReassertAfterNativeRefresh];
+        });
+    }];
+    _didBecomeActiveObserver = [NSNotificationCenter.defaultCenter
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(__unused NSNotification *note) {
+        LGNativeIconPackViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        UITableView *visibleTable = strongSelf.tableView;
+        visibleTable.backgroundColor = [strongSelf lg_pageBackgroundColor];
+        [strongSelf lg_reloadAndReassertAfterNativeRefresh];
+    }];
+}
+
+- (void)dealloc {
+    if (_changedIconObserver) {
+        [NSNotificationCenter.defaultCenter removeObserver:_changedIconObserver];
+    }
+    if (_didBecomeActiveObserver) {
+        [NSNotificationCenter.defaultCenter removeObserver:_didBecomeActiveObserver];
+    }
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    UITableView *tableView = self.tableView;
+    tableView.backgroundColor = [self lg_pageBackgroundColor];
+    [tableView reloadData];
+    __weak UITableView *weakTable = tableView;
+    LGInstallAppearanceMenu(self, tableView, ^{ [weakTable reloadData]; });
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    LGScheduleAppearancePlacement(self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self lg_reloadAndReassertAfterNativeRefresh];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    if (previousTraitCollection.userInterfaceStyle == self.traitCollection.userInterfaceStyle) return;
+    // The cover color sampled while this screen was pushed can be a resolved
+    // (non-dynamic) UIColor. Refresh from the active Apollo/custom theme when
+    // the system appearance changes so the card does not retain its old mode.
+    _cardBackgroundColor = LGThemedCardBackgroundColor(nil);
+    UITableView *tableView = self.tableView;
+    tableView.backgroundColor = [self lg_pageBackgroundColor];
+    [tableView reloadData];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return 1;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    NSInteger nativeCount = [self lg_nativeRowCountForTableView:tableView];
+    return nativeCount + (_pack == LGStandardPackUltra
+        ? (NSInteger)kLGStandardPackEntries_ultraCount + 1 : 0)
+        + ([self lg_shouldAppendEAPForNativeCount:nativeCount] ? 1 : 0);
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if ([self lg_isEAPRow:indexPath.row tableView:tableView]) {
+        static NSString *const reuseID = @"LGAddedSekritIconCell";
+        LGAddedSekritIconCell *cell = (LGAddedSekritIconCell *)
+            [tableView dequeueReusableCellWithIdentifier:reuseID];
+        if (!cell) {
+            cell = [[LGAddedSekritIconCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                                reuseIdentifier:reuseID];
+        }
+        LGConfigureEAPCell(cell);
+        [self lg_styleEAPCell:cell tableView:tableView atIndexPath:indexPath];
+        return cell;
+    }
+    const LGIconRowEntry *addedEntry = [self lg_addedEntryForRow:indexPath.row tableView:tableView];
+    if (addedEntry) {
+        static NSString *const reuseID = @"LGAddedUltraIconCell";
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+        if (!cell) {
+            cell = [[LGAddedUltraIconCell alloc]
+                initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
+        }
+        NSString *iconID = @(addedEntry->iconID);
+        cell.textLabel.text = @(addedEntry->displayName);
+        cell.detailTextLabel.text = @(addedEntry->designer);
+        cell.imageView.image = LGAddedUltraThumbnail(iconID);
+        cell.imageView.layer.cornerRadius = 16.0;
+        cell.imageView.layer.cornerCurve = kCACornerCurveContinuous;
+        cell.imageView.clipsToBounds = YES;
+        // Mark these hand-built rows before willDisplay so the shared settings
+        // theme pass treats their title exactly like a native primary label.
+        [self apollo_applyPrimaryTextColorToCell:cell];
+        [self lg_styleAddedUltraCell:cell tableView:tableView atIndexPath:indexPath];
+        return cell;
+    }
+    id source = _sourceController;
+    if (!source) return [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    NSIndexPath *nativeIndexPath = [self lg_nativeIndexPathForDisplayedIndexPath:indexPath];
+    if (!nativeIndexPath) return [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    LGSetForwardedNativeSection(source, _nativeSection);
+    LGSetForwardedUIKitRow(source, indexPath.row);
+    UITableViewCell *cell = ((id (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(
+        source, @selector(tableView:cellForRowAtIndexPath:), tableView, nativeIndexPath);
+    LGSetForwardedUIKitRow(source, NSNotFound);
+    LGSetForwardedNativeSection(source, NSNotFound);
+    // Apollo's specialized Default cell paints its contentView separately.
+    // In our inset-grouped wrapper that fill stops before the accessory area,
+    // producing a visibly shorter/tinted first row. Let the cell itself own
+    // one continuous card fill, matching every other Standard icon row.
+    NSInteger rowCount = [self tableView:tableView numberOfRowsInSection:indexPath.section];
+    LGNormalizeNativeIconCellBackground(cell, _cardBackgroundColor,
+                                        indexPath.row == 0, indexPath.row == rowCount - 1);
+    BOOL selected = [self lg_rowIsActive:indexPath.row tableView:tableView];
+    LGSetNativeIconCellCheckmark(cell, selected);
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell
+                                      forRowAtIndexPath:(NSIndexPath *)indexPath {
+    id source = _sourceController;
+    if (!source) return;
+
+    if ([self lg_isEAPRow:indexPath.row tableView:tableView]) {
+        [self apollo_applyPrimaryTextColorToCell:cell];
+        [super tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+        [self lg_styleEAPCell:cell tableView:tableView atIndexPath:indexPath];
+        return;
+    }
+
+    const LGIconRowEntry *addedEntry = [self lg_addedEntryForRow:indexPath.row tableView:tableView];
+    if (addedEntry) {
+        // Mark primary text before the settings base applies the active theme.
+        [self apollo_applyPrimaryTextColorToCell:cell];
+        [super tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+        [self lg_styleAddedUltraCell:cell tableView:tableView atIndexPath:indexPath];
+        return;
+    }
+    NSIndexPath *nativeIndexPath = [self lg_nativeIndexPathForDisplayedIndexPath:indexPath];
+    if (!nativeIndexPath) return;
+
+    // Let the tweak-owned settings base apply its native theme first. Our
+    // source-controller bridge and persisted selection state must be the last
+    // writers; otherwise this superclass pass can restore Apollo's stale
+    // Default accessory and replace the inset-grouped card fill after resume.
+    [super tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+    LGSetForwardedNativeSection(source, _nativeSection);
+    LGSetForwardedUIKitRow(source, indexPath.row);
+    ((void (*)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *))objc_msgSend)(
+        source, @selector(tableView:willDisplayCell:forRowAtIndexPath:), tableView, cell, nativeIndexPath);
+    LGSetForwardedUIKitRow(source, NSNotFound);
+    LGSetForwardedNativeSection(source, NSNotFound);
+    [self lg_captureNativeTypographyFromCell:cell];
+    // Normalize after both native styling passes so every Standard pack keeps
+    // the Community-style rounded card from its first presentation onward.
+    NSInteger rowCount = [self tableView:tableView numberOfRowsInSection:indexPath.section];
+    LGNormalizeNativeIconCellBackground(cell, _cardBackgroundColor,
+                                        indexPath.row == 0, indexPath.row == rowCount - 1);
+    // Apollo rebuilds its private accessory during willDisplay. Reassert the
+    // persisted selection afterward so backgrounding cannot visually revert
+    // an active Standard icon to Default.
+    LGSetNativeIconCellCheckmark(cell,
+        [self lg_rowIsActive:indexPath.row tableView:tableView]);
+    if (_pack == LGStandardPackUltra) {
+        LGFixLegacyUltraPreview(cell, nativeIndexPath.row);
+        [cell setNeedsLayout];
+        [cell layoutIfNeeded];
+    }
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (_pack == LGStandardPackApolloOriginals) return @"Original Icons";
+
+    id source = _sourceController;
+    if (!source) return nil;
+    LGSetForwardedNativeSection(source, _nativeSection);
+    NSString *title = ((id (*)(id, SEL, UITableView *, NSInteger))objc_msgSend)(
+        source, @selector(tableView:titleForHeaderInSection:), tableView, 0);
+    LGSetForwardedNativeSection(source, NSNotFound);
+    return title;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    id source = _sourceController;
+    if (!source) return nil;
+    LGSetForwardedNativeSection(source, _nativeSection);
+    NSString *title = ((id (*)(id, SEL, UITableView *, NSInteger))objc_msgSend)(
+        source, @selector(tableView:titleForFooterInSection:), tableView, 0);
+    LGSetForwardedNativeSection(source, NSNotFound);
+    return title;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    id source = _sourceController;
+    if (!source) return UITableViewAutomaticDimension;
+    if ([self lg_isEAPRow:indexPath.row tableView:tableView]) {
+        NSInteger nativeCount = [self lg_nativeRowCountForTableView:tableView];
+        if (nativeCount <= 0) return 104.0;
+        NSIndexPath *templatePath = [NSIndexPath indexPathForRow:nativeCount - 1 inSection:0];
+        LGSetForwardedNativeSection(source, _nativeSection);
+        CGFloat height = ((CGFloat (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(
+            source, @selector(tableView:heightForRowAtIndexPath:), tableView, templatePath);
+        LGSetForwardedNativeSection(source, NSNotFound);
+        return height;
+    }
+
+    NSInteger nativeCount = [self lg_nativeRowCountForTableView:tableView];
+    const LGIconRowEntry *addedEntry = [self lg_addedEntryForRow:indexPath.row tableView:tableView];
+    NSIndexPath *nativeIndexPath = addedEntry
+        ? [NSIndexPath indexPathForRow:MAX(0, nativeCount - 1) inSection:0]
+        : [self lg_nativeIndexPathForDisplayedIndexPath:indexPath];
+    if (nativeCount <= 0 || !nativeIndexPath) return 104.0;
+    LGSetForwardedNativeSection(source, _nativeSection);
+    LGSetForwardedUIKitRow(source, indexPath.row);
+    CGFloat height = ((CGFloat (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(
+        source, @selector(tableView:heightForRowAtIndexPath:), tableView, nativeIndexPath);
+    LGSetForwardedUIKitRow(source, NSNotFound);
+    LGSetForwardedNativeSection(source, NSNotFound);
+    return height;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    id source = _sourceController;
+    if (!source) return UITableViewAutomaticDimension;
+    LGSetForwardedNativeSection(source, _nativeSection);
+    CGFloat height = ((CGFloat (*)(id, SEL, UITableView *, NSInteger))objc_msgSend)(
+        source, @selector(tableView:heightForHeaderInSection:), tableView, 0);
+    LGSetForwardedNativeSection(source, NSNotFound);
+    return height;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    id source = _sourceController;
+    if (!source) return;
+    // Re-tapping the active icon must not send it through Apollo's setter a
+    // second time. Besides doing unnecessary work, that path briefly mutates
+    // Apollo's private accessory state and makes the persisted checkmark
+    // appear to change. End only the table's transient pressed state.
+    if ([self lg_rowIsActive:indexPath.row tableView:tableView]) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        // Do not reload the row while its press-release transform is still
+        // animating. In some dark custom themes UIKit keeps the outgoing cell
+        // snapshot visible, which looks like a duplicated expanding row.
+        __weak LGNativeIconPackViewController *weakSelf = self;
+        LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+            [weakSelf lg_reassertVisibleNativeRows];
+        });
+        return;
+    }
+
+    if ([self lg_isEAPRow:indexPath.row tableView:tableView]) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        __weak UITableView *weakTable = tableView;
+        NSInteger row = indexPath.row;
+        LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+            UITableView *strongTable = weakTable;
+            if (!strongTable) return;
+            LGApplyAlternateIcon(strongTable, kLGEAPIconID, ^(BOOL success) {
+                if (!success) return;
+                LGClearPersistedActiveIconID();
+                LGPersistActiveStandardPackRow(LGStandardPackSekrit, row);
+                [strongTable reloadData];
+            });
+        });
+        return;
+    }
+
+    const LGIconRowEntry *addedEntry = [self lg_addedEntryForRow:indexPath.row tableView:tableView];
+    if (addedEntry) {
+        NSString *iconID = @(addedEntry->iconID);
+        __weak UITableView *weakTable = tableView;
+        LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+            UITableView *strongTable = weakTable;
+            if (!strongTable) return;
+            LGApplyAlternateIcon(strongTable, iconID, ^(BOOL success) {
+                if (!success) return;
+                // These are Standard Ultra icons even though their assets are
+                // supplied by this tweak. Store the Standard pack/row only
+                // after iOS confirms the change.
+                LGClearPersistedActiveIconID();
+                LGPersistActiveStandardPackRow(LGStandardPackUltra, NSNotFound);
+                [NSUserDefaults.standardUserDefaults setObject:iconID
+                    forKey:kLGActiveStandardAddedIconIDDefaultsKey];
+                [strongTable reloadData];
+            });
+        });
+        return;
+    }
+
+    if (_pack == LGStandardPackApolloOriginals) {
+        // Apollo Originals' source controller leaves its native row selected
+        // until the icon confirmation appears. Clear that selected state
+        // after one brief pressed frame, matching Ultra and Sekrit. The small
+        // delay also lets Default visibly highlight before its direct setter.
+        __weak UITableView *weakSelectionTable = tableView;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.07 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelectionTable deselectRowAtIndexPath:indexPath animated:YES];
+        });
+    }
+
+    if (_pack == LGStandardPackApolloOriginals && indexPath.row == 0) {
+        // Default is the only row whose native source path starts a second
+        // serialized selection. Apply it directly inside the same haptic
+        // transaction as every other Standard icon instead.
+        __weak UITableView *weakTable = tableView;
+        LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+            UITableView *strongTable = weakTable;
+            if (!strongTable) return;
+            LGApplyAlternateIcon(strongTable, nil, ^(BOOL success) {
+                if (success) {
+                    // Default is the first Apollo Originals choice, so keep
+                    // that pack active on the main picker just like any other
+                    // selected Standard icon.
+                    LGPersistActiveStandardPackRow(LGStandardPackApolloOriginals, 0);
+                    [strongTable reloadData];
+                }
+            });
+        });
+        return;
+    }
+
+    __weak id weakSource = source;
+    __weak UITableView *weakTable = tableView;
+    NSInteger nativeSection = _nativeSection;
+    LGStandardPack pack = _pack;
+    NSIndexPath *nativeIndexPath = [self lg_nativeIndexPathForDisplayedIndexPath:indexPath];
+    if (!nativeIndexPath) return;
+    LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+        id strongSource = weakSource;
+        UITableView *strongTable = weakTable;
+        if (!strongSource || !strongTable) return;
+        LGSetForwardedNativeSection(strongSource, nativeSection);
+        LGSetForwardedUIKitRow(strongSource, indexPath.row);
+        // Ultra's inserted sequel rows shift displayed positions, while
+        // Apollo's source controller still identifies native icons by its
+        // original row. Persist that stable native row after confirmation.
+        NSInteger persistedRow = pack == LGStandardPackUltra
+            ? nativeIndexPath.row : indexPath.row;
+        LGBeginPendingStandardPackSelection(pack, persistedRow);
+        ((void (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(
+            strongSource, @selector(tableView:didSelectRowAtIndexPath:), strongTable, nativeIndexPath);
+        LGSetForwardedUIKitRow(strongSource, NSNotFound);
+        LGSetForwardedNativeSection(strongSource, NSNotFound);
+    });
+}
+
+@end
+
+#pragma mark - Group description header (pack contents screen)
+
+// A short free-form sentence describing the pack, shown as a section header
+// above its icon grid — only added when the group has a non-empty
+// `description` in icons.json. Self-sizing (numberOfLines = 0), so unlike
+// the fixed-height cells above, wrapping here is fine: it's a real section
+// header, not a grid row that needs to stay aligned with its neighbors.
+@interface LGGroupDescriptionHeaderView : UICollectionReusableView
+- (void)configureWithText:(NSString *)text;
+@end
+
+@implementation LGGroupDescriptionHeaderView {
+    UILabel *_label;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+
+    _label = [[UILabel alloc] init];
+    _label.translatesAutoresizingMaskIntoConstraints = NO;
+    _label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    _label.textColor = UIColor.secondaryLabelColor;
+    _label.numberOfLines = 0;
+    [self addSubview:_label];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_label.topAnchor constraintEqualToAnchor:self.topAnchor],
+        [_label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:kLGGridSpacing],
+        [_label.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-kLGGridSpacing],
+        [_label.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-8],
+    ]];
+    return self;
+}
+
+- (void)configureWithText:(NSString *)text {
+    _label.text = text;
+}
+
+@end
+
+#pragma mark - Pack contents grid view controller
+
+// Displays every icon in a single group as an adaptive grid. Parameterised by
+// group index so no group-specific knowledge is hardcoded here.
+@interface LGGroupIconsViewController : UICollectionViewController
+- (instancetype)initWithGroupIndex:(NSInteger)groupIndex;
+@end
+
+@implementation LGGroupIconsViewController {
+    NSInteger _gi;
+    UIColor *_cardBackgroundColor;
+    BOOL _didRevealInitialSelection;
+}
+
+- (void)lg_refreshVisibleSelection {
+    const LGRuntimeGroup *group = LGGroupAt(_gi);
+    if (!group) return;
+    NSString *activeID = LGActiveIconID();
+    UIColor *accent = ApolloThemeAccentColor() ?: self.view.tintColor ?: UIColor.systemBlueColor;
+    for (NSIndexPath *indexPath in self.collectionView.indexPathsForVisibleItems) {
+        if (indexPath.item >= group->count) continue;
+        LGIconGridCell *cell = (LGIconGridCell *)[self.collectionView cellForItemAtIndexPath:indexPath];
+        if (![cell isKindOfClass:LGIconGridCell.class]) continue;
+        const LGIconRow *row = &group->rows[indexPath.item];
+        BOOL selected = activeID.length && [row->iconID isEqualToString:activeID];
+        [cell configureWithRow:row
+                     selected:selected
+                  accentColor:accent
+          cardBackgroundColor:_cardBackgroundColor];
+    }
+}
+
+- (instancetype)initWithGroupIndex:(NSInteger)groupIndex {
+    UICollectionViewCompositionalLayout *layout = [[UICollectionViewCompositionalLayout alloc]
+        initWithSectionProvider:^NSCollectionLayoutSection *(NSInteger sectionIndex, id<NSCollectionLayoutEnvironment> env) {
+            CGFloat width = env.container.effectiveContentSize.width;
+            NSInteger columns = 2;
+            if (width >= kLGGridWideThresholdLarge) columns = 4;
+            else if (width >= kLGGridWideThresholdMedium) columns = 3;
+
+            // Matches section.contentInsets (kLGGridSpacing each side) and
+            // group.interItemSpacing (kLGGridSpacing between columns) below —
+            // the exact width each item cell will actually receive.
+            CGFloat contentWidth = width - 2 * kLGGridSpacing;
+            CGFloat columnWidth = (contentWidth - (columns - 1) * kLGGridSpacing) / columns;
+            CGFloat cellHeight = LGMeasuredGridCellHeight(columnWidth);
+
+            NSCollectionLayoutSize *itemSize = [NSCollectionLayoutSize
+                sizeWithWidthDimension:[NSCollectionLayoutDimension fractionalWidthDimension:1.0]
+                       heightDimension:[NSCollectionLayoutDimension absoluteDimension:cellHeight]];
+            NSCollectionLayoutItem *item = [NSCollectionLayoutItem itemWithLayoutSize:itemSize];
+
+            NSCollectionLayoutSize *groupSize = [NSCollectionLayoutSize
+                sizeWithWidthDimension:[NSCollectionLayoutDimension fractionalWidthDimension:1.0]
+                       heightDimension:[NSCollectionLayoutDimension absoluteDimension:cellHeight]];
+            // NB: horizontalGroupWithLayoutSize:repeatingSubitem:count: needs iOS 16;
+            // this tweak's device floor is iOS 14, so use the iOS-13 predecessor
+            // (deprecated in 16, not unavailable — Makefile already demotes
+            // -Wdeprecated-declarations to non-fatal for this target).
+            NSCollectionLayoutGroup *group = [NSCollectionLayoutGroup horizontalGroupWithLayoutSize:groupSize
+                                                                                              subitem:item
+                                                                                                count:columns];
+            group.interItemSpacing = [NSCollectionLayoutSpacing fixedSpacing:kLGGridSpacing];
+
+            NSCollectionLayoutSection *section = [NSCollectionLayoutSection sectionWithGroup:group];
+            section.interGroupSpacing = kLGGridSpacing;
+            section.contentInsets = NSDirectionalEdgeInsetsMake(kLGGridSpacing, kLGGridSpacing, kLGGridSpacing, kLGGridSpacing);
+
+            const LGRuntimeGroup *g = LGGroupAt(groupIndex); // captured by value; self isn't initialized yet
+            if (g && g->groupDescription.length) {
+                NSCollectionLayoutSize *headerSize = [NSCollectionLayoutSize
+                    sizeWithWidthDimension:[NSCollectionLayoutDimension fractionalWidthDimension:1.0]
+                           heightDimension:[NSCollectionLayoutDimension estimatedDimension:36.0]];
+                NSCollectionLayoutBoundarySupplementaryItem *header = [NSCollectionLayoutBoundarySupplementaryItem
+                    boundarySupplementaryItemWithLayoutSize:headerSize
+                                                 elementKind:UICollectionElementKindSectionHeader
+                                                   alignment:NSRectAlignmentTop];
+                section.boundarySupplementaryItems = @[header];
+            }
+            return section;
+        }];
+
+    self = [super initWithCollectionViewLayout:layout];
+    if (!self) return nil;
+    _gi = groupIndex;
+    const LGRuntimeGroup *g = LGGroupAt(groupIndex);
+    if (g) self.title = g->title;
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    [self.collectionView registerClass:[LGIconGridCell class] forCellWithReuseIdentifier:kLGGridCellReuseID];
+    [self.collectionView registerClass:[LGGroupDescriptionHeaderView class]
+             forSupplementaryViewOfKind:UICollectionElementKindSectionHeader
+                    withReuseIdentifier:kLGDescriptionHeaderReuseID];
+    [self lg_applyTheme];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self lg_applyTheme];
+    [self lg_installAppearanceMenu];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    LGScheduleAppearancePlacement(self);
+    if (_didRevealInitialSelection || CGRectIsEmpty(self.collectionView.bounds)) return;
+    _didRevealInitialSelection = YES;
+
+    NSString *activeID = LGActiveIconID();
+    const LGRuntimeGroup *group = LGGroupAt(_gi);
+    if (!activeID.length || !group) return;
+
+    for (NSInteger index = 0; index < group->count; index++) {
+        if (![group->rows[index].iconID isEqualToString:activeID]) continue;
+        NSIndexPath *indexPath = [NSIndexPath indexPathForItem:index inSection:0];
+        [self.collectionView scrollToItemAtIndexPath:indexPath
+                                    atScrollPosition:UICollectionViewScrollPositionCenteredVertically
+                                            animated:NO];
+        break;
+    }
+}
+
+- (void)lg_installAppearanceMenu {
+    __weak UICollectionView *weakCollectionView = self.collectionView;
+    LGInstallAppearanceMenu(self, self.collectionView, ^{
+        [weakCollectionView reloadData];
+    });
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    [self lg_applyTheme];
+    // System-following previews and eagerly-resolved selection-ring colors
+    // both need a redraw if Dark Mode changes while this screen is open.
+    if (previousTraitCollection.userInterfaceStyle != self.traitCollection.userInterfaceStyle) {
+        [self.collectionView reloadData];
+    }
+}
+
+// Mirrors ApolloSettingsTableViewController's apollo_applyTheme, since this
+// screen is a UICollectionViewController rather than a table VC and can't
+// subclass that base.
+- (void)lg_applyTheme {
+    UIColor *accent = ApolloThemeAccentColor() ?: self.view.tintColor ?: UIColor.systemBlueColor;
+    self.view.tintColor = accent;
+    self.collectionView.tintColor = accent;
+    self.navigationController.navigationBar.tintColor = accent;
+
+    // Cast is safe: the function only reads navigationController.viewControllers,
+    // not anything table-specific on self. Finds the App Icon pack list one
+    // level up, already rendered before this screen was pushed.
+    UITableView *sourceTable = ApolloInheritedSettingsThemeSourceTableView((UITableViewController *)(id)self);
+    _cardBackgroundColor = LGThemedCardBackgroundColor(sourceTable);
+    self.collectionView.backgroundColor = LGThemedPageBackgroundColor(sourceTable);
+}
+
+- (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section {
+    const LGRuntimeGroup *g = LGGroupAt(_gi);
+    return g ? g->count : 0;
+}
+
+- (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)indexPath {
+    LGIconGridCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:kLGGridCellReuseID forIndexPath:indexPath];
+    const LGRuntimeGroup *g = LGGroupAt(_gi);
+    if (g && indexPath.item < g->count) {
+        const LGIconRow *row = &g->rows[indexPath.item];
+        NSString *activeID = LGActiveIconID();
+        BOOL selected = activeID != nil && [row->iconID isEqualToString:activeID];
+        UIColor *accent = ApolloThemeAccentColor() ?: self.view.tintColor ?: UIColor.systemBlueColor;
+        [cell configureWithRow:row selected:selected accentColor:accent cardBackgroundColor:_cardBackgroundColor];
+    }
+    return cell;
+}
+
+- (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+    [collectionView deselectItemAtIndexPath:indexPath animated:YES];
+    const LGRuntimeGroup *g = LGGroupAt(_gi);
+    if (!g || indexPath.item >= g->count) return;
+    __weak LGGroupIconsViewController *weakSelf = self;
+    LGApplyIconUsingPreferredAppearance(collectionView, &g->rows[indexPath.item], ^(BOOL success) {
+        if (success) [weakSelf lg_refreshVisibleSelection];
+    });
+}
+
+- (UICollectionReusableView *)collectionView:(UICollectionView *)collectionView
+           viewForSupplementaryElementOfKind:(NSString *)kind
+                                  atIndexPath:(NSIndexPath *)indexPath {
+    LGGroupDescriptionHeaderView *header = [collectionView
+        dequeueReusableSupplementaryViewOfKind:kind
+                            withReuseIdentifier:kLGDescriptionHeaderReuseID
+                                   forIndexPath:indexPath];
+    const LGRuntimeGroup *g = LGGroupAt(_gi);
+    [header configureWithText:g ? g->groupDescription : nil];
+    return header;
+}
+
+@end
+
+#pragma mark - Apollo's own "Default" row checkmark correction
+//
+// Apollo's native App Icon list (its OWN section/rows, untouched by us) has
+// a bug we can't fix at the source: its "Default" row's checkmark logic
+// (SettingsAppIconViewController, decompiled via Hopper) resolves
+// UIApplication.alternateIconName through Apollo's own private name->id
+// table (an `AppIcon(rawValue:)`-style lookup covering only ITS OWN known
+// icon names) and normalizes "unrecognized name" to the same id as "no
+// alternate icon at all" (id 0 = Default). Since our Liquid Glass icon names
+// ("jryng", "igerman00", "helios", ...) were never in Apollo's own table,
+// Apollo's Default row shows checked whenever one of OUR icons is active —
+// this is unconditional on whether alternateIconName itself is reliable, so
+// it reproduces even where our own sideloading workaround doesn't apply.
+//
+// The checkmark isn't drawn via the native `accessoryType` alone: the
+// matched-row branch in Apollo's code writes directly to a private,
+// non-@objc raw ivar (`apolloAccessoryType`) on its own ApolloTableViewCell
+// subclass, which is what actually drives the visible checkmark. No ObjC
+// selector exposes it, so it has to be poked via the runtime rather than
+// object_setIvar (only valid for `id`-typed ivars).
+static void LGCorrectDefaultRowCheckmark(UITableViewCell *cell) {
+    if (!cell) return;
+    NSString *activeID = LGActiveIconID();
+    if (!activeID.length && LGDefaultIconIsConfirmed()) {
+        return; // Default is positively confirmed — leave Apollo's checkmark alone.
+    }
+
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.accessoryView = nil;
+
+    Ivar ivar = class_getInstanceVariable([cell class], "apolloAccessoryType");
+    if (ivar) {
+        ptrdiff_t offset = ivar_getOffset(ivar);
+        uint8_t *field = (uint8_t *)(__bridge void *)cell + offset;
+        // ApolloAccessoryType has two payload cases (0 and 1); Swift encodes
+        // Optional.none as 2. Writing 0 here selects Apollo's checkmark case.
+        *field = 2;
+    }
+}
+
+static void LGSetNativeIconCellCheckmark(UITableViewCell *cell, BOOL selected) {
+    if (!cell) return;
+    objc_setAssociatedObject(cell, &kLGNativeIconCellSelectedKey, @(selected),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // Standard packs use Apollo's native table cells, but their stock tick is
+    // visually different from the circular accent badge used by Liquid Glass
+    // icons and pack cards. Supply that same SF Symbol as a stable accessory.
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    UIImageView *badge = objc_getAssociatedObject(cell, &kLGNativeIconCellCheckBadgeKey);
+    if (selected && !badge) {
+        UIImageSymbolConfiguration *configuration =
+            [UIImageSymbolConfiguration configurationWithPointSize:19.0
+                                                             weight:UIImageSymbolWeightRegular];
+        UIImage *image = [[UIImage systemImageNamed:@"checkmark.circle.fill"
+                                  withConfiguration:configuration]
+                          imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        badge = [[UIImageView alloc] initWithImage:image];
+        badge.frame = CGRectMake(0.0, 0.0, 19.0, 19.0);
+        badge.contentMode = UIViewContentModeScaleAspectFit;
+        badge.isAccessibilityElement = NO;
+        objc_setAssociatedObject(cell, &kLGNativeIconCellCheckBadgeKey, badge,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (selected) {
+        badge.tintColor = ApolloThemeAccentColor() ?: cell.tintColor;
+        cell.accessoryView = badge;
+    } else {
+        cell.accessoryView = nil;
+    }
+
+    Ivar ivar = class_getInstanceVariable([cell class], "apolloAccessoryType");
+    if (ivar) {
+        ptrdiff_t offset = ivar_getOffset(ivar);
+        uint8_t *field = (uint8_t *)(__bridge void *)cell + offset;
+        // Keep Apollo's private accessory empty. Otherwise its highlight pass
+        // replaces our circular badge with Apollo's differently-shaped tick.
+        *field = 2;
+    }
+}
+
+#pragma mark - Remembering a hooked view controller's table view
+//
+// A couple of lifecycle hooks (traitCollectionDidChange:, viewWillAppear:)
+// need the table view to refresh visible content, but aren't handed one as a
+// parameter. Neither _TtC6Apollo29SettingsAppIconViewController nor
+// _TtC6Apollo22SettingsViewController is a UITableViewController (confirmed
+// the hard way for the former — casting self and sending -tableView crashed
+// with doesNotRecognizeSelector:), so there's no safe property to reach for
+// either. Instead, stash the table view (via associated object, unretained —
+// the VC's own view hierarchy already owns it) the first time any hooked
+// tableView: method hands us one. Keyed per (viewController, key) pair by
+// objc_setAssociatedObject itself, so this is safely shared across both VCs'
+// hook blocks below — each instance gets its own slot.
+static char kLGRememberedTableViewKey;
+static char kLGDailyRolloverTimerKey;
+static char kLGPickerHasAppearedKey;
+static __weak UITableView *sLGAppIconPickerTableView;
+
+static void LGRememberTableView(id viewController, UITableView *tableView) {
+    if (tableView) objc_setAssociatedObject(viewController, &kLGRememberedTableViewKey, tableView, OBJC_ASSOCIATION_ASSIGN);
+}
+
+static UITableView *LGRememberedTableView(id viewController) {
+    return objc_getAssociatedObject(viewController, &kLGRememberedTableViewKey);
+}
+
+static void LGRememberGridGeometry(UIView *view, NSMutableArray *geometry) {
+    if (!view.window) return;
+    CALayer *layer = view.layer;
+    CALayer *visible = layer.presentationLayer ?: layer;
+    [geometry addObject:@[layer, [NSValue valueWithCGPoint:visible.position],
+                          [NSValue valueWithCGRect:visible.bounds]]];
+    for (UIView *child in view.subviews) LGRememberGridGeometry(child, geometry);
+}
+
+static void LGAnimateGridGeometry(NSArray *geometry) {
+    for (NSArray *entry in geometry) {
+        CALayer *layer = entry[0];
+        CGPoint position = [entry[1] CGPointValue];
+        CGRect bounds = [entry[2] CGRectValue];
+        if (CGPointEqualToPoint(position, layer.position) && CGRectEqualToRect(bounds, layer.bounds)) continue;
+        CABasicAnimation *movement = [CABasicAnimation animationWithKeyPath:@"position"];
+        movement.fromValue = entry[1];
+        movement.toValue = [NSValue valueWithCGPoint:layer.position];
+        CABasicAnimation *resize = [CABasicAnimation animationWithKeyPath:@"bounds"];
+        resize.fromValue = entry[2];
+        resize.toValue = [NSValue valueWithCGRect:layer.bounds];
+        CAAnimationGroup *animation = [CAAnimationGroup animation];
+        animation.animations = @[movement, resize];
+        animation.duration = 0.3;
+        animation.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [layer addAnimation:animation forKey:@"ApolloPackGridGeometry"];
+    }
+}
+
+static void LGUpdateMainPackColumns(UITableView *table, BOOL animated) {
+    if (!table) return;
+    NSInteger columns = LGMeasuredPackColumnCount(table);
+    if (columns == LGMainPackColumnCount(table)) return;
+
+    // Sidebar visibility changes the safe area, not necessarily the table's
+    // bounds. Keep both the cards and Daily Spotlight alive, and animate only
+    // their geometry. No row reload means there is no old/new image ghosting.
+    [table layoutIfNeeded];
+    BOOL animate = animated && table.window && !UIAccessibilityIsReduceMotionEnabled();
+    NSHashTable *cells = objc_getAssociatedObject(table, &kLGPreparedPackCellsKey);
+    NSMutableArray *geometry = [NSMutableArray array];
+    if (animate) {
+        for (LGPackGridRowCell *cell in cells) LGRememberGridGeometry(cell, geometry);
+        for (NSInteger section = LGPacksSectionIndex(); section <= LGStandardPacksSectionIndex(); section++) {
+            LGRememberGridGeometry([table headerViewForSection:section], geometry);
+        }
+    }
+    objc_setAssociatedObject(table, &kLGPackColumnsKey, @(columns), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [UIView performWithoutAnimation:^{
+        // UIKit can prepare Standard packs below the viewport before this
+        // resize makes them visible. Update those cells too, otherwise their
+        // old two-column constraints outlive the new single-row height.
+        for (LGPackGridRowCell *cell in cells) {
+            [cell setColumnCount:columns];
+        }
+        // Re-measure the section cells' heights without changing their identity.
+        [table beginUpdates];
+        [table endUpdates];
+        [table layoutIfNeeded];
+        for (LGPackGridRowCell *cell in cells) [cell layoutIfNeeded];
+    }];
+    // UITableView's row-height animation clips/reveals the old row while Auto
+    // Layout is also moving the cards. Commit the final layout once, then move
+    // the existing layers from their current presentation geometry instead.
+    // This also permits a rapid reversal without fading or duplicate cards.
+    if (animate) LGAnimateGridGeometry(geometry);
+    ApolloLog(@"[AppIcon] adapted pack grid to %ld columns animated=%d", (long)columns, animate);
+}
+
+static void LGReloadDailyFeaturedSection(UITableView *tableView, BOOL animated) {
+    if (!tableView) return;
+    void (^reload)(void) = ^{
+        [tableView reloadSections:[NSIndexSet indexSetWithIndex:(NSUInteger)LGFeaturedSectionIndex()]
+                 withRowAnimation:UITableViewRowAnimationNone];
+    };
+    if (!animated || !tableView.window) {
+        reload();
+        return;
+    }
+    [UIView transitionWithView:tableView
+                      duration:0.35
+                       options:UIViewAnimationOptionTransitionCrossDissolve |
+                               UIViewAnimationOptionAllowUserInteraction
+                    animations:reload
+                    completion:nil];
+}
+
+static void LGScheduleDailyFeaturedRollover(id viewController) {
+    NSTimer *existing = objc_getAssociatedObject(viewController, &kLGDailyRolloverTimerKey);
+    [existing invalidate];
+
+    NSCalendar *calendar = NSCalendar.currentCalendar;
+    NSDate *tomorrow = [calendar dateByAddingUnit:NSCalendarUnitDay
+                                            value:1
+                                           toDate:NSDate.date
+                                          options:0];
+    NSDate *midnight = [calendar startOfDayForDate:tomorrow];
+    NSTimeInterval delay = MAX(1.0, [midnight timeIntervalSinceNow]);
+
+    __weak id weakController = viewController;
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:delay repeats:NO block:^(__unused NSTimer *firedTimer) {
+        id controller = weakController;
+        if (!controller) return;
+        UITableView *tableView = LGRememberedTableView(controller);
+        if (LGRefreshDailyFeaturedRowsIfNeeded()) LGReloadDailyFeaturedSection(tableView, YES);
+        LGScheduleDailyFeaturedRollover(controller);
+    }];
+    objc_setAssociatedObject(viewController, &kLGDailyRolloverTimerKey,
+                             timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+#pragma mark - Hooks
+
+%hook _TtC6Apollo29SettingsAppIconViewController
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    if (!LGAlternateIconsAvailable()) return;
+    UIViewController *controller = (UIViewController *)self;
+    UITableView *tableView = LGRememberedTableView(self);
+    if (tableView) sLGAppIconPickerTableView = tableView;
+    BOOL hasAppeared = [objc_getAssociatedObject(self, &kLGPickerHasAppearedKey) boolValue];
+    if (hasAppeared) LGRefreshVisiblePickerSelection(tableView, YES);
+    objc_setAssociatedObject(self, &kLGPickerHasAppearedKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (LGRefreshDailyFeaturedRowsIfNeeded()) LGReloadDailyFeaturedSection(tableView, NO);
+    LGScheduleDailyFeaturedRollover(self);
+    __weak UITableView *weakTableView = tableView;
+    LGInstallAppearanceMenu(controller, tableView ?: controller.view, ^{
+        [weakTableView reloadData];
+    });
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if (!LGAlternateIconsAvailable()) return;
+    LGScheduleAppearancePlacement((UIViewController *)self);
+    UITableView *table = LGRememberedTableView(self);
+    if (!table || LGMeasuredPackColumnCount(table) == LGMainPackColumnCount(table) ||
+        [objc_getAssociatedObject(table, &kLGPackColumnsUpdateKey) boolValue]) return;
+    // Safe-area changes also resize a split pane without changing the full
+    // table's bounds. Defer the constraint update out of UIKit's layout traversal.
+    objc_setAssociatedObject(table, &kLGPackColumnsUpdateKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UITableView *weakTable = table;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableView *table = weakTable;
+        if (!table) return;
+        objc_setAssociatedObject(table, &kLGPackColumnsUpdateKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        LGUpdateMainPackColumns(table, ApolloDuoSplitIsUnfolded() && !ApolloDuoSplitIsResizing());
+    });
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    NSTimer *timer = objc_getAssociatedObject(self, &kLGDailyRolloverTimerKey);
+    [timer invalidate];
+    objc_setAssociatedObject(self, &kLGDailyRolloverTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    LGRememberTableView(self, tableView);
+    sLGAppIconPickerTableView = tableView;
+    NSInteger originalCount = %orig;
+    if (!LGAlternateIconsAvailable()) return originalCount;
+    // Every selectable native collection is represented by the Standard pack
+    // cards. Do not leave Apollo's obsolete standalone SPCA purchase card at
+    // the bottom now that its icon is directly available inside Ultra.
+    return LGInjectedSectionCount();
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (LGAlternateIconsAvailable()) {
+        NSInteger forwardedSection = LGForwardedNativeSection(self);
+        if (forwardedSection != NSNotFound) return %orig(tableView, forwardedSection);
+        if (LGHasFeaturedSection() && section == LGFeaturedSectionIndex()) return 1;
+        if (section == LGPacksSectionIndex()) return LGNonEmptyGroupCount() > 0 ? 1 : 0;
+        if (section == LGStandardPacksSectionIndex()) return 1;
+        return %orig(tableView, LGRemapSectionToOriginal(section));
+    }
+    NSInteger nativeCount = %orig;
+    LGRememberEAPAppendDecision(self, section, nativeCount);
+    return nativeCount + (LGShouldAppendEAPRow(section, nativeCount) ? 1 : 0);
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSInteger forwardedSection = LGForwardedNativeSection(self);
+    if (LGAlternateIconsAvailable() && forwardedSection != NSNotFound) {
+        NSIndexPath *nativeIndexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:forwardedSection];
+        NSInteger uikitRow = LGForwardedUIKitRow(self);
+        LG_REMAP_ROW_SCOPE(tableView, forwardedSection, 0,
+                           uikitRow == NSNotFound ? NSNotFound : nativeIndexPath.row,
+                           uikitRow);
+        UITableViewCell *cell = %orig(tableView, nativeIndexPath);
+        if (forwardedSection == 0 && indexPath.row == 0) LGCorrectDefaultRowCheckmark(cell);
+        return cell;
+    }
+    if (LGAlternateIconsAvailable() && LGHasFeaturedSection() && indexPath.section == LGFeaturedSectionIndex()) {
+        LGRefreshDailyFeaturedRowsIfNeeded();
+        LGFeaturedStripCell *cell = (LGFeaturedStripCell *)[tableView dequeueReusableCellWithIdentifier:kLGFeaturedStripReuseID];
+        if (![cell isMemberOfClass:[LGFeaturedStripCell class]])
+            cell = [[LGFeaturedStripCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:kLGFeaturedStripReuseID];
+
+        UIColor *accent = ApolloThemeAccentColor() ?: tableView.tintColor ?: UIColor.systemBlueColor;
+        UITableView *sourceTable = ApolloInheritedSettingsThemeSourceTableView((UITableViewController *)(id)self);
+        __weak UITableView *weakTableView = tableView;
+        [cell configureWithRows:sFeaturedRows
+                          count:sFeaturedCount
+                 selectedIconID:LGActiveSpotlightIconID()
+                    accentColor:accent
+            cardBackgroundColor:LGThemedCardBackgroundColor(sourceTable)
+                     tapHandler:^(const LGIconRow *row) {
+            const LGSpotlightStandardIcon *standard = LGSpotlightStandardIconForID(row->iconID);
+            if (standard) {
+                LGApplySpotlightStandardIcon(weakTableView, standard);
+                return;
+            }
+            LGApplyIconUsingPreferredAppearance(weakTableView, row, ^(BOOL success) {
+                if (success) LGRefreshVisiblePickerSelection(weakTableView, YES);
+            });
+        }];
+        return cell;
+    }
+    if (LGAlternateIconsAvailable() && indexPath.section == LGPacksSectionIndex()) {
+        LGPackGridRowCell *cell = (LGPackGridRowCell *)[tableView dequeueReusableCellWithIdentifier:kLGPackGridRowReuseID];
+        if (![cell isMemberOfClass:[LGPackGridRowCell class]])
+            cell = [[LGPackGridRowCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:kLGPackGridRowReuseID];
+        LGRememberPreparedPackCell(tableView, cell);
+
+        NSInteger columnCount = LGMainPackColumnCount(tableView);
+        UITableView *sourceTable = ApolloInheritedSettingsThemeSourceTableView((UITableViewController *)(id)self);
+        __weak UIViewController *weakController = (UIViewController *)self;
+        LGStandardPack activeStandardPack = LGActiveStandardPack();
+        [cell configureWithGroupColumnCount:columnCount
+                            selectedGroupIndex:activeStandardPack == LGStandardPackCount
+                                ? LGGroupIndexForIconID(LGActiveIconID()) : NSNotFound
+                                   accentColor:ApolloThemeAccentColor() ?: tableView.tintColor
+                           cardBackgroundColor:LGThemedCardBackgroundColor(sourceTable)
+                                    tapHandler:^(NSInteger groupIndex) {
+            LGGroupIconsViewController *vc = [[LGGroupIconsViewController alloc] initWithGroupIndex:groupIndex];
+            [weakController.navigationController pushViewController:vc animated:YES];
+        }];
+        return cell;
+    }
+    if (LGAlternateIconsAvailable() && indexPath.section == LGStandardPacksSectionIndex()) {
+        LGPackGridRowCell *cell = (LGPackGridRowCell *)[tableView dequeueReusableCellWithIdentifier:kLGStandardPackGridRowReuseID];
+        if (![cell isMemberOfClass:[LGPackGridRowCell class]])
+            cell = [[LGPackGridRowCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:kLGStandardPackGridRowReuseID];
+        LGRememberPreparedPackCell(tableView, cell);
+
+        NSInteger columnCount = LGMainPackColumnCount(tableView);
+        UITableView *sourceTable = ApolloInheritedSettingsThemeSourceTableView((UITableViewController *)(id)self);
+        UIColor *cardBackgroundColor = LGThemedCardBackgroundColor(sourceTable);
+        objc_setAssociatedObject(self, &kLGPickerCardBackgroundColorKey, cardBackgroundColor,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        __weak UIViewController *weakController = (UIViewController *)self;
+        __weak id weakSourceController = self;
+        __weak UITableView *weakSourceTable = tableView;
+        [cell configureWithStandardColumnCount:columnCount
+                              selectedStandardPack:LGDisplayedActiveStandardPack()
+                                      accentColor:ApolloThemeAccentColor() ?: tableView.tintColor
+                              cardBackgroundColor:cardBackgroundColor
+                                       tapHandler:^(NSInteger cardIndex) {
+            LGStandardPack pack = (LGStandardPack)cardIndex;
+            UIViewController *destination = nil;
+            if (pack == LGStandardPackCommunity) {
+                id source = weakSourceController;
+                UITableView *sourceTable = weakSourceTable;
+                if (!source || !sourceTable) return;
+                LGSetForwardedNativeSection(source, 1);
+                ((void (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(
+                    source, @selector(tableView:didSelectRowAtIndexPath:), sourceTable,
+                    [NSIndexPath indexPathForRow:0 inSection:0]);
+                LGSetForwardedNativeSection(source, NSNotFound);
+                return;
+            } else {
+                destination = [[LGNativeIconPackViewController alloc] initWithSourceController:weakSourceController
+                                                                                   sourceTable:weakSourceTable
+                                                                           cardBackgroundColor:cardBackgroundColor
+                                                                                          pack:pack];
+            }
+            if (destination) [weakController.navigationController pushViewController:destination animated:YES];
+        }];
+        return cell;
+    }
+    if (LGAlternateIconsAvailable()) {
+        NSIndexPath *r = LGRemapIndexPathToOriginal(indexPath);
+        LG_REMAP_SCOPE(tableView, r.section, indexPath.section);
+        UITableViewCell *cell = %orig(tableView, r);
+        // Apollo's own Default row (its section 0, row 0) — see
+        // LGCorrectDefaultRowCheckmark for why it needs correcting.
+        if (r.section == 0 && r.row == 0) LGCorrectDefaultRowCheckmark(cell);
+        return cell;
+    }
+    if (LGIsAppendedEAPRow(self, indexPath.section, indexPath.row)) {
+        return LGCreateEAPCell();
+    }
+    return %orig;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (LGAlternateIconsAvailable()) {
+        NSInteger forwardedSection = LGForwardedNativeSection(self);
+        if (forwardedSection != NSNotFound) {
+            NSIndexPath *nativeIndexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:forwardedSection];
+            NSInteger uikitRow = LGForwardedUIKitRow(self);
+            LG_REMAP_ROW_SCOPE(tableView, forwardedSection, 0,
+                               uikitRow == NSNotFound ? NSNotFound : nativeIndexPath.row,
+                               uikitRow);
+            %orig(tableView, cell, nativeIndexPath);
+            if (forwardedSection == 0 && indexPath.row == 0) LGCorrectDefaultRowCheckmark(cell);
+            return;
+        }
+        if (LGSectionIsOurs(indexPath.section)) return;
+        NSIndexPath *r = LGRemapIndexPathToOriginal(indexPath);
+        LG_REMAP_SCOPE(tableView, r.section, indexPath.section);
+        %orig(tableView, cell, r);
+        // Apollo's own willDisplayCell pass may re-derive the same
+        // checkmark state %orig set in cellForRowAtIndexPath — correct it
+        // again here so whichever pass is authoritative for final rendering
+        // still ends up right.
+        if (r.section == 0 && r.row == 0) LGCorrectDefaultRowCheckmark(cell);
+        return;
+    }
+    NSInteger nativeCount = kLGNativeSekritIconCount;
+    if (LGIsAppendedEAPRow(self, indexPath.section, indexPath.row)) {
+        NSIndexPath *templatePath = [NSIndexPath indexPathForRow:nativeCount - 1
+                                                       inSection:indexPath.section];
+        %orig(tableView, cell, templatePath);
+        LGConfigureEAPCell(cell);
+        return;
+    }
+    %orig;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (LGAlternateIconsAvailable()) {
+        NSInteger forwardedSection = LGForwardedNativeSection(self);
+        if (forwardedSection != NSNotFound) return %orig(tableView, forwardedSection);
+        if (LGHasFeaturedSection() && section == LGFeaturedSectionIndex()) return LGFeaturedSectionTitle();
+        if (section == LGPacksSectionIndex()) return kLGSectionBrandTitle;
+        if (section == LGStandardPacksSectionIndex()) return kLGStandardSectionTitle;
+        return %orig(tableView, LGRemapSectionToOriginal(section));
+    }
+    return %orig;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (LGAlternateIconsAvailable()) {
+        NSInteger forwardedSection = LGForwardedNativeSection(self);
+        if (forwardedSection != NSNotFound) return %orig(tableView, forwardedSection);
+        if (LGSectionIsOurs(section)) return nil;
+        return %orig(tableView, LGRemapSectionToOriginal(section));
+    }
+    return %orig;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (LGAlternateIconsAvailable()) {
+        NSInteger forwardedSection = LGForwardedNativeSection(self);
+        if (forwardedSection != NSNotFound) {
+            NSIndexPath *nativeIndexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:forwardedSection];
+            NSInteger uikitRow = LGForwardedUIKitRow(self);
+            LG_REMAP_ROW_SCOPE(tableView, forwardedSection, 0,
+                               uikitRow == NSNotFound ? NSNotFound : nativeIndexPath.row,
+                               uikitRow);
+            return %orig(tableView, nativeIndexPath);
+        }
+        if (LGHasFeaturedSection() && indexPath.section == LGFeaturedSectionIndex()) return kLGFeaturedStripHeight;
+        NSInteger columns = LGMainPackColumnCount(tableView);
+        if (indexPath.section == LGPacksSectionIndex()) return LGPackGridRowHeight() * LGPacksSectionRowCount(columns);
+        if (indexPath.section == LGStandardPacksSectionIndex()) return LGPackGridRowHeight() * LGCardRowCount(LGStandardPackCount, columns);
+        NSIndexPath *r = LGRemapIndexPathToOriginal(indexPath);
+        LG_REMAP_SCOPE(tableView, r.section, indexPath.section);
+        return %orig(tableView, r);
+    }
+    NSInteger nativeCount = kLGNativeSekritIconCount;
+    if (LGIsAppendedEAPRow(self, indexPath.section, indexPath.row)) {
+        NSIndexPath *templatePath = [NSIndexPath indexPathForRow:nativeCount - 1
+                                                       inSection:indexPath.section];
+        return %orig(tableView, templatePath);
+    }
+    return %orig;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    if (LGAlternateIconsAvailable()) {
+        NSInteger forwardedSection = LGForwardedNativeSection(self);
+        if (forwardedSection != NSNotFound) return %orig(tableView, forwardedSection);
+        if (LGSectionIsOurs(section)) return UITableViewAutomaticDimension;
+        return %orig(tableView, LGRemapSectionToOriginal(section));
+    }
+    return %orig;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSInteger forwardedSection = LGForwardedNativeSection(self);
+    if (LGAlternateIconsAvailable() && forwardedSection != NSNotFound) {
+        NSIndexPath *nativeIndexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:forwardedSection];
+        if (forwardedSection == 0 && indexPath.row == 0) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
+            __weak UITableView *weakTV = tableView;
+            LGApplyAlternateIconSerialized(tableView, nil, ^(BOOL success) {
+                if (success) [weakTV reloadData];
+            });
+            return;
+        }
+        if (sLGIconChangeInProgress) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
+            ApolloLog(@"[LGIconPicker] ignoring native icon selection while another change is active");
+            return;
+        }
+        NSInteger uikitRow = LGForwardedUIKitRow(self);
+        LG_REMAP_ROW_SCOPE(tableView, forwardedSection, 0,
+                           uikitRow == NSNotFound ? NSNotFound : nativeIndexPath.row,
+                           uikitRow);
+        %orig(tableView, nativeIndexPath);
+        return;
+    }
+    if (LGAlternateIconsAvailable() && LGHasFeaturedSection() && indexPath.section == LGFeaturedSectionIndex()) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        // Individual card controls own selection inside the horizontal strip.
+        return;
+    }
+    if (LGAlternateIconsAvailable() && indexPath.section == LGPacksSectionIndex()) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        // Individual card controls own navigation inside each grid row.
+        return;
+    }
+    if (LGAlternateIconsAvailable() && indexPath.section == LGStandardPacksSectionIndex()) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        return;
+    }
+    if (LGAlternateIconsAvailable()) {
+        NSIndexPath *r = LGRemapIndexPathToOriginal(indexPath);
+        // Bypass Apollo's redundant "Having issues setting?" alert for Default.
+        if (r.section == 0 && r.row == 0) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
+            __weak UITableView *weakTV = tableView;
+            LGApplyAlternateIconSerialized(tableView, nil, ^(BOOL success) {
+                if (success) [weakTV reloadData];
+            });
+            return;
+        }
+        if (sLGIconChangeInProgress) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
+            ApolloLog(@"[LGIconPicker] ignoring native icon selection while another change is active");
+            return;
+        }
+        LG_REMAP_SCOPE(tableView, r.section, indexPath.section);
+        %orig(tableView, r);
+        return;
+    }
+    if (LGIsAppendedEAPRow(self, indexPath.section, indexPath.row)) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        __weak UITableView *weakTable = tableView;
+        LGApplyAlternateIconSerialized(tableView, kLGEAPIconID, ^(BOOL success) {
+            if (success) [weakTable reloadData];
+        });
+        return;
+    }
+    %orig;
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig;
+    // Artwork and selection rings resolve eagerly. Pack cells also retain
+    // explicit card heights, so refresh those constraints and scaled fonts
+    // when Dynamic Type changes even if the column count stays the same.
+    UIViewController *vc = (UIViewController *)self;
+    BOOL appearanceChanged = previousTraitCollection.userInterfaceStyle != vc.traitCollection.userInterfaceStyle;
+    BOOL textSizeChanged = ![previousTraitCollection.preferredContentSizeCategory
+        isEqualToString:vc.traitCollection.preferredContentSizeCategory];
+    if (LGAlternateIconsAvailable() && (appearanceChanged || textSizeChanged)) {
+        UITableView *tableView = LGRememberedTableView(self);
+        [tableView reloadData];
+    }
+}
+
+- (void)viewWillTransitionToSize:(CGSize)size
+       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    %orig;
+    if (!LGAlternateIconsAvailable()) return;
+    (void)size;
+
+    UITableView *tableView = LGRememberedTableView(self);
+    [coordinator animateAlongsideTransition:nil completion:^(__unused id context) {
+        LGUpdateMainPackColumns(tableView, NO);
+    }];
+}
+
+%end
+
+%hook _TtC6Apollo19ApolloTableViewCell
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig;
+    NSNumber *pickerSelection = objc_getAssociatedObject(self, &kLGNativeIconCellSelectedKey);
+    if (pickerSelection) {
+        // Standard icon rows use the same compressed press and spring release
+        // as Liquid Glass icon cards. Only picker-owned rows carry this marker.
+        LGSetPressAnimationHighlighted((UITableViewCell *)self,
+                                       LGNativeIconCellPressAnimation((UITableViewCell *)self),
+                                       highlighted);
+        // Apollo rebuilds its private accessory when a press begins and ends.
+        // Reapply our picker-owned badge after that redraw so holding or
+        // re-tapping the active icon cannot change the checkmark's shape.
+        LGSetNativeIconCellCheckmark((UITableViewCell *)self,
+                                     pickerSelection.boolValue);
+    }
+}
+
+- (void)prepareForReuse {
+    LGPressAnimationBox *box = objc_getAssociatedObject(self, &kLGNativeIconCellPressAnimationKey);
+    if (box) LGResetPressAnimation((UITableViewCell *)self, &box->_state);
+    %orig;
+}
+
+%end
+
+static UIColor *LGCommunityCardBackgroundColor(id controller) {
+    UIColor *stored = objc_getAssociatedObject(controller, &kLGCommunityCardBackgroundColorKey);
+    if (stored) return stored;
+
+    UIViewController *viewController = (UIViewController *)controller;
+    NSArray<UIViewController *> *stack = viewController.navigationController.viewControllers;
+    NSUInteger index = [stack indexOfObject:viewController];
+    if (index != NSNotFound && index > 0) {
+        UIColor *pickerColor = objc_getAssociatedObject(stack[index - 1],
+                                                        &kLGPickerCardBackgroundColorKey);
+        if (pickerColor) stored = pickerColor;
+    }
+    UITableView *sourceTable = ApolloInheritedSettingsThemeSourceTableView(
+        (UITableViewController *)(id)controller);
+    if (!stored && !ApolloThemeSourceTableIsStale(sourceTable)) {
+        stored = LGThemedCardBackgroundColor(sourceTable);
+    }
+    if (stored) objc_setAssociatedObject(controller, &kLGCommunityCardBackgroundColorKey, stored,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return stored ?: LGThemedCardBackgroundColor(nil);
+}
+
+static void LGStyleCommunityIconCell(id controller,
+                                     UITableViewCell *cell,
+                                     UITableView *tableView,
+                                     NSIndexPath *indexPath) {
+    if (!cell || !tableView || !indexPath) return;
+    UIColor *accent = ApolloThemeAccentColor() ?: tableView.tintColor;
+    cell.tintColor = accent;
+    cell.accessoryView.tintColor = accent;
+    for (UIView *subview in cell.contentView.subviews) subview.tintColor = accent;
+
+    NSInteger rowCount = [tableView numberOfRowsInSection:indexPath.section];
+    LGNormalizeNativeIconCellBackground(cell, LGCommunityCardBackgroundColor(controller),
+                                        indexPath.row == 0,
+                                        indexPath.row == rowCount - 1);
+    LGSetNativeIconCellCheckmark(cell,
+        LGActiveStandardPackRow(LGStandardPackCommunity) == indexPath.row);
+}
+
+%hook _TtC6Apollo39SettingsCommunityIconPackViewController
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    UITableView *tableView = MSHookIvar<UITableView *>(self, "tableView");
+    __weak UITableView *weakTable = tableView;
+    LGInstallAppearanceMenu((UIViewController *)self, tableView, ^{
+        [weakTable reloadData];
+    });
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    LGScheduleAppearancePlacement((UIViewController *)self);
+}
+
+%new
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return @"Community Icons";
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    return nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    LGRememberTableView(self, tableView);
+    UITableViewCell *cell = %orig;
+    LGStyleCommunityIconCell(self, cell, tableView, indexPath);
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell
+                                      forRowAtIndexPath:(NSIndexPath *)indexPath {
+    %orig;
+    // Apollo's custom-theme pass runs during willDisplay and can overwrite
+    // cellForRow's card color. Reassert the same picker-owned fill used by
+    // Apollo Originals, Ultra, and Sekrit after that native pass completes.
+    LGStyleCommunityIconCell(self, cell, tableView, indexPath);
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    BOOL replayingSelection = [objc_getAssociatedObject(self, &kLGCommunitySelectionReplayKey) boolValue];
+    if (!replayingSelection &&
+        LGStandardPackRowIsActive(LGStandardPackCommunity, indexPath.row, NSNotFound)) {
+        // Match the tweak-owned Standard packs: an already-active row keeps
+        // its checkmark and ends only the table's temporary pressed state.
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        __weak UITableView *weakTable = tableView;
+        __weak id weakSelf = self;
+        LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+            UITableView *strongTable = weakTable;
+            id strongSelf = weakSelf;
+            if (!strongTable || !strongSelf) return;
+            LGStyleCommunityIconCell(strongSelf,
+                                     [strongTable cellForRowAtIndexPath:indexPath],
+                                     strongTable, indexPath);
+        });
+        return;
+    }
+
+    if (replayingSelection) {
+        objc_setAssociatedObject(self, &kLGCommunitySelectionReplayKey, nil,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        LGBeginPendingStandardPackSelection(LGStandardPackCommunity, indexPath.row);
+        %orig;
+        return;
+    }
+
+    __weak id weakController = self;
+    __weak UITableView *weakTable = tableView;
+    LGPerformNativeIconSelectionWithFeedback(tableView, ^{
+        id controller = weakController;
+        UITableView *strongTable = weakTable;
+        if (!controller || !strongTable) return;
+        // Re-enter once after the haptic delay. The associated marker keeps
+        // that second pass from scheduling itself again.
+        objc_setAssociatedObject(controller, &kLGCommunitySelectionReplayKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ((void (*)(id, SEL, UITableView *, NSIndexPath *))objc_msgSend)(
+            controller, @selector(tableView:didSelectRowAtIndexPath:), strongTable, indexPath);
+    });
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig;
+    if (previousTraitCollection.userInterfaceStyle == ((UIViewController *)self).traitCollection.userInterfaceStyle) return;
+    objc_setAssociatedObject(self, &kLGCommunityCardBackgroundColorKey,
+                             LGThemedCardBackgroundColor(nil),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UITableView *tableView = LGRememberedTableView(self);
+    tableView.backgroundColor = LGThemedPageBackgroundColor(nil);
+    [tableView reloadData];
+}
+
+%end
+
+#pragma mark - Main Settings "App Icon" row
+//
+// Apollo's own main Settings list (one screen up from the picker) has its own
+// "App Icon" row showing a left-side thumbnail + right-side value label (e.g.
+// "Default"). Apollo builds both directly from
+// UIApplication.sharedApplication.alternateIconName — the same API
+// LGActiveIconID() already treats as unreliable on sideloaded distributions
+// (see the comment above LGActiveIconID). When it reports nil even though one
+// of our icons is active, this row silently reverts to showing Apollo's own
+// default icon and name. Fix it the same way as the picker's Default-row
+// checkmark: override the row after Apollo finishes building it, using our
+// own reliable LGActiveIconID().
+
+static UIImage *LGMainSettingsIconThumbnail(UIImage *preview) {
+    if (!preview) return nil;
+    CGSize size = CGSizeMake(29.0, 29.0);
+    UIGraphicsImageRendererFormat *format = UIGraphicsImageRendererFormat.preferredFormat;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+    return [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:(CGRect){ CGPointZero, size }
+                                                        cornerRadius:6.0];
+        [clip addClip];
+        [preview drawInRect:(CGRect){ CGPointZero, size }];
+    }];
+}
+
+static void LGKeepMainSettingsIconSquare(UITableViewCell *cell) {
+    cell.imageView.contentMode = UIViewContentModeScaleAspectFill;
+    cell.imageView.clipsToBounds = NO;
+    cell.imageView.layer.cornerRadius = 0.0;
+}
+
+// The applied custom icon (a Liquid Glass row, or an Ultra-pack addition) as a preview image and
+// display name, from our own record rather than UIApplication.alternateIconName, which is wrong
+// on some sideloaded installs. NO for the default icon and Apollo's stock icons. `preview` can
+// still come back nil when the artwork is missing; `dark` picks the variant for an "automatic"
+// appearance. Shared by the Settings row below and the sheets outside the picker.
+static BOOL LGActiveCustomIcon(BOOL dark, UIImage **preview, NSString **displayName) {
+    NSString *activeID = LGActiveIconID();
+    const LGIconRow *row = activeID.length ? LGRowForIconID(activeID) : NULL;
+    const LGIconRowEntry *added = LGActiveStandardPack() == LGStandardPackUltra
+        ? LGStandardPackAddedEntryForIconID(LGActiveStandardAddedIconID()) : NULL;
+    if (!row && !added) return NO;
+
+    if (added) {
+        NSString *iconID = @(added->iconID);
+        // Tweak-supplied Ultra additions use generated previews, while SPCA keeps Apollo's
+        // original file-based icon, so fall back to the file-based one.
+        if (preview) *preview = LGPreviewImage(iconID, @"default") ?: LGStandardIconPreview(iconID);
+        if (displayName) *displayName = @(added->displayName);
+    } else {
+        LGIconAppearanceMode mode = LGAppearanceModeFromAlternateIconName(LGActiveAlternateIconName());
+        NSString *variant = mode == LGIconAppearanceModeLight ? @"default"
+            : mode == LGIconAppearanceModeDark ? @"dark"
+            : (dark ? @"dark" : @"default");
+        if (preview) *preview = LGPreviewImage(row->iconID, variant);
+        if (displayName) *displayName = row->displayName;
+    }
+    return YES;
+}
+
+// For sheets outside the picker (What's New, the update prompt), which showed the default icon
+// before this record was consulted. nil for the default icon and Apollo's stock icons, which
+// ApolloCurrentAppIcon resolves from Info.plist.
+static UIImage *LGActiveIconPreviewForSheets(void) {
+    BOOL dark = NO;
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (window.isKeyWindow) { dark = LGIsDarkAppearance(window); break; }
+    }
+    UIImage *preview = nil;
+    LGActiveCustomIcon(dark, &preview, NULL);
+    return preview;
+}
+
+%hook _TtC6Apollo22SettingsViewController
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = %orig;
+    LGRememberTableView(self, tableView);
+    if (!LGAlternateIconsAvailable()) return cell;
+    // Section 1 holds the mainSettings list (App Icon is one of several rows
+    // there); pixelPal being conditionally present makes the row's absolute
+    // index unstable, so match by title rather than a hardcoded row number.
+    if (indexPath.section != 1) return cell;
+    if (![cell.textLabel.text isEqualToString:@"App Icon"]) return cell;
+
+    UIImage *preview = nil;
+    NSString *displayName = nil;
+    if (!LGActiveCustomIcon(LGIsDarkAppearance(cell), &preview, &displayName)) {
+        return cell; // true Default or a stock Apollo icon
+    }
+    if (preview) {
+        cell.imageView.image = LGMainSettingsIconThumbnail(preview);
+        LGKeepMainSettingsIconSquare(cell);
+    }
+
+    // Clear attributedText first: Apollo may have populated the value via
+    // either text or attributedText depending on build, so this guarantees
+    // our plain text wins regardless of which one it used.
+    if (cell.detailTextLabel) {
+        cell.detailTextLabel.attributedText = nil;
+        cell.detailTextLabel.text = displayName;
+    }
+
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    %orig;
+    if (!LGAlternateIconsAvailable() || indexPath.section != 1 ||
+        ![cell.textLabel.text isEqualToString:@"App Icon"]) return;
+
+    NSString *activeID = LGActiveIconID();
+    LGStandardPack activePack = LGActiveStandardPack();
+    BOOL addedStandardActive = activePack == LGStandardPackUltra &&
+        LGStandardPackAddedEntryForIconID(LGActiveStandardAddedIconID()) != NULL;
+    if ((activeID.length && LGRowForIconID(activeID)) || addedStandardActive) {
+        LGKeepMainSettingsIconSquare(cell);
+    }
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    // Popping back from the picker after changing the icon doesn't re-fetch
+    // already-built cells on its own — reload so this row picks up the change
+    // immediately rather than staying stale until the user scrolls it away
+    // and back. No-op on a screen's very first appearance if nothing has been
+    // remembered yet, which is fine: the initial cellForRowAtIndexPath: pass
+    // above already renders correctly.
+    if (!LGAlternateIconsAvailable()) return;
+    UITableView *tableView = LGRememberedTableView(self);
+    [tableView reloadData];
+}
+
+%end
+
+#pragma mark - UITableView bridge hooks
+//
+// Apollo's data-source/delegate methods call back into the table view using
+// the Apollo-perspective indexPath. Rewrite it to the UIKit-visible indexPath
+// while a remap scope is active so UIKit's row-data lookups see the correct layout.
+
+%hook UITableView
+
+- (__kindof UITableViewCell *)dequeueReusableCellWithIdentifier:(NSString *)ident forIndexPath:(NSIndexPath *)ip {
+    NSNumber *nativeSection = objc_getAssociatedObject(self, &kLGNativeDetailTableSectionKey);
+    if (nativeSection && ident.length) {
+        NSMutableSet<NSString *> *registered = objc_getAssociatedObject(self, &kLGNativeDetailRegisteredIdentifiersKey);
+        if (!registered) {
+            registered = [NSMutableSet set];
+            objc_setAssociatedObject(self, &kLGNativeDetailRegisteredIdentifiersKey,
+                                     registered, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (![registered containsObject:ident]) {
+            Class cellClass = (nativeSection.integerValue == 0
+                ? ApolloClassApolloDefaultTableViewCell
+                : ApolloClassApolloSubtitleTableViewCell) ?: UITableViewCell.class;
+            [self registerClass:cellClass forCellReuseIdentifier:ident];
+            [registered addObject:ident];
+        }
+    }
+    return %orig(ident, LGRewriteForActiveScope(self, ip));
+}
+- (UITableViewCell *)cellForRowAtIndexPath:(NSIndexPath *)ip {
+    return %orig(LGRewriteForActiveScope(self, ip));
+}
+- (CGRect)rectForRowAtIndexPath:(NSIndexPath *)ip {
+    return %orig(LGRewriteForActiveScope(self, ip));
+}
+- (void)deselectRowAtIndexPath:(NSIndexPath *)ip animated:(BOOL)animated {
+    %orig(LGRewriteForActiveScope(self, ip), animated);
+}
+
+%end
+
+%ctor {
+    if (LGAlternateIconsAvailable()) {
+        ApolloAppIconSetProvider(LGActiveIconPreviewForSheets);
+        NSMutableString *summary = [NSMutableString string];
+        if (sFeaturedCount > 0) [summary appendFormat:@"%ld featured, ", (long)sFeaturedCount];
+        for (NSInteger i = 0; i < sGroupCount; i++) {
+            if (i) [summary appendString:@", "];
+            [summary appendFormat:@"%ld %@", (long)sGroups[i].count, sGroups[i].groupID];
+        }
+        ApolloLog(@"[LGIconPicker] ctor: injecting %ld section(s) — %@", (long)LGInjectedSectionCount(), summary);
+
+        // Diagnostic for the "checkmark silently reverts to Default some
+        // time after being set" reports: log the raw system + persisted
+        // values (distinguishing nil from a non-nil-but-empty string, since
+        // LGActiveIconID now treats both the same but they'd have different
+        // root causes) on every foreground so a recurrence can be traced in
+        // `log show --predicate 'subsystem == "apollofix"'`.
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                            object:nil
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) {
+            NSString *system = UIApplication.sharedApplication.alternateIconName;
+            NSString *persisted = [NSUserDefaults.standardUserDefaults stringForKey:kLGActiveIconDefaultsKey];
+            NSString *applied = [NSUserDefaults.standardUserDefaults stringForKey:kLGAppliedIconNameDefaultsKey];
+            NSString *systemDesc = system == nil ? @"(nil)" : (system.length ? system : @"(empty, non-nil)");
+            NSString *persistedDesc = persisted == nil ? @"(nil)" : (persisted.length ? persisted : @"(empty, non-nil)");
+            ApolloLog(@"[LGIconPicker] foreground check: alternateIconName=%@ persisted=%@ applied=%@",
+                      systemDesc, persistedDesc, applied ?: @"(nil)");
+            // The migration's own icon change already redraws the icon.
+            if (LGMigrateLegacyClassicsSelectionIfNeeded()) {
+                LGMarkIconCheckedForThisInstall();
+            } else {
+                LGRepairHomeScreenIconAfterUpdateIfNeeded();
+            }
+            if (LGRefreshDailyFeaturedRowsIfNeeded()) {
+                LGReloadDailyFeaturedSection(sLGAppIconPickerTableView, YES);
+            }
+        }];
+    } else {
+        ApolloLog(@"[LGIconPicker] ctor: LG asset catalog not detected, hooks will passthrough");
+    }
+}

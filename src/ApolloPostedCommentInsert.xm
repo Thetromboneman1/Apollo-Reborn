@@ -1,0 +1,300 @@
+// Animate a freshly posted comment into the thread.
+//
+// Apollo's CommentsViewController.commentSubmitted(_:composeViewController:replyingTo:comment:error:)
+// appends the new RDKComment to its CommentTree, bumps the link's totalComments, and refreshes the
+// list through its ListAdapter with `animated: false` (Hopper: sub_10071a8f0 → sub_100701e44 →
+// sub_100173230(0, …)). The adapter's updates block picks UITableViewRowAnimationNone (5) when that
+// flag is false and UITableViewRowAnimationAutomatic (100) when true, then calls
+// -[ASTableNode performBatchAnimated:updates:completion:] with the same flag. So the new row and
+// everything below it snap into place in a single frame — usually while the compose sheet is still
+// sliding away, which is the "forced into place" feel.
+//
+// The delegate call runs synchronously inside the RDKClient submit completion on the main thread,
+// so the window is narrow and precise: wrap the completion of the submit funnel, and while it runs
+// treat the comments list's non-animated batch as animated, with the new row fading in while the
+// rows below slide down to make room.
+//
+// "N more replies" inserts through the same non-animated batch; ApolloLoadMoreComments.xm arms
+// the same promotion through ApolloCommentsRunWithAnimatedBatch (ApolloCommentsBatchAnimation.h),
+// so this file stays the single owner of the comments-list batch hooks.
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import "ApolloCommon.h"
+#import "ApolloClasses.h"
+#import "ApolloCommentsBatchAnimation.h"
+
+@interface ASDisplayNode : NSObject
+- (BOOL)isNodeLoaded;
+- (UIView *)view;
+- (void)layoutIfNeeded;
+- (void)recursivelyEnsureDisplaySynchronously:(BOOL)sync;
+@end
+
+@interface ASTableNode : ASDisplayNode
+@end
+
+// RedditKit's RDKObjectCompletionBlock: the parsed RDKComment (or nil) and an error.
+typedef void (^ApolloPostedCommentCompletion)(id object, NSError *error);
+
+// The armed promotion: set only while ApolloCommentsRunWithAnimatedBatch's body runs on the main
+// thread (a successful comment-submit completion, or a load-more insert) and restored afterwards
+// (@finally-guarded), so the only batch updates that can observe it are the ones Apollo issues
+// from inside that body. Main-thread only.
+@interface ApolloCommentsBatchPromotion : NSObject
+@property (nonatomic, copy) NSString *reason;
+@property (nonatomic, copy) void (^willAnimate)(id tableNode);
+@property (nonatomic, copy) void (^didFinish)(BOOL finished);
+@end
+
+@implementation ApolloCommentsBatchPromotion
+@end
+
+static ApolloCommentsBatchPromotion *sApolloCommentsBatchPromotion = nil;
+// Non-zero while the animated batch's updates block runs, so the row-level calls inside it can
+// swap `.none` for a fade. Main-thread only.
+static NSUInteger sApolloPostedCommentBatchDepth = 0;
+
+// The batch must belong to a comments thread: walk the responder chain from the table view.
+static BOOL ApolloPostedCommentTableIsCommentsList(ASTableNode *tableNode) {
+    Class commentsClass = ApolloClassCommentsViewController;
+    if (!commentsClass) return NO;
+    if (![tableNode isNodeLoaded]) return NO;
+    UIResponder *responder = [tableNode view];
+    while (responder) {
+        if ([responder isKindOfClass:commentsClass]) return YES;
+        responder = responder.nextResponder;
+    }
+    return NO;
+}
+
+// Rows the promoted batch inserts or reloads. Their cells are created a moment later, and
+// Texture rasterises a fresh cell's text nodes asynchronously — the body lands a frame before
+// the byline (text plus the avatar attachment), which is visible while the row fades in. So
+// each of those cells is laid out and drawn synchronously in -willDisplayCell:, before UIKit
+// starts the insert/reload animation. Consumed row by row; cleared when the batch completes
+// or after a short deadline (a cancelled pop can leave rows undisplayed). Main-thread only.
+static __weak UITableView *sApolloPostedCommentPendingTableView = nil;
+static NSMutableSet<NSIndexPath *> *sApolloPostedCommentPendingRows = nil;
+static CFAbsoluteTime sApolloPostedCommentPendingDeadline = 0;
+// Row operations recorded while the promoted batch's updates block runs.
+static NSMutableArray<NSIndexPath *> *sApolloPostedCommentInsertedRows = nil;
+static NSMutableArray<NSIndexPath *> *sApolloPostedCommentReloadedRows = nil;
+static NSMutableArray<NSIndexPath *> *sApolloPostedCommentDeletedRows = nil;
+
+static void ApolloPostedCommentClearPending(void) {
+    sApolloPostedCommentPendingTableView = nil;
+    sApolloPostedCommentPendingRows = nil;
+    sApolloPostedCommentPendingDeadline = 0;
+}
+
+// UIKit batch semantics: reloads and deletes name OLD rows, inserts name NEW rows, and the
+// surviving old rows fill the new slots the inserts leave free, in order. Map a reloaded old
+// row to the slot its recreated cell will occupy.
+static NSIndexPath *ApolloPostedCommentNewIndexPathForReloadedRow(NSIndexPath *oldPath) {
+    NSInteger section = oldPath.section;
+    NSInteger rank = oldPath.row;
+    for (NSIndexPath *deleted in sApolloPostedCommentDeletedRows) {
+        if (deleted.section == section && deleted.row < oldPath.row) rank--;
+    }
+    NSMutableIndexSet *insertedSlots = [NSMutableIndexSet indexSet];
+    for (NSIndexPath *inserted in sApolloPostedCommentInsertedRows) {
+        if (inserted.section == section) [insertedSlots addIndex:(NSUInteger)inserted.row];
+    }
+    NSInteger slot = 0;
+    NSInteger survivorsSeen = -1;
+    while (YES) {
+        if (![insertedSlots containsIndex:(NSUInteger)slot]) {
+            survivorsSeen++;
+            if (survivorsSeen == rank) break;
+        }
+        slot++;
+        if (slot > 100000) return nil;   // defensive: never spin on a malformed batch
+    }
+    return [NSIndexPath indexPathForRow:slot inSection:section];
+}
+
+static void ApolloPostedCommentRecordPendingRows(ASTableNode *tableNode) {
+    NSMutableSet<NSIndexPath *> *rows = [NSMutableSet set];
+    [rows addObjectsFromArray:sApolloPostedCommentInsertedRows];
+    for (NSIndexPath *reloaded in sApolloPostedCommentReloadedRows) {
+        NSIndexPath *mapped = ApolloPostedCommentNewIndexPathForReloadedRow(reloaded);
+        if (mapped) [rows addObject:mapped];
+    }
+    UIView *view = [tableNode isNodeLoaded] ? [tableNode view] : nil;
+    if (rows.count == 0 || ![view isKindOfClass:[UITableView class]]) {
+        ApolloPostedCommentClearPending();
+        return;
+    }
+    sApolloPostedCommentPendingTableView = (UITableView *)view;
+    sApolloPostedCommentPendingRows = rows;
+    sApolloPostedCommentPendingDeadline = CFAbsoluteTimeGetCurrent() + 2.0;
+}
+
+// Draw a pending row's fresh cell now: apply its pending layout (the frame is final, the row
+// was measured before the batch) and rasterise every text/image node on this turn, so the
+// first committed frame of the animation shows the whole comment.
+static void ApolloPostedCommentDisplayPendingCell(UITableView *tableView, UITableViewCell *cell, NSIndexPath *indexPath) {
+    if (tableView != sApolloPostedCommentPendingTableView || CFAbsoluteTimeGetCurrent() > sApolloPostedCommentPendingDeadline) {
+        ApolloPostedCommentClearPending();
+        return;
+    }
+    if (![sApolloPostedCommentPendingRows containsObject:indexPath]) return;
+    [sApolloPostedCommentPendingRows removeObject:indexPath];
+    if (sApolloPostedCommentPendingRows.count == 0) ApolloPostedCommentClearPending();
+
+    id node = nil;
+    if ([cell respondsToSelector:@selector(node)]) {
+        node = ((id (*)(id, SEL))objc_msgSend)(cell, @selector(node));
+    }
+    if (![node isKindOfClass:ApolloClassASCellNode]) {
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] row %ld has no cell node to draw (%{public}@)", (long)indexPath.row, NSStringFromClass([cell class]));
+        return;
+    }
+    [node layoutIfNeeded];
+    [node recursivelyEnsureDisplaySynchronously:YES];
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] drew fresh cell synchronously for row %ld", (long)indexPath.row);
+}
+
+void ApolloCommentsRunWithAnimatedBatch(NSString *reason,
+                                        NS_NOESCAPE dispatch_block_t body,
+                                        void (^willAnimate)(id tableNode),
+                                        void (^didFinish)(BOOL finished)) {
+    if (!body) return;
+    if (!NSThread.isMainThread) {
+        // Off-main deliveries can't be paired with a main-thread batch; run them untouched.
+        body();
+        return;
+    }
+    ApolloCommentsBatchPromotion *promotion = [ApolloCommentsBatchPromotion new];
+    promotion.reason = reason.length > 0 ? reason : @"comments update";
+    promotion.willAnimate = willAnimate;
+    promotion.didFinish = didFinish;
+    ApolloCommentsBatchPromotion *previous = sApolloCommentsBatchPromotion;
+    sApolloCommentsBatchPromotion = promotion;
+    @try {
+        body();
+    } @finally {
+        sApolloCommentsBatchPromotion = previous;
+    }
+}
+
+
+%hook RDKClient
+
+// Every comment submit funnels through here (the onLink: / asReplyToComment: variants tail-call
+// it). ApolloOwnCommentFlair.xm hooks the same funnel to arm its flair backfill; both hooks only
+// observe and call %orig, so their order is irrelevant.
+- (id)submitComment:(id)body onThingWithFullName:(id)fullName completion:(ApolloPostedCommentCompletion)completion {
+    if (!completion) {
+        return %orig;
+    }
+    ApolloPostedCommentCompletion wrapped = ^(id object, NSError *error) {
+        // A failed submit shows an alert instead of inserting; nothing to animate.
+        if (error != nil || object == nil) {
+            completion(object, error);
+            return;
+        }
+        ApolloCommentsRunWithAnimatedBatch(@"posted comment", ^{
+            completion(object, error);
+        }, nil, nil);
+    };
+    return %orig(body, fullName, wrapped);
+}
+
+%end
+
+%hook ASTableNode
+
+- (void)performBatchAnimated:(BOOL)animated updates:(void (^)(void))updates completion:(void (^)(BOOL))completion {
+    ApolloCommentsBatchPromotion *promotion = sApolloCommentsBatchPromotion;
+    if (!promotion || animated) {
+        %orig;
+        return;
+    }
+    if (!ApolloPostedCommentTableIsCommentsList(self)) {
+        ApolloLog(@"[PostedCommentInsert] non-animated batch during a %@ is not on a comments list — leaving it", promotion.reason);
+        %orig;
+        return;
+    }
+    ApolloLog(@"[PostedCommentInsert] animating the %@ batch on table %p", promotion.reason, self);
+    if (promotion.willAnimate) promotion.willAnimate(self);
+    ApolloPostedCommentClearPending();
+    sApolloPostedCommentInsertedRows = [NSMutableArray array];
+    sApolloPostedCommentReloadedRows = [NSMutableArray array];
+    sApolloPostedCommentDeletedRows = [NSMutableArray array];
+    ASTableNode *tableNode = self; // strong capture: hooked self is __unsafe_unretained
+    void (^animatedUpdates)(void) = ^{
+        sApolloPostedCommentBatchDepth++;
+        @try {
+            if (updates) updates();
+        } @finally {
+            sApolloPostedCommentBatchDepth--;
+        }
+        ApolloPostedCommentRecordPendingRows(tableNode);
+        sApolloPostedCommentInsertedRows = nil;
+        sApolloPostedCommentReloadedRows = nil;
+        sApolloPostedCommentDeletedRows = nil;
+    };
+    void (^didFinish)(BOOL) = promotion.didFinish;
+    void (^wrappedCompletion)(BOOL) = ^(BOOL finished) {
+        ApolloPostedCommentClearPending();
+        if (completion) completion(finished);
+        if (didFinish) didFinish(finished);
+    };
+    %orig(YES, animatedUpdates, wrappedCompletion);
+}
+
+// Apollo's updates block records the row animation it computed from its own (false) flag; inside
+// the batch we promoted, substitute a fade. (`.automatic` — what Apollo's own animated updates
+// use — resolves to a top slide for a row inserted right under the header, so the new comment
+// emerges from underneath the post header; a fade keeps it in place while the rows below make
+// room.)
+- (void)insertRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
+    if (sApolloPostedCommentBatchDepth > 0 && animation == UITableViewRowAnimationNone) {
+        [sApolloPostedCommentInsertedRows addObjectsFromArray:indexPaths];
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] insert %lu row(s) → fade", (unsigned long)indexPaths.count);
+        %orig(indexPaths, UITableViewRowAnimationFade);
+        return;
+    }
+    %orig;
+}
+
+- (void)reloadRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
+    if (sApolloPostedCommentBatchDepth > 0 && animation == UITableViewRowAnimationNone) {
+        [sApolloPostedCommentReloadedRows addObjectsFromArray:indexPaths];
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] reload %lu row(s) → fade", (unsigned long)indexPaths.count);
+        %orig(indexPaths, UITableViewRowAnimationFade);
+        return;
+    }
+    %orig;
+}
+
+- (void)deleteRowsAtIndexPaths:(NSArray *)indexPaths withRowAnimation:(UITableViewRowAnimation)animation {
+    if (sApolloPostedCommentBatchDepth > 0 && animation == UITableViewRowAnimationNone) {
+        [sApolloPostedCommentDeletedRows addObjectsFromArray:indexPaths];
+        os_log_debug(ApolloFixLog(), "[ApolloFix] [PostedCommentInsert] delete %lu row(s) → fade", (unsigned long)indexPaths.count);
+        %orig(indexPaths, UITableViewRowAnimationFade);
+        return;
+    }
+    %orig;
+}
+
+%end
+
+%hook ASTableView
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    %orig;
+    if (!sApolloPostedCommentPendingRows) return;
+    ApolloPostedCommentDisplayPendingCell(tableView, cell, indexPath);
+}
+
+%end
+
+%ctor {
+    %init;
+    ApolloLog(@"[PostedCommentInsert] hook installed (comment-submit batch → animated)");
+}

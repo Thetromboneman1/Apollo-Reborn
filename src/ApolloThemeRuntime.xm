@@ -1,0 +1,2686 @@
+#import "ApolloThemeRuntime.h"
+#import "ApolloThemeStore.h"
+#import "ApolloThemeCompiler.h"
+#import "ApolloThemeGalleryCatalog.h"
+#import "ApolloClassicBarTheme.h"
+#import "ApolloCommon.h"
+#import "ApolloState.h"
+#import "ApolloSwiftRuntime.h"
+#import <CoreText/CoreText.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <dlfcn.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+
+#include <atomic>
+#import "ApolloClasses.h"
+
+@class ASDisplayNode;
+
+// ASSizeRange ABI stand-in (two by-value CGSizes) so Logos can hook
+// -layoutSpecThatFits:; matches ApolloTextureDecls.h's ApolloTextureSizeRange
+// (not imported here — its ASTextNode/ASDisplayNode interfaces would collide
+// with this file's local declarations).
+struct ApolloThemeSizeRange { CGSize min; CGSize max; };
+
+@interface ASDisplayNode : NSObject
+- (ASDisplayNode *)supernode;
+@property (nonatomic, strong) UIColor *backgroundColor;
+@end
+
+@interface ASTextNode : ASDisplayNode
+@property (nonatomic, copy) NSAttributedString *attributedText;
+@end
+
+@interface ASTextNode2 : ASTextNode
+@end
+
+@interface ASButtonNode : ASDisplayNode
+- (void)setAttributedTitle:(NSAttributedString *)title forState:(NSUInteger)state;
+- (void)setTitle:(NSString *)title withFont:(UIFont *)font withColor:(UIColor *)color forState:(NSUInteger)state;
+- (void)setTitle:(NSString *)title withFont:(UIFont *)font withColor:(UIColor *)color withShadowColor:(UIColor *)shadowColor withShadowOffset:(CGSize)shadowOffset forState:(NSUInteger)state;
+@end
+
+@interface ASImageNode : ASDisplayNode
+- (void)setImageModificationBlock:(id)block;
+@end
+
+@interface _UINavigationBarTitleControl : UIControl
+@end
+
+// Apollo's feed/subreddit search-field pill. A plain UITextField whose
+// background Apollo builds from the SAME literal RGB constant it uses for
+// hairline row separators (0xC7C7CC light / 0x646466 dark — see
+// docs/theme-builder-RE.md's "separator" role: "row separators + search/input
+// field fills"). kSeparatorEntries below intentionally remaps that constant
+// globally so the Advanced "Separators" override reaches real divider lines,
+// but that means it also recolors this field's fill, since both draw from the
+// identical constant and can't be told apart by RGB alone. Given its own sink
+// (below) so it lands on "Raised" (inset controls/elevated panels) instead.
+@interface _TtC6Apollo24ApolloSearchBarTextField : UITextField
+@end
+
+// Apollo inserts these Texture cells between comment sections. Their internal
+// separatorNode is painted from Apollo's shared "gray" role (the same role as
+// muted text), rather than from its separator role, so RGB remapping alone
+// cannot distinguish the divider from a genuine muted label.
+@interface _TtC6Apollo21ThinSeparatorCellNode : ASDisplayNode
+@end
+
+// The post header above a comment thread owns two more explicit Texture
+// hairlines: one above the action quick bar and one above the comments list.
+@interface _TtC6Apollo22CommentsHeaderCellNode : ASDisplayNode
+@end
+
+// ===========================================================================
+// Runtime state
+// ===========================================================================
+
+// UIColor construction and Texture layout read theme state from arbitrary
+// threads, while theme edits/reloads are serialized on main. Publish the whole
+// compiled theme as one immutable snapshot: readers perform one acquire load
+// and never take a lock in the UIColor hot path. Snapshots intentionally live
+// for the process lifetime. They are tiny and reloads are user-driven/rare;
+// avoiding reclamation makes a loaded pointer safe for the complete hook call.
+typedef struct {
+    bool enabled;
+    ApolloThemeFont fontChoices[ApolloThemeModeCount];
+    bool voteArrowsAccent[ApolloThemeModeCount];
+    uint32_t tokens[ApolloThemeModeCount][ApolloThemeTokenCount];
+    uint64_t epoch;
+} ApolloThemeRuntimeSnapshot;
+
+static const ApolloThemeRuntimeSnapshot kApolloThemeDefaultSnapshot = {
+    false,
+    { ApolloThemeFontSystem, ApolloThemeFontSystem },
+    { false, false },
+    {},
+    0,
+};
+static std::atomic<const ApolloThemeRuntimeSnapshot *> sRuntimeSnapshot { &kApolloThemeDefaultSnapshot };
+static std::atomic<uint64_t> sRuntimeEpoch { 0 };
+static std::atomic<bool> sDebugLogging { false };
+
+static inline const ApolloThemeRuntimeSnapshot *ApolloThemeCurrentSnapshot(void) {
+    return sRuntimeSnapshot.load(std::memory_order_acquire);
+}
+
+static void ApolloThemePublishSnapshot(ApolloThemeRuntimeSnapshot *snapshot) {
+    snapshot->epoch = sRuntimeEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    sRuntimeSnapshot.store(snapshot, std::memory_order_release);
+}
+
+static uintptr_t sApolloStart = 0;
+static uintptr_t sApolloEnd = 0;
+static uintptr_t sTweakStart = 0;
+static uintptr_t sTweakEnd = 0;
+
+// Apply UIKit-owned colours at the view sink as well as at UIColor creation.
+// UITableView creates its default hairline colour inside UIKit, so the
+// caller-gated UIColor.separatorColor hook deliberately cannot see it. The
+// Search tab likewise uses a stock UISearchBar (not ApolloSearchBarTextField),
+// whose input fill is assembled inside UIKit from its own palette.
+static void ApplyThemeTableSeparator(UITableView *tableView) {
+    if (!ApolloThemeCurrentSnapshot()->enabled || !tableView) return;
+    UIColor *separator = ApolloThemeRuntimeColor(ApolloThemeTokenSeparator);
+    if (separator && ![tableView.separatorColor isEqual:separator]) {
+        tableView.separatorColor = separator;
+    }
+}
+
+static const void *kApolloThemeSearchPillKey = &kApolloThemeSearchPillKey;
+
+static void ApplyThemeSearchFieldBackground(UISearchBar *searchBar) {
+    if (!searchBar) return;
+    UITextField *field = searchBar.searchTextField;
+    UIView *pill = field ? objc_getAssociatedObject(field, kApolloThemeSearchPillKey) : nil;
+    // The pill is tweak-owned, so UIKit has no native state transition that
+    // removes it when the custom runtime turns off. The disable invalidation
+    // re-enters here through the trait cascade; use that pass to tear down the
+    // stale themed fill immediately. Keep the association so a later re-enable
+    // can cheaply reinsert the same view.
+    if (!ApolloThemeCurrentSnapshot()->enabled) {
+        [pill removeFromSuperview];
+        return;
+    }
+    // Elevated (== card), NOT Tertiary/raised: Apollo natively paints the
+    // Search tab's whole header band with the theme's raised surface, so a
+    // raised pill would vanish into its own band. The card color keeps the
+    // pill distinct on that band (and reads like an inset control on the
+    // bars-colored toolbars other search bars sit in).
+    UIColor *pillColor = ApolloThemeRuntimeColor(ApolloThemeTokenElevatedBackground);
+    if (!pillColor || !field) return;
+    // Writing searchTextField.backgroundColor does nothing visible: the stock
+    // UISearchBar draws its pill via _UISearchBarSearchFieldBackgroundView and
+    // UISearchBarTextField never renders its own backgroundColor — so on the
+    // Search tab the themed fill silently missed (issue #748). (A themed
+    // setSearchFieldBackgroundImage: was tried first; UIKit swaps in an image
+    // background host but never renders the image.) Instead paint the capsule
+    // ourselves: an inert themed overlay stacked directly above UIKit's pill
+    // view and below the field's text/icons — same overlay pattern the rest of
+    // the tweak uses.
+    if (!pill) {
+        pill = [[UIView alloc] initWithFrame:field.bounds];
+        pill.userInteractionEnabled = NO;
+        pill.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        pill.layer.cornerRadius = IsLiquidGlass() ? 18.0 : 10.0;
+        pill.layer.cornerCurve = kCACornerCurveContinuous;
+        objc_setAssociatedObject(field, kApolloThemeSearchPillKey, pill, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Resolve the dynamic color EXPLICITLY against the search BAR's traits
+    // instead of assigning it dynamic and trusting the pill's own trait
+    // environment. Under iOS 27 Liquid Glass the field hosts inserted
+    // subviews in a container whose effective style can disagree with the
+    // bar, and the dynamic color then resolves the LIGHT card variant on a
+    // dark themed Search tab (3.5.1 regression report — near-white pill,
+    // unreadable placeholder). The bar itself always carries the correct
+    // themed style, and both apply points (didMoveToWindow /
+    // traitCollectionDidChange:) re-run this on every trait change, so a
+    // statically resolved color stays current across light/dark flips.
+    pill.backgroundColor = [pillColor resolvedColorWithTraitCollection:searchBar.traitCollection];
+    pill.frame = field.bounds;
+    if (pill.superview != field) {
+        // Directly above UIKit's own background view when it exists (covering
+        // its grey material), else at the very back. The name scan also
+        // accepts effect/glass hosts: iOS 27's Liquid Glass field can draw
+        // its material through a view without "Background" in the class name,
+        // and a pill inserted at index 0 would sit UNDER that material and
+        // wash out.
+        UIView *systemPill = nil;
+        for (UIView *sub in field.subviews) {
+            if (sub == pill) continue;
+            NSString *cls = NSStringFromClass(sub.class);
+            if ([cls containsString:@"Background"] || [cls containsString:@"Glass"]
+                || [sub isKindOfClass:UIVisualEffectView.class]) { systemPill = sub; break; }
+        }
+        if (systemPill) [field insertSubview:pill aboveSubview:systemPill];
+        else [field insertSubview:pill atIndex:0];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pinned separator nodes (issues #963, #911)
+// ---------------------------------------------------------------------------
+// A one-shot didLoad recolor of these hairlines is not enough: Apollo repaints
+// them AFTER our write, from Swift-internal colour passes with no ObjC entry
+// point to hook (Apollo 1.15.11 addresses, for the next RE session):
+//   * when the full post arrives, CommentsHeaderSectionController re-binds the
+//     header node's link and re-runs its colour pass (sub_1004f2384 ->
+//     sub_1005685c4 -> sub_10056affc), repainting both header hairlines with
+//     the shared gray-role colour (sub_10068cda0) — issue #963's two stock
+//     lines around the quick bar "after loading the whole thread";
+//   * on scene foreground / appearance re-evaluation, a Swift-vtable
+//     "apply colours" override on each cell class (sub_10056ca1c for the
+//     header, sub_1003ad1c8 for ThinSeparatorCellNode) runs the same pass —
+//     issue #911's separators reverting after backgrounding the app.
+// Every one of those passes funnels through -[ASDisplayNode
+// setBackgroundColor:] on the same node instance (created once, at cell init),
+// so instead of chasing each trigger, pin the node itself: isa-swizzle it onto
+// a dynamic subclass whose setBackgroundColor: rewrites any incoming colour to
+// the theme's Separator token while a custom theme is enabled, and passes
+// writes through untouched when it isn't. The subclass overrides nothing ASDK
+// inspects at node init, and the pin is installed from didLoad (main thread,
+// node quiescent).
+static Class ApolloThemePinnedSeparatorClassForBase(Class base) {
+    static NSMutableDictionary<NSString *, Class> *sPinnedClasses;  // main-thread only (didLoad)
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sPinnedClasses = [NSMutableDictionary new]; });
+    NSString *baseName = NSStringFromClass(base);
+    Class cached = sPinnedClasses[baseName];
+    if (cached) return cached;
+
+    NSString *name = [@"ApolloRebornPinnedSeparator_" stringByAppendingString:baseName];
+    Class pinned = objc_getClass(name.UTF8String);
+    if (!pinned) {
+        SEL sel = @selector(setBackgroundColor:);
+        Method proto = class_getInstanceMethod(base, sel);
+        if (!proto) return Nil;
+        pinned = objc_allocateClassPair(base, name.UTF8String, 0);
+        if (!pinned) return Nil;
+        // Message super from `base` explicitly rather than from
+        // class_getSuperclass(object_getClass(node)) — if KVO ever stacks its
+        // own subclass on top of the pin, the latter would loop back into this
+        // IMP forever.
+        IMP imp = imp_implementationWithBlock(^(id node, UIColor *color) {
+            UIColor *out = color;
+            if (color && ApolloThemeCurrentSnapshot()->enabled) {
+                UIColor *separator = ApolloThemeRuntimeColor(ApolloThemeTokenSeparator);
+                if (separator) out = separator;
+            }
+            if (out != color && sDebugLogging.load(std::memory_order_relaxed)) {
+                ApolloLog(@"ThemeRuntime: pinned separator %p rewrote #%06X -> Separator",
+                          node, ApolloThemeRGBFromUIColor(color));
+            }
+            struct objc_super sup = { node, base };
+            ((void (*)(struct objc_super *, SEL, UIColor *))objc_msgSendSuper)(&sup, sel, out);
+        });
+        class_addMethod(pinned, sel, imp, method_getTypeEncoding(proto));
+        objc_registerClassPair(pinned);
+    }
+    sPinnedClasses[baseName] = pinned;
+    return pinned;
+}
+
+static void ApolloThemePinSeparatorNode(ASDisplayNode *node) {
+    if (!node) return;
+    const char *cname = class_getName(object_getClass(node));
+    if (strncmp(cname, "ApolloRebornPinnedSeparator_", 28) == 0) return;  // already pinned
+    if (strncmp(cname, "NSKVONotifying_", 15) == 0) return;  // never slide under a KVO isa
+    Class pinned = ApolloThemePinnedSeparatorClassForBase(object_getClass(node));
+    if (pinned) object_setClass(node, pinned);
+}
+
+static void ApplyThemeThinSeparatorNode(_TtC6Apollo21ThinSeparatorCellNode *cellNode) {
+    if (!ApolloThemeCurrentSnapshot()->enabled || !cellNode) return;
+    ASDisplayNode *separatorNode = ApolloObjectIvar(cellNode, "separatorNode");
+    UIColor *separator = ApolloThemeRuntimeColor(ApolloThemeTokenSeparator);
+    if (separatorNode && separator) {
+        ApolloThemePinSeparatorNode(separatorNode);
+        separatorNode.backgroundColor = separator;
+    }
+}
+
+static void ApplyThemeCommentsHeaderSeparators(_TtC6Apollo22CommentsHeaderCellNode *headerNode) {
+    if (!ApolloThemeCurrentSnapshot()->enabled || !headerNode) return;
+    UIColor *separator = ApolloThemeRuntimeColor(ApolloThemeTokenSeparator);
+    if (!separator) return;
+
+    ASDisplayNode *quickBarSeparator = ApolloObjectIvar(headerNode, "quickBarSeparatorNode");
+    ASDisplayNode *commentsSeparator = ApolloObjectIvar(headerNode, "commentsSeparatorNode");
+    if (quickBarSeparator) {
+        ApolloThemePinSeparatorNode(quickBarSeparator);
+        quickBarSeparator.backgroundColor = separator;
+    }
+    if (commentsSeparator) {
+        ApolloThemePinSeparatorNode(commentsSeparator);
+        commentsSeparator.backgroundColor = separator;
+    }
+}
+
+static void RecordImageBounds(const struct mach_header *mh, intptr_t slide, uintptr_t *outStart, uintptr_t *outEnd) {
+    if (!mh || mh->magic != MH_MAGIC_64) return;
+
+    uintptr_t start = (uintptr_t)mh;
+    uintptr_t end = start;
+    const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    const struct mach_header_64 *mh64 = (const struct mach_header_64 *)mh;
+    for (uint32_t c = 0; c < mh64->ncmds; c++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, SEG_PAGEZERO) != 0) {
+                uintptr_t segEnd = (uintptr_t)((intptr_t)seg->vmaddr + slide) + (uintptr_t)seg->vmsize;
+                if (segEnd > end) end = segEnd;
+            }
+        }
+        p += lc->cmdsize;
+    }
+
+    *outStart = start;
+    *outEnd = (end > start) ? end : (start + 0x8000000);
+}
+
+static void FindRuntimeImages(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        size_t len = strlen(name);
+        if (len >= 7 && strcmp(name + len - 7, "/Apollo") == 0) {
+            RecordImageBounds(mh, slide, &sApolloStart, &sApolloEnd);
+        } else if (strstr(name, "ApolloReborn")) {
+            RecordImageBounds(mh, slide, &sTweakStart, &sTweakEnd);
+        }
+    }
+}
+
+static inline BOOL CallerMayUseThemeRuntime(uintptr_t caller) {
+    if (sApolloStart && caller >= sApolloStart && caller < sApolloEnd) return YES;
+    if (sTweakStart && caller >= sTweakStart && caller < sTweakEnd) return YES;
+    return NO;
+}
+
+static inline UIColor *SemColor(ApolloThemeToken t, uintptr_t caller) {
+    if (!CallerMayUseThemeRuntime(caller)) return nil;
+    return ApolloThemeRuntimeColor(t);
+}
+// Repaint strategy. The window-style flip is the PRIMARY, proven-safe mechanism:
+// it toggles each window's overrideUserInterfaceStyle for one runloop turn,
+// which drives a trait-change cascade that re-resolves our dynamic token colours
+// app-wide. It is self-contained (touches only our own override) and cannot put
+// Apollo's theme system into an inconsistent state.
+//
+// Posting Apollo's own ApolloSpecificThemeChanged / CommentsColorThemeChanged is
+// DISABLED by default: although Apollo's picker posts them, it does so only as
+// the tail of a full apply sequence that first updates the Combine Published
+// theme value. Posting them standalone made Apollo's observers (ThemeableWindow,
+// retained CommentsViewControllers) repaint against state we never set up, which
+// crashed on the post-apply repaint. Kept behind a flag for future use.
+// Repaint via Apollo's own theme-change notifications (flash-free, repaints live).
+// The earlier crash was the UIColor value-constructor over-release, NOT the
+// notifications, so these are safe now that the constructors are fixed. The
+// window-style flip is ON by default because donor-constructor remaps produce
+// static colours; without a trait cascade, already-created views can keep stale
+// background/card colours until they are recreated naturally.
+static std::atomic<bool> sLegacyRepaint { true };
+static const bool sPostNativeNotifications = true;
+
+// Re-entrancy guard: while a dynamic-colour provider is building a concrete
+// colour for a token, the UIColor constructor hook must not re-map it.
+static __thread int sBypassHook = 0;
+
+// ---------------------------------------------------------------------------
+// Theme font (per-theme app-wide font, spec: 4 system designs only)
+// ---------------------------------------------------------------------------
+
+// Guard against UIKit re-entering a hooked UIFont factory while we re-derive
+// a font through fontWithDescriptor:size:.
+static __thread int sFontBypass = 0;
+
+static ApolloThemeMode CurrentRuntimeMode(void) {
+    return UITraitCollection.currentTraitCollection.userInterfaceStyle == UIUserInterfaceStyleDark
+        ? ApolloThemeModeDark : ApolloThemeModeLight;
+}
+
+static BOOL ClassNameLooksApolloOwned(const char *name);
+static BOOL TextSinkMayUseTheme(id object, uintptr_t caller);
+static NSAttributedString *ThemedAttributedText(NSAttributedString *text,
+                                                id owner,
+                                                uintptr_t caller);
+
+// Pinned views carry a font the tweak chose deliberately in a SPECIFIC design
+// (the editor's font-picker tiles and preview rows must each render their own
+// design, not the active theme's). Both the sink hooks and the refresh walk
+// skip them.
+static const void *kApolloThemeFontPinnedKey = &kApolloThemeFontPinnedKey;
+static const void *kApolloThemeBackgroundColorPassthroughKey = &kApolloThemeBackgroundColorPassthroughKey;
+static const void *kApolloThemeOriginalAttributedTextKey =
+    &kApolloThemeOriginalAttributedTextKey;
+static __thread NSInteger sAttributedTextAssignmentBypass;
+static const void *kApolloThemeNavigationButtonTitlesKey =
+    &kApolloThemeNavigationButtonTitlesKey;
+static __thread NSInteger sNavigationButtonTitleAssignmentBypass;
+
+void ApolloThemeRuntimeSetFontPinned(id view, BOOL pinned) {
+    if (!view) return;
+    objc_setAssociatedObject(view, kApolloThemeFontPinnedKey,
+                             pinned ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+void ApolloThemeRuntimeSetBackgroundColorPassthrough(id view, BOOL enabled) {
+    if (!view) return;
+    objc_setAssociatedObject(view, kApolloThemeBackgroundColorPassthroughKey,
+                             enabled ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL BackgroundColorPassthrough(id view) {
+    return view && [objc_getAssociatedObject(view, kApolloThemeBackgroundColorPassthroughKey) boolValue];
+}
+
+static BOOL FontPinned(id view) {
+    return view && [objc_getAssociatedObject(view, kApolloThemeFontPinnedKey) boolValue];
+}
+
+// Re-derive a system font in the active theme's design. Caller-gated like the
+// colour hooks: only Apollo's own code (and the tweak) get themed fonts, so
+// UIKit-built chrome (system alerts, share sheet, keyboard) keeps SF Pro —
+// which also keeps the wide SF Mono design out of fixed-width system chrome.
+static UIFont *ThemedFont(UIFont *font, uintptr_t caller) {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (!snapshot->enabled || !font || sFontBypass) return font;
+    ApolloThemeFont choice = snapshot->fontChoices[CurrentRuntimeMode()];
+    if (choice == ApolloThemeFontSystem) return font;
+    if (!CallerMayUseThemeRuntime(caller)) return font;
+    sFontBypass++;
+    UIFont *themed = ApolloThemeFontApply(choice, font);
+    sFontBypass--;
+    return themed;
+}
+
+static BOOL FontLooksLikeAppleSystemDesign(UIFont *font) {
+    if (![font isKindOfClass:[UIFont class]]) return NO;
+    NSString *fontName = font.fontName ?: @"";
+    NSString *familyName = font.familyName ?: @"";
+
+    // System-design fonts use private/postscript names rather than normal
+    // bundled font names. Keep the predicate conservative so explicit app
+    // fonts such as markdown code faces survive sink-level rewriting.
+    if ([fontName hasPrefix:@".SF"] ||
+        [fontName hasPrefix:@".NewYork"] ||
+        [fontName hasPrefix:@".AppleSystem"]) {
+        return YES;
+    }
+    if ([familyName hasPrefix:@"SF "] ||
+        [familyName hasPrefix:@"SF-"] ||
+        [familyName isEqualToString:@"New York"] ||
+        [familyName hasPrefix:@"New York"] ||
+        [familyName isEqualToString:@".AppleSystemUIFont"]) {
+        return YES;
+    }
+    return NO;
+}
+
+// Apollo's markdown code faces do NOT come through fontWithName: as originally
+// assumed here — they're built with monospacedSystemFontOfSize:weight:, which
+// is itself a *system-design* font (name .AppleSystemUIFontMonospaced / family
+// prefixed .SFMono) and therefore matches FontLooksLikeAppleSystemDesign above.
+// Left unguarded, every sink/refresh path re-derives it into the active theme
+// design and strips the monospacing — reproducible under ANY custom theme,
+// including one whose font choice is plain SF Pro (the sink/refresh/attach
+// paths don't short-circuit on System the way ThemedFont() does; they still
+// call ApolloThemeFontApply(System, font), which rebuilds from a proportional
+// pristine descriptor). Exempt anything already monospaced, independent of design.
+static BOOL FontIsMonospaced(UIFont *font) {
+    if (![font isKindOfClass:[UIFont class]]) return NO;
+    if (font.fontDescriptor.symbolicTraits & UIFontDescriptorTraitMonoSpace) return YES;
+    NSString *fontName = font.fontName ?: @"";
+    NSString *familyName = font.familyName ?: @"";
+    return [fontName localizedCaseInsensitiveContainsString:@"Mono"] ||
+           [familyName localizedCaseInsensitiveContainsString:@"Mono"];
+}
+
+// Single themeability gate used by every sink/refresh/attach path: a font must
+// look like a re-derivable Apple system design AND not already be monospaced
+// (code faces stay put no matter which design the theme is set to).
+static BOOL FontIsThemeable(UIFont *font) {
+    return FontLooksLikeAppleSystemDesign(font) && !FontIsMonospaced(font);
+}
+
+static UIFont *ThemedTextSinkFont(UIFont *font, id owner, uintptr_t caller) {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (!snapshot->enabled || !font || sFontBypass) return font;
+    if (FontPinned(owner)) return font;
+    if (!TextSinkMayUseTheme(owner, caller)) return font;
+    if (!FontIsThemeable(font)) return font;
+
+    sFontBypass++;
+    UIFont *themed = ApolloThemeFontApply(snapshot->fontChoices[CurrentRuntimeMode()], font);
+    sFontBypass--;
+    // Preserve identity when the design didn't change, so attributed-string
+    // rewrites can skip the copy.
+    if (!themed || [themed.fontName isEqualToString:font.fontName]) return font;
+    return themed;
+}
+
+// ---------------------------------------------------------------------------
+// Donor + exact Apollo palette lookup tables (spec §8.1, §11.2)
+// ---------------------------------------------------------------------------
+
+// mode: 0 = light, 1 = dark, 0xFF = mode-independent (resolve via current trait).
+#define kModeCurrent 0xFF
+typedef struct { uint32_t rgb; ApolloThemeToken token; uint8_t mode; } RGBTokenEntry;
+
+// outrun donor role constants -> semantic token + the mode that constant
+// represents. The light and dark constants are distinct, so each match pins a
+// specific mode and we return that mode's *static* token colour. Apollo re-emits
+// these constants when the resolved theme flips light<->dark, so a static return
+// stays correct — and a UIColor value-constructor must NOT return a dynamic
+// colour (it over-releases inside UIKit cell prep; see the constructor hooks).
+//
+//   accent      -> Accent              (C400A6 / FF00D8)
+//   primaryBG   -> SecondaryBackground (card surface: CFD7E8 / 061636)
+//   secondaryBG -> Background          (page behind cells: BAC1D1 / 081D47)
+//   tertiaryBG  -> TertiaryBackground  (raised: C1C8D9 / 041129)
+//   separator   -> Separator           (B5B9C7 / 06214D, 203454)
+//   bar         -> BarBackground        (C5CAD9 / 031229, 182237)
+//   gray        -> SecondaryLabel       (ABABAB / 484E5B)
+//   unread      -> Selection            (95C0EE / 034388)
+//
+// Outrun's dark separator and bar each have two constants. Their getters
+// (sub_10068d6e0 separator, sub_10068de08 bar) read UsePureBlackDarkMode from
+// the group.com.christianselig.apollo suite: #06214D / #031229 with Pure Black
+// on, #203454 / #182237 with it off. Both pairs must map, or every custom
+// theme with Pure Black off keeps Outrun's navy wherever Apollo paints the
+// bar role: the classic feed search toolbar and the filler above it when the
+// feed is pulled down (#1452). Each constant is built once in the binary,
+// inside those getters, so the extra entries can't catch unrelated colours.
+static const RGBTokenEntry kDonorEntries[] = {
+    { 0xC400A6, ApolloThemeTokenAccent,              ApolloThemeModeLight },
+    { 0xFF00D8, ApolloThemeTokenAccent,              ApolloThemeModeDark  },
+    { 0xCFD7E8, ApolloThemeTokenSecondaryBackground, ApolloThemeModeLight },
+    { 0x061636, ApolloThemeTokenSecondaryBackground, ApolloThemeModeDark  },
+    { 0xBAC1D1, ApolloThemeTokenBackground,          ApolloThemeModeLight },
+    { 0x081D47, ApolloThemeTokenBackground,          ApolloThemeModeDark  },
+    { 0xC1C8D9, ApolloThemeTokenTertiaryBackground,  ApolloThemeModeLight },
+    { 0x041129, ApolloThemeTokenTertiaryBackground,  ApolloThemeModeDark  },
+    { 0xB5B9C7, ApolloThemeTokenSeparator,           ApolloThemeModeLight },
+    { 0x06214D, ApolloThemeTokenSeparator,           ApolloThemeModeDark  },
+    { 0x203454, ApolloThemeTokenSeparator,           ApolloThemeModeDark  }, // Pure Black off
+    { 0xC5CAD9, ApolloThemeTokenBarBackground,       ApolloThemeModeLight },
+    { 0x031229, ApolloThemeTokenBarBackground,       ApolloThemeModeDark  },
+    { 0x182237, ApolloThemeTokenBarBackground,       ApolloThemeModeDark  }, // Pure Black off
+    { 0xABABAB, ApolloThemeTokenSecondaryLabel,      ApolloThemeModeLight },
+    { 0x484E5B, ApolloThemeTokenSecondaryLabel,      ApolloThemeModeDark  },
+    // Inbox unread-message tint. Outrun's UNREAD row background comes from a
+    // dedicated per-theme getter (sub_10068ee00), not the shared role palette —
+    // these two constants are exclusive to InboxCellNode and unique in the
+    // whole binary, so swapping them here can't hit anything else. There is no
+    // "unread" token, so route it to Selection — the theme's highlight family.
+    // Apollo derives the pressed state for unread rows by darkening whatever
+    // this returns, so the pressed variant follows the theme automatically.
+    { 0x95C0EE, ApolloThemeTokenSelection,           ApolloThemeModeLight },
+    { 0x034388, ApolloThemeTokenSelection,           ApolloThemeModeDark  },
+};
+
+// Apollo's separator constants are emitted outside the donor slot and outside
+// text sinks, so they stay on the value-constructor path. Text palette constants
+// are handled later at ASTextNode/ASButtonNode/UILabel sinks instead of here:
+// matching them by render class avoids the old v1 "near-neutral gray" sweep.
+static const RGBTokenEntry kSeparatorEntries[] = {
+    { 0xC7C7CC, ApolloThemeTokenSeparator,      kModeCurrent },
+    { 0x646466, ApolloThemeTokenSeparator,      kModeCurrent },
+};
+
+typedef struct { uint32_t rgb; ApolloThemeToken token; } TextPaletteEntry;
+
+// Decoded from Apollo's native text palette helper sub_100689abc(role, read,
+// dark). The helper builds these as hex strings and then calls sub_100752f2c,
+// which ends in UIColor initWithRed:green:blue:alpha:. We intentionally use the
+// constants only at text render sinks, never as global constructor remaps.
+static const TextPaletteEntry kTextPaletteEntries[] = {
+    // role 0: primary. sub_100689abc(role, isRead, isDark) emits three
+    // unread/read pairs, the third gated on "UsePureBlackDarkMode" in the
+    // group.com.christianselig.apollo suite (branch at 0x100689d78):
+    //
+    //     light             #000000 / #999999
+    //     dark              #EEEFF5 / #939499
+    //     dark, pure black  #D0D1D6 / #86868A
+    //
+    // Only the read halves route to SecondaryLabel; that is what keeps a
+    // read/unread distinction under custom themes (issue #716). #D0D1D6 is a
+    // PRIMARY despite being the dimmest of the three — routing it to
+    // SecondaryLabel greys out nearly all text for Pure Black Dark Mode users.
+    // #303030 is emitted nowhere in the binary and is kept only as a defensive
+    // alias of the light primary.
+    { 0x000000, ApolloThemeTokenLabel },
+    { 0x303030, ApolloThemeTokenLabel },
+    { 0xEEEFF5, ApolloThemeTokenLabel },
+    { 0xD0D1D6, ApolloThemeTokenLabel },
+    { 0x999999, ApolloThemeTokenSecondaryLabel },
+    { 0x939499, ApolloThemeTokenSecondaryLabel },
+    { 0x86868A, ApolloThemeTokenSecondaryLabel },
+
+    // role 1: secondary.
+    { 0x666666, ApolloThemeTokenSecondaryLabel },
+    { 0xB3B3B3, ApolloThemeTokenSecondaryLabel },
+    { 0x94969D, ApolloThemeTokenSecondaryLabel },
+    { 0x75777A, ApolloThemeTokenSecondaryLabel },
+    { 0x97AEB4, ApolloThemeTokenSecondaryLabel },
+    { 0x628087, ApolloThemeTokenSecondaryLabel },
+    { 0x919191, ApolloThemeTokenSecondaryLabel },
+    { 0x84878C, ApolloThemeTokenSecondaryLabel },
+
+    // role 2: tertiary.
+    { 0x858585, ApolloThemeTokenTertiaryLabel },
+    { 0xBFBFBF, ApolloThemeTokenTertiaryLabel },
+    { 0x61626A, ApolloThemeTokenTertiaryLabel },
+    { 0x5D5E61, ApolloThemeTokenTertiaryLabel },
+    { 0x7E9296, ApolloThemeTokenTertiaryLabel },
+    { 0x5B6A6D, ApolloThemeTokenTertiaryLabel },
+
+    // role 3/default: quaternary.
+    { 0xB5B5B5, ApolloThemeTokenQuaternaryLabel },
+    { 0xD7D7D7, ApolloThemeTokenQuaternaryLabel },
+    { 0x505257, ApolloThemeTokenQuaternaryLabel },
+    { 0x424345, ApolloThemeTokenQuaternaryLabel },
+    { 0x69797D, ApolloThemeTokenQuaternaryLabel },
+    { 0x465154, ApolloThemeTokenQuaternaryLabel },
+};
+
+// Fast first-byte (red) filter so the hot path bails before scanning.
+static uint8_t sRByteFilter[256];
+
+static void BuildByteFilter(void) {
+    memset(sRByteFilter, 0, sizeof(sRByteFilter));
+    for (size_t i = 0; i < sizeof(kDonorEntries) / sizeof(kDonorEntries[0]); i++)
+        sRByteFilter[(kDonorEntries[i].rgb >> 16) & 0xFF] = 1;
+    for (size_t i = 0; i < sizeof(kSeparatorEntries) / sizeof(kSeparatorEntries[0]); i++)
+        sRByteFilter[(kSeparatorEntries[i].rgb >> 16) & 0xFF] = 1;
+}
+
+static inline BOOL LookupToken(uint32_t rgb, uintptr_t caller, ApolloThemeToken *out, uint8_t *outMode) {
+    if (!CallerMayUseThemeRuntime(caller)) return NO;
+    if (!sRByteFilter[(rgb >> 16) & 0xFF]) return NO;
+    for (size_t i = 0; i < sizeof(kDonorEntries) / sizeof(kDonorEntries[0]); i++) {
+        if (kDonorEntries[i].rgb == rgb) { *out = kDonorEntries[i].token; *outMode = kDonorEntries[i].mode; return YES; }
+    }
+    for (size_t i = 0; i < sizeof(kSeparatorEntries) / sizeof(kSeparatorEntries[0]); i++) {
+        if (kSeparatorEntries[i].rgb == rgb) { *out = kSeparatorEntries[i].token; *outMode = kSeparatorEntries[i].mode; return YES; }
+    }
+    return NO;
+}
+
+static BOOL TextPaletteTokenForRGB(uint32_t rgb, ApolloThemeToken *out) {
+    for (size_t i = 0; i < sizeof(kTextPaletteEntries) / sizeof(kTextPaletteEntries[0]); i++) {
+        if (kTextPaletteEntries[i].rgb == rgb) {
+            if (out) *out = kTextPaletteEntries[i].token;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL ColorComponents(UIColor *color, CGFloat *outR, CGFloat *outG, CGFloat *outB, CGFloat *outA) {
+    if (![color isKindOfClass:[UIColor class]]) return NO;
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    if ([color getRed:&r green:&g blue:&b alpha:&a]) {
+        if (outR) *outR = r; if (outG) *outG = g; if (outB) *outB = b; if (outA) *outA = a;
+        return YES;
+    }
+    CGFloat w = 0;
+    if ([color getWhite:&w alpha:&a]) {
+        if (outR) *outR = w; if (outG) *outG = w; if (outB) *outB = w; if (outA) *outA = a;
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL TextPaletteTokenForColor(UIColor *color, ApolloThemeToken *outToken, CGFloat *outAlpha) {
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    if (!ColorComponents(color, &r, &g, &b, &a)) return NO;
+    if (outAlpha) *outAlpha = a;
+    return TextPaletteTokenForRGB(ApolloThemeRGBKeyFromComponents(r, g, b), outToken);
+}
+
+static BOOL ClassNameLooksApolloOwned(const char *name) {
+    if (!name) return NO;
+    return strncmp(name, "Apollo", 6) == 0 ||
+           strstr(name, ".Apollo") != NULL;
+}
+
+// Walk supernode (Texture), then the RESPONDER chain, then superview.
+// nextResponder must outrank superview: the responder chain interleaves each
+// view's managing view controller, so a label inside an Apollo controller is
+// vetted in a few hops. The old superview-first walk had to climb the entire
+// UIKit view stack and then window→scene→application→AppDelegate — 10-13 hops
+// depending on presentation depth, which straddled the budget and made the
+// gate (and therefore all font/text theming) fail on deeper screens.
+static BOOL ObjectChainLooksApolloOwned(id object) {
+    id current = object;
+    for (NSUInteger i = 0; current && i < 16; i++) {
+        if (ClassNameLooksApolloOwned(class_getName(object_getClass(current)))) return YES;
+
+        id next = nil;
+        if ([current respondsToSelector:@selector(supernode)]) {
+            @try {
+                next = ((id (*)(id, SEL))objc_msgSend)(current, @selector(supernode));
+            } @catch (__unused NSException *e) {
+                next = nil;
+            }
+        }
+        if (!next && [current respondsToSelector:@selector(nextResponder)]) {
+            @try {
+                next = ((id (*)(id, SEL))objc_msgSend)(current, @selector(nextResponder));
+            } @catch (__unused NSException *e) {
+                next = nil;
+            }
+        }
+        if (!next && [current respondsToSelector:@selector(superview)]) {
+            @try {
+                next = ((id (*)(id, SEL))objc_msgSend)(current, @selector(superview));
+            } @catch (__unused NSException *e) {
+                next = nil;
+            }
+        }
+        if (next == current) break;
+        current = next;
+    }
+    return NO;
+}
+
+static UINavigationBar *NavigationBarForDescendant(UIView *view) {
+    for (UIView *v = view; v != nil; v = v.superview) {
+        if ([v isKindOfClass:[UINavigationBar class]]) return (UINavigationBar *)v;
+    }
+    return nil;
+}
+
+static UIViewController *ChromeBarOwningViewController(UIView *bar) {
+    for (UIResponder *responder = bar; responder; responder = responder.nextResponder) {
+        if ([responder isKindOfClass:[UINavigationController class]]) {
+            UINavigationController *navigationController = (UINavigationController *)responder;
+            return navigationController.visibleViewController ?: navigationController.topViewController;
+        }
+        if ([responder isKindOfClass:[UIViewController class]]) {
+            return (UIViewController *)responder;
+        }
+    }
+    return nil;
+}
+
+// Nav/tab bars host their labels outside Apollo's view/responder chain, so
+// ownership is vetted at the bar: either the chain reaches an Apollo class,
+// the bar's delegate is one, or the owning navigation controller is currently
+// displaying one. UINavigationBar.delegate is normally the UINavigationController
+// itself, so checking only the delegate misses Apollo's Swift child controllers.
+static BOOL ChromeBarLooksApolloOwned(UIView *bar) {
+    if (!([bar isKindOfClass:[UINavigationBar class]] || [bar isKindOfClass:[UITabBar class]])) return NO;
+    if (ObjectChainLooksApolloOwned(bar)) return YES;
+    id delegate = ((id (*)(id, SEL))objc_msgSend)(bar, @selector(delegate));
+    if (delegate && ClassNameLooksApolloOwned(class_getName(object_getClass(delegate)))) return YES;
+    UIViewController *owner = ChromeBarOwningViewController(bar);
+    if (owner && ClassNameLooksApolloOwned(class_getName(object_getClass(owner)))) return YES;
+    return NO;
+}
+
+// Re-derive one live text control's font into `target`'s design. Only touches
+// fonts that are Apple system designs (explicit app fonts like markdown code
+// faces survive) and skips pinned views (the editor's picker tiles).
+static BOOL AttributedTextSuppliesAllTextFonts(NSAttributedString *text) {
+    if (![text isKindOfClass:[NSAttributedString class]] || text.length == 0) return NO;
+    __block BOOL foundFont = NO;
+    __block BOOL foundUnstyledText = NO;
+    [text enumerateAttributesInRange:NSMakeRange(0, text.length)
+                             options:0
+                          usingBlock:^(NSDictionary<NSAttributedStringKey, id> *attributes,
+                                       NSRange range,
+                                       BOOL *stop) {
+        if ([attributes[NSFontAttributeName] isKindOfClass:[UIFont class]]) {
+            foundFont = YES;
+            return;
+        }
+        // Attachments use their own bounds and intentionally have no font.
+        if ([attributes[NSAttachmentAttributeName] isKindOfClass:[NSTextAttachment class]]) return;
+        foundUnstyledText = YES;
+        *stop = YES;
+    }];
+    return foundFont && !foundUnstyledText;
+}
+
+static void SetLabelAttributedTextWithoutRecapture(UILabel *label,
+                                                   NSAttributedString *text) {
+    sAttributedTextAssignmentBypass++;
+    label.attributedText = text;
+    sAttributedTextAssignmentBypass--;
+}
+
+static UIView *NavigationTitleControlForDescendant(UIView *view) {
+    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
+        if ([NSStringFromClass(ancestor.class) isEqualToString:@"_UINavigationBarTitleControl"]) return ancestor;
+    }
+    return nil;
+}
+
+static BOOL NavigationTitleOwnsButtonLabel(UIView *view) {
+    // Asking UIButton for titleLabel from a label setter re-enters its lazy
+    // title update. Identify the existing generated label without that getter.
+    Class buttonLabelClass = ApolloClassUIButtonLabel;
+    if (!buttonLabelClass || ![view isKindOfClass:buttonLabelClass]) return NO;
+    for (UIView *ancestor = view.superview; ancestor; ancestor = ancestor.superview) {
+        if ([ancestor isKindOfClass:UIButton.class]) {
+            // Retain ownership while UIKit moves the title between adaptors.
+            return NavigationTitleControlForDescendant(ancestor) != nil ||
+                (!ancestor.window && objc_getAssociatedObject(ancestor, kApolloThemeNavigationButtonTitlesKey) != nil);
+        }
+    }
+    return NO;
+}
+
+static NSMutableDictionary<NSNumber *, id> *NavigationButtonTitleSources(UIButton *button,
+                                                                       BOOL create) {
+    NSMutableDictionary *sources = objc_getAssociatedObject(button, kApolloThemeNavigationButtonTitlesKey);
+    if (!sources && create) {
+        sources = [NSMutableDictionary dictionary];
+        // iOS 27 getters fall back to Normal for unset states. Adopt Normal
+        // only; the setter hook captures explicit states without inventing copies.
+        NSAttributedString *normal = [button attributedTitleForState:UIControlStateNormal];
+        if (normal) sources[@(UIControlStateNormal)] = [normal copy];
+        objc_setAssociatedObject(button, kApolloThemeNavigationButtonTitlesKey,
+                                 sources, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return sources;
+}
+
+static __thread NSUInteger sNavigationChromeColorReadDepth;
+
+UIColor *ApolloNavigationChromeColor(void) {
+    sNavigationChromeColorReadDepth++;
+    UIColor *color = UIColor.labelColor;
+    sNavigationChromeColorReadDepth--;
+    return color;
+}
+
+UIColor *ApolloModeratorColor(void) {
+    return [UIColor colorWithRed:(48.0 / 255.0) green:(209.0 / 255.0) blue:(88.0 / 255.0) alpha:1.0];
+}
+
+static BOOL ApolloUsesLegacyModeratorColor(CGFloat r, CGFloat g, CGFloat b, uintptr_t caller) {
+    // Scope the exact palette replacement to Apollo, not UIKit or other libraries.
+    return r == 0.0 && fabs(g - 148.0 / 255.0) < 0.00001 &&
+        fabs(b - 15.0 / 255.0) < 0.00001 &&
+        sApolloStart && caller >= sApolloStart && caller < sApolloEnd;
+}
+
+static UIColor *NavigationTitlePrimaryColor(void) {
+    if (IsLiquidGlass()) return ApolloNavigationChromeColor();
+    return ApolloThemeCurrentSnapshot()->enabled
+        ? ApolloThemeRuntimeColor(ApolloThemeTokenLabel) : UIColor.labelColor;
+}
+
+static NSAttributedString *NavigationTitleAttributedText(NSAttributedString *source,
+                                                        id owner, UIColor *primaryColor) {
+    if (!source.length) return source;
+    NSAttributedString *base = ApolloThemeCurrentSnapshot()->enabled
+        ? ThemedAttributedText(source, owner, (uintptr_t)&NavigationTitleAttributedText) : source;
+    if (!primaryColor) return base;
+    NSMutableAttributedString *colored = [base mutableCopy];
+    [colored addAttribute:NSForegroundColorAttributeName value:primaryColor
+                    range:NSMakeRange(0, colored.length)];
+    return colored;
+}
+
+static void ApplyThemeToNavigationTitleControl(UIView *titleControl);
+
+static char kApolloNeutralNavigationTitleKey;
+
+static BOOL ApolloNeutralNavigationTitle(UIView *view) {
+    if (!IsLiquidGlass()) return NO;
+    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
+        if (objc_getAssociatedObject(ancestor, &kApolloNeutralNavigationTitleKey)) return YES;
+    }
+    return NO;
+}
+
+static CGSize ApolloNavigationTitleFittingSize(UIButton *button, CGSize size) {
+    if (!IsLiquidGlass() || !isfinite(size.height) || size.height <= 44.0 || !isfinite(size.width) || size.width <= 0) return size;
+    if (!ApolloNeutralNavigationTitle(button) &&
+        ![NSStringFromClass(button.class) isEqualToString:@"Apollo.DualLabelTitleButton"]) return size;
+    NSAttributedString *title = button.currentAttributedTitle;
+    if (!title.length) return size;
+    CGFloat textHeight = ceil([title boundingRectWithSize:CGSizeMake(size.width, CGFLOAT_MAX)
+        options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading context:nil].size.height);
+    // Keep larger accessibility titles intact; remove only surplus button padding.
+    if (isfinite(textHeight) && textHeight > 0 && textHeight <= 44.0) size.height = 44.0;
+    return size;
+}
+
+static void RefreshFontOnTextControl(UIView *view, ApolloThemeFont target) {
+    if (FontPinned(view)) return;
+    // UIButton owns this label; theme its state table so updates persist.
+    if (NavigationTitleOwnsButtonLabel(view)) return;
+    if ([view isKindOfClass:[UILabel class]] &&
+        AttributedTextSuppliesAllTextFonts(((UILabel *)view).attributedText)) {
+        UILabel *label = (UILabel *)view;
+        NSAttributedString *original = objc_getAssociatedObject(
+            label, kApolloThemeOriginalAttributedTextKey);
+        NSAttributedString *source = original ?: label.attributedText;
+        NSAttributedString *themed = ApolloThemeCurrentSnapshot()->enabled
+            ? ThemedAttributedText(source, label,
+                                   (uintptr_t)&RefreshFontOnTextControl)
+            : source;
+        if (![themed isEqualToAttributedString:label.attributedText]) {
+            SetLabelAttributedTextWithoutRecapture(label, themed);
+        }
+        return;
+    }
+    UIFont *font = ((UILabel *)view).font; // UILabel/UITextField/UITextView all expose `font`
+    if (![font isKindOfClass:[UIFont class]] || !FontIsThemeable(font)) return;
+    sFontBypass++;
+    UIFont *themed = ApolloThemeFontApply(target, font);
+    if (themed && ![themed.fontName isEqualToString:font.fontName]) {
+        // Set inside the bypass: the font is already derived, the sink hook
+        // must not re-derive it (and must not fight a target of System).
+        ((void (*)(id, SEL, id))objc_msgSend)(view, @selector(setFont:), themed);
+    }
+    sFontBypass--;
+}
+
+static BOOL ViewIsFontRefreshable(UIView *view) {
+    return [view isKindOfClass:[UILabel class]] ||
+           [view isKindOfClass:[UITextField class]] ||
+           [view isKindOfClass:[UITextView class]];
+}
+
+// `vetted` propagates a one-time ownership decision down a subtree (a vetted
+// bar's labels never chain back to Apollo classes individually). Outside a
+// vetted subtree, each text control is gated exactly like the sink hooks.
+static void RefreshFontsInViewTree(UIView *view, ApolloThemeFont target, BOOL vetted) {
+    if ([NSStringFromClass(view.class) isEqualToString:@"_UINavigationBarTitleControl"]) {
+        // Apply font and color together to avoid briefly restoring old colors.
+        ApplyThemeToNavigationTitleControl(view);
+        return;
+    }
+    if (!vetted && ([view isKindOfClass:[UINavigationBar class]] || [view isKindOfClass:[UITabBar class]])) {
+        if (!ChromeBarLooksApolloOwned(view)) return; // foreign chrome: leave the whole subtree alone
+        vetted = YES;
+    }
+    if (ViewIsFontRefreshable(view) && (vetted || ObjectChainLooksApolloOwned(view))) {
+        RefreshFontOnTextControl(view, target);
+    }
+    for (UIView *subview in view.subviews) {
+        RefreshFontsInViewTree(subview, target, vetted);
+    }
+}
+
+void ApolloThemeRuntimeRefreshFonts(void) {
+    // Runs even when the runtime is INACTIVE: disabling theming (or switching
+    // to the System font) must walk existing labels back to SF Pro — nothing
+    // else re-derives a font until the view happens to be recreated.
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    ApolloThemeFont target = snapshot->enabled
+        ? snapshot->fontChoices[CurrentRuntimeMode()]
+        : ApolloThemeFontSystem;
+    for (UIWindow *window in ApolloAllWindows()) {
+        RefreshFontsInViewTree(window, target, NO);
+    }
+}
+
+// Attach-time repair: UIKit configures table/collection cell labels while the
+// cell is DETACHED (cellForRow… runs before the cell joins the table), so the
+// set-time sink gate has no superview/responder chain to vet and those fonts
+// stay SF Pro — the manager's own rows rendered unthemed while its (attached)
+// headers/footers themed fine. The moment a text control joins a window the
+// chain exists, so re-derive from didMoveToWindow. Ordering matters for the
+// hot path (every cell recycle): bail on font identity (Apply is cached)
+// BEFORE paying for the ownership walk.
+static void RethemeFontOnAttach(UIView *view) {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (!snapshot->enabled || sFontBypass) return;
+    if (!view.window) return;
+    if (FontPinned(view)) return;
+    if (NavigationTitleOwnsButtonLabel(view)) return;
+    // An attributed label's visible font and color come from its string, while
+    // UILabel.font remains the backing line-box font. Theme the attributed
+    // runs in place, but leave that backing font untouched: replacing it can
+    // both enlarge the rendered text and collapse spacing that intentionally
+    // relies on a larger line box (Recently Read's 12pt stats inside a default
+    // 17pt label).
+    if ([view isKindOfClass:[UILabel class]] &&
+        AttributedTextSuppliesAllTextFonts(((UILabel *)view).attributedText)) {
+        if (!ObjectChainLooksApolloOwned(view)) return;
+        UILabel *label = (UILabel *)view;
+        NSAttributedString *original = objc_getAssociatedObject(
+            label, kApolloThemeOriginalAttributedTextKey);
+        NSAttributedString *source = original ?: label.attributedText;
+        NSAttributedString *themed = ThemedAttributedText(
+            source, label, (uintptr_t)&RethemeFontOnAttach);
+        if (![themed isEqualToAttributedString:label.attributedText]) {
+            SetLabelAttributedTextWithoutRecapture(label, themed);
+        }
+        return;
+    }
+    UIFont *font = ((UILabel *)view).font; // UILabel/UITextField/UITextView all expose `font`
+    if (![font isKindOfClass:[UIFont class]] || !FontIsThemeable(font)) return;
+    sFontBypass++;
+    UIFont *themed = ApolloThemeFontApply(snapshot->fontChoices[CurrentRuntimeMode()], font);
+    if (themed && ![themed.fontName isEqualToString:font.fontName] && ObjectChainLooksApolloOwned(view)) {
+        ((void (*)(id, SEL, id))objc_msgSend)(view, @selector(setFont:), themed);
+    }
+    sFontBypass--;
+}
+
+static void ApplyThemeToNavigationTitleContent(UIView *view, ApolloThemeFont target,
+                                              UIColor *primaryColor) {
+    if ([view isKindOfClass:UIButton.class]) {
+        UIButton *button = (UIButton *)view;
+        NSMutableDictionary<NSNumber *, id> *sources = NavigationButtonTitleSources(button, YES);
+        for (NSNumber *state in sources.allKeys) {
+            id source = sources[state];
+            if (source == NSNull.null) continue;
+            NSAttributedString *themed = NavigationTitleAttributedText(source, button, primaryColor);
+            if ([themed isEqualToAttributedString:[button attributedTitleForState:state.unsignedIntegerValue]]) continue;
+            sNavigationButtonTitleAssignmentBypass++;
+            [button setAttributedTitle:themed forState:state.unsignedIntegerValue];
+            sNavigationButtonTitleAssignmentBypass--;
+        }
+        if (![button attributedTitleForState:UIControlStateNormal].length) {
+            // Plain titles use titleLabel.font but button-state colors.
+            UILabel *label = button.titleLabel;
+            UIFont *font = label.font;
+            if (!FontPinned(label) && FontIsThemeable(font)) {
+                sFontBypass++;
+                UIFont *themed = ApolloThemeFontApply(target, font);
+                if (themed && ![themed.fontName isEqualToString:font.fontName]) label.font = themed;
+                sFontBypass--;
+            }
+            if (primaryColor && ![[button titleColorForState:UIControlStateNormal] isEqual:primaryColor]) {
+                [button setTitleColor:primaryColor forState:UIControlStateNormal];
+            }
+        }
+    }
+    if ([view isKindOfClass:[UILabel class]]) {
+        if (NavigationTitleOwnsButtonLabel(view)) return;
+        UILabel *label = (UILabel *)view;
+        NSAttributedString *original =
+            objc_getAssociatedObject(label, kApolloThemeOriginalAttributedTextKey);
+        NSAttributedString *source = original ?: label.attributedText;
+        if (source.length > 0) {
+            // A separate font pass would restore old colors and restart the
+            // two-line comments title's content transitions on every layout.
+            NSAttributedString *colored = NavigationTitleAttributedText(source, label, primaryColor);
+            if (![colored isEqualToAttributedString:label.attributedText]) {
+                SetLabelAttributedTextWithoutRecapture(label, colored);
+            }
+        } else {
+            RefreshFontOnTextControl(view, target);
+            if (primaryColor && ![label.textColor isEqual:primaryColor]) label.textColor = primaryColor;
+        }
+    } else if (ViewIsFontRefreshable(view)) {
+        RefreshFontOnTextControl(view, target);
+    }
+    for (UIView *subview in view.subviews) {
+        ApplyThemeToNavigationTitleContent(subview, target, primaryColor);
+    }
+}
+
+static void ApplyThemeToNavigationTitleControl(UIView *titleControl) {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (![titleControl isKindOfClass:[UIView class]]) return;
+    if (!ChromeBarLooksApolloOwned(NavigationBarForDescendant(titleControl))) return;
+    ApolloThemeFont target = snapshot->enabled
+        ? snapshot->fontChoices[CurrentRuntimeMode()]
+        : ApolloThemeFontSystem;
+    ApplyThemeToNavigationTitleContent(titleControl, target, NavigationTitlePrimaryColor());
+}
+
+// Per-thread text-sink bypass (ASDK builds nodes off the main thread, so a
+// plain global would leak the bypass across concurrently-initializing nodes).
+// Raised around the duration-pill restore below (issue #710) so our own
+// corrective setAttributedText: is not re-themed by the ASTextNode sink.
+static __thread NSInteger sTextSinkBypass;
+
+void ApolloThemeRuntimePerformTextSinkBypass(void (^block)(void)) {
+    if (!block) return;
+    sTextSinkBypass++;
+    block();
+    sTextSinkBypass--;
+}
+
+static BOOL TextSinkMayUseTheme(id object, uintptr_t caller) {
+    if (!ApolloThemeCurrentSnapshot()->enabled) return NO;
+    if (sTextSinkBypass > 0) return NO;
+    if (CallerMayUseThemeRuntime(caller)) return YES;
+    return ObjectChainLooksApolloOwned(object);
+}
+
+// ---------------------------------------------------------------------------
+// Public accessors
+// ---------------------------------------------------------------------------
+
+BOOL ApolloThemeRuntimeIsActive(void) { return ApolloThemeCurrentSnapshot()->enabled; }
+
+// Build a FRESH dynamic colour for a token. We deliberately do NOT cache and
+// vend a shared singleton: handing the same retained UIColor instance back
+// through hooked UIColor constructors/accessors leads to ARC retain/release
+// imbalances at the UIKit call sites (observed as an over-release of our
+// UIDynamicProviderColor → EXC_BAD_ACCESS in objc_release during the table's
+// cell-prep autorelease drain). A fresh, independently-owned object per call is
+// freed normally by its caller and sidesteps the entire problem. The provider
+// reads the current immutable snapshot, so light/dark + edits still resolve
+// correctly without taking the old unfair lock on every resolution.
+static UIColor *ApolloThemeMakeDynamicColor(ApolloThemeToken token) {
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        ApolloThemeMode mode = (tc.userInterfaceStyle == UIUserInterfaceStyleDark)
+            ? ApolloThemeModeDark : ApolloThemeModeLight;
+        const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+        uint32_t rgb = snapshot->tokens[mode][token];
+        sBypassHook++;
+        UIColor *c = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return c;
+    }];
+}
+
+UIColor *ApolloThemeRuntimeColor(ApolloThemeToken token) {
+    if (!ApolloThemeCurrentSnapshot()->enabled || token >= ApolloThemeTokenCount) return nil;
+    return ApolloThemeMakeDynamicColor(token);
+}
+
+UIFont *ApolloThemeRuntimeFont(UIFont *base) {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    ApolloThemeFont choice = snapshot->fontChoices[CurrentRuntimeMode()];
+    if (!snapshot->enabled || choice == ApolloThemeFontSystem || !base) return base;
+    sFontBypass++;
+    UIFont *themed = ApolloThemeFontApply(choice, base);
+    sFontBypass--;
+    return themed ?: base;
+}
+
+uint64_t ApolloThemeRuntimeEpoch(void) {
+    return ApolloThemeCurrentSnapshot()->epoch;
+}
+
+// For explicit, already-RESOLVED colors that were derived from a theme token
+// under the WRONG appearance: ambient resolution (kModeCurrent /
+// UITraitCollection.currentTraitCollection) during context-menu preview
+// building follows the SYSTEM style, not Apollo's themed window, so a dark
+// themed feed can get a light-variant platter color (issue #810). Find the
+// token whose light-or-dark value matches the resolved RGB and return that
+// token's value for `traits`' mode; nil when the color isn't a theme token
+// value (caller keeps the original) or no correction is needed.
+UIColor *ApolloThemeRuntimeReresolveColor(UIColor *color, UITraitCollection *traits) {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (!snapshot->enabled || !color || !traits) return nil;
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    if (!ColorComponents(color, &r, &g, &b, &a) || a < 0.99) return nil;
+    uint32_t rgb = ApolloThemeRGBKeyFromComponents(r, g, b);
+    ApolloThemeMode target = (traits.userInterfaceStyle == UIUserInterfaceStyleDark)
+        ? ApolloThemeModeDark : ApolloThemeModeLight;
+    // Surface tokens ONLY. A platter background is always a surface color;
+    // scanning text/separator/fill tokens invites value collisions with
+    // catastrophic corrections — e.g. a legitimately dark-resolved #000000
+    // platter also matches Label's LIGHT value and would be "corrected" to the
+    // near-white dark Label color.
+    static const ApolloThemeToken kSurfaceTokens[] = {
+        ApolloThemeTokenBackground,
+        ApolloThemeTokenSecondaryBackground,
+        ApolloThemeTokenTertiaryBackground,
+        ApolloThemeTokenElevatedBackground,
+        ApolloThemeTokenBarBackground,
+    };
+    uint32_t out = rgb;
+    BOOL found = NO;
+    for (NSUInteger i = 0; i < sizeof(kSurfaceTokens) / sizeof(kSurfaceTokens[0]); i++) {
+        ApolloThemeToken t = kSurfaceTokens[i];
+        if (snapshot->tokens[ApolloThemeModeLight][t] == rgb || snapshot->tokens[ApolloThemeModeDark][t] == rgb) {
+            out = snapshot->tokens[target][t];
+            found = YES;
+            break;
+        }
+    }
+    if (!found || out == rgb) return nil;
+    sBypassHook++;
+    UIColor *corrected = ApolloThemeUIColorFromRGB(out);
+    sBypassHook--;
+    return corrected;
+}
+
+static UIColor *ThemedTextColorForSourceColor(UIColor *source, id owner, uintptr_t caller) {
+    if (!TextSinkMayUseTheme(owner, caller)) return source;
+
+    ApolloThemeToken token;
+    CGFloat alpha = 1;
+    if (!TextPaletteTokenForColor(source, &token, &alpha)) return source;
+
+    UIColor *replacement = ApolloThemeRuntimeColor(token);
+    if (!replacement) return source;
+    if (alpha < 0.995) replacement = [replacement colorWithAlphaComponent:alpha];
+    if (sDebugLogging.load(std::memory_order_relaxed)) {
+        uint32_t rgb = ApolloThemeRGBFromUIColor(source);
+        ApolloLog(@"ThemeRuntime: text #%06X -> %@", rgb, ApolloThemeTokenKey(token));
+    }
+    return replacement;
+}
+
+static NSAttributedString *ThemedAttributedText(NSAttributedString *text, id owner, uintptr_t caller) {
+    if (![text isKindOfClass:[NSAttributedString class]] || text.length == 0) return text;
+    if (!TextSinkMayUseTheme(owner, caller)) return text;
+
+    __block NSMutableAttributedString *rewritten = nil;
+    NSRange full = NSMakeRange(0, text.length);
+    [text enumerateAttribute:NSFontAttributeName
+                     inRange:full
+                     options:0
+                  usingBlock:^(id value, NSRange range, BOOL *stop) {
+        if (![value isKindOfClass:[UIFont class]]) return;
+        UIFont *replacement = ThemedTextSinkFont(value, owner, caller);
+        if (replacement == value) return;
+        if (!rewritten) rewritten = [text mutableCopy];
+        [rewritten addAttribute:NSFontAttributeName value:replacement range:range];
+    }];
+    [text enumerateAttribute:NSForegroundColorAttributeName
+                     inRange:full
+                     options:0
+                  usingBlock:^(id value, NSRange range, BOOL *stop) {
+        if (![value isKindOfClass:[UIColor class]]) return;
+        UIColor *replacement = ThemedTextColorForSourceColor(value, owner, caller);
+        if (replacement == value) return;
+        if (!rewritten) rewritten = [text mutableCopy];
+        [rewritten addAttribute:NSForegroundColorAttributeName value:replacement range:range];
+    }];
+    return rewritten ?: text;
+}
+
+static NSAttributedString *ThemedPlaceholderText(UITextField *field, NSAttributedString *placeholder, uintptr_t caller) {
+    if (![field isKindOfClass:[UITextField class]]) return placeholder;
+    if (!TextSinkMayUseTheme(field, caller)) return placeholder;
+
+    NSMutableAttributedString *working = nil;
+    if ([placeholder isKindOfClass:[NSAttributedString class]] && placeholder.length > 0) {
+        working = [placeholder mutableCopy];
+    } else if (field.placeholder.length > 0) {
+        working = [[NSMutableAttributedString alloc] initWithString:field.placeholder];
+    }
+    if (!working.length) return placeholder;
+
+    NSRange full = NSMakeRange(0, working.length);
+    __block BOOL hasFont = NO;
+    [working enumerateAttribute:NSFontAttributeName inRange:full options:0 usingBlock:^(id value, NSRange range, BOOL *stop) {
+        if ([value isKindOfClass:[UIFont class]]) { hasFont = YES; *stop = YES; }
+    }];
+    if (!hasFont && [field.font isKindOfClass:[UIFont class]]) {
+        [working addAttribute:NSFontAttributeName value:field.font range:full];
+    }
+    return ThemedAttributedText(working, field, caller);
+}
+
+// Resolve a token's static RGB components (0..1) for a mode. The value-
+// constructor hooks feed these straight into %orig(...) — i.e. UIKit's own
+// colorWithRed:/initWithRed: with new components — exactly as the v1 builder
+// did. Returning %orig's result (rather than a colour built in a helper and
+// returned across call boundaries) preserves ARC's autoreleased-return-value
+// chain; building a substitute colour any other way over-releases it inside
+// UIKit's cell-prep autorelease drain. `mode` may be kModeCurrent (greys).
+static void ApolloThemeTokenComponents(const ApolloThemeRuntimeSnapshot *snapshot,
+                                       ApolloThemeToken token, uint8_t mode,
+                                       CGFloat *outR, CGFloat *outG, CGFloat *outB) {
+    if (mode == kModeCurrent) {
+        mode = (UITraitCollection.currentTraitCollection.userInterfaceStyle == UIUserInterfaceStyleDark)
+            ? ApolloThemeModeDark : ApolloThemeModeLight;
+    }
+    uint32_t rgb = snapshot->tokens[mode][token];
+    *outR = ((rgb >> 16) & 0xFF) / 255.0;
+    *outG = ((rgb >> 8) & 0xFF) / 255.0;
+    *outB = (rgb & 0xFF) / 255.0;
+}
+
+void ApolloThemeRuntimeSetDebugLogging(BOOL on) { sDebugLogging.store(on, std::memory_order_relaxed); }
+BOOL ApolloThemeRuntimeDebugLogging(void) { return sDebugLogging.load(std::memory_order_relaxed); }
+BOOL ApolloThemeRuntimeUseLegacyRepaintFallback(void) { return sLegacyRepaint.load(std::memory_order_relaxed); }
+void ApolloThemeRuntimeSetLegacyRepaintFallback(BOOL on) { sLegacyRepaint.store(on, std::memory_order_relaxed); }
+
+// ===========================================================================
+// Compile / reload
+// ===========================================================================
+
+void ApolloThemeRuntimeReload(void) {
+    ApolloThemeStore *store = [ApolloThemeStore shared];
+    BOOL crashed = store.runtimeDisabledDueToCrash;
+    BOOL enable = store.customThemeEnabled && !crashed;
+    NSDictionary *lightTheme = enable ? [store themeForMode:ApolloThemeModeLight] : nil;
+    NSDictionary *darkTheme = enable ? [store themeForMode:ApolloThemeModeDark] : nil;
+
+    if (!lightTheme || !darkTheme) {
+        const ApolloThemeRuntimeSnapshot *current = ApolloThemeCurrentSnapshot();
+        ApolloThemeRuntimeSnapshot *next = new ApolloThemeRuntimeSnapshot(*current);
+        next->enabled = false;
+        next->fontChoices[ApolloThemeModeLight] = ApolloThemeFontSystem;
+        next->fontChoices[ApolloThemeModeDark] = ApolloThemeFontSystem;
+        next->voteArrowsAccent[ApolloThemeModeLight] = false;
+        next->voteArrowsAccent[ApolloThemeModeDark] = false;
+        ApolloThemePublishSnapshot(next);
+        ApolloLog(@"ThemeRuntime: reload -> INACTIVE (enabledFlag=%d crashKill=%d activeTheme=%@)",
+                  store.customThemeEnabled, crashed, store.activeThemeID ?: @"(none)");
+        return;
+    }
+
+    ApolloCompiledTheme *compiled[ApolloThemeModeCount] = { nil, nil };
+    @try {
+        NSDictionary *themes[ApolloThemeModeCount] = { lightTheme, darkTheme };
+        for (NSUInteger mode = 0; mode < ApolloThemeModeCount; mode++) {
+            NSDictionary *theme = themes[mode];
+            compiled[mode] = [ApolloCompiledTheme compiledThemeWithInput:theme[@"input"]
+                                                                  variant:ApolloThemeVariantFromKey(theme[@"variant"])
+                                                          advancedEnabled:[theme[kApolloThemeAdvancedOptionsEnabledKey] boolValue]];
+        }
+    } @catch (NSException *e) {
+        ApolloLog(@"ThemeRuntime: COMPILE EXCEPTION %@ — %@ (light=%@ dark=%@)",
+                  e.name, e.reason, lightTheme[@"name"], darkTheme[@"name"]);
+        const ApolloThemeRuntimeSnapshot *current = ApolloThemeCurrentSnapshot();
+        ApolloThemeRuntimeSnapshot *next = new ApolloThemeRuntimeSnapshot(*current);
+        next->enabled = false;
+        ApolloThemePublishSnapshot(next);
+        return;
+    }
+
+    const ApolloThemeRuntimeSnapshot *current = ApolloThemeCurrentSnapshot();
+    ApolloThemeRuntimeSnapshot *next = new ApolloThemeRuntimeSnapshot(*current);
+    for (NSUInteger m = 0; m < ApolloThemeModeCount; m++) {
+        for (NSUInteger t = 0; t < ApolloThemeTokenCount; t++) {
+            next->tokens[m][t] = [compiled[m] rgbForToken:(ApolloThemeToken)t mode:(ApolloThemeMode)m];
+        }
+        NSDictionary *theme = m == ApolloThemeModeDark ? darkTheme : lightTheme;
+        next->fontChoices[m] = ApolloThemeFontFromKey(theme[kApolloThemeFontKey]);
+        next->voteArrowsAccent[m] = [theme[kApolloThemeVoteArrowsAccentKey] boolValue];
+    }
+    next->enabled = true;
+    ApolloThemePublishSnapshot(next);
+
+    ApolloLog(@"ThemeRuntime: reload -> ACTIVE light='%@' dark='%@' | light bg=#%06X card=#%06X accent=#%06X label=#%06X | dark bg=#%06X card=#%06X accent=#%06X",
+              lightTheme[@"name"], darkTheme[@"name"],
+              next->tokens[0][ApolloThemeTokenBackground], next->tokens[0][ApolloThemeTokenSecondaryBackground],
+              next->tokens[0][ApolloThemeTokenAccent], next->tokens[0][ApolloThemeTokenLabel],
+              next->tokens[1][ApolloThemeTokenBackground], next->tokens[1][ApolloThemeTokenSecondaryBackground],
+              next->tokens[1][ApolloThemeTokenAccent]);
+
+    sFontBypass++;
+    UIFont *base = [UIFont systemFontOfSize:17.0 weight:UIFontWeightRegular];
+    sFontBypass--;
+    ApolloThemeFont currentFont = next->fontChoices[CurrentRuntimeMode()];
+    UIFont *resolved = ApolloThemeFontApply(currentFont, base);
+    ApolloLog(@"ThemeRuntime: font sample light=%@ dark=%@ base='%@' -> resolved='%@'",
+              ApolloThemeFontKey(next->fontChoices[0]), ApolloThemeFontKey(next->fontChoices[1]), base.fontName, resolved.fontName);
+    UIFont *defaultSample = ApolloThemeFontApply(ApolloThemeFontSystem, base);
+    UIFont *roundedSample = ApolloThemeFontApply(ApolloThemeFontRounded, base);
+    UIFont *serifSample = ApolloThemeFontApply(ApolloThemeFontSerif, base);
+    UIFont *monoSample = ApolloThemeFontApply(ApolloThemeFontMono, base);
+    ApolloLog(@"ThemeRuntime: font designs default='%@' rounded='%@' serif='%@' mono='%@'",
+              defaultSample.fontName, roundedSample.fontName, serifSample.fontName, monoSample.fontName);
+}
+
+// ===========================================================================
+// Apollo theme system bridge (donor hijack + previous-theme restore)
+// ===========================================================================
+
+static NSString * const kAppGroupSuite  = @"group.com.christianselig.apollo";
+static NSString * const kAppColorThemeKey = @"AppColorTheme";
+static const uint8_t kDonorThemeRawValue = 5; // outrun
+
+// Apollo's own Pure Black Dark Mode toggles (group defaults, same suite as
+// AppColorTheme). UsePurePUREBlackMode is a stronger tier on top of
+// UsePureBlackDarkMode; both apply only to non-tinted stock themes (Apollo's
+// theme screen: "Pure black affects Apollo themes only").
+static NSString * const kUsePureBlackDarkModeKey = @"UsePureBlackDarkMode";
+static NSString * const kUsePurerBlackDarkModeKey = @"UsePurePUREBlackMode";
+static NSString * const kPureBlackReduceSmearingKey = @"PureBlackModeReduceSmearing";
+
+// Stock AppColorTheme metadata, indexed by raw value: enum case name, accent
+// {light, dark}, card background {light, dark}, page background
+// {light, dark}, and separator {light, dark} (docs/theme-builder-RE.md;
+// accents recovered from the 1.15.11 binary's accent switch — jump table
+// 0x100ae3c14, arms off 0x10068b6bc). One table so all five stay in sync.
+//
+// tinted themes (solarized/outrun/sunset/sepia/dracula) retint everything
+// themselves, and their card, page and accent ignore Pure Black. (Apollo's
+// own separator and bar getters still fork on it for all but dracula; see
+// kDonorEntries for Outrun's pair.) Non-tinted themes share one
+// baseline each (card 0x20252F, page 0x2B3039, separator 0x474E5C) that
+// ApolloStockNonTintedDarkCardRGB / ...PageRGB / ...SeparatorRGB override per
+// Apollo's Pure Black tier.
+static const struct { const char *name; uint32_t light, dark; uint32_t bgLight, bgDark; uint32_t pageLight, pageDark; uint32_t sepLight, sepDark; BOOL tinted; } kStockThemes[] = {
+    {"default",         0x007AFF, 0x2399FF, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"nefertiti",       0x01A200, 0x01A200, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"fieryStare",      0xFF0000, 0xFD0000, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"spookyPumpkin",   0xFF6200, 0xF25D00, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"solarized",       0x268BD2, 0x268BD2, 0xFDF6E3, 0x002B36, 0xE6DFCF, 0x003745, 0xE0DCCD, 0x002836, YES},
+    {"outrun",          0xC400A6, 0xFF00D8, 0xCFD7E8, 0x061636, 0xBAC1D1, 0x081D47, 0xB5B9C7, 0x06214D, YES},
+    {"sunset",          0xFF6600, 0xFF7D00, 0xFFE3D0, 0x000F29, 0xF2D8C7, 0x12223D, 0xE0CBBD, 0x061B40, YES},
+    {"sepia",           0xB88023, 0xD3AC72, 0xF1EAD9, 0x211E1A, 0xDBD5CA, 0x38332C, 0xD4CEC0, 0x29271F, YES},
+    {"monochromatic",   0x000000, 0xFFFFFF, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"navy",            0x0058B8, 0x0060C9, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"skiesOnSkies",    0x00B5F2, 0x01ADE8, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"majesticPurple",  0x8800FF, 0x9C2CFF, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"magentasplosion", 0xFF00B2, 0xE800A2, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"sniffingWalnut",  0xA74E00, 0xA74E00, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"fisherKing",      0x808286, 0x76787D, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"chumbus",         0xF8F8F8, 0x20242B, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+    {"dracula",         0x9760FF, 0xAD81FF, 0xF8F8F3, 0x1A1D29, 0xEDEDE8, 0x222636, 0xD7D3E0, 0x242838, YES},
+    {"mint",            0x37BB98, 0x62DFA7, 0xFFFFFF, 0x20252F, 0xF2F3F7, 0x2B3039, 0xEEEEEF, 0x474E5C, NO},
+};
+enum { kStockThemeCount = sizeof(kStockThemes) / sizeof(kStockThemes[0]) };
+
+static NSUserDefaults *GroupDefaults(void) {
+    static NSUserDefaults *g;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ g = [[NSUserDefaults alloc] initWithSuiteName:kAppGroupSuite]; });
+    return g;
+}
+
+static BOOL RawForThemeName(NSString *name, uint8_t *outRaw) {
+    if (!name.length) return NO;
+    for (uint8_t i = 0; i < kStockThemeCount; i++) {
+        if ([name isEqualToString:@(kStockThemes[i].name)]) { if (outRaw) *outRaw = i; return YES; }
+    }
+    return NO;
+}
+
+static __weak NSObject *sThemeManager = nil;
+
+// Write Apollo's in-memory ThemeManager.appColorTheme enum byte so a switch
+// takes effect without a relaunch. Falls back to the persisted default if the
+// manager hasn't been captured yet.
+static BOOL SetLiveAppColorThemeRaw(uint8_t raw) {
+    NSObject *tm = sThemeManager;
+    if (!tm) {
+        ApolloLog(@"ThemeRuntime: SetLiveAppColorThemeRaw(%d) — ThemeManager not captured; applies next launch", raw);
+        return NO;
+    }
+    Ivar ivar = class_getInstanceVariable(object_getClass(tm), "appColorTheme");
+    if (!ivar) {
+        ApolloLog(@"ThemeRuntime: SetLiveAppColorThemeRaw(%d) — appColorTheme ivar missing", raw);
+        return NO;
+    }
+    *((uint8_t *)(__bridge void *)tm + ivar_getOffset(ivar)) = raw;
+    ApolloLog(@"ThemeRuntime: live appColorTheme ivar set to raw %d", raw);
+    return YES;
+}
+
+// Read the live appColorTheme raw byte (counterpart of SetLiveAppColorThemeRaw);
+// falls back to the persisted group-defaults selection pre-capture.
+static BOOL GetLiveAppColorThemeRaw(uint8_t *outRaw) {
+    NSObject *tm = sThemeManager;
+    if (tm) {
+        static Ivar sIvar;   // resolved once — this sits on per-cell accent paths
+        if (!sIvar) sIvar = class_getInstanceVariable(object_getClass(tm), "appColorTheme");
+        if (sIvar) { *outRaw = *((uint8_t *)(__bridge void *)tm + ivar_getOffset(sIvar)); return YES; }
+    }
+    return RawForThemeName([GroupDefaults() stringForKey:kAppColorThemeKey], outRaw);
+}
+
+// Accent of the currently-selected stock Apollo theme; nil while the custom
+// runtime is active (stock slot hijacked to the donor) or theme unknown.
+// Internal — external callers go through ApolloThemeAccentColor().
+static UIColor *ApolloThemeStockAccentColor(void) {
+    if (ApolloThemeCurrentSnapshot()->enabled) return nil;   // stock slot is hijacked to the donor theme
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw)) return nil;
+    if (raw >= kStockThemeCount) return nil;
+    uint32_t light = kStockThemes[raw].light, dark = kStockThemes[raw].dark;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        uint32_t rgb = (tc.userInterfaceStyle == UIUserInterfaceStyleDark) ? dark : light;
+        sBypassHook++;
+        UIColor *c = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return c;
+    }];
+}
+
+UIColor *ApolloThemeAccentColor(void) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenAccent);
+    return custom ?: ApolloThemeStockAccentColor();
+}
+
+// Stock tap feedback is independent of the selected accent (#743).
+UIColor *ApolloThemeRowHighlightColor(void) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenRowHighlight);
+    if (custom) return custom;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+        return ApolloThemeUIColorFromRGB(traits.userInterfaceStyle == UIUserInterfaceStyleDark
+            ? 0x34373F : 0xF0F1F3);
+    }];
+}
+
+// Dark-mode card override for a non-tinted stock theme, per Apollo's Pure
+// Black tier. PURER is only consulted when Pure Black is also on — Apollo
+// hides its toggle (and ignores the stored value) once Pure Black is off,
+// but doesn't clear it, so an unconditional check would resurrect a stale
+// YES. Read live, not cached: colorWithDynamicProvider: only runs on trait
+// resolution, and -boolForKey: is cheap after the first read.
+static BOOL ApolloStockNonTintedDarkCardRGB(uint32_t *outRGB) {
+    NSUserDefaults *d = GroupDefaults();
+    if (![d boolForKey:kUsePureBlackDarkModeKey]) return NO;
+    if ([d boolForKey:kUsePurerBlackDarkModeKey]) {
+        if (outRGB) *outRGB = [d boolForKey:kPureBlackReduceSmearingKey] ? 0x050505 : 0x000000;
+        return YES;
+    }
+    if (outRGB) *outRGB = 0x131516;
+    return YES;
+}
+
+// Card/cell background ("primaryBG") of the currently-selected stock Apollo
+// theme; nil while the custom runtime is active (donor hijack) or theme
+// unknown. Internal — external callers go through ApolloThemeCardBackgroundColor().
+static UIColor *ApolloThemeStockCardBackgroundColor(void) {
+    if (ApolloThemeCurrentSnapshot()->enabled) return nil;
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw)) return nil;
+    if (raw >= kStockThemeCount) return nil;
+    uint32_t light = kStockThemes[raw].bgLight, dark = kStockThemes[raw].bgDark;
+    BOOL tinted = kStockThemes[raw].tinted;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        uint32_t rgb = light;
+        if (tc.userInterfaceStyle == UIUserInterfaceStyleDark) {
+            uint32_t pureBlackRGB = 0;
+            rgb = (!tinted && ApolloStockNonTintedDarkCardRGB(&pureBlackRGB)) ? pureBlackRGB : dark;
+        }
+        sBypassHook++;
+        UIColor *c = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return c;
+    }];
+}
+
+// The EFFECTIVE card/cell background for tweak-drawn UI: the custom theme's
+// card color when one is active, else the stock theme's (Pure Black Dark
+// Mode aware). nil only if neither can be determined — callers supply their
+// own last-resort (typically secondarySystemGroupedBackgroundColor).
+UIColor *ApolloThemeCardBackgroundColor(void) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryBackground);
+    return custom ?: ApolloThemeStockCardBackgroundColor();
+}
+
+// Dark-mode page-background override for a non-tinted stock theme. Simpler
+// than the card override: Apollo's page background is already black as soon
+// as Pure Black itself is on — PURER only pushes the CARD the rest of the
+// way, it doesn't change the page any further.
+static BOOL ApolloStockNonTintedDarkPageRGB(uint32_t *outRGB) {
+    NSUserDefaults *d = GroupDefaults();
+    if (![d boolForKey:kUsePureBlackDarkModeKey]) return NO;
+    if (outRGB) *outRGB = [d boolForKey:kPureBlackReduceSmearingKey] ? 0x050505 : 0x000000;
+    return YES;
+}
+
+// Page background ("secondaryBG") of the currently-selected stock Apollo
+// theme; nil while the custom runtime is active (donor hijack) or theme
+// unknown. Internal — external callers go through ApolloThemePageBackgroundColor().
+static UIColor *ApolloThemeStockPageBackgroundColor(void) {
+    if (ApolloThemeCurrentSnapshot()->enabled) return nil;
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw)) return nil;
+    if (raw >= kStockThemeCount) return nil;
+    uint32_t light = kStockThemes[raw].pageLight, dark = kStockThemes[raw].pageDark;
+    BOOL tinted = kStockThemes[raw].tinted;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        uint32_t rgb = light;
+        if (tc.userInterfaceStyle == UIUserInterfaceStyleDark) {
+            uint32_t pureBlackRGB = 0;
+            rgb = (!tinted && ApolloStockNonTintedDarkPageRGB(&pureBlackRGB)) ? pureBlackRGB : dark;
+        }
+        sBypassHook++;
+        UIColor *c = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return c;
+    }];
+}
+
+// The EFFECTIVE page background for tweak-drawn UI: the custom theme's page
+// color when one is active, else the stock theme's (Pure Black Dark Mode
+// aware). nil only if neither can be determined — callers supply their own
+// last-resort (typically systemGroupedBackgroundColor).
+UIColor *ApolloThemePageBackgroundColor(void) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenBackground);
+    return custom ?: ApolloThemeStockPageBackgroundColor();
+}
+
+// Settings labels share Apollo's stock text palette. Keep this in the theme
+// runtime so custom themes and both Pure Black modes follow the same rules as
+// native rows, without copying a possibly stale on-screen label color.
+static UIColor *ApolloThemeSettingsLabelColor(BOOL secondary) {
+    UIColor *custom = ApolloThemeRuntimeColor(secondary ? ApolloThemeTokenSecondaryLabel : ApolloThemeTokenLabel);
+    if (custom) return custom;
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw) || raw >= kStockThemeCount) return nil;
+    BOOL tinted = kStockThemes[raw].tinted;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+        BOOL dark = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
+        uint32_t black = 0;
+        BOOL pure = dark && !tinted && ApolloStockNonTintedDarkPageRGB(&black);
+        uint32_t rgb = secondary ? (dark ? 0x94969D : 0x666666)
+            : (dark ? (pure ? 0xD0D1D6 : 0xEEEFF5) : 0x000000);
+        sBypassHook++;
+        UIColor *color = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return color;
+    }];
+}
+
+UIColor *ApolloThemeSettingsTextColor(void) { return ApolloThemeSettingsLabelColor(NO); }
+UIColor *ApolloThemeSettingsSecondaryTextColor(void) { return ApolloThemeSettingsLabelColor(YES); }
+
+// Share custom-token and stock Pure Black handling across the list's row,
+// section header, primary text, and secondary text roles.
+static UIColor *ApolloThemeSubredditListColor(NSUInteger role) {
+    ApolloThemeToken token = role == 0 ? ApolloThemeTokenSecondaryBackground
+        : role == 1 ? ApolloThemeTokenBackground
+        : role == 2 ? ApolloThemeTokenLabel : ApolloThemeTokenSecondaryLabel;
+    UIColor *custom = ApolloThemeRuntimeColor(token);
+    if (custom) return custom;
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw) || raw >= kStockThemeCount) return nil;
+    BOOL tinted = kStockThemes[raw].tinted;
+    UIColor *surface = role == 0 ? ApolloThemeCardBackgroundColor() : ApolloThemePageBackgroundColor();
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+        BOOL dark = traits.userInterfaceStyle == UIUserInterfaceStyleDark;
+        uint32_t black = 0;
+        BOOL pure = dark && !tinted && ApolloStockNonTintedDarkPageRGB(&black);
+        if (role < 2 && !pure) return [surface resolvedColorWithTraitCollection:traits];
+        uint32_t rgb = role == 0 ? black : role == 1 ? 0x1A1A1A
+            : role == 2 ? (dark ? (pure ? 0xD0D1D6 : 0xEEEFF5) : 0x000000)
+            : (dark ? 0x94969D : 0x666666);
+        sBypassHook++;
+        UIColor *color = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return color;
+    }];
+}
+
+UIColor *ApolloThemeSubredditListBackgroundColor(void) { return ApolloThemeSubredditListColor(0); }
+UIColor *ApolloThemeSubredditListHeaderBackgroundColor(void) { return ApolloThemeSubredditListColor(1); }
+UIColor *ApolloThemeSubredditListTextColor(void) { return ApolloThemeSubredditListColor(2); }
+UIColor *ApolloThemeSubredditListSecondaryTextColor(void) { return ApolloThemeSubredditListColor(3); }
+
+// Dark-mode separator override for a non-tinted stock theme. One "on" value
+// covers both Pure Black tiers — PURER doesn't push the separator any
+// further than plain Pure Black does (unlike the card).
+BOOL ApolloThemeUsesPureBlackDarkMode(UITraitCollection *traits) {
+    if (traits.userInterfaceStyle != UIUserInterfaceStyleDark) return NO;
+    if (ApolloThemeCurrentSnapshot()->enabled) return NO;
+
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw)) return NO;
+    if (raw >= kStockThemeCount || kStockThemes[raw].tinted) return NO;
+
+    return [GroupDefaults() boolForKey:kUsePureBlackDarkModeKey];
+}
+
+UIColor *ApolloThemeSecondaryTextColor(UITraitCollection *traits) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryLabel);
+    if (custom) return custom;
+
+    if (traits.userInterfaceStyle != UIUserInterfaceStyleDark) {
+        return [UIColor secondaryLabelColor];
+    }
+
+    uint32_t rgb = ApolloThemeUsesPureBlackDarkMode(traits) ? 0x75777A : 0x94969D;
+
+    sBypassHook++;
+    UIColor *color = ApolloThemeUIColorFromRGB(rgb);
+    sBypassHook--;
+    return color;
+}
+
+UIColor *ApolloThemePureBlackCardColor(UITraitCollection *traits) {
+    if (!ApolloThemeUsesPureBlackDarkMode(traits)) return nil;
+
+    sBypassHook++;
+    UIColor *color = ApolloThemeUIColorFromRGB(0x131516);
+    sBypassHook--;
+    return color;
+}
+
+static BOOL ApolloStockNonTintedDarkSeparatorRGB(uint32_t *outRGB) {
+    NSUserDefaults *d = GroupDefaults();
+    if (![d boolForKey:kUsePureBlackDarkModeKey]) return NO;
+    if (outRGB) *outRGB = 0x313741;
+    return YES;
+}
+
+// Separator color of the currently-selected stock Apollo theme; nil while
+// the custom runtime is active (donor hijack) or theme unknown. Internal —
+// external callers go through ApolloThemeSeparatorColor().
+static UIColor *ApolloThemeStockSeparatorColor(void) {
+    if (ApolloThemeCurrentSnapshot()->enabled) return nil;
+    uint8_t raw = 0;
+    if (!GetLiveAppColorThemeRaw(&raw)) return nil;
+    if (raw >= kStockThemeCount) return nil;
+    uint32_t light = kStockThemes[raw].sepLight, dark = kStockThemes[raw].sepDark;
+    BOOL tinted = kStockThemes[raw].tinted;
+    return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *tc) {
+        uint32_t rgb = light;
+        if (tc.userInterfaceStyle == UIUserInterfaceStyleDark) {
+            uint32_t pureBlackRGB = 0;
+            rgb = (!tinted && ApolloStockNonTintedDarkSeparatorRGB(&pureBlackRGB)) ? pureBlackRGB : dark;
+        }
+        sBypassHook++;
+        UIColor *c = ApolloThemeUIColorFromRGB(rgb);
+        sBypassHook--;
+        return c;
+    }];
+}
+
+// The EFFECTIVE separator color for tweak-drawn UI: the custom theme's
+// separator when one is active, else the stock theme's (Pure Black Dark
+// Mode aware). nil only if neither can be determined — callers supply their
+// own last-resort (typically UIColor.separatorColor).
+UIColor *ApolloThemeSeparatorColor(void) {
+    UIColor *custom = ApolloThemeRuntimeColor(ApolloThemeTokenSeparator);
+    return custom ?: ApolloThemeStockSeparatorColor();
+}
+
+void ApolloThemeRuntimeEnable(void) {
+    ApolloThemeStore *store = [ApolloThemeStore shared];
+    NSString *current = [GroupDefaults() stringForKey:kAppColorThemeKey];
+    NSString *donor = [store runtimeDonorTheme];
+    ApolloLog(@"ThemeRuntime: ENABLE requested (currentAppColorTheme=%@ donor=%@ activeTheme=%@)",
+              current ?: @"(none)", donor, store.activeThemeID ?: @"(none)");
+    // Remember the real selected theme before hijacking the donor slot.
+    if (current.length && ![current isEqualToString:donor]) {
+        store.previousApolloTheme = current;
+    }
+    [GroupDefaults() setObject:donor forKey:kAppColorThemeKey];
+    [store restoreLastCustomSelection];
+    ApolloThemeRuntimeReload();
+    SetLiveAppColorThemeRaw(kDonorThemeRawValue);
+    ApolloThemeRuntimeInvalidate();
+    ApolloLog(@"ThemeRuntime: enabled (donor=%@, prev=%@)", donor, store.previousApolloTheme);
+}
+
+void ApolloThemeRuntimeDisable(void) {
+    ApolloThemeStore *store = [ApolloThemeStore shared];
+    [store selectApolloTheme];
+    const ApolloThemeRuntimeSnapshot *current = ApolloThemeCurrentSnapshot();
+    ApolloThemeRuntimeSnapshot *next = new ApolloThemeRuntimeSnapshot(*current);
+    next->enabled = false;
+    ApolloThemePublishSnapshot(next);
+
+    NSString *prev = store.previousApolloTheme;
+    uint8_t raw = 0; // AppColorTheme.default fallback
+    if (prev.length) {
+        [GroupDefaults() setObject:prev forKey:kAppColorThemeKey];
+        RawForThemeName(prev, &raw);
+    } else {
+        [GroupDefaults() removeObjectForKey:kAppColorThemeKey];
+    }
+    SetLiveAppColorThemeRaw(raw);
+    ApolloThemeRuntimeInvalidate();
+    ApolloLog(@"ThemeRuntime: disabled (restored=%@ raw=%d)", prev ?: @"default", raw);
+}
+
+// ===========================================================================
+// Invalidation (spec §12)
+// ===========================================================================
+
+static void PostThemeNotifications(void) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc postNotificationName:@"com.christianselig.ApolloSpecificThemeChanged" object:nil];
+    [nc postNotificationName:@"com.christianselig.CommentsColorThemeChanged" object:nil];
+}
+
+// Legacy fallback: flip each window's override style for one runloop turn to
+// drive a full trait-change cascade (re-resolves cached dynamic colours).
+static void LegacyFlipRepaint(void) {
+    NSArray<UIWindow *> *windows = ApolloAllWindows();
+    NSMutableArray<NSNumber *> *saved = [NSMutableArray array];
+    for (UIWindow *w in windows) {
+        [saved addObject:@(w.overrideUserInterfaceStyle)];
+        UIUserInterfaceStyle eff = w.traitCollection.userInterfaceStyle;
+        w.overrideUserInterfaceStyle = (eff == UIUserInterfaceStyleDark)
+            ? UIUserInterfaceStyleLight : UIUserInterfaceStyleDark;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [windows enumerateObjectsUsingBlock:^(UIWindow *w, NSUInteger idx, BOOL *stop) {
+            if (idx < saved.count) w.overrideUserInterfaceStyle = (UIUserInterfaceStyle)saved[idx].integerValue;
+        }];
+    });
+}
+
+void ApolloThemeRuntimeInvalidate(void) {
+    BOOL active = ApolloThemeCurrentSnapshot()->enabled;
+    BOOL legacyRepaint = sLegacyRepaint.load(std::memory_order_relaxed);
+    ApolloLog(@"ThemeRuntime: invalidate (active=%d flip=%d postNotifs=%d)", active, legacyRepaint, sPostNativeNotifications);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (sPostNativeNotifications) PostThemeNotifications();
+        if (legacyRepaint) LegacyFlipRepaint();
+        // Colours re-resolve via the trait cascade, but fonts on existing
+        // views only change if something re-derives them — walk the windows.
+        ApolloThemeRuntimeRefreshFonts();
+        ApolloLog(@"ThemeRuntime: invalidate applied");
+    });
+}
+
+// ===========================================================================
+// Hooks
+// ===========================================================================
+
+%group ApolloThemeRuntimeManagerHook
+%hook _TtC6Apollo12ThemeManager
+- (id)init {
+    id result = %orig;
+    sThemeManager = result;
+    ApolloLog(@"ThemeRuntime: captured ThemeManager %p", result);
+    return result;
+}
+%end
+%end
+
+%group ApolloThemeRuntimeHooks
+
+%hook UIColor
+
+// --- donor-constant + separator remap (hot path) ---
+// These VALUE CONSTRUCTORS return STATIC plain colours (never dynamic provider
+// colours — those over-release inside UIKit cell prep). The donor constant pins
+// the mode; separator constants resolve against the current trait. Apollo
+// re-emits these on a light<->dark change, and our invalidate flips the window
+// style, so static is OK. Native text palette colours are handled by the text
+// sink hooks below, not by this constructor path.
+
++ (UIColor *)colorWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (ApolloUsesLegacyModeratorColor(r, g, b, (uintptr_t)__builtin_return_address(0))) {
+        return %orig(48.0 / 255.0, 209.0 / 255.0, 88.0 / 255.0, a);
+    }
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (snapshot->enabled && !sBypassHook) {
+        uint32_t rgb = ApolloThemeRGBKeyFromComponents(r, g, b);
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        ApolloThemeToken token; uint8_t mode;
+        if (LookupToken(rgb, caller, &token, &mode)) {
+            if (sDebugLogging.load(std::memory_order_relaxed)) ApolloLog(@"ThemeRuntime: donor #%06X -> %@", rgb, ApolloThemeTokenKey(token));
+            CGFloat R, G, B; ApolloThemeTokenComponents(snapshot, token, mode, &R, &G, &B);
+            return %orig(R, G, B, a);
+        }
+    }
+    return %orig;
+}
+
+// Apollo is Swift: UIColor(red:green:blue:alpha:) compiles to this instance
+// initialiser, so this is the primary donor entry point.
+- (UIColor *)initWithRed:(CGFloat)r green:(CGFloat)g blue:(CGFloat)b alpha:(CGFloat)a {
+    if (ApolloUsesLegacyModeratorColor(r, g, b, (uintptr_t)__builtin_return_address(0))) {
+        return %orig(48.0 / 255.0, 209.0 / 255.0, 88.0 / 255.0, a);
+    }
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (snapshot->enabled && !sBypassHook) {
+        uint32_t rgb = ApolloThemeRGBKeyFromComponents(r, g, b);
+        uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+        ApolloThemeToken token; uint8_t mode;
+        if (LookupToken(rgb, caller, &token, &mode)) {
+            if (sDebugLogging.load(std::memory_order_relaxed)) ApolloLog(@"ThemeRuntime: donor(init) #%06X a=%.2f -> %@", rgb, a, ApolloThemeTokenKey(token));
+            CGFloat R, G, B; ApolloThemeTokenComponents(snapshot, token, mode, &R, &G, &B);
+            return %orig(R, G, B, a);
+        }
+    }
+    return %orig;
+}
+
+// --- semantic UIKit accessor overrides (spec §10) ---
+// Keyed on meaning, so they cover the colours Apollo draws from UIKit's palette
+// (which the RGB hook never sees because they resolve inside UIKit). Written out
+// explicitly because Logos preprocessing runs before the C preprocessor, so
+// %orig can't live inside a C macro.
+
++ (UIColor *)systemBackgroundColor {
+    UIColor *c = SemColor(ApolloThemeTokenBackground, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)secondarySystemBackgroundColor {
+    UIColor *c = SemColor(ApolloThemeTokenSecondaryBackground, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)tertiarySystemBackgroundColor {
+    UIColor *c = SemColor(ApolloThemeTokenTertiaryBackground, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)systemGroupedBackgroundColor {
+    UIColor *c = SemColor(ApolloThemeTokenBackground, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)secondarySystemGroupedBackgroundColor {
+    UIColor *c = SemColor(ApolloThemeTokenSecondaryBackground, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)tertiarySystemGroupedBackgroundColor {
+    UIColor *c = SemColor(ApolloThemeTokenTertiaryBackground, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
+
++ (UIColor *)labelColor {
+    if (sNavigationChromeColorReadDepth) return %orig;
+    UIColor *c = SemColor(ApolloThemeTokenLabel, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)secondaryLabelColor {
+    UIColor *c = SemColor(ApolloThemeTokenSecondaryLabel, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)tertiaryLabelColor {
+    UIColor *c = SemColor(ApolloThemeTokenTertiaryLabel, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)quaternaryLabelColor {
+    UIColor *c = SemColor(ApolloThemeTokenQuaternaryLabel, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)placeholderTextColor {
+    UIColor *c = SemColor(ApolloThemeTokenPlaceholderText, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
+
++ (UIColor *)separatorColor {
+    UIColor *c = SemColor(ApolloThemeTokenSeparator, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)opaqueSeparatorColor {
+    UIColor *c = SemColor(ApolloThemeTokenOpaqueSeparator, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
+
++ (UIColor *)systemFillColor {
+    UIColor *c = SemColor(ApolloThemeTokenFill, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)secondarySystemFillColor {
+    UIColor *c = SemColor(ApolloThemeTokenSecondaryFill, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)tertiarySystemFillColor {
+    UIColor *c = SemColor(ApolloThemeTokenTertiaryFill, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
++ (UIColor *)quaternarySystemFillColor {
+    UIColor *c = SemColor(ApolloThemeTokenQuaternaryFill, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
+
++ (UIColor *)linkColor {
+    UIColor *c = SemColor(ApolloThemeTokenLink, (uintptr_t)__builtin_return_address(0));
+    if (c) return c;
+    return %orig;
+}
+
+%end
+
+// --- theme font (per-theme app-wide font) ---
+// Every hooked entry is a UIFont FACTORY: we let %orig build the exact font
+// Apollo asked for, then re-derive it through the descriptor design axis
+// (ApolloThemeFontApply), preserving size/weight/traits/Dynamic Type. Apollo
+// is Swift, but UIFont.systemFont(ofSize:)/preferredFont(forTextStyle:)
+// compile down to these class methods, so Texture attributed strings are
+// covered. fontWithDescriptor:size: (our own re-derive path) is deliberately
+// NOT hooked at the factory level, and neither is monospacedDigitSystemFontOfSize:
+// weight: (column-aligned counters, which every design already honours) nor
+// monospacedSystemFontOfSize:weight: (Apollo's markdown code blocks — NOT
+// fontWithName: as previously assumed here). The latter two are still system-
+// design fonts by name/family, so they DO reach the sink hooks below (setFont:,
+// attributed-string rewrites); FontIsThemeable()'s FontIsMonospaced() check is
+// what actually keeps code blocks monospaced, not an unhooked factory.
+
+%hook UIFont
+
++ (UIFont *)systemFontOfSize:(CGFloat)size {
+    UIFont *font = %orig;
+    return ThemedFont(font, (uintptr_t)__builtin_return_address(0));
+}
+
++ (UIFont *)systemFontOfSize:(CGFloat)size weight:(UIFontWeight)weight {
+    UIFont *font = %orig;
+    return ThemedFont(font, (uintptr_t)__builtin_return_address(0));
+}
+
++ (UIFont *)boldSystemFontOfSize:(CGFloat)size {
+    UIFont *font = %orig;
+    return ThemedFont(font, (uintptr_t)__builtin_return_address(0));
+}
+
++ (UIFont *)italicSystemFontOfSize:(CGFloat)size {
+    UIFont *font = %orig;
+    return ThemedFont(font, (uintptr_t)__builtin_return_address(0));
+}
+
++ (UIFont *)preferredFontForTextStyle:(UIFontTextStyle)style {
+    UIFont *font = %orig;
+    return ThemedFont(font, (uintptr_t)__builtin_return_address(0));
+}
+
++ (UIFont *)preferredFontForTextStyle:(UIFontTextStyle)style compatibleWithTraitCollection:(UITraitCollection *)traitCollection {
+    UIFont *font = %orig;
+    return ThemedFont(font, (uintptr_t)__builtin_return_address(0));
+}
+
+%end
+
+// SF Pro Rounded has no true italic face. CoreText doesn't fail an italic
+// request against it — it silently hands back an upright descriptor while
+// still reporting the trait as satisfied, so the caller has no way to detect
+// the failure after the fact. That caller isn't just this tweak's own code:
+// Apollo's OWN markdown-to-attributedstring conversion asks OUR factory hooks
+// above for a body font (getting back an already-Rounded one), then tries to
+// add italic to THAT font itself via fontDescriptorWithSymbolicTraits: — and
+// silently gets the same upright result, before ApolloThemeFontApply's own
+// per-run theming ever sees the text. By the time a per-run fixup could look
+// at it, the italic intent is already gone with no signal left to recover it.
+// Catch it at the one place both call sites actually go through: redirect the
+// WHOLE request to the DEFAULT (SF Pro) design at the same weight, which
+// always has a real italic face, whenever a Rounded-family descriptor is
+// asked for italic and doesn't already have it.
+%hook UIFontDescriptor
+
+- (UIFontDescriptor *)fontDescriptorWithSymbolicTraits:(UIFontDescriptorSymbolicTraits)symbolicTraits {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (snapshot->enabled && snapshot->fontChoices[CurrentRuntimeMode()] == ApolloThemeFontRounded &&
+        (symbolicTraits & UIFontDescriptorTraitItalic) &&
+        !(self.symbolicTraits & UIFontDescriptorTraitItalic) &&
+        [self.postscriptName localizedCaseInsensitiveContainsString:@"Rounded"] &&
+        CallerMayUseThemeRuntime((uintptr_t)__builtin_return_address(0))) {
+        // self.fontAttributes[UIFontDescriptorTraitsAttribute] isn't reliably
+        // populated once a descriptor is already concrete (which this one is
+        // — it came from an already-resolved .SFUIRounded-Bold-style font):
+        // the weight is baked into the postscript name at that point, not
+        // restated in the abstract traits dict. Resolving self into a font
+        // and reading CTFontCopyTraits (same technique ApolloThemeFontApply
+        // uses) is what actually reports the real weight — the traits-dict
+        // read silently defaulted every case to Regular, dropping bold.
+        CGFloat weight = UIFontWeightRegular;
+        UIFont *selfFont = [UIFont fontWithDescriptor:self size:(self.pointSize > 0 ? self.pointSize : 17.0)];
+        if (selfFont) {
+            NSDictionary *ctTraits = CFBridgingRelease(CTFontCopyTraits((__bridge CTFontRef)selfFont));
+            NSNumber *weightValue = ctTraits[(__bridge NSString *)kCTFontWeightTrait];
+            if ([weightValue isKindOfClass:[NSNumber class]]) weight = weightValue.doubleValue;
+        }
+        // Set weight and the caller's full requested symbolic traits (bold,
+        // italic, whatever else) TOGETHER in one combined traits dictionary.
+        // fontDescriptorWithSymbolicTraits: is documented as a FAMILY-MEMBER
+        // LOOKUP ("returns a new font descriptor reference in the same
+        // family with the given symbolic traits"), not an attribute merge —
+        // calling it after separately setting weight via
+        // fontDescriptorByAddingAttributes: silently discarded the weight
+        // (a bold Rounded header lost its boldness once italicized),
+        // because it replaces the descriptor with whichever family member
+        // matches the coarse symbolic bits, disregarding the fine-grained
+        // numeric weight set moments earlier.
+        //
+        // Start from the same descriptor ApolloThemeFontApply rebuilds this
+        // font from (its own text style, or the plain system UI font for a
+        // systemFontOfSize: font), so the italic run keeps the paragraph's tag
+        // and line spacing. A Body start gave italic runs Body leading while
+        // the rest of a comment has none, so lines with italics sat looser.
+        // Weight goes on first, as in ApolloThemeFontApply, so the symbolic
+        // traits already carry the bold bit a bold weight implies. Self's
+        // point size carries over, as fontDescriptorWithSymbolicTraits:
+        // normally does, for a caller that builds the font at size 0.
+        UIFontDescriptor *fallback = [ApolloThemeFontPristineDescriptor(
+            [self objectForKey:UIFontDescriptorTextStyleAttribute], YES)
+            fontDescriptorByAddingAttributes:@{
+                UIFontDescriptorTraitsAttribute: @{ UIFontWeightTrait: @(weight) },
+            }];
+        NSMutableDictionary *attributes = [NSMutableDictionary dictionaryWithObject:@{
+            UIFontWeightTrait: @(weight),
+            UIFontSymbolicTrait: @(fallback.symbolicTraits | symbolicTraits),
+        } forKey:UIFontDescriptorTraitsAttribute];
+        if (self.pointSize > 0) attributes[UIFontDescriptorSizeAttribute] = @(self.pointSize);
+        return [fallback fontDescriptorByAddingAttributes:attributes];
+    }
+    return %orig;
+}
+
+%end
+
+%hook ASTextNode
+
+- (void)setAttributedText:(NSAttributedString *)attributedText {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedAttributedText(attributedText, (id)self, caller));
+}
+
+%end
+
+%hook ASTextNode2
+
+- (void)setAttributedText:(NSAttributedString *)attributedText {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedAttributedText(attributedText, (id)self, caller));
+}
+
+%end
+
+%hook ASButtonNode
+
+- (void)setAttributedTitle:(NSAttributedString *)title forState:(NSUInteger)state {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedAttributedText(title, (id)self, caller), state);
+}
+
+- (void)setTitle:(NSString *)title withFont:(UIFont *)font withColor:(UIColor *)color forState:(NSUInteger)state {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(title, ThemedTextSinkFont(font, (id)self, caller), ThemedTextColorForSourceColor(color, (id)self, caller), state);
+}
+
+- (void)setTitle:(NSString *)title withFont:(UIFont *)font withColor:(UIColor *)color withShadowColor:(UIColor *)shadowColor withShadowOffset:(CGSize)shadowOffset forState:(NSUInteger)state {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(title, ThemedTextSinkFont(font, (id)self, caller), ThemedTextColorForSourceColor(color, (id)self, caller), shadowColor, shadowOffset, state);
+}
+
+%end
+
+%hook UILabel
+
+- (void)setFont:(UIFont *)font {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedTextSinkFont(font, (id)self, caller));
+}
+
+- (void)setTextColor:(UIColor *)textColor {
+    if (ApolloNeutralNavigationTitle(self)) {
+        %orig(ApolloNavigationChromeColor());
+        return;
+    }
+    if (ApolloThemeCurrentSnapshot()->enabled && NavigationTitleOwnsButtonLabel(self)) {
+        %orig(textColor);
+        return;
+    }
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedTextColorForSourceColor(textColor, (id)self, caller));
+}
+
+- (void)setAttributedText:(NSAttributedString *)attributedText {
+    // Navigation buttons already theme their state table. Do not recolor the
+    // generated label again, undoing its native chrome color.
+    if (sAttributedTextAssignmentBypass ||
+        (ApolloThemeCurrentSnapshot()->enabled && NavigationTitleOwnsButtonLabel(self))) {
+        %orig(attributedText);
+        return;
+    }
+    if (ApolloNeutralNavigationTitle(self)) {
+        %orig(NavigationTitleAttributedText(attributedText, self, ApolloNavigationChromeColor()));
+        return;
+    }
+    objc_setAssociatedObject(self, kApolloThemeOriginalAttributedTextKey,
+                             [attributedText copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedAttributedText(attributedText, (id)self, caller));
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    RethemeFontOnAttach((UIView *)self);
+}
+
+%end
+
+%hook UIButton
+
+- (CGSize)intrinsicContentSize {
+    CGSize nativeSize = %orig;
+    return ApolloNavigationTitleFittingSize(self, nativeSize);
+}
+
+- (CGSize)sizeThatFits:(CGSize)size {
+    CGSize nativeSize = %orig(size);
+    return ApolloNavigationTitleFittingSize(self, nativeSize);
+}
+
+- (void)setTitleColor:(UIColor *)color forState:(UIControlState)state {
+    if (ApolloNeutralNavigationTitle(self)) color = ApolloNavigationChromeColor();
+    %orig(color, state);
+}
+
+- (void)setAttributedTitle:(NSAttributedString *)title forState:(UIControlState)state {
+    if (sNavigationButtonTitleAssignmentBypass) {
+        %orig(title, state);
+        return;
+    }
+    // Capture both title lines before attachment so retheming uses the raw source.
+    if (ApolloNeutralNavigationTitle(self)) {
+        %orig(NavigationTitleAttributedText(title, self, ApolloNavigationChromeColor()), state);
+        return;
+    }
+    BOOL dualTitle = [NSStringFromClass(self.class) isEqualToString:@"Apollo.DualLabelTitleButton"];
+    NSMutableDictionary<NSNumber *, id> *sources = NavigationButtonTitleSources(self, dualTitle);
+    if (sources) {
+        sources[@(state)] = title ? [title copy] : NSNull.null;
+        UIView *control = NavigationTitleControlForDescendant(self);
+        // Recoloring this system button after attachment triggers UIKit's title
+        // fade-out/in. Apollo assigns the comments title before the button
+        // reaches the title control, so the attach path can only correct it
+        // afterwards — one white frame, then a 600ms fade, on every refresh
+        // that changes the count. Color it on its first assignment instead.
+        if (dualTitle ||
+            (control && ChromeBarLooksApolloOwned(NavigationBarForDescendant(control)))) {
+            %orig(NavigationTitleAttributedText(title, self, NavigationTitlePrimaryColor()), state);
+            return;
+        }
+    }
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedAttributedText(title, (id)self, caller), state);
+}
+
+%end
+
+// --- vote arrows: accent-color option (spec: kApolloThemeVoteArrowsAccentKey) ---
+//
+// DualStateButtonNode (the up/down vote arrow widget — Apollo.swift /
+// DualStateButtonNode.swift) recolors its iconNode (an ASImageNode) on every
+// appearance update via `[iconNode setImageModificationBlock:
+// ASImageNodeTintColorModificationBlock(color)]` — RE'd in sub_10044bc94
+// (Apollo 1.15.11): `color` is plain white while the vote is active
+// (isActive==1, drawn over a separate green/blue-violet backgroundNode pill
+// keyed on the `type` ivar) and a neutral gray (Apollo's shared
+// tertiary-label palette helper) while inactive. We only retint the inactive
+// case — swapping the idle gray for the theme's accent — and leave the
+// active white-on-green/blue-violet pill alone, since that pairing is the
+// actual "you voted this way" signal and forcing both directions to the same
+// accent would erase it. Since ASImageNodeTintColorModificationBlock is
+// AsyncDisplayKit's own public C entry point (not an Apollo-private
+// address), we intercept the ObjC sink that consumes its result —
+// setImageModificationBlock: — rather than the private colour-selection
+// helper itself. Scoped to DualStateButtonNode's iconNode via supernode,
+// since ASImageNode.setImageModificationBlock: is otherwise used for
+// arbitrary icon tinting app-wide.
+
+// AsyncDisplayKit is loaded into the host process by Apollo itself, but the
+// tweak dylib doesn't link against it — resolve this public C entry point at
+// runtime (like the rest of this file resolves Apollo/Texture classes via
+// objc_getClass) rather than linking the framework in just for one symbol.
+typedef id (*ASImageNodeTintColorModificationBlockFn)(UIColor *color);
+static ASImageNodeTintColorModificationBlockFn ASImageNodeTintColorModificationBlockPtr(void) {
+    static ASImageNodeTintColorModificationBlockFn fn;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fn = (ASImageNodeTintColorModificationBlockFn)dlsym(RTLD_DEFAULT, "ASImageNodeTintColorModificationBlock");
+    });
+    return fn;
+}
+
+%hook ASImageNode
+
+- (void)setImageModificationBlock:(id)block {
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    if (snapshot->enabled && snapshot->voteArrowsAccent[CurrentRuntimeMode()]) {
+        Class dualStateCls = ApolloClassDualStateButtonNode;
+        id supernode = dualStateCls ? [(ASDisplayNode *)self supernode] : nil;
+        // isActive==YES is Apollo's own "this is the cast vote" state (white
+        // icon over its green/blue-violet backgroundNode pill) — leave that
+        // alone so the pill's own colour still reads as feedback. Only the
+        // idle/neutral-gray icon (isActive==NO) gets the accent tint.
+        if ([supernode isMemberOfClass:dualStateCls] && !MSHookIvar<BOOL>(supernode, "isActive")) {
+            ASImageNodeTintColorModificationBlockFn tintFn = ASImageNodeTintColorModificationBlockPtr();
+            UIColor *accent = tintFn ? ApolloThemeRuntimeColor(ApolloThemeTokenAccent) : nil;
+            if (accent) {
+                id accentBlock = tintFn(accent);
+                if (accentBlock) {
+                    %orig(accentBlock);
+                    return;
+                }
+            }
+        }
+    }
+    %orig;
+}
+
+%end
+
+// Classic (non-glass) bar chrome (#787). Apollo fills UINavigationBar and
+// UITabBar from the donor's tertiaryBG constant (stock Outrun #C1C8D9 light /
+// #041129 dark), while ApolloSearchToolbar already uses the donor's bar
+// constant (#C5CAD9 / #031229). The donor remap turns those into Raised and
+// Bars respectively. The editor defines Bars as navigation bars, tab-bar
+// backing, and other app chrome, so replace only an opaque, already-remapped
+// Raised fill at the nav/tab appearance sinks. Exact token matching preserves
+// unrelated colours; stock themes, disabled custom themes, transparent fills,
+// generic toolbar appearances, and Liquid Glass all pass through unchanged.
+static UIColor *ApolloThemeClassicBarFill(UIColor *color) {
+    if (!color) return color;
+    const ApolloThemeRuntimeSnapshot *snapshot = ApolloThemeCurrentSnapshot();
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    BOOL liquidGlass = IsLiquidGlass();
+    BOOL hasComponents = snapshot->enabled && !liquidGlass && ColorComponents(color, &r, &g, &b, &a);
+    uint32_t rgb = hasComponents ? ApolloThemeRGBKeyFromComponents(r, g, b) : 0;
+    if (!ApolloClassicBarShouldRouteRaisedToBars(
+            snapshot->enabled, liquidGlass, hasComponents, a, rgb,
+            snapshot->tokens[ApolloThemeModeLight][ApolloThemeTokenTertiaryBackground],
+            snapshot->tokens[ApolloThemeModeDark][ApolloThemeTokenTertiaryBackground])) return color;
+
+    return ApolloThemeRuntimeColor(ApolloThemeTokenBarBackground) ?: color;
+}
+
+%hook UIBarAppearance
+
+- (void)setBackgroundColor:(UIColor *)color {
+    // UINavigationBar and UITabBar only. UIToolbar and other appearance
+    // subclasses keep the colour Apollo assigned them.
+    if ([self isKindOfClass:[UINavigationBarAppearance class]] ||
+        [self isKindOfClass:[UITabBarAppearance class]]) {
+        color = ApolloThemeClassicBarFill(color);
+    }
+    %orig(color);
+}
+
+%end
+
+%hook UITabBar
+- (void)didMoveToWindow {
+    %orig;
+    if (IsLiquidGlass() && self.window) {
+        UIColor *accent = ApolloThemeAccentColor();
+        if (accent) self.tintColor = accent;
+    }
+}
+
+- (void)setTintColor:(UIColor *)color {
+    // Moderator pages change their navigation accent, not the selected tab's identity.
+    if (IsLiquidGlass()) color = ApolloThemeAccentColor() ?: color;
+    %orig(color);
+}
+
+- (void)setBarTintColor:(UIColor *)color {
+    %orig(ApolloThemeClassicBarFill(color));
+}
+%end
+
+%hook UINavigationItem
+
+- (void)setTitleView:(UIView *)view {
+    if (IsLiquidGlass() && [view isKindOfClass:[UITextField class]]) {
+        // A text field is never a title. UIKit lends a titleView UISearchBar's
+        // own search field to its private _UISearchBarNavigationItem the first
+        // time the bar shows Cancel (setShowsCancelButton:animated: ->
+        // displayNavBarCancelButton:animated: -> searchNavigationItem ->
+        // setUpSearchNavigationItem -> setTitleView:field). The Search tab's
+        // bar is one: Apollo shows Cancel when editing begins, and the prep
+        // below baked the chrome colour into the field's placeholder label and
+        // tagged the field as a neutral title for good, so the dim placeholder
+        // came back in the title colour after Cancel until the screen was
+        // rebuilt.
+        ApolloLog(@"ThemeRuntime: setTitleView: %@ on %@ is a text field; skipping neutral title prep",
+                  NSStringFromClass(view.class), NSStringFromClass(object_getClass(self)));
+    } else if (IsLiquidGlass() && view) {
+        // Prepare custom titles before UIKit snapshots the incoming page.
+        objc_setAssociatedObject(view, &kApolloNeutralNavigationTitleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        view.tintColor = ApolloNavigationChromeColor();
+        ApplyThemeToNavigationTitleContent(view, ApolloThemeCurrentSnapshot()->enabled
+            ? ApolloThemeCurrentSnapshot()->fontChoices[CurrentRuntimeMode()] : ApolloThemeFontSystem,
+            ApolloNavigationChromeColor());
+    }
+    %orig(view);
+}
+
+%end
+
+%hook _TtC6Apollo27AutoModeratorViewController
+
+- (void)viewDidLoad {
+    %orig;
+    if (IsLiquidGlass()) {
+        UIBarButtonItem *close = ((UIViewController *)self).navigationItem.leftBarButtonItem;
+        close.tintColor = ApolloNavigationChromeColor();
+        if (close.image) close.image = [close.image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        close.customView.tintColor = ApolloNavigationChromeColor();
+    }
+}
+
+%end
+
+%hook _UINavigationBarTitleControl
+
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window) ApplyThemeToNavigationTitleControl((UIView *)self);
+}
+
+- (void)layoutSubviews {
+    %orig;
+    ApplyThemeToNavigationTitleControl((UIView *)self);
+}
+
+%end
+
+%hook UITextField
+
+- (void)setFont:(UIFont *)font {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedTextSinkFont(font, (id)self, caller));
+}
+
+- (void)setPlaceholder:(NSString *)placeholder {
+    %orig;
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    NSAttributedString *themed = ThemedPlaceholderText((UITextField *)self, self.attributedPlaceholder, caller);
+    if (themed && themed != self.attributedPlaceholder) {
+        self.attributedPlaceholder = themed;
+    }
+}
+
+- (void)setAttributedPlaceholder:(NSAttributedString *)attributedPlaceholder {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedPlaceholderText((UITextField *)self, attributedPlaceholder, caller));
+}
+
+- (void)setAttributedText:(NSAttributedString *)attributedText {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedAttributedText(attributedText, (id)self, caller));
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    RethemeFontOnAttach((UIView *)self);
+}
+
+%end
+
+// UIKit chooses default table separators from inside UIKit itself. That call
+// is intentionally outside the app/tweak caller gate on UIColor's semantic
+// accessors, so enforce the semantic token on the table sink. This covers
+// Apollo's native Appearance tables; Texture's comment dividers are handled
+// separately below because they are independent ASDisplayNodes.
+%hook UITableView
+
+- (void)setSeparatorColor:(UIColor *)color {
+    UIColor *separator = ApolloThemeCurrentSnapshot()->enabled ? ApolloThemeRuntimeColor(ApolloThemeTokenSeparator) : nil;
+    %orig(separator ?: color);
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    ApplyThemeTableSeparator(self);
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig;
+    ApplyThemeTableSeparator(self);
+}
+
+%end
+
+// Comment threads use explicit ThinSeparatorCellNode objects between sections.
+// Hopper (Apollo 1.15.11, sub_1003acddc) shows separatorNode receiving
+// sub_10068cda0: Apollo's shared gray/muted-text palette helper. Override the
+// semantic sink after the cell finishes loading so the line follows the
+// Separators editor token without globally reclassifying muted text colors —
+// and pin the node so Apollo's later colour passes (foreground/appearance
+// re-runs of sub_1003acddc via its vtable thunk sub_1003ad1c8, issue #911)
+// can't repaint it back to the stock gray.
+%hook _TtC6Apollo21ThinSeparatorCellNode
+
+- (void)didLoad {
+    %orig;
+    ApplyThemeThinSeparatorNode(self);
+}
+
+%end
+
+// The GIF/gallery duration pill (issue #710). Apollo's Swift init
+// (sub_1002d78a4) builds a translucent WHITE capsule with BLACK text in both
+// appearances. #000000 is the light primary in kTextPaletteEntries, so without
+// this the ASTextNode sink swaps it for the theme's dynamic Label colour —
+// near-black in light mode, near-white in dark, i.e. white-on-white. The
+// capsule is never themed, so only the text moves.
+//
+// There is nowhere to raise the bypass around that assignment: -init is a Swift
+// unimplemented-initializer stub that is never called, the designated init
+// reaches ASDisplayNode via objc_msgSendSuper2, -layoutSpecThatFits: runs long
+// after the text is set, and -didLoad never fires — the pill loads no view or
+// layer of its own. So schedule the restore from the layout pass and write on
+// the main thread once it has ended; mutating node state mid-layout is
+// unsupported in ASDK. The flag is set at schedule time so repeated passes
+// queue the work once.
+static const void *kApolloThemePillRestoredKey = &kApolloThemePillRestoredKey;
+
+static void ApolloThemeRestoreOverlayPillText(id node) {
+    if (!node || !ApolloThemeCurrentSnapshot()->enabled) return;
+    id textNode = ApolloObjectIvar(node, "textNode");
+    if (![textNode respondsToSelector:@selector(attributedText)]) return;
+
+    NSAttributedString *text = [textNode attributedText];
+    if (![text isKindOfClass:[NSAttributedString class]] || text.length == 0) return;
+
+    if (sDebugLogging) {
+        UIColor *was = [text attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL];
+        ApolloLog(@"ThemeRuntime: pill '%@' restore #%06X -> #000000",
+                  text.string, ApolloThemeRGBFromUIColor(was));
+    }
+    NSMutableAttributedString *stock = [text mutableCopy];
+    [stock addAttribute:NSForegroundColorAttributeName
+                  value:[UIColor blackColor]
+                  range:NSMakeRange(0, stock.length)];
+    sTextSinkBypass++;
+    [textNode setAttributedText:stock];
+    sTextSinkBypass--;
+}
+
+%hook _TtC6Apollo20SmallInfoOverlayNode
+
+- (id)layoutSpecThatFits:(struct ApolloThemeSizeRange)fits {
+    id result = %orig;
+    // ASDK lays out off the main thread; schedule, never write, from in here.
+    if (ApolloThemeCurrentSnapshot()->enabled &&
+        !objc_getAssociatedObject(self, kApolloThemePillRestoredKey)) {
+        objc_setAssociatedObject(self, kApolloThemePillRestoredKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        __weak id weakNode = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ApolloThemeRestoreOverlayPillText(weakNode);
+        });
+    }
+    return result;
+}
+
+%end
+
+// The post header uses its own pair of ASDisplayNode hairlines, so these do not
+// pass through UITableView or ThinSeparatorCellNode. Apply the same semantic
+// separator token once Apollo has finished constructing/loading the header,
+// and pin both nodes: the full-post rebind repaints them right after load
+// (issue #963's two stock lines around the quick bar) and the foreground
+// colour pass repaints them again (issue #911) — see the pin comment above.
+%hook _TtC6Apollo22CommentsHeaderCellNode
+
+- (void)didLoad {
+    %orig;
+    ApplyThemeCommentsHeaderSeparators(self);
+}
+
+%end
+
+// The main Search tab is a stock UISearchBar created by SearchViewController,
+// while feed search uses ApolloSearchBarTextField below. Give both kinds of
+// input the Raised token instead of allowing UIKit/Apollo's shared separator
+// constant to leak into their fill.
+%hook UISearchBar
+
+- (void)didMoveToWindow {
+    %orig;
+    ApplyThemeSearchFieldBackground(self);
+    // Header Style (ApolloScrollEdgeEffect.xm) shares this hook rather than
+    // adding a second UISearchBar didMoveToWindow.
+    ApolloHeaderStyleSearchBarDidMoveToWindow(self);
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig;
+    ApplyThemeSearchFieldBackground(self);
+}
+
+%end
+
+// See the forward-declaration comment above for why this needs its own sink:
+// Apollo fills this field's background from the same constant as real
+// separator hairlines, so the blanket kSeparatorEntries remap would otherwise
+// paint the search pill in the Advanced "Separators" color. Route it to
+// "Raised" instead, matching how that token is already described in the
+// editor ("inset controls and elevated panels").
+%hook _TtC6Apollo24ApolloSearchBarTextField
+
+- (void)setBackgroundColor:(UIColor *)color {
+    if (BackgroundColorPassthrough(self)) {
+        %orig(color);
+        return;
+    }
+    UIColor *raised = ApolloThemeRuntimeColor(ApolloThemeTokenTertiaryBackground);
+    %orig(raised ?: color);
+}
+
+%end
+
+%hook UITextView
+
+- (void)setFont:(UIFont *)font {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedTextSinkFont(font, (id)self, caller));
+}
+
+- (void)setAttributedText:(NSAttributedString *)attributedText {
+    uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+    %orig(ThemedAttributedText(attributedText, (id)self, caller));
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    RethemeFontOnAttach((UIView *)self);
+}
+
+%end
+
+%end // ApolloThemeRuntimeHooks
+
+static char kApolloNavigationDualTitleTintPinnedKey;
+
+%group ApolloNavigationDualTitleChrome
+%hook ApolloDualLabelTitleButton
+
+- (void)setTintColor:(UIColor *)color {
+    // System-button vibrancy uses tint even when attributed text is neutral.
+    UIColor *chrome = NavigationTitlePrimaryColor();
+    // Install an explicit tint once; later native nil resets must not restart
+    // UIKit's title transition or return the button to its inherited accent.
+    if (objc_getAssociatedObject(self, &kApolloNavigationDualTitleTintPinnedKey) &&
+        [((UIView *)self).tintColor isEqual:chrome]) return;
+    objc_setAssociatedObject(self, &kApolloNavigationDualTitleTintPinnedKey,
+        @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    %orig(chrome);
+}
+
+%end
+%end
+
+// ===========================================================================
+// Constructor
+// ===========================================================================
+
+%ctor {
+    @autoreleasepool {
+        FindRuntimeImages();
+        BuildByteFilter();
+        %init(ApolloThemeRuntimeHooks);
+        Class dualTitleButton = objc_getClass("Apollo.DualLabelTitleButton");
+        if (dualTitleButton) {
+            %init(ApolloNavigationDualTitleChrome, ApolloDualLabelTitleButton = dualTitleButton);
+        }
+        BOOL haveTM = objc_getClass("_TtC6Apollo12ThemeManager") != nil;
+        if (haveTM) %init(ApolloThemeRuntimeManagerHook);
+        ApolloLog(@"ThemeRuntime: ctor — UIColor hooks installed, ThemeManager hook=%d", haveTM);
+        // Crash kill-switch bookkeeping + initial compile.
+        ApolloThemeStore *store = [ApolloThemeStore shared];
+        ApolloThemeGalleryRegisterWithStore();
+        [store migrateIfNeeded];
+        [store beginLaunchAttempt];
+        if (store.runtimeDisabledDueToCrash)
+            ApolloLog(@"ThemeRuntime: ctor — runtime DISABLED by crash kill-switch");
+        ApolloThemeRuntimeReload();
+        // Stability bookkeeping is anchored to the first main-queue drain, not
+        // ctor time: during an iOS prewarm this ctor runs but the run loop does
+        // not, so both marks must wait for the app to REALLY launch (a timer
+        // from ctor would have long expired by the time a prewarmed process is
+        // foregrounded, shrinking the crash-detection window to zero).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [store markRunLoopStarted];
+            // Mark launch stable once the UI has had time to come up (the feed
+            // renders within ~1-3s; 5s clears the kill-switch marker for a
+            // healthy launch while still catching a theme crashing at startup).
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [store markLaunchStable]; });
+        });
+        // Reaching the background is also proof the launch didn't brick: the
+        // user got in and left before the 5s timer. Without this, backgrounding
+        // quickly and later being jetsammed while suspended (timer never fired)
+        // would count a strike against the theme. One-shot — the timer owns
+        // every later stable mark.
+        __block id bgObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
+            [store markLaunchStable];
+            if (bgObserver) { [[NSNotificationCenter defaultCenter] removeObserver:bgObserver]; bgObserver = nil; }
+        }];
+    }
+}

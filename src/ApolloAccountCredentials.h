@@ -1,0 +1,196 @@
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+// Per-account Reddit OAuth credential overrides.
+//
+// Today (pre-this-file) the tweak has exactly one global Reddit API client
+// id/secret/redirect URI (sRedditClientId/sRedditClientSecret/sRedirectURI in
+// ApolloState.{h,m}), forced onto every signed-in account. That breaks the
+// moment a second account needs a different key, and even breaks a single
+// account's *next token refresh* if the global key is later changed (the
+// refresh_token is bound server-side to the client_id it was issued under).
+//
+// This module lets each account carry its own client id/secret/redirect URI,
+// keyed by lowercased Reddit username, persisted as a flat dictionary in
+// standardUserDefaults (UDKeyPerAccountCredentials). An account with no entry
+// here falls back to the existing global default — so single-account installs
+// with only the global key set keep working with zero migration.
+//
+// Secrets are stored in plaintext NSUserDefaults, matching the existing
+// single global sRedditClientSecret's storage today (not a new regression;
+// candidate for a later keychain-hardening pass).
+
+// Per-account credential entry. Any field may be empty (falls back to the
+// global default for that field).
+@interface ApolloAccountCredentialEntry : NSObject
+@property (nonatomic, copy) NSString *clientId;
+@property (nonatomic, copy) NSString *clientSecret;
+@property (nonatomic, copy) NSString *redirectURI;
+// YES if at least one field is non-empty (i.e. this account overrides the default).
+@property (nonatomic, readonly) BOOL hasCustomCredentials;
+@end
+
+// Plain C functions below — called from both Objective-C (.m) and
+// Objective-C++/Logos (.xm) translation units, so they need C linkage to
+// avoid a C++ name-mangling mismatch at link time.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Returns the stored entry for `username` (case-insensitive), or nil if the
+// account has no per-account override.
+ApolloAccountCredentialEntry * _Nullable ApolloAccountCredentialsFor(NSString *username);
+
+// Upserts (and persists) the credential entry for `username`. Empty strings
+// are stored as empty (meaning "fall back to default" for that field), not nil.
+void ApolloAccountCredentialsSet(NSString *username, NSString *_Nullable clientId,
+                                  NSString *_Nullable clientSecret, NSString *_Nullable redirectURI);
+
+// Removes any stored override for `username` (e.g. when the account is deleted).
+void ApolloAccountCredentialsRemove(NSString *username);
+
+// All stored per-account entries, keyed by lowercased username. Used by the
+// account switcher to render per-account key-status badges.
+NSDictionary<NSString *, ApolloAccountCredentialEntry *> *ApolloAllAccountCredentials(void);
+
+// Reverse lookup: given a client_id presented as the Basic-Auth username on
+// Reddit's token endpoint, find the matching secret — checking every stored
+// per-account entry first, then the global default. Returns empty string if
+// no match has a non-empty secret. This intentionally does NOT depend on
+// "which account is active" — Reddit's token requests self-identify by
+// client_id, so any account's refresh can be resolved this way regardless of
+// which account is foregrounded right now.
+NSString *ApolloSecretForClientId(NSString *_Nullable clientId);
+
+// Effective client id / redirect URI to install on RDKOAuthCredential right
+// now: the active account's stored override, falling back to the global
+// default (sRedditClientId / sRedirectURI-or-default) when the active
+// account (or no account yet, e.g. the signed-out app-only client) has none.
+// An interactive sign-in (Add Account, the signed-out splash) does NOT
+// resolve through these: its credential carries the default it started with
+// (see the interactive sign-in section below).
+NSString *ApolloEffectiveRedditClientId(void);
+NSString *ApolloEffectiveRedirectURI(void);
+
+// Interactive (API-key) sign-in credentials. A new sign-in (Add Account or
+// the signed-out splash, "Sign In With API Key") must use the DEFAULT key from
+// Settings for the authorize URL AND the authorization_code exchange. The
+// functions above would instead hand it the ACTIVE account's pinned key,
+// which can be stale (#1232: Reddit rejects the grant with a bare 400 "{}"),
+// and even when it works the new account ends up pinned to the default while
+// its refresh token is bound to the other key. The override can't be a
+// process-global flag either: the active account keeps refreshing with its
+// own pin while the sign-in sheet is open. So the default is captured onto
+// the sign-in's own RDKOAuthCredential (associated object) when Apollo
+// creates it (the RDKClient -authenticateWithClientIdentifier:redirectURI:
+// hook in Tweak.xm). Every other credential resolves exactly as before, and
+// a cancelled or failed sign-in needs no cleanup: Apollo drops that RDKClient
+// and the snapshot goes with it. After a successful sign-in the snapshot
+// stays on the new account's credential, since its tokens are bound to that
+// key; after a relaunch that account resolves through its pin like any other.
+//
+// Captures the current default (sRedditClientId / sRedditClientSecret /
+// sRedirectURI, raw, like the account pin) onto `credential`. With no default
+// API key set at all it captures what the sign-in sent before this existed
+// (the active account's saved key), so that setup doesn't fall through to
+// Apollo's own client id; the new account is still pinned to what it used.
+void ApolloAccountCredentialsBeginInteractiveSignIn(id credential);
+// NO when a new sign-in has no API key to send: none in Settings and none
+// saved on the active account. Its authorize URL then carries Apollo's own
+// client id (the RDKOAuthCredential -clientIdentifier hook falls back to it),
+// which Reddit rejects only after the person has logged in.
+BOOL ApolloAccountCredentialsNewSignInHasAPIKey(void);
+// The snapshot captured for `credential`, or nil for every other credential.
+ApolloAccountCredentialEntry * _Nullable ApolloInteractiveSignInCredentialsFor(id _Nullable credential);
+// What RDKOAuthCredential's -clientIdentifier / -redirectURI hooks return for
+// `credential`: its sign-in snapshot when it has one (redirect falls back to
+// the built-in default like ApolloEffectiveRedirectURI), else the effective
+// values above. Empty client id = keep the credential's own stored value.
+NSString *ApolloRedditClientIdForCredential(id _Nullable credential);
+NSString *ApolloRedirectURIForCredential(id _Nullable credential);
+// Called when an RDKClient installs its user (-setCurrentUser:,
+// -updateCurrentUserWithNewUser:). If `client`'s credential carries a sign-in
+// snapshot, pins `username` to it — overwriting any older entry, because the
+// new refresh token is bound to the snapshot's client id (removing an account
+// doesn't clear its pin, so the same username signing in again would
+// otherwise keep its old key) — and returns YES. Pins once per credential,
+// so later identity refreshes of the same client don't rewrite it. Returns NO
+// (nothing written) for every other client, including every account decoded
+// from RedditAccounts2.
+BOOL ApolloAccountCredentialsPinInteractiveSignIn(id _Nullable client, NSString *username);
+
+// Lowercased username of the account RDKClient currently considers signed in
+// ([[RDKClient sharedClient] currentUser].username), or nil if none/unavailable.
+NSString * _Nullable ApolloActiveAccountUsername(void);
+
+// A persisted active-account lookup that distinguishes a real signed-out state
+// from an unreadable/transient account archive. Per-account stores must not treat
+// an unknown decode as anonymous or they can install the wrong user's data.
+typedef NS_ENUM(NSInteger, ApolloPersistedAccountIdentityStatus) {
+    ApolloPersistedAccountIdentityUnknown = 0,
+    ApolloPersistedAccountIdentitySignedOut,
+    ApolloPersistedAccountIdentitySignedIn,
+};
+ApolloPersistedAccountIdentityStatus ApolloResolvePersistedActiveAccountIdentity(
+    NSString * _Nullable * _Nullable outNormalizedUsername);
+
+// Live equivalent used from AccountManager's synchronous account-change
+// notification. Its in-memory selection changes before the defaults mirror is
+// persisted, so quick-switch consumers must prefer this signal at that point.
+ApolloPersistedAccountIdentityStatus ApolloResolveLiveActiveAccountIdentity(
+    NSString * _Nullable * _Nullable outNormalizedUsername);
+
+// Every readable, normalized username in the persisted RedditAccounts2 array.
+// Used for non-destructive first-enable migrations of per-account data.
+NSSet<NSString *> *ApolloPersistedAccountUsernames(void);
+
+// Status-bearing variant. YES means the full persisted account array was
+// decoded and every entry had a usable username (an empty array is valid).
+// NO means callers must defer a migration instead of treating the account set
+// as empty and committing an incomplete store.
+BOOL ApolloResolvePersistedAccountUsernames(
+    NSSet<NSString *> * _Nullable * _Nullable outUsernames);
+
+// Invalidate the cached active username after either side of Apollo's persisted
+// account selection changes. Tweak.xm calls this from narrowly-scoped
+// NSUserDefaults write hooks for RedditAccounts2 / CurrentRedditAccountIndex.
+void ApolloInvalidateActiveAccountUsernameCache(void);
+
+// The live RDKClient selected by Apollo's AccountManager, or nil when there is
+// no signed-in account. Do not use RDKClient.sharedClient for account mutations:
+// that singleton is Apollo's application-only/bootstrap client and normally has
+// no currentUser even while a real account is active.
+id _Nullable ApolloActiveAccountClient(void);
+
+// Login-persistence diagnostics: count of persisted accounts and how many carry a currentUser.
+void ApolloPersistedAccountStats(NSInteger *outCount, NSInteger *outWithUser);
+
+// Interactive OAuth (API-key) sign-in tracking. Auth modes are mutually
+// exclusive per account, but nothing used to enforce the transition: an
+// account that once had a web session and later signs in WITH an API key kept
+// its stale web-session entry, which permanently masked it as "keyless" (the
+// entry wins at the transport chokepoint and in the switcher badge). The OAuth
+// callback arms this flag; the RDKClient user-install hook consumes it — but
+// ONLY for a username that did not yet exist in the persisted account blobs
+// OR the web-session username index at arm time (see the implementation note
+// in ApolloAccountCredentials.m for why identity-binding is required: the
+// install hooks also fire from
+// NSKeyedUnarchiver decodes and background identity refreshes of stored
+// accounts, which must never spend the flag or remove a session).
+//
+// Arm when an OAuth authorization callback carrying ?code= is delivered
+// (both the universal WKWebView flow and native ASWebAuthenticationSession).
+void ApolloNoteInteractiveOAuthSignIn(void);
+// Disarm without consuming (sign-in cancelled or failed).
+void ApolloCancelInteractiveOAuthSignIn(void);
+// Consume for `username`: YES exactly once, iff armed within the last 120
+// seconds AND `username` was not present in either identity source at arm time.
+// Installs for pre-existing usernames return NO without disarming.
+BOOL ApolloTakeInteractiveOAuthSignInForNewUsername(NSString *username);
+
+#ifdef __cplusplus
+}
+#endif
+
+NS_ASSUME_NONNULL_END

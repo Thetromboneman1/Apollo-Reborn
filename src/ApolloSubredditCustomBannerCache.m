@@ -1,0 +1,360 @@
+#import "ApolloSubredditCustomBannerCache.h"
+
+#import "ApolloCommon.h"
+#import "ApolloMemoryDiagnostics.h"
+
+NSString *const ApolloSubredditCustomBannerChangedNotification = @"ApolloSubredditCustomBannerChangedNotification";
+NSString *const ApolloSubredditCustomBannerSubredditNameKey = @"subredditName";
+
+static CGFloat const ApolloSubredditCustomBannerAspectRatio = 5.0;
+static CGFloat const ApolloSubredditCustomBannerMaxWidth = 1280.0;
+static CGFloat const ApolloSubredditCustomBannerJPEGQuality = 0.85;
+static NSUInteger const ApolloSubredditCustomBannerMaxBytes = 1572864; // 1.5 MB
+
+@interface ApolloSubredditCustomBannerCache ()
+@property(nonatomic, strong) NSCache<NSString *, UIImage *> *imageCache;
+@property(nonatomic) dispatch_queue_t ioQueue;
+@property(atomic, copy) NSSet<NSString *> *storedKeys;
+@property(nonatomic, strong) NSObject *storedKeysLock;
+@property(nonatomic, copy) NSString *storagePath;
+- (void)ensureStorageDirectory;
+- (void)cacheImage:(UIImage *)image forKey:(NSString *)key;
+- (void)publishStoredKey:(NSString *)key present:(BOOL)present;
+- (void)replaceStoredKeys:(NSSet<NSString *> *)keys;
+- (void)postChangedNotificationForSubreddit:(nullable NSString *)subredditName;
+@end
+
+@implementation ApolloSubredditCustomBannerCache
+
++ (instancetype)sharedCache {
+    static ApolloSubredditCustomBannerCache *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[ApolloSubredditCustomBannerCache alloc] init];
+    });
+    return cache;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _ioQueue = dispatch_queue_create("com.apollofix.subredditCustomBannerCache.io", DISPATCH_QUEUE_SERIAL);
+        // One custom header is on screen at a time and each is stored on
+        // disk, so the memory copy only has to cover recent scrollback.
+        _imageCache = [[NSCache alloc] init];
+        _imageCache.countLimit = 80;
+        _imageCache.totalCostLimit = 10 * 1024 * 1024;
+        ApolloMemoryRegisterPurgableCache(@"subreddit-banners", _imageCache);
+        _storedKeysLock = [NSObject new];
+        _storedKeys = [NSSet set];
+
+        NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+        NSString *cacheRoot = paths.firstObject ?: NSTemporaryDirectory();
+        _storagePath = [cacheRoot stringByAppendingPathComponent:@"ApolloFix/SubredditCustomBanners"];
+
+        // Inventory filenames away from the first header render. The previous
+        // path decoded only the requested file on a cache miss, but did its file
+        // read and decode synchronously on the caller. A visible subreddit now
+        // rehydrates lazily on this serial I/O queue.
+        dispatch_async(_ioQueue, ^{
+            [self ensureStorageDirectory];
+            NSArray<NSString *> *files = [[NSFileManager defaultManager]
+                contentsOfDirectoryAtPath:self.storagePath error:nil] ?: @[];
+            NSMutableSet<NSString *> *keys = [NSMutableSet set];
+            for (NSString *file in files) {
+                if (![file.pathExtension.lowercaseString isEqualToString:@"jpg"]) continue;
+                NSString *key = file.stringByDeletingPathExtension.lowercaseString;
+                if (key.length == 0) continue;
+                [keys addObject:key];
+            }
+            [self replaceStoredKeys:keys];
+            if (keys.count > 0) [self postChangedNotificationForSubreddit:nil];
+        });
+    }
+    return self;
+}
+
+- (NSString *)normalizedSubredditName:(NSString *)subredditName {
+    if (![subredditName isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = [subredditName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([clean hasPrefix:@"/r/"] || [clean hasPrefix:@"/R/"]) clean = [clean substringFromIndex:3];
+    if ([clean hasPrefix:@"r/"] || [clean hasPrefix:@"R/"]) clean = [clean substringFromIndex:2];
+    if (clean.length == 0) return nil;
+    return clean.lowercaseString;
+}
+
+- (NSString *)storageDirectory {
+    return self.storagePath;
+}
+
+- (void)ensureStorageDirectory {
+    [[NSFileManager defaultManager] createDirectoryAtPath:self.storagePath
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+}
+
+- (NSString *)filePathForSubreddit:(NSString *)subredditName {
+    NSString *key = [self normalizedSubredditName:subredditName];
+    if (key.length == 0) return nil;
+    return [[self storageDirectory] stringByAppendingPathComponent:[key stringByAppendingString:@".jpg"]];
+}
+
+- (void)cacheImage:(UIImage *)image forKey:(NSString *)key {
+    if (!image || key.length == 0) return;
+    [self.imageCache setObject:image forKey:key cost:ApolloImageByteCost(image)];
+}
+
+- (void)publishStoredKey:(NSString *)key present:(BOOL)present {
+    if (key.length == 0) return;
+    @synchronized (self.storedKeysLock) {
+        NSSet<NSString *> *storedKeys = self.storedKeys;
+        if ([storedKeys containsObject:key] == present) return;
+        NSMutableSet<NSString *> *keys = [storedKeys mutableCopy];
+        if (present) [keys addObject:key];
+        else [keys removeObject:key];
+        self.storedKeys = keys;
+    }
+}
+
+- (void)replaceStoredKeys:(NSSet<NSString *> *)keys {
+    @synchronized (self.storedKeysLock) {
+        self.storedKeys = keys ?: [NSSet set];
+    }
+}
+
+- (UIImage *)normalizedBannerImageFromImage:(UIImage *)image {
+    if (!image || image.size.width <= 0.0 || image.size.height <= 0.0) return nil;
+
+    CGSize pixelSize = CGSizeMake(image.size.width * image.scale, image.size.height * image.scale);
+    if (pixelSize.width <= 1.0 || pixelSize.height <= 1.0) return nil;
+
+    CGFloat imageAspect = pixelSize.width / pixelSize.height;
+    CGRect cropRect;
+    if (imageAspect > ApolloSubredditCustomBannerAspectRatio) {
+        CGFloat cropHeight = pixelSize.height;
+        CGFloat cropWidth = cropHeight * ApolloSubredditCustomBannerAspectRatio;
+        cropRect = CGRectMake((pixelSize.width - cropWidth) / 2.0, 0.0, cropWidth, cropHeight);
+    } else {
+        CGFloat cropWidth = pixelSize.width;
+        CGFloat cropHeight = cropWidth / ApolloSubredditCustomBannerAspectRatio;
+        cropRect = CGRectMake(0.0, (pixelSize.height - cropHeight) / 2.0, cropWidth, cropHeight);
+    }
+
+    CGImageRef croppedRef = CGImageCreateWithImageInRect(image.CGImage, cropRect);
+    if (!croppedRef) return nil;
+    UIImage *cropped = [UIImage imageWithCGImage:croppedRef scale:image.scale orientation:image.imageOrientation];
+    CGImageRelease(croppedRef);
+    if (!cropped) return nil;
+
+    CGFloat targetWidth = MIN(ApolloSubredditCustomBannerMaxWidth, cropped.size.width * cropped.scale);
+    CGFloat targetHeight = targetWidth / ApolloSubredditCustomBannerAspectRatio;
+    CGSize targetSize = CGSizeMake(targetWidth / cropped.scale, targetHeight / cropped.scale);
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    // TODO: Modernization - the normalized banner is persisted and served from a
+    // subreddit-keyed cache to every window, so there is no single display
+    // scale to use; the fallback only matters for a zero-scale source. Needs a
+    // scale-independent pipeline (pixel-sized render) rather than a caller's traits.
+    format.scale = cropped.scale > 0.0 ? cropped.scale : [UIScreen mainScreen].scale;
+    format.opaque = YES;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:targetSize format:format];
+    return [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        [cropped drawInRect:CGRectMake(0.0, 0.0, targetSize.width, targetSize.height)];
+    }];
+}
+
+- (NSData *)jpegDataForNormalizedImage:(UIImage *)image {
+    if (!image) return nil;
+
+    NSData *data = UIImageJPEGRepresentation(image, ApolloSubredditCustomBannerJPEGQuality);
+    if (data.length <= ApolloSubredditCustomBannerMaxBytes) return data;
+
+    for (CGFloat quality = 0.75; quality >= 0.45; quality -= 0.1) {
+        data = UIImageJPEGRepresentation(image, quality);
+        if (data.length <= ApolloSubredditCustomBannerMaxBytes) return data;
+    }
+    return data;
+}
+
+- (void)postChangedNotificationForSubreddit:(NSString *)subredditName {
+    NSString *key = [self normalizedSubredditName:subredditName];
+    NSDictionary *userInfo = key.length > 0
+        ? @{ApolloSubredditCustomBannerSubredditNameKey: key}
+        : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSubredditCustomBannerChangedNotification
+                                                            object:self
+                                                          userInfo:userInfo];
+    });
+}
+
+- (UIImage *)cachedBannerForSubreddit:(NSString *)subredditName {
+    NSString *key = [self normalizedSubredditName:subredditName];
+    if (key.length == 0) return nil;
+
+    UIImage *memory = [self.imageCache objectForKey:key];
+    if (memory) return memory;
+
+    if ([self.storedKeys containsObject:key]) dispatch_async(self.ioQueue, ^{
+        if ([self.imageCache objectForKey:key]) return;
+        NSString *path = [self filePathForSubreddit:key];
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data.length) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+            [self publishStoredKey:key present:NO];
+            [self postChangedNotificationForSubreddit:key];
+            return;
+        }
+        // TODO: Modernization - rehydrates the shared, subreddit-keyed cache entry
+        // (any window may read it) with no caller trait source. Keep in step with
+        // the save-path decode in -saveBanner:forSubreddit:error:; a fix needs a
+        // scale-independent decode, which changes image.size for all consumers.
+        UIImage *diskImage = [UIImage imageWithData:data scale:UIScreen.mainScreen.scale];
+        if (!diskImage) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+            [self publishStoredKey:key present:NO];
+            [self postChangedNotificationForSubreddit:key];
+            return;
+        }
+        [self cacheImage:diskImage forKey:key];
+        [self postChangedNotificationForSubreddit:key];
+    });
+    return nil;
+}
+
+- (BOOL)hasCustomBannerForSubreddit:(NSString *)subredditName {
+    NSString *key = [self normalizedSubredditName:subredditName];
+    return key.length > 0 && [self.storedKeys containsObject:key];
+}
+
+- (NSURL *)cachedBannerFileURLForSubreddit:(NSString *)subredditName {
+    NSString *key = [self normalizedSubredditName:subredditName];
+    if (key.length == 0 || ![self.storedKeys containsObject:key]) return nil;
+    NSString *path = [self filePathForSubreddit:subredditName];
+    return path.length > 0 ? [NSURL fileURLWithPath:path isDirectory:NO] : nil;
+}
+
+- (BOOL)saveBanner:(UIImage *)image forSubreddit:(NSString *)subredditName error:(NSError **)error {
+    NSString *key = [self normalizedSubredditName:subredditName];
+    NSString *path = [self filePathForSubreddit:subredditName];
+    if (key.length == 0 || path.length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ApolloSubredditCustomBannerCache"
+                                         code:1
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Invalid subreddit name."}];
+        }
+        return NO;
+    }
+
+    UIImage *normalized = [self normalizedBannerImageFromImage:image];
+    NSData *jpeg = [self jpegDataForNormalizedImage:normalized];
+    if (!jpeg.length) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ApolloSubredditCustomBannerCache"
+                                         code:2
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Could not process the selected image."}];
+        }
+        return NO;
+    }
+
+    __block BOOL ok = NO;
+    dispatch_sync(self.ioQueue, ^{
+        [self ensureStorageDirectory];
+        ok = [jpeg writeToFile:path atomically:YES];
+        if (ok) [self publishStoredKey:key present:YES];
+    });
+    if (!ok) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ApolloSubredditCustomBannerCache"
+                                         code:3
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Could not save the custom banner."}];
+        }
+        return NO;
+    }
+
+    // TODO: Modernization - must decode at the same scale as the cold-cache
+    // rehydrate in -cachedBannerForSubreddit: (no trait source there), so the
+    // in-memory entry matches whichever path populated it.
+    UIImage *stored = [UIImage imageWithData:jpeg scale:[UIScreen mainScreen].scale];
+    if (stored) [self cacheImage:stored forKey:key];
+
+    ApolloLog(@"[SubredditHeaders] saved custom banner subreddit=%@ bytes=%lu", key, (unsigned long)jpeg.length);
+    [self postChangedNotificationForSubreddit:key];
+    return YES;
+}
+
+- (BOOL)removeBannerForSubreddit:(NSString *)subredditName {
+    NSString *key = [self normalizedSubredditName:subredditName];
+    NSString *path = [self filePathForSubreddit:subredditName];
+    if (key.length == 0 || path.length == 0) return NO;
+
+    [self.imageCache removeObjectForKey:key];
+
+    BOOL existed = [self.storedKeys containsObject:key];
+    [self publishStoredKey:key present:NO];
+    if (existed) [self postChangedNotificationForSubreddit:key];
+    dispatch_async(self.ioQueue, ^{
+        NSError *removeError = nil;
+        BOOL removed = [[NSFileManager defaultManager] removeItemAtPath:path error:&removeError];
+        if (!removed && [removeError.domain isEqualToString:NSCocoaErrorDomain] &&
+            removeError.code == NSFileNoSuchFileError) {
+            removed = YES;
+        }
+        if (!removed) {
+            [self publishStoredKey:key present:YES];
+            ApolloLogError(@"[SubredditHeaders] failed to remove custom banner subreddit=%@ error=%@",
+                key, removeError.localizedDescription ?: @"unknown");
+            // Always publish the final state. Startup inventory may have run
+            // between the optimistic update and this queued mutation even when
+            // the caller's initial `existed` snapshot was false.
+            [self postChangedNotificationForSubreddit:key];
+            return;
+        }
+        // The startup inventory block may have published this key after the
+        // caller's optimistic removal but before this queued delete ran.
+        [self publishStoredKey:key present:NO];
+        ApolloLog(@"[SubredditHeaders] removed custom banner subreddit=%@", key);
+        [self postChangedNotificationForSubreddit:key];
+    });
+    return existed;
+}
+
+- (void)clearAllCustomBanners {
+    [self.imageCache removeAllObjects];
+    [self replaceStoredKeys:[NSSet set]];
+    [self postChangedNotificationForSubreddit:nil];
+    dispatch_async(self.ioQueue, ^{
+        NSString *directory = [self storageDirectory];
+        NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:directory error:nil];
+        NSMutableSet<NSString *> *failedKeys = [NSMutableSet set];
+        for (NSString *file in files) {
+            if ([file.pathExtension.lowercaseString isEqualToString:@"jpg"]) {
+                NSString *key = file.stringByDeletingPathExtension.lowercaseString;
+                NSError *removeError = nil;
+                BOOL removed = [[NSFileManager defaultManager]
+                    removeItemAtPath:[directory stringByAppendingPathComponent:file] error:&removeError];
+                if (!removed && [removeError.domain isEqualToString:NSCocoaErrorDomain] &&
+                    removeError.code == NSFileNoSuchFileError) {
+                    removed = YES;
+                }
+                if (!removed) {
+                    if (key.length > 0) [failedKeys addObject:key];
+                    ApolloLogError(@"[SubredditHeaders] failed clearing custom banner file=%@ error=%@",
+                        file, removeError.localizedDescription ?: @"unknown");
+                }
+            }
+        }
+        [self replaceStoredKeys:failedKeys];
+        ApolloLog(@"[SubredditHeaders] cleared all custom banners");
+        // Correct any startup-inventory notification that reached the main
+        // queue before deletion completed, regardless of the optimistic state.
+        [self postChangedNotificationForSubreddit:nil];
+    });
+}
+
+- (NSUInteger)customBannerCount {
+    return self.storedKeys.count;
+}
+
+@end

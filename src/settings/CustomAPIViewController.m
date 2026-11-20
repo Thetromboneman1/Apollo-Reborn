@@ -1,0 +1,6626 @@
+#import "palhome/ApolloPalHomeStore.h"
+#import "palhome/ApolloPalHomeWidgetRenderer.h"
+#import "ApolloProfilePicturesPreview.h"
+#import "ApolloSettingsShortcutsViewController.h"
+#import "ApolloSearchLandingPreferences.h"
+#import "settings/CustomAPIViewController.h"
+#import "settings/ApolloSetupAssistant.h"
+#import "ApolloSignInSplash.h"
+#import "ApolloSpelling.h"
+#import "settings/ApolloSiriSettingsViewController.h"
+#import "ApolloCommon.h"
+#import "ApolloAppIcon.h"
+#import "ApolloFeedShortcutsAppearance.h"
+#import "ApolloThemeRuntime.h"
+#import "ApolloNotificationBackend.h"
+#import "ApolloBarkNotifications.h"
+#import "ApolloPushNotifications.h"
+#import "ApolloUsageHeartbeat.h"
+#import "ApolloUpdateChecker.h"
+#import "InlineMediaSettingsViewController.h"
+#import "settings/ApolloPollSettingsViewController.h"
+#import "ApolloOfflineMode.h"
+#import "settings/ApolloSettingsRouter.h"
+#import "InfoRowSettingsViewController.h"
+#import "ApolloWebSessionLoginViewController.h"
+#import "ApolloDirectChatWeb.h"
+#import "ApolloUnreadBadges.h"
+#import "ApolloMessageDraftStore.h"
+#import "ApolloDevvitPosts.h"        // ApolloDevvitFeedOwnershipChangedNotification
+#import "ApolloFloatingTabs.h"       // close-all / fan-out entry points for the toggles
+#import "ApolloAllPlusNSFW.h"        // ApolloAllPlusInvalidate() -- drop cached candidates on toggle
+#import "settings/ApolloAISettingsViewController.h"
+#import "ApolloWebSessionStore.h"
+#import "ApolloReduceRateLimiting.h"
+#import "ApolloWebJSONRouteUpdates.h"
+#import "settings/ApolloKeylessRouteStatusViewController.h"
+#import "ApolloKagiSearch.h"         // Kagi Session Link (Search tab's Kagi mode)
+#import "ApolloKagiSearchParsing.h"  // ApolloKagiNormalizeSessionToken()
+#import "ApolloAccountCredentials.h"
+#import "ApolloWebJSON.h"           // ApolloWebJSONBearerIsSynthetic() — widget setup code
+#import "ApolloPerAccountFavorites.h"
+#import "ApolloICloudReadState.h"
+#import "ApolloFavoritesSorting.h"
+#import "ApolloState.h"
+#import "ApolloScrollToTop.h"
+#import "ApolloSessionRestoration.h"
+#import "ApolloTabBarHideStyle.h"
+#import "ApolloDuoRail.h"
+#import "ApolloDuoCompatibility.h"
+#import "ApolloDuoSplitView.h"
+#import "ApolloTagFilters.h"
+#import "ApolloBadgeBookScraper.h"   // ApolloBadgeBookInvalidate() — Clear Tweak Caches
+#import "ApolloUserProfileCache.h"
+#import "ApolloLinkPreviewCache.h"
+#import "ApolloLinkPreviewShapeMemory.h"
+#import "settings/ApolloDeletedCommentsSettingsViewController.h"
+#import "settings/ApolloLinkPreviewSettingsViewController.h"
+#import "settings/ApolloProfileLayoutViewController.h"
+#import "ApolloSubredditCustomBannerCache.h"
+#import "ApolloSubredditCustomIconCache.h"
+#import "ApolloSubredditInfoCache.h"
+#import "ApolloBannedProfile.h"
+#import "ApolloProfileSocialLinks.h"
+#import "ApolloWhatsNew.h"           // ApolloWhatsNewPresentForDebug() — TEMPORARY debug row
+#import "UserDefaultConstants.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import "B64ImageEncodings.h"
+// Relative path on purpose: a plain "Version.h" can resolve to theos's
+// vendored lowercase version.h from this subdirectory.
+#import "../Version.h"
+#import "Defaults.h"
+#import "settings/ApolloBackupRestore.h"
+#import "settings/ApolloBackupDocument.h"
+#import "settings/ApolloAutomaticBackup.h"
+#import "settings/ApolloAutomaticBackupViewController.h"
+#import "settings/ApolloLocalBackupsViewController.h"
+#import "settings/ApolloICloudBackupStore.h"
+#import "settings/ApolloICloudBackupsViewController.h"
+#import "settings/ApolloThanksToViewController.h"
+#import "settings/ApolloBuyUsACoffeeViewController.h"
+#import "settings/ApolloReportViewController.h"
+#import "crash/ApolloCrashManager.h"
+#import "crash/ApolloCrashReportsViewController.h"
+#import "settings/ApolloOpenInAppViewController.h"
+#import "settings/SavedCategoriesViewController.h"
+#import "settings/ApolloSubredditLayoutViewController.h"
+#import "settings/ApolloSubredditSectionsViewController.h"
+#import "ApolloActionMenuLayout.h"
+#import "settings/ApolloActionMenuSettingsViewController.h"
+#import "ApolloFollowingSection.h"
+#import "settings/TranslationSettingsViewController.h"
+#import "PictureInPictureViewController.h"
+#import "TagFiltersViewController.h"
+#import "ipad/ApolloPaneLayout.h"
+#import "ipad/ApolloIPadLayoutWelcome.h"
+
+// The six speeds the "Hold for Video Speed" picker offers, in display order. They
+// mirror the video player's own speed menu minus 1.0× (holding at normal speed
+// would be a no-op). ApolloSanitizedHoldSpeed() guards the stored value to this set.
+static const float kVideoHoldSpeeds[] = { 0.25f, 0.5f, 0.75f, 1.25f, 1.5f, 2.0f };
+static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailable);
+
+// Compact native pull-down used by Liquid Glass settings. The current value
+// stays visible in the row and the paired chevrons communicate that it opens
+// a menu rather than navigating to another screen.
+static UIButton *ApolloSettingsMenuButton(NSString *menuTitle,
+                                          NSString *currentTitle,
+                                          NSArray<NSString *> *titles,
+                                          NSInteger currentIndex,
+                                          void (^apply)(NSInteger index)) {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIImageSymbolConfiguration *symbolConfiguration =
+        [UIImageSymbolConfiguration configurationWithPointSize:9.0 weight:UIImageSymbolWeightSemibold];
+    UIImage *chevrons = [UIImage systemImageNamed:@"chevron.up.chevron.down"
+                                withConfiguration:symbolConfiguration];
+    UIColor *foreground = UIColor.secondaryLabelColor;
+    if (@available(iOS 15.0, *)) {
+        UIButtonConfiguration *configuration = [UIButtonConfiguration plainButtonConfiguration];
+        configuration.title = currentTitle;
+        configuration.image = chevrons;
+        configuration.imagePlacement = NSDirectionalRectEdgeTrailing;
+        configuration.imagePadding = 3.0;
+        configuration.contentInsets = NSDirectionalEdgeInsetsZero;
+        configuration.baseForegroundColor = foreground;
+        configuration.titleTextAttributesTransformer =
+            ^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *attributes) {
+                NSMutableDictionary *compact = [attributes mutableCopy];
+                compact[NSFontAttributeName] = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+                compact[NSForegroundColorAttributeName] = foreground;
+                return compact;
+            };
+        button.configuration = configuration;
+    } else {
+        [button setTitle:currentTitle forState:UIControlStateNormal];
+        [button setImage:chevrons forState:UIControlStateNormal];
+        [button setTitleColor:foreground forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        button.semanticContentAttribute = UISemanticContentAttributeForceRightToLeft;
+    }
+    button.tintColor = foreground;
+    NSMutableArray<UIAction *> *actions = [NSMutableArray arrayWithCapacity:titles.count];
+    [titles enumerateObjectsUsingBlock:^(NSString *title, NSUInteger index, __unused BOOL *stop) {
+        UIAction *action = [UIAction actionWithTitle:title image:nil identifier:nil
+                                             handler:^(__unused UIAction *selected) {
+            if (apply) apply((NSInteger)index);
+        }];
+        action.state = ((NSInteger)index == currentIndex)
+            ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [actions addObject:action];
+    }];
+    UIMenuOptions options = 0;
+    if (@available(iOS 15.0, *)) options = UIMenuOptionsSingleSelection;
+    button.menu = [UIMenu menuWithTitle:menuTitle image:nil identifier:nil
+                                options:options children:actions];
+    button.showsMenuAsPrimaryAction = YES;
+    button.accessibilityLabel = currentTitle;
+    [button sizeToFit];
+    return button;
+}
+
+// "0.25×" / "0.5×" / … / "2×", using the U+00D7 multiplication sign Apollo uses.
+static NSString *ApolloVideoHoldSpeedTitle(float speed) {
+    NSString *num;
+    if (fabsf(speed - 0.25f) < 0.001f)      num = @"0.25";
+    else if (fabsf(speed - 0.5f)  < 0.001f) num = @"0.5";
+    else if (fabsf(speed - 0.75f) < 0.001f) num = @"0.75";
+    else if (fabsf(speed - 1.25f) < 0.001f) num = @"1.25";
+    else if (fabsf(speed - 1.5f)  < 0.001f) num = @"1.5";
+    else if (fabsf(speed - 2.0f)  < 0.001f) num = @"2";
+    else                                    num = [NSString stringWithFormat:@"%g", speed];
+    return [num stringByAppendingFormat:@"%C", (unichar)0x00D7];
+}
+
+static BOOL sLinkPreviewModeRefreshPending = NO;
+static NSString *sPendingLinkPreviewModeRefreshArea = nil;
+static NSInteger sPendingLinkPreviewModeRefreshMode = ApolloLinkPreviewModeFull;
+
+static UIImage *ApolloAboutHeliosIcon(UITraitCollection *traits) {
+    static UIImage *lightArtwork;
+    static UIImage *darkArtwork;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        lightArtwork = ApolloAppIconPreview(@"helios", @"default");
+        darkArtwork = ApolloAppIconPreview(@"helios", @"dark");
+    });
+    if (!lightArtwork || !darkArtwork) return nil;
+
+    traits = traits ?: UITraitCollection.currentTraitCollection;
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.scale = traits.displayScale ?: UIScreen.mainScreen.scale;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
+        initWithSize:CGSizeMake(29.0, 29.0) format:format];
+    NSMutableArray<UIImage *> *images = [NSMutableArray arrayWithCapacity:2];
+    for (NSNumber *style in @[@(UIUserInterfaceStyleLight), @(UIUserInterfaceStyleDark)]) {
+        UIImage *artwork = style.integerValue == UIUserInterfaceStyleDark ? darkArtwork : lightArtwork;
+        UIImage *image = [[renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+            [artwork drawInRect:CGRectMake(0, 0, 29.0, 29.0)];
+        }] imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+        [images addObject:image];
+    }
+    return ApolloSettingsIconImage(images[0], images[1], traits);
+}
+
+static UIImage *ApolloGitHubSettingsArtwork(UIImage *artwork, UIImage *darkArtwork,
+                                            UITraitCollection *traits) {
+    if (!artwork || !darkArtwork) return nil;
+    return ApolloSettingsTileImage(UIColor.whiteColor, 29.0, traits,
+                                  ^(BOOL dark, __unused UIColor *resolvedColor) {
+        CGContextRef context = UIGraphicsGetCurrentContext();
+        CGContextSaveGState(context);
+        if (dark) {
+            CGRect rect = CGRectMake(3.5, 3.5, 22.0, 22.0);
+            [darkArtwork drawInRect:rect];
+        } else {
+            CGRect rect = CGRectMake(0, 0, 29.0, 29.0);
+            CGContextClearRect(context, rect);
+            [[UIBezierPath bezierPathWithRoundedRect:rect cornerRadius:6.5] addClip];
+            [artwork drawInRect:rect];
+        }
+        CGContextRestoreGState(context);
+    });
+}
+
+static UIImage *ApolloAboutGitHubMark(UIImage *artwork) {
+    static UIImage *mark;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CGImageRef source = artwork.CGImage;
+        if (!source) return;
+        size_t width = CGImageGetWidth(source), height = CGImageGetHeight(source);
+        if (!width || !height || width > 512 || height > 512) return;
+        uint8_t *pixels = (uint8_t *)calloc(width * height, 4);
+        if (!pixels) return;
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef context = CGBitmapContextCreate(pixels, width, height, 8, width * 4, colorSpace,
+                                                     kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(colorSpace);
+        if (!context) { free(pixels); return; }
+        CGContextDrawImage(context, CGRectMake(0, 0, width, height), source);
+        size_t minX = width, minY = height, maxX = 0, maxY = 0;
+        for (size_t y = 0; y < height; y++) {
+            for (size_t x = 0; x < width; x++) {
+                uint8_t *pixel = pixels + (y * width + x) * 4;
+                // Recover the black logo's coverage as an antialiased white mask.
+                unsigned luminance = (299 * pixel[0] + 587 * pixel[1] + 114 * pixel[2] + 500) / 1000;
+                uint8_t coverage = (uint8_t)(pixel[3] - MIN(luminance, pixel[3]));
+                pixel[0] = pixel[1] = pixel[2] = pixel[3] = coverage;
+                if (!coverage) continue;
+                minX = MIN(minX, x); minY = MIN(minY, y);
+                maxX = MAX(maxX, x); maxY = MAX(maxY, y);
+            }
+        }
+        if (minX != width) {
+            CGImageRef mask = CGBitmapContextCreateImage(context);
+            CGImageRef cropped = mask ? CGImageCreateWithImageInRect(mask,
+                CGRectMake(minX, minY, maxX - minX + 1, maxY - minY + 1)) : NULL;
+            if (cropped) {
+                mark = [UIImage imageWithCGImage:cropped scale:artwork.scale orientation:artwork.imageOrientation];
+                CGImageRelease(cropped);
+            }
+            if (mask) CGImageRelease(mask);
+        }
+        CGContextRelease(context);
+        free(pixels);
+    });
+    return mark;
+}
+
+static NSString *ApolloIPadPaneLayoutSettingDetail(void) {
+    if (!ApolloPaneLayoutSupported()) {
+        // Standard builds can't switch glass on, so point at the right build.
+        return ApolloLiquidGlassCanToggle()
+            ? @"Requires Liquid Glass. Turn it on under Interface \u2192 Appearance, then reopen Apollo."
+            : @"Requires the Liquid Glass version of Apollo Reborn.";
+    }
+    BOOL desired = [NSUserDefaults.standardUserDefaults boolForKey:UDKeyIPadPaneLayout];
+    BOOL active = ApolloPaneLayoutActive();
+    if (desired != active) {
+        return desired
+            ? @"Will turn on after Apollo quits and reopens. The current single-column layout remains active until then."
+            : @"Will turn off after Apollo quits and reopens. The current iPad Layout remains active until then.";
+    }
+    return @"Beta on iPadOS 26 or newer. Keep favorites in the sidebar and read posts and comments side by side. You can switch back anytime. Reopen Apollo to apply changes.";
+}
+
+@interface ApolloFeedShortcutsPreviewState : NSObject
+@property (nonatomic, copy) NSArray<NSNumber *> *visibleIndexes;
+@property (nonatomic) ApolloSubredditFeedIconStyle iconStyle;
+@property (nonatomic) ApolloSubredditFeedLayout layout;
+@property (nonatomic) BOOL hideDescriptions;
+@property (nonatomic) CGFloat previewHeight;
+@property (nonatomic) BOOL usesCompactFourUp;
+@property (nonatomic, strong) UITraitCollection *traitCollection;
+@end
+
+@implementation ApolloFeedShortcutsPreviewState
+@end
+
+static ApolloFeedShortcutsPreviewState *ApolloFeedShortcutsCurrentPreviewState(
+    UITraitCollection *traitCollection,
+    CGFloat availableWidth) {
+    ApolloFeedShortcutsPreviewState *state = [ApolloFeedShortcutsPreviewState new];
+    state.visibleIndexes = ApolloFeedShortcutDisplayIndexes();
+    state.iconStyle = (ApolloSubredditFeedIconStyle)sSubredditFeedIconStyle;
+    state.traitCollection = traitCollection;
+    state.layout = ApolloFeedShortcutEffectiveLayout(sSubredditFeedLayout,
+                                                       state.visibleIndexes.count,
+                                                       traitCollection);
+    state.usesCompactFourUp = ApolloFeedShortcutUsesCompactLayout(state.layout, state.visibleIndexes.count,
+                                                                  availableWidth, 336.0);
+    state.hideDescriptions = sHideSubredditListDescriptions;
+    if (state.layout == ApolloSubredditFeedLayoutRows) {
+        NSUInteger count = state.visibleIndexes.count;
+        CGFloat rowsHeight = (CGFloat)count * ApolloFeedShortcutPreviewRowItemHeight(traitCollection);
+        CGFloat spacingHeight = count > 1 ? (CGFloat)(count - 1) * 8.0 : 0.0;
+        state.previewHeight = rowsHeight + spacingHeight + 16.0;
+    } else {
+        state.previewHeight = ApolloFeedShortcutLayoutHeightForCount(state.layout, traitCollection,
+                                                                     state.visibleIndexes.count);
+    }
+    return state;
+}
+
+static UIFont *ApolloFeedShortcutsPreviewTitleFont(ApolloFeedShortcutsPreviewState *state) {
+    if (!state.usesCompactFourUp) {
+        return [UIFont preferredFontForTextStyle:UIFontTextStyleBody
+                          compatibleWithTraitCollection:state.traitCollection];
+    }
+    CGFloat pointSize = ApolloFeedShortcutCompactTitlePointSize(state.layout, state.visibleIndexes.count);
+    UIFont *baseFont = [UIFont systemFontOfSize:pointSize];
+    return [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody]
+        scaledFontForFont:baseFont
+        compatibleWithTraitCollection:state.traitCollection];
+}
+
+static CGFloat ApolloFeedShortcutsPreviewSideBySideCenterOffset(ApolloFeedShortcutsPreviewState *state) {
+    NSUInteger itemCount = state.visibleIndexes.count;
+    if (state.layout != ApolloSubredditFeedLayoutSideBySide || itemCount < 3) return 0.0;
+    if (ApolloFeedShortcutSplitsOntoTwoLines(state.layout, itemCount)) return 0.0; // each line centres itself
+
+    NSInteger firstIndex = state.visibleIndexes.firstObject.integerValue;
+    NSInteger lastIndex = state.visibleIndexes.lastObject.integerValue;
+    UIFont *font = ApolloFeedShortcutsPreviewTitleFont(state);
+    CGFloat firstTitleWidth = ceil([ApolloFeedShortcutShortTitle(firstIndex)
+        sizeWithAttributes:@{ NSFontAttributeName: font }].width);
+    CGFloat lastTitleWidth = ceil([ApolloFeedShortcutShortTitle(lastIndex)
+        sizeWithAttributes:@{ NSFontAttributeName: font }].width);
+    ApolloFeedShortcutItemGeometry firstGeometry =
+        ApolloFeedShortcutItemGeometryForLayout(state.layout, itemCount, firstIndex);
+    ApolloFeedShortcutItemGeometry lastGeometry =
+        ApolloFeedShortcutItemGeometryForLayout(state.layout, itemCount, lastIndex);
+    CGFloat visualCenterOffset = (firstGeometry.centerXOffset + lastGeometry.centerXOffset) / 2.0 +
+        (lastTitleWidth - firstTitleWidth) / 4.0;
+    CGFloat scale = UIScreen.mainScreen.scale;
+    return round(-visualCenterOffset * scale) / scale;
+}
+
+@interface ApolloFeedShortcutsPreviewView : UIView
+@property (nonatomic, weak) UITableView *hostTableView;
+@property (nonatomic, strong) ApolloFeedShortcutsPreviewState *previewState;
+@property (nonatomic, strong) NSDictionary<NSNumber *, UIView *> *shortcutItemViewsByIndex;
+@property (nonatomic, strong) NSArray<UIView *> *shortcutSeparators;
+- (void)apollo_configurePreview;
+@end
+
+@implementation ApolloFeedShortcutsPreviewView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+
+    self.backgroundColor = UIColor.clearColor;
+    self.opaque = NO;
+    return self;
+}
+
+- (UIStackView *)apollo_textStackWithTitle:(NSString *)title detail:(NSString *)detail {
+    UILabel *titleLabel = [UILabel new];
+    titleLabel.text = title;
+    titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    titleLabel.textColor = UIColor.labelColor;
+    titleLabel.adjustsFontForContentSizeCategory = YES;
+
+    NSMutableArray<UIView *> *labels = [NSMutableArray arrayWithObject:titleLabel];
+    if (detail.length > 0) {
+        UILabel *detailLabel = [UILabel new];
+        detailLabel.text = detail;
+        detailLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+        detailLabel.textColor = UIColor.secondaryLabelColor;
+        detailLabel.adjustsFontForContentSizeCategory = YES;
+        [labels addObject:detailLabel];
+    }
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:labels];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.alignment = UIStackViewAlignmentLeading;
+    stack.spacing = 1.0;
+    return stack;
+}
+
+- (UIView *)apollo_previewItemAtIndex:(NSInteger)index
+                            itemCount:(NSUInteger)itemCount
+                               layout:(ApolloSubredditFeedLayout)layout
+                          contentView:(UIView **)contentView
+             contentCenterXConstraint:(NSLayoutConstraint **)contentCenterXConstraint {
+    UIImageView *iconView = [[UIImageView alloc] initWithImage:ApolloFeedShortcutIconImage(index,
+                                                                                           self.previewState.iconStyle,
+                                                                                           layout,
+                                                                                           itemCount)];
+    iconView.contentMode = UIViewContentModeScaleAspectFit;
+    iconView.translatesAutoresizingMaskIntoConstraints = NO;
+
+    if (layout == ApolloSubredditFeedLayoutRows) {
+        CGFloat iconSize = ApolloFeedShortcutDisplayIconSize(self.previewState.iconStyle, layout, itemCount);
+        [NSLayoutConstraint activateConstraints:@[
+            [iconView.widthAnchor constraintEqualToConstant:iconSize],
+            [iconView.heightAnchor constraintEqualToConstant:iconSize]
+        ]];
+        NSString *detail = self.previewState.hideDescriptions ? nil : ApolloFeedShortcutDetail(index);
+        UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[
+            iconView,
+            [self apollo_textStackWithTitle:ApolloFeedShortcutRowTitle(index) detail:detail]
+        ]];
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.alignment = UIStackViewAlignmentCenter;
+        row.spacing = 12.0;
+        [row.heightAnchor constraintEqualToConstant:ApolloFeedShortcutPreviewRowItemHeight(
+            self.previewState.traitCollection)].active = YES;
+        return row;
+    }
+
+    BOOL sideBySide = layout == ApolloSubredditFeedLayoutSideBySide;
+    BOOL iconDock = layout == ApolloSubredditFeedLayoutIconDock;
+    ApolloFeedShortcutItemGeometry geometry =
+        ApolloFeedShortcutItemGeometryForLayout(layout, itemCount, index);
+    BOOL compactSideBySide = self.previewState.usesCompactFourUp && sideBySide;
+    BOOL compactGrid = self.previewState.usesCompactFourUp &&
+        layout == ApolloSubredditFeedLayoutGrid;
+    CGFloat iconSize = ApolloFeedShortcutDisplayIconSize(self.previewState.iconStyle, layout, itemCount);
+    if (compactSideBySide) iconSize = MIN(iconSize, 28.0);
+    [NSLayoutConstraint activateConstraints:@[
+        [iconView.widthAnchor constraintEqualToConstant:iconSize],
+        [iconView.heightAnchor constraintEqualToConstant:iconSize]
+    ]];
+    UILabel *label = nil;
+    if (!iconDock) {
+        label = [UILabel new];
+        label.text = ApolloFeedShortcutShortTitle(index);
+        label.font = ApolloFeedShortcutsPreviewTitleFont(self.previewState);
+        label.textColor = UIColor.labelColor;
+        label.adjustsFontForContentSizeCategory = YES;
+        label.adjustsFontSizeToFitWidth = YES;
+        label.minimumScaleFactor = 0.5;
+        label.lineBreakMode = NSLineBreakByClipping;
+        label.textAlignment = NSTextAlignmentCenter;
+        [label setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+                                              forAxis:UILayoutConstraintAxisHorizontal];
+    }
+
+    NSArray<UIView *> *arrangedSubviews = iconDock ? @[ iconView ] : @[ iconView, label ];
+    UIStackView *content = [[UIStackView alloc] initWithArrangedSubviews:arrangedSubviews];
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    content.axis = sideBySide
+        ? UILayoutConstraintAxisHorizontal
+        : UILayoutConstraintAxisVertical;
+    content.alignment = UIStackViewAlignmentCenter;
+    content.spacing = compactSideBySide ? 2.5 : ApolloFeedShortcutContentSpacing(layout, itemCount);
+
+    UIView *item = [UIView new];
+    [item addSubview:content];
+    NSLayoutConstraint *centerConstraint = [content.centerXAnchor constraintEqualToAnchor:item.centerXAnchor];
+    centerConstraint.constant = geometry.centerXOffset + (compactGrid && index == 3 ? 2.0 : 0.0);
+    [NSLayoutConstraint activateConstraints:@[
+        centerConstraint,
+        [content.centerYAnchor constraintEqualToAnchor:item.centerYAnchor]
+    ]];
+    if (!geometry.usesFlexibleSideBySideLayout) {
+        CGFloat horizontalMargin = compactGrid ? 0.0 : geometry.horizontalMargin;
+        [NSLayoutConstraint activateConstraints:@[
+            [content.leadingAnchor constraintGreaterThanOrEqualToAnchor:item.leadingAnchor constant:horizontalMargin],
+            [content.trailingAnchor constraintLessThanOrEqualToAnchor:item.trailingAnchor constant:-horizontalMargin]
+        ]];
+    }
+    if (contentView) *contentView = content;
+    if (contentCenterXConstraint) *contentCenterXConstraint = centerConstraint;
+    return item;
+}
+
+- (void)apollo_configurePreview {
+    ApolloFeedShortcutsPreviewState *state = self.previewState;
+    if (!state) return;
+    NSArray<NSNumber *> *visibleIndexes = state.visibleIndexes;
+    ApolloSubredditFeedLayout layout = state.layout;
+    BOOL usesShortcutLayout = layout != ApolloSubredditFeedLayoutRows;
+    NSMutableArray<UIView *> *shortcutItems = [NSMutableArray arrayWithCapacity:visibleIndexes.count];
+    NSMutableDictionary<NSNumber *, UIView *> *itemViewsByIndex =
+        [NSMutableDictionary dictionaryWithCapacity:visibleIndexes.count];
+    NSMutableArray<UIView *> *contentViews = [NSMutableArray arrayWithCapacity:visibleIndexes.count];
+    NSMutableArray<NSLayoutConstraint *> *centerConstraints = [NSMutableArray arrayWithCapacity:visibleIndexes.count];
+    for (NSNumber *index in visibleIndexes) {
+        UIView *contentView = nil;
+        NSLayoutConstraint *centerConstraint = nil;
+        UIView *item = [self apollo_previewItemAtIndex:index.integerValue
+                                             itemCount:visibleIndexes.count
+                                                layout:layout
+                                           contentView:&contentView
+                              contentCenterXConstraint:&centerConstraint];
+        [shortcutItems addObject:item];
+        itemViewsByIndex[index] = item;
+        if (contentView) [contentViews addObject:contentView];
+        if (centerConstraint) [centerConstraints addObject:centerConstraint];
+    }
+    self.shortcutItemViewsByIndex = [itemViewsByIndex copy];
+
+    if (usesShortcutLayout) {
+        UIColor *separatorColor = ApolloThemeSeparatorColor()
+            ?: self.hostTableView.separatorColor
+            ?: UIColor.separatorColor;
+        self.shortcutSeparators = ApolloFeedShortcutInstallLayout(self,
+                                                                   shortcutItems,
+                                                                   contentViews,
+                                                                   centerConstraints,
+                                                                   layout,
+                                                                   separatorColor,
+                                                                   ApolloFeedShortcutsPreviewSideBySideCenterOffset(state));
+        if (layout == ApolloSubredditFeedLayoutSideBySide && contentViews.count >= 3) {
+            [NSLayoutConstraint activateConstraints:@[
+                [contentViews.firstObject.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.leadingAnchor],
+                [contentViews.lastObject.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor]
+            ]];
+        }
+        return;
+    }
+    self.shortcutSeparators = @[];
+
+    UIStackView *previewStack = [[UIStackView alloc] initWithArrangedSubviews:shortcutItems];
+    previewStack.axis = UILayoutConstraintAxisVertical;
+    previewStack.alignment = UIStackViewAlignmentFill;
+    previewStack.distribution = UIStackViewDistributionFillEqually;
+    previewStack.spacing = 8.0;
+    previewStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:previewStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [previewStack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16.0],
+        [previewStack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16.0],
+        [previewStack.topAnchor constraintEqualToAnchor:self.topAnchor constant:8.0],
+        [previewStack.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-8.0]
+    ]];
+}
+
+@end
+
+@interface CustomAPIViewController (ApolloFeedShortcutsPreview)
+- (void)apollo_refreshFeedShortcutsPreviewAnimated:(BOOL)animated;
+@end
+
+static BOOL ApolloInterfaceSupportsPhoneTabBarControls(void) {
+    return ApolloDuoCurrentMode() == ApolloDuoModePhone && !ApolloDuoRailHasVisibleSideBar();
+}
+
+static BOOL ApolloInterfaceSupportsBarScrollSettings(void) {
+    // Duo preferences stay configurable in every pose, even when the bottom
+    // tab bar is currently replaced by the always-visible side rail.
+    return ApolloDuoUsesAdaptiveBars() || ApolloInterfaceSupportsPhoneTabBarControls();
+}
+
+@interface CustomAPIViewController ()
+@property (nonatomic) BOOL resolvingRestoreFolder;
+// Hub only: whether the Setup section last rendered its "add a Reddit key"
+// footer, so viewWillAppear reloads that section only when the answer flips.
+@property (nonatomic) BOOL setupFooterShowsKeyNudge;
+// A height pass for restyled link footers is queued (see
+// -apollo_refreshFooterTextViews).
+@property (nonatomic) BOOL footerLinkHeightPassPending;
+@end
+
+// A UISlider that suspends ancestor pan/swipe/edge gestures while the user is
+// dragging it. Apollo's settings live in horizontally swipe-navigable panes, and
+// that swipe recognizer (plus the table's scroll pan) otherwise steals the
+// slider's left/right drag -- you'd have to drag UP first to make the swipe fail
+// before the slider would track. beginTracking fires on touchesBegan, before any
+// ancestor recognizer decides on the subsequent moves, so disabling them here
+// lets the slider own the horizontal drag; they're restored when tracking ends.
+@interface ApolloAPSlider : UISlider
+@property (nonatomic, strong) NSMutableArray<UIGestureRecognizer *> *apSuspended;
+@end
+
+@implementation ApolloAPSlider
+- (UIViewController *)apOwningViewController {
+    UIResponder *r = self.nextResponder;
+    while (r && ![r isKindOfClass:[UIViewController class]]) r = r.nextResponder;
+    return (UIViewController *)r;
+}
+- (void)apSuspendAncestorGestures {
+    if (!self.apSuspended) self.apSuspended = [NSMutableArray array];
+    // Disable EVERY enabled gesture recognizer on the whole ancestor chain (up
+    // through the window) for the duration of the drag. Apollo's swipe-to-exit
+    // gesture isn't necessarily a stock UIPan/Swipe/ScreenEdge subclass, so
+    // class-filtering missed it; during a slider drag nothing else needs to
+    // recognize, and everything is restored the moment tracking ends.
+    for (UIView *v = self.superview; v; v = v.superview) {
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            if (gr.isEnabled) { gr.enabled = NO; [self.apSuspended addObject:gr]; }
+        }
+    }
+    // The interactive-pop gesture can live on the nav controller's view (not
+    // always on the ancestor chain we can see); disable it explicitly too.
+    UIGestureRecognizer *pop = [self apOwningViewController].navigationController.interactivePopGestureRecognizer;
+    if (pop && pop.isEnabled) { pop.enabled = NO; [self.apSuspended addObject:pop]; }
+}
+- (void)apRestoreAncestorGestures {
+    for (UIGestureRecognizer *gr in self.apSuspended) gr.enabled = YES;
+    [self.apSuspended removeAllObjects];
+}
+- (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    // UIControl only follows up with end/cancelTracking when this returns YES
+    // (a tap on the bare track returns NO), so only suspend for a real drag.
+    BOOL tracking = [super beginTrackingWithTouch:touch withEvent:event];
+    if (tracking) [self apSuspendAncestorGestures];
+    return tracking;
+}
+- (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
+    [super endTrackingWithTouch:touch withEvent:event];
+    [self apRestoreAncestorGestures];
+}
+- (void)cancelTrackingWithEvent:(UIEvent *)event {
+    [super cancelTrackingWithEvent:event];
+    [self apRestoreAncestorGestures];
+}
+@end
+
+@implementation CustomAPIViewController
+
+typedef NS_ENUM(NSInteger, Tag) {
+    TagRedditClientId = 0,
+    TagRedditClientSecret,
+    TagImgurClientId,
+    TagImageChestAPIToken,
+    TagGiphyAPIKey,
+    TagRedirectURI,
+    TagUserAgent,
+    TagTrendingSubredditsSource,
+    TagRandomSubredditsSource,
+    TagRandNsfwSubredditsSource,
+    TagTrendingLimit,
+    TagRecentlyVisitedLimit,
+    TagReadPostMaxCount,
+    TagNotificationBackendURL,
+    TagNotificationBackendRegistrationToken,
+    TagBarkPushURL,
+    TagKagiSessionLink,
+};
+
+#pragma mark - Helpers
+
+- (UITextField *)apollo_textFieldInCell:(UITableViewCell *)cell {
+    for (UIView *subview in cell.contentView.subviews) {
+        if ([subview isKindOfClass:[UITextField class]]) {
+            return (UITextField *)subview;
+        }
+    }
+    return nil;
+}
+
+- (BOOL)apollo_isMaskedAPIKeyTag:(NSInteger)tag {
+    return tag == TagRedditClientId
+        || tag == TagRedditClientSecret
+        || tag == TagImgurClientId
+        || tag == TagImageChestAPIToken
+        || tag == TagGiphyAPIKey
+        || tag == TagKagiSessionLink;
+}
+
+- (void)apollo_applySecureTextEntry:(BOOL)secure toCell:(UITableViewCell *)cell {
+    [self apollo_textFieldInCell:cell].secureTextEntry = secure;
+}
+
+- (NSArray<NSString *> *)registeredURLSchemes {
+    NSArray *urlTypes = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleURLTypes"];
+    NSMutableArray *schemes = [NSMutableArray array];
+    for (NSDictionary *urlType in urlTypes) {
+        NSArray *urlSchemes = urlType[@"CFBundleURLSchemes"];
+        if (urlSchemes) {
+            for (NSString *scheme in urlSchemes) {
+                if (![scheme hasPrefix:@"twitterkit-"]) {
+                    [schemes addObject:scheme];
+                }
+            }
+        }
+    }
+    return schemes;
+}
+
+- (BOOL)isRedirectURISchemeValid:(NSString *)uriString {
+    if (uriString.length == 0) {
+        return YES; // Empty uses default, which is valid
+    }
+    NSURL *url = [NSURL URLWithString:uriString];
+    NSString *scheme = [url scheme];
+    if (!scheme) {
+        return NO;
+    }
+    NSArray *registeredSchemes = [self registeredURLSchemes];
+    for (NSString *registered in registeredSchemes) {
+        if ([scheme caseInsensitiveCompare:registered] == NSOrderedSame) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (BOOL)apollo_usesCustomOAuthSignIn {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseCustomOAuthSignIn];
+}
+
+- (NSString *)apollo_redirectURIDetailText {
+    if ([self apollo_usesCustomOAuthSignIn]) {
+        return @"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported, including http/https (required for \"Web app\" Reddit API clients).";
+    }
+
+    NSString *registered = [[self registeredURLSchemes] componentsJoinedByString:@", "];
+    if (registered.length == 0) registered = @"none";
+    return [NSString stringWithFormat:@"Must match the app whose API key you're using. URI scheme (part before ://) must be registered in Info.plist under CFBundleURLTypes. Registered: %@", registered];
+}
+
+- (void)apollo_applyRedirectURITextColorToCell:(UITableViewCell *)cell {
+    UITextField *textField = [self apollo_textFieldInCell:cell];
+    if (!textField) return;
+    textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
+}
+
+- (UIImage *)decodeBase64ToImage:(NSString *)strEncodeData {
+    NSData *data = [[NSData alloc]initWithBase64EncodedString:strEncodeData options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    return [UIImage imageWithData:data];
+}
+
+- (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+        message:message
+        preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil];
+    [alert addAction:okAction];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)apollo_applyThemeToCell:(UITableViewCell *)cell {
+    [super apollo_applyThemeToCell:cell];
+    if (!cell) return;
+
+    // Fill via the cell's own layer (super sets cell.backgroundColor), NOT
+    // contentView: UIKit layers the selectedBackgroundView between the
+    // background and the contentView, so an opaque contentView would hide the
+    // tap highlight everywhere except the accessory gutter (the ">" arrow sits
+    // outside contentView). Keeping contentView clear lets the highlight show
+    // across the whole row while the layer fill keeps the unselected colour
+    // identical.
+    cell.contentView.backgroundColor = [UIColor clearColor];
+
+    UIView *selectedBackground = [[UIView alloc] init];
+    selectedBackground.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.18];
+    cell.selectedBackgroundView = selectedBackground;
+}
+
+// Restyles the link footers the table is showing for the current theme, the way
+// they are built. A footer that was showing when the theme changed under a
+// pushed screen (Theme Manager is one of the hub's Shortcuts) otherwise came
+// back with the old theme's text colour, link colour and font. UIKit shows
+// these footers as plain views, and -footerViewForSection: only returns
+// UITableViewHeaderFooterViews, so they are found among the table's own
+// subviews by the section title each was tagged with in
+// -tableView:viewForFooterInSection:.
+- (void)apollo_refreshFooterTextViews {
+    BOOL heightChanged = NO;
+    NSInteger sectionCount = self.tableView.numberOfSections;
+    for (NSInteger section = 0; section < sectionCount; section++) {
+        UIView *footerView = [self.tableView footerViewForSection:section];
+        if (![footerView isKindOfClass:[ApolloSettingsLinkFooterView class]]) continue;
+
+        UITextView *textView = ((ApolloSettingsLinkFooterView *)footerView).linkTextView;
+        NSAttributedString *text = [self footerAttributedTextForSection:section];
+        if (!text) continue;
+        [self apollo_styleFooterLinkTextView:textView withText:text];
+        CGFloat width = CGRectGetWidth(textView.bounds) ?: [self apollo_footerLinkWidthInTableView:self.tableView];
+        if (width <= 0) continue;
+        CGFloat fitted = ceil([textView sizeThatFits:CGSizeMake(width, CGFLOAT_MAX)].height);
+        if (fabs(fitted - CGRectGetHeight(footerView.bounds)) >= 0.5) heightChanged = YES;
+    }
+    if (heightChanged) [self apollo_scheduleFooterLinkHeightPass];
+}
+
+// A theme font change can leave a restyled link footer taller than the height
+// the table gave it (its last lines cut off) or shorter. An empty updates pass
+// makes the table ask -tableView:heightForFooterInSection: again, which
+// measures the same way. Run it once any transition is over (a pass during one
+// gets its settle captured), and keep the rows on screen where they are.
+- (void)apollo_scheduleFooterLinkHeightPass {
+    if (self.footerLinkHeightPassPending) return;
+    self.footerLinkHeightPassPending = YES;
+    __weak typeof(self) weakSelf = self;
+    void (^pass)(void) = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.footerLinkHeightPassPending = NO;
+        UITableView *tableView = strongSelf.tableView;
+        if (!tableView.window) return;
+        ApolloLog(@"[SettingsForm] link footers changed height with the theme — re-measuring");
+        [strongSelf performUpdateKeepingVisibleRowsInPlace:^{
+            [tableView beginUpdates];
+            [tableView endUpdates];
+        }];
+    };
+    id<UIViewControllerTransitionCoordinator> coordinator = self.transitionCoordinator;
+    if (coordinator && [coordinator animateAlongsideTransition:nil
+                                                   completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) { pass(); }]) {
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), pass);
+}
+
+- (UIImage *)roundedImage:(UIImage *)image size:(CGFloat)size cornerRadius:(CGFloat)radius {
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(size, size)];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
+        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, size, size) cornerRadius:radius] addClip];
+        [image drawInRect:CGRectMake(0, 0, size, size)];
+    }];
+}
+
+- (NSString *)preferredGIFFallbackFormatText {
+    return (sPreferredGIFFallbackFormat == 0) ? @"GIF" : @"MP4";
+}
+
+- (BOOL)apollo_nativeHideBarsOnScrollEnabled {
+    return ApolloTabBarHideBarsEnabled();
+}
+
+- (void)setPreferredGIFFallbackFormat:(NSInteger)format {
+    sPreferredGIFFallbackFormat = (format == 0) ? 0 : 1;
+    [[NSUserDefaults standardUserDefaults] setInteger:sPreferredGIFFallbackFormat forKey:UDKeyPreferredGIFFallbackFormat];
+    [self reloadRowWithID:@"media.gifFallback"];
+}
+
+// Title + options + "(Current)" only — the shared picker replicates it exactly
+// (apply fires even when the current option is re-picked; the setter is idempotent).
+- (void)presentPreferredGIFFallbackFormatSheetFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Preferred GIF Fallback Format",
+                                @[@"MP4", @"GIF"],
+                                (sPreferredGIFFallbackFormat == 1) ? 0 : 1,
+                                ^(NSInteger pickedIndex) {
+        [weakSelf setPreferredGIFFallbackFormat:(pickedIndex == 0) ? 1 : 0];
+    });
+}
+
+- (NSString *)unmuteCommentsVideosModeText {
+    switch (sUnmuteCommentsVideos) {
+        case 1:  return @"Remember";
+        case 2:  return @"Always";
+        default: return @"Default";
+    }
+}
+
+- (void)setUnmuteCommentsVideosMode:(NSInteger)mode {
+    sUnmuteCommentsVideos = mode;
+    [[NSUserDefaults standardUserDefaults] setInteger:sUnmuteCommentsVideos forKey:UDKeyUnmuteCommentsVideos];
+    [self reloadRowWithID:@"media.unmuteComments"];
+}
+
+// Title + options + "(Current)" only — shared picker (option index == stored mode).
+- (void)presentUnmuteCommentsVideosModeSheetFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Unmute Videos in Comments",
+                                @[@"Default", @"Remember from Fullscreen Player", @"Always"],
+                                sUnmuteCommentsVideos,
+                                ^(NSInteger pickedIndex) {
+        [weakSelf setUnmuteCommentsVideosMode:pickedIndex];
+    });
+}
+
+- (NSString *)shareLinkHostText {
+    return ApolloShareLinkHostDisplayName((ShareLinkHost)sShareLinkHost);
+}
+
+- (void)setShareLinkHost:(NSInteger)host {
+    if (host == ShareLinkHostRetiredOldReddit ||
+        host < ShareLinkHostDefault || host > ShareLinkHostFXReddit) {
+        host = ShareLinkHostDefault;
+    }
+    sShareLinkHost = host;
+    [[NSUserDefaults standardUserDefaults] setInteger:sShareLinkHost
+                                                forKey:UDKeyShareLinkHost];
+    [self reloadRowWithID:@"media.shareLinkHost"];
+}
+
+- (void)presentShareLinkHostSheetFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    NSArray<NSNumber *> *hostValues = @[
+        @(ShareLinkHostDefault), @(ShareLinkHostVXReddit), @(ShareLinkHostFXReddit)
+    ];
+    NSUInteger currentIndex = [hostValues indexOfObject:@(sShareLinkHost)];
+    if (currentIndex == NSNotFound) currentIndex = 0;
+    ApolloSettingsPresentPicker(
+        self,
+        sourceView,
+        @"Share Link Host",
+        @[
+            ApolloShareLinkHostDisplayName(ShareLinkHostDefault),
+            ApolloShareLinkHostDisplayName(ShareLinkHostVXReddit),
+            ApolloShareLinkHostDisplayName(ShareLinkHostFXReddit)
+        ],
+        (NSInteger)currentIndex,
+        ^(NSInteger pickedIndex) {
+            if (pickedIndex >= 0 && pickedIndex < (NSInteger)hostValues.count) {
+                [weakSelf setShareLinkHost:hostValues[(NSUInteger)pickedIndex].integerValue];
+            }
+        });
+}
+
+- (NSString *)unmuteFeedVideosModeText {
+    switch (sUnmuteFeedVideos) {
+        case 1:  return @"Remember";
+        case 2:  return @"Always";
+        default: return @"Never";
+    }
+}
+
+- (void)setUnmuteFeedVideosMode:(NSInteger)mode {
+    sUnmuteFeedVideos = mode;
+    [[NSUserDefaults standardUserDefaults] setInteger:sUnmuteFeedVideos forKey:UDKeyUnmuteFeedVideos];
+    [self reloadRowWithID:@"media.unmuteFeed"];
+}
+
+// Title + options + "(Current)" only — shared picker (option index == stored mode).
+- (void)presentUnmuteFeedVideosModeSheetFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Unmute Videos in Feed",
+                                @[@"Never", @"Remember", @"Always"],
+                                sUnmuteFeedVideos,
+                                ^(NSInteger pickedIndex) {
+        [weakSelf setUnmuteFeedVideosMode:pickedIndex];
+    });
+}
+
+- (void)feedVideoScrubberSwitchToggled:(UISwitch *)sender {
+    sFeedVideoScrubber = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedVideoScrubber forKey:UDKeyFeedVideoScrubber];
+}
+
+- (void)videoScrollSmoothingSwitchToggled:(UISwitch *)sender {
+    sFeedVideoScrollSmoothing = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedVideoScrollSmoothing forKey:UDKeyFeedVideoScrollSmoothing];
+}
+
+- (void)forwardSwipeForgetSwitchToggled:(UISwitch *)sender {
+    sForwardSwipeForgetAfterScrolling = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sForwardSwipeForgetAfterScrolling
+                                            forKey:UDKeyForwardSwipeForgetAfterScrolling];
+}
+
+- (NSString *)mediaUploadProviderText {
+    switch (sImageUploadProvider) {
+        case ImageUploadProviderReddit:   return @"Reddit";
+        case ImageUploadProviderImgChest: return @"Image Chest";
+        case ImageUploadProviderImgur:
+        default:                          return @"Imgur";
+    }
+}
+
+- (void)setImageUploadProvider:(NSInteger)provider {
+    sImageUploadProvider = provider;
+    [[NSUserDefaults standardUserDefaults] setInteger:sImageUploadProvider forKey:UDKeyImageUploadProvider];
+    [self reloadRowWithID:@"media.uploadHost"];
+}
+
+- (void)presentImageUploadProviderSheetFromSourceView:(UIView *)sourceView {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Media Upload Host"
+                                                                   message:@"Where to upload media attached to posts and comments."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSString *imgurTitle = (sImageUploadProvider == ImageUploadProviderImgur) ? @"Imgur (Current)" : @"Imgur";
+    NSString *redditTitle = (sImageUploadProvider == ImageUploadProviderReddit) ? @"Reddit (Current)" : @"Reddit";
+    NSString *imgChestTitle = (sImageUploadProvider == ImageUploadProviderImgChest) ? @"Image Chest (Current)" : @"Image Chest";
+
+    [sheet addAction:[UIAlertAction actionWithTitle:imgurTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self setImageUploadProvider:ImageUploadProviderImgur];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:redditTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self setImageUploadProvider:ImageUploadProviderReddit];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:imgChestTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        // Uploading requires an API token (free at imgchest.com); without one
+        // there is nothing to authenticate the POST with.
+        if (sImageChestAPIToken.length == 0) {
+            [self showAlertWithTitle:@"Image Chest API Key Required"
+                             message:@"Add your Image Chest API key under Apollo Reborn → Accounts & API Keys first, then select Image Chest as the upload host."];
+            return;
+        }
+        [self setImageUploadProvider:ImageUploadProviderImgChest];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (NSString *)commentLinkHostText {
+    switch (sCommentLinkHost) {
+        case CommentLinkHostImgur:    return @"Imgur";
+        case CommentLinkHostImgChest: return @"Image Chest";
+        case CommentLinkHostOff:
+        default:                      return @"Off";
+    }
+}
+
+- (void)setCommentLinkHost:(NSInteger)host {
+    sCommentLinkHost = host;
+    [[NSUserDefaults standardUserDefaults] setInteger:sCommentLinkHost forKey:UDKeyCommentLinkHost];
+    // An open comment composer's image-button gate depends on this (the button
+    // un-blocks while a link host is set) — let it re-apply immediately.
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloCommentLinkHostChangedNotification object:nil];
+    [self reloadRowWithID:@"media.commentLinkHost"];
+    // The Prefer Native Images row is only shown while a link host is set.
+    [self visibilityDidChange];
+}
+
+- (void)commentLinkPreferNativeSwitchToggled:(UISwitch *)sender {
+    sCommentLinkPreferNative = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyCommentLinkPreferNative];
+}
+
+- (void)presentCommentLinkHostSheetFromSourceView:(UIView *)sourceView {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Comment Link Host"
+                                                                   message:@"Images added to a comment or reply upload to this host and are inserted as a plain link instead of a native Reddit image — so they still work in subreddits that don't allow images or GIFs in comments. Apollo shows the linked image inline; other apps and the website show a tappable link. Posts keep using the Media Upload Host.\n\nTo use this host only where it's needed, turn on Prefer Native Images: comment images then upload to Reddit and display inline wherever the subreddit allows them."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSString *offTitle = (sCommentLinkHost == CommentLinkHostOff) ? @"Off (Current)" : @"Off";
+    NSString *imgurTitle = (sCommentLinkHost == CommentLinkHostImgur) ? @"Imgur (Current)" : @"Imgur";
+    NSString *imgChestTitle = (sCommentLinkHost == CommentLinkHostImgChest) ? @"Image Chest (Current)" : @"Image Chest";
+
+    [sheet addAction:[UIAlertAction actionWithTitle:offTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        [self setCommentLinkHost:CommentLinkHostOff];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:imgurTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        // Uploads are signed with the Imgur client id at the request chokepoint;
+        // keyless ones just 401 — refuse the host rather than fail silently later.
+        if (sImgurClientId.length == 0) {
+            [self showAlertWithTitle:@"Imgur API Key Required"
+                             message:@"Add your Imgur API key under Apollo Reborn → Accounts & API Keys first, then select Imgur as the comment link host."];
+            return;
+        }
+        [self setCommentLinkHost:CommentLinkHostImgur];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:imgChestTitle style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        // Same gate as the Media Upload Host picker: uploading needs an API token.
+        if (sImageChestAPIToken.length == 0) {
+            [self showAlertWithTitle:@"Image Chest API Key Required"
+                             message:@"Add your Image Chest API key under Apollo Reborn → Accounts & API Keys first, then select Image Chest as the comment link host."];
+            return;
+        }
+        [self setCommentLinkHost:CommentLinkHostImgChest];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (NSString *)linkPreviewModeTextForMode:(NSInteger)mode {
+    switch (mode) {
+        case ApolloLinkPreviewModeOff:     return @"Off";
+        case ApolloLinkPreviewModeCompact: return @"Compact";
+        case ApolloLinkPreviewModeFull:
+        default:                           return @"Full";
+    }
+}
+
+- (void)openLinkPreviewSettings {
+    ApolloLinkPreviewSettingsViewController *vc =
+        [[ApolloLinkPreviewSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    __weak typeof(self) weakSelf = self;
+    vc.settingsDidChange = ^(NSString *area) {
+        [weakSelf noteLinkPreviewChangeForArea:area];
+    };
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
+- (void)openDeletedCommentsSettings {
+    ApolloDeletedCommentsSettingsViewController *vc =
+        [[ApolloDeletedCommentsSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
+
+// The Rich Link Preview sub-screen mutates the shared state and posts the live
+// notification itself; this just arms the deferred refresh so the feed/comments
+// rebuild once the whole settings stack is dismissed (mirrors the old in-Media
+// setters' use of these flags, consumed in viewWillDisappear).
+- (void)noteLinkPreviewChangeForArea:(NSString *)area {
+    sLinkPreviewModeRefreshPending = YES;
+    sPendingLinkPreviewModeRefreshArea = area.length > 0 ? area : @"card-color";
+    sPendingLinkPreviewModeRefreshMode = ApolloLinkPreviewModeFull;
+}
+
+#pragma mark - View Lifecycle
+
+// The hub and its group screens share this class family; hub-only behavior
+// (including the API-key setup footer) keys off this.
+- (BOOL)apollo_isHub {
+    return [self class] == [CustomAPIViewController class];
+}
+
+// Screen title; group-screen subclasses override.
+- (NSString *)apollo_screenTitle {
+    return @"Apollo Reborn";
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+
+    self.title = [self apollo_screenTitle];
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(apollo_iCloudReadStateDidChange:)
+        name:ApolloICloudReadStateDidChangeNotification object:nil];
+
+    if (![self apollo_isHub]) return;
+    // What the first table load renders; viewWillAppear compares against it.
+    self.setupFooterShowsKeyNudge = sRedditClientId.length == 0;
+}
+
+- (void)apollo_iCloudReadStateDidChange:(__unused NSNotification *)notification {
+    [self reloadRowWithID:@"gen.iCloudReadState"];
+    [self reloadRowWithID:@"gen.iCloudReadStateStatus"];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self apollo_applyTheme];
+    // The theme may have changed while this screen was covered (Theme Manager
+    // is one of the hub's Shortcuts).
+    [self apollo_refreshFooterTextViews];
+    // Refresh the Web Session Login status line after returning from the login
+    // flow (signed-in user / write-token availability may have just changed).
+    // No-ops while the row is hidden (API-Key-Free Mode off).
+    [self reloadRowWithID:@"api.webSessionLogin"];
+    // Modern Chat/Modmail can be switched from other surfaces (and the one-time
+    // migration writes them on first launch) — re-read both.
+    [self reloadRowWithID:@"api.modernChat"];
+    [self reloadRowWithID:@"api.modernModmail"];
+    // Refresh the Apollo AI and Rich Link Previews status subtitles after returning
+    // from their subviews.
+    [self reloadRowWithID:@"feat.infoRow"];
+    [self reloadRowWithID:@"ai.settings"];
+    [self reloadRowWithID:@"inlineMedia.settings"];
+    [self reloadRowWithID:@"linkPreviews.settings"];
+    [self reloadRowWithID:@"polls.settings"];
+    [self reloadRowWithID:@"sub.feedShortcuts"];
+    // Refresh the tab-bar presentation and its dependent rows after
+    // returning to Interface or after preferences are restored elsewhere.
+    [self visibilityDidChange];
+    [self reloadRowWithID:@"interface.hideBarsOnScroll"];
+    [self reloadRowWithID:@"interface.hideTopBarToo"];
+    [self reloadRowWithID:@"interface.tabBarScrollBehavior"];
+    [self reloadRowWithID:@"siri.settings"];
+    // The Setup section footer (onboarding nudge) collapses once a Reddit key
+    // exists, which may have just been entered on the pushed API Keys screen.
+    // Section 0 is Setup on the hub; reloading it re-evaluates the footer.
+    // Only when the nudge actually flips, though: a section reload re-measures
+    // that section's header and footer, and this runs inside the pop transition
+    // on every return to the hub, so an unconditional reload left a settle for
+    // the transition to animate (the list came back a few points high and slid
+    // down into place). Same suppression as -reloadRowWithID: for the rare
+    // reload that is still needed.
+    BOOL showsKeyNudge = sRedditClientId.length == 0;
+    if ([self apollo_isHub] && self.tableView.numberOfSections > 0 &&
+        showsKeyNudge != self.setupFooterShowsKeyNudge) {
+        self.setupFooterShowsKeyNudge = showsKeyNudge;
+        [UIView performWithoutAnimation:^{
+            [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
+                          withRowAnimation:UITableViewRowAnimationNone];
+            [self.tableView layoutIfNeeded];
+        }];
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+
+    if (!sLinkPreviewModeRefreshPending) return;
+    sLinkPreviewModeRefreshPending = NO;
+
+    NSString *areaName = [sPendingLinkPreviewModeRefreshArea copy] ?: @"unknown";
+    NSInteger mode = sPendingLinkPreviewModeRefreshMode;
+    NSDictionary *userInfo = @{
+        @"area": areaName,
+        @"mode": @(mode),
+        @"reason": @"settings-disappear",
+    };
+
+    // The feed/comment view is usually revealed right after this controller exits.
+    // Fire a short delayed refresh so off-screen cells get rebuilt when visible again.
+    ApolloLog(@"[LinkPreviews] settings-exit-mode-refresh area=%@ mode=%ld", areaName, (long)mode);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(350 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloLinkPreviewModeDidChangeNotification
+                                                            object:nil
+                                                          userInfo:userInfo];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloLinkPreviewModeDidChangeNotification
+                                                            object:nil
+                                                          userInfo:userInfo];
+    });
+}
+
+#pragma mark - Form
+
+// The hub as data: six sections (Setup / Features / Data / Advanced /
+// Privacy / About — the settings IA restructure). Feature rows disclose the
+// group screens below, which are thin subclasses overriding -buildForm with
+// their slice of sections; every row (including the conditionally-visible
+// ones) is declared exactly once across the family. Conditional rows carry
+// .visible blocks and their parent toggles call -visibilityDidChange; sibling
+// refreshes are by identity (-reloadRowWithID:), never by index path. The
+// attributed link-bearing footers ride the viewForFooterInSection override
+// below, keyed by section header title (identity survives the screen split).
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[
+        [self buildSetupSection],
+        [self buildSiriSection],
+        [self buildFeaturesSection],
+        [self buildShortcutsSection],
+        [self buildDataSection],
+        [self buildAdvancedSection],
+        [self buildPrivacySection],
+        [self buildAboutSection],
+    ];
+}
+
+// These screens retain their contextual homes in Apollo's own settings (where
+// they sit beside related native controls), but a second entrance here keeps
+// established Reborn users from having to remember the migration map.
+- (ApolloSettingsSection *)buildShortcutsSection {
+    ApolloSettingsRow *openInApp =
+        [self hubDisclosureRowWithID:@"shortcut.openInApp" title:@"Open in App" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloOpenInAppViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *pip =
+        [self hubDisclosureRowWithID:@"shortcut.pip" title:@"Picture-in-Picture" subtitle:nil
+                                push:^UIViewController * {
+            return [[PictureInPictureViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *translation =
+        [self hubDisclosureRowWithID:@"shortcut.translation" title:@"Translation" subtitle:nil
+                                push:^UIViewController * {
+            return [[TranslationSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *savedCategories =
+        [self hubDisclosureRowWithID:@"shortcut.savedCategories" title:@"Saved Categories" subtitle:nil
+                                push:^UIViewController * {
+            return [[SavedCategoriesViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *tagFilters =
+        [self hubDisclosureRowWithID:@"shortcut.tagFilters" title:@"Tag Filters" subtitle:nil
+                                push:^UIViewController * {
+            return [[TagFiltersViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    // Instantiated through the settings router so this stays the same screen
+    // the apollo://reborn/settings/theme-manager deep link opens; the canonical
+    // entrance remains Apollo's Settings > Appearance > Theme Manager.
+    ApolloSettingsRow *themeManager =
+        [self hubDisclosureRowWithID:@"shortcut.themeManager" title:@"Theme Manager" subtitle:nil
+                                push:^UIViewController * {
+            return ApolloSettingsRouteInstantiate(@"theme-manager");
+        }];
+    // Flair is intentionally a switch alias, not another screen: Appearance →
+    // Flair remains the canonical native placement and the same preference is
+    // changed from either entrance.
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *colorFlairs =
+        [ApolloSettingsRow switchRowWithID:@"shortcut.colorFlairs"
+                                     title:@"Color Flairs"
+                                      isOn:^BOOL { return sEnableFlairColors; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf flairColorsSwitchToggled:sender]; }];
+
+    openInApp.iconSystemName = @"arrow.up.forward.app.fill";      openInApp.iconTileColor = [UIColor systemBlueColor];
+    pip.iconSystemName = @"pip.fill";                             pip.iconTileColor = [UIColor systemPurpleColor];
+    translation.iconSystemName = @"character.bubble.fill";        translation.iconTileColor = [UIColor systemTealColor];
+    savedCategories.iconSystemName = @"apollo.saved-categories";  savedCategories.iconTileColor = [UIColor systemGreenColor];
+    tagFilters.iconSystemName = @"tag.fill";                      tagFilters.iconTileColor = [UIColor systemOrangeColor];
+    themeManager.iconSystemName = @"paintbrush.fill";             themeManager.iconTileColor = ApolloThemeManagerIconColor();
+    colorFlairs.iconSystemName = @"paintpalette.fill";            colorFlairs.iconTileColor = [UIColor systemPinkColor];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Shortcuts"
+                                            footer:@"Quick links to settings that also live in their own sections and in Apollo's settings."
+                                              rows:@[ themeManager, openInApp, pip, translation, savedCategories, tagFilters, colorFlairs ]];
+}
+
+// Shared plain disclosure-row builder for the hub's navigation rows: title
+// (+ optional status subtitle block, re-evaluated on reload) and a push.
+- (ApolloSettingsRow *)hubDisclosureRowWithID:(NSString *)rowID
+                                        title:(NSString *)title
+                                     subtitle:(NSString * (^)(void))subtitle
+                                         push:(UIViewController * (^)(void))makeVC {
+    __weak typeof(self) weakSelf = self;
+    NSString *reuseID = [@"Cell_Hub_" stringByAppendingString:rowID];
+    ApolloSettingsRow *navigationRow = [ApolloSettingsRow customRowWithID:rowID
+                                         cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:reuseID];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 0;
+            cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
+        }
+        cell.textLabel.text = title;
+        cell.textLabel.numberOfLines = 0;
+        cell.detailTextLabel.text = subtitle ? subtitle() : nil;
+        [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+        return cell;
+    }
+                                     onSelect:^{
+        UIViewController *vc = makeVC();
+        if (!vc) return;
+        if (weakSelf.navigationController) {
+            [weakSelf.navigationController pushViewController:vc animated:YES];
+        } else {
+            UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:vc];
+            [weakSelf presentViewController:navigation animated:YES completion:nil];
+        }
+    }];
+    if (!IsLiquidGlass() && !subtitle) {
+        // UIKit self-sizes these multiline-label navigation cells to 52pt
+        // even when their title fits one line. Match classic native rows,
+        // measuring the title so larger text can still grow instead of clip.
+        __weak ApolloSettingsRow *weakRow = navigationRow;
+        navigationRow.height = ^CGFloat {
+            return ApolloSettingsClassicRowHeight(weakSelf.tableView, title, nil,
+                                                  weakRow.iconSystemName != nil, 24.0);
+        };
+    }
+    return navigationRow;
+}
+
+// Compact disclosure row for settings hubs where the current value belongs on
+// the trailing edge instead of wrapping beneath the navigation title.
+- (ApolloSettingsRow *)hubValueDisclosureRowWithID:(NSString *)rowID
+                                             title:(NSString *)title
+                                             value:(NSString * (^)(void))value
+                                              push:(UIViewController * (^)(void))makeVC {
+    __weak typeof(self) weakSelf = self;
+    NSString *reuseID = [@"Cell_HubValue_" stringByAppendingString:rowID];
+    return [ApolloSettingsRow customRowWithID:rowID
+                                         cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:reuseID];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+        }
+        cell.textLabel.text = title;
+        cell.detailTextLabel.text = value ? value() : nil;
+        [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+        return cell;
+    }
+                                     onSelect:^{
+        UIViewController *vc = makeVC();
+        if (!vc) return;
+        if (weakSelf.navigationController) {
+            [weakSelf.navigationController pushViewController:vc animated:YES];
+        } else {
+            UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:vc];
+            [weakSelf presentViewController:navigation animated:YES completion:nil];
+        }
+    }];
+}
+
+- (ApolloSettingsSection *)buildSetupSection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *assistant =
+        [ApolloSettingsRow buttonRowWithID:@"setup.assistant" title:@"Setup Assistant"
+            action:^{ ApolloSetupAssistantPresentFrom(weakSelf); }];
+    assistant.iconSystemName = @"wand.and.stars";
+    assistant.iconTileColor = UIColor.systemPurpleColor;
+    ApolloSettingsRow *apiKeys =
+        [self hubDisclosureRowWithID:@"setup.apiKeys"
+                               title:@"Accounts & API Keys"
+                            subtitle:^NSString * { return @"Reddit · Imgur · Giphy · Image Chest · Kagi"; }
+                                push:^UIViewController * {
+            return [[ApolloAccountsAPIKeysViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    apiKeys.iconSystemName = @"key.fill";
+    apiKeys.iconTileColor = [UIColor systemGrayColor];
+    return [ApolloSettingsSection sectionWithTitle:@"Setup"
+                                            footer:@"Your Reddit sign-in credentials, plus optional Imgur, Giphy and Image Chest keys for uploads and GIFs, and a Kagi Session Link for searching Reddit with Kagi."
+                                              rows:@[ assistant, apiKeys ]];
+}
+
+- (ApolloSettingsSection *)buildFeaturesSection {
+    ApolloSettingsRow *posts =
+        [self hubDisclosureRowWithID:@"feat.posts" title:@"Posts & Feeds" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloPostsFeedsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *comments =
+        [self hubDisclosureRowWithID:@"feat.comments" title:@"Comments" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloCommentsSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *media =
+        [self hubDisclosureRowWithID:@"feat.media" title:@"Media" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloMediaSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *subreddits =
+        [self hubDisclosureRowWithID:@"feat.subreddits" title:@"Subreddits" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloSubredditsSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *profileLayout =
+        [self hubDisclosureRowWithID:@"feat.profileLayout"
+                               title:@"User Profiles"
+                            subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloUserProfilesSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *interface_ =
+        [self hubDisclosureRowWithID:@"feat.interface" title:@"Interface" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloInterfaceSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    ApolloSettingsRow *duo =
+        [self hubDisclosureRowWithID:@"feat.duo" title:@"iPhone Duo" subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloDuoSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    duo.visible = ^BOOL { return ApolloDuoDeviceDetected(); };
+    duo.iconSystemName = @"iphone.duo";
+    duo.iconTileColor = UIColor.systemIndigoColor;
+    ApolloSettingsRow *linkPreviews = [self buildLinkPreviewsRow];
+    ApolloSettingsRow *polls = [self buildPollsRow];
+    ApolloSettingsRow *apolloAI = [self buildApolloAIRow];
+    ApolloSettingsRow *palHome = [self hubDisclosureRowWithID:@"feat.palHome" title:@"Pal Home"
+        subtitle:^NSString * { return ApolloPalHomeStore.isPalHomeEnabled ? @"A cosy home for every Pixel Pal" : @"Try a cosy home for your Pixel Pals"; }
+        push:^UIViewController * { return ApolloSettingsRouteInstantiate(@"pal-home-settings"); }];
+    palHome.iconSystemName = @"house.fill";
+    palHome.iconTileColor = [UIColor systemBrownColor];
+    ApolloSettingsRow *offline = [self hubDisclosureRowWithID:@"feat.offline" title:@"Offline Mode"
+        subtitle:^NSString * {
+            // First line only: what's saved ("42 posts · 3 videos · 87 MB").
+            return [[[ApolloOfflineModeController sharedController] librarySummary] componentsSeparatedByString:@"\n"].firstObject;
+        }
+        push:^UIViewController * { return ApolloSettingsRouteInstantiate(@"offline-mode"); }];
+    offline.iconSystemName = @"airplane";
+    offline.iconTileColor = [UIColor systemCyanColor];
+
+    posts.iconSystemName        = @"newspaper.fill";              posts.iconTileColor        = [UIColor systemOrangeColor];
+    comments.iconSystemName     = @"text.bubble.fill";            comments.iconTileColor     = [UIColor systemGreenColor];
+    media.iconSystemName        = @"play.rectangle.fill";         media.iconTileColor        = [UIColor systemPinkColor];
+    subreddits.iconSystemName   = @"person.3.fill";               subreddits.iconTileColor   = [UIColor systemRedColor];
+    profileLayout.iconSystemName = @"person.crop.circle.fill";   profileLayout.iconTileColor = [UIColor systemTealColor];
+    interface_.iconSystemName   = @"slider.horizontal.3";         interface_.iconTileColor   = [UIColor systemPurpleColor];
+    linkPreviews.iconSystemName = @"link";                        linkPreviews.iconTileColor = [UIColor systemBlueColor];
+    polls.iconSystemName        = @"chart.bar.fill";              polls.iconTileColor        = [UIColor systemYellowColor];
+    apolloAI.iconSystemName     = @"sparkles";                    apolloAI.iconTileColor     = [UIColor systemIndigoColor];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Features"
+                                            footer:@"Fine-tune posts, comments, media, subreddits, profile layout and the interface."
+                                              rows:@[ posts, comments, media, subreddits, profileLayout, interface_, duo,
+                                                      linkPreviews, polls, apolloAI, palHome, offline ]];
+}
+
+- (ApolloSettingsSection *)buildAdvancedSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *backend =
+        [self hubDisclosureRowWithID:@"adv.backend"
+                               title:@"Notification Backend"
+                            subtitle:^NSString * {
+            NSString *url = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyNotificationBackendURL] ?: @"";
+            return url.length > 0 ? url : @"Self-hosted apollo-backend · off";
+        }
+                                push:^UIViewController * {
+            return [[ApolloNotificationBackendViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+
+    ApolloSettingsRow *flex =
+        [ApolloSettingsRow switchRowWithID:@"gen.flex"
+                                     title:@"FLEX Debugging"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFLEX]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf flexSwitchToggled:sender]; }];
+
+    // Diagnostics belong with the other developer tools, not tucked into About.
+    ApolloSettingsRow *exportLogs =
+        [ApolloSettingsRow buttonRowWithID:@"about.exportLogs"
+                                     title:@"Export Debug Logs"
+                                    action:^{ [weakSelf exportLogs]; }];
+
+    // Dev-only fault injection for the login-persistence recovery path (broken-keychain
+    // simulation, keychain report, protection-class poisoning). Only visible with FLEX
+    // (developer mode) on; see -flexSwitchToggled: for the visibility refresh.
+    ApolloSettingsRow *loginPersistenceDebug =
+        [ApolloSettingsRow valueRowWithID:@"adv.loginPersistenceDebug"
+                                    title:@"🔧 Login Persistence Debug"
+                                   detail:^NSString * { return [weakSelf loginPersistenceDebugStatusText]; }
+                                 onSelect:^{
+            [weakSelf presentLoginPersistenceDebugSheetFromSourceView:[weakSelf cellForRowID:@"adv.loginPersistenceDebug"]];
+        }];
+    loginPersistenceDebug.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFLEX]; };
+    loginPersistenceDebug.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        BOOL forceMiss = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDebugForceAccountReadMiss];
+        BOOL noRecover = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDebugDisableKeychainRecovery];
+        cell.detailTextLabel.textColor = (forceMiss || noRecover) ? [UIColor systemRedColor] : [UIColor secondaryLabelColor];
+    };
+
+    backend.iconSystemName    = @"bell.badge.fill";              backend.iconTileColor    = [UIColor systemRedColor];
+    flex.iconSystemName       = @"ant.fill";                     flex.iconTileColor       = [UIColor systemGrayColor];
+    exportLogs.iconSystemName = @"square.and.arrow.up.on.square.fill"; exportLogs.iconTileColor = [UIColor systemGrayColor];
+    // TEMPORARY dev-only: presents the What's New sheet on demand, bypassing
+    // gating (never touches UDKeyLastSeenWhatsNewVersion, so it's safe to tap
+    // repeatedly). Remove this row and ApolloWhatsNewPresentForDebug() once the
+    // gated flow has shipped and this is no longer needed for testing.
+    ApolloSettingsRow *whatsNewDebug =
+        [ApolloSettingsRow buttonRowWithID:@"adv.whatsNewDebug"
+                                     title:@"🔧 What's New Debug"
+                                    action:^{ ApolloWhatsNewPresentForDebug(); }];
+    whatsNewDebug.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFLEX]; };
+
+    loginPersistenceDebug.iconSystemName = @"wrench.and.screwdriver.fill"; loginPersistenceDebug.iconTileColor = [UIColor systemGrayColor];
+    whatsNewDebug.iconSystemName = @"sparkles"; whatsNewDebug.iconTileColor = [UIColor systemGrayColor];
+
+    ApolloSettingsRow *iPadWelcomeDebug =
+        [ApolloSettingsRow buttonRowWithID:@"adv.iPadWelcomeDebug"
+                                     title:@"Preview iPad Layout Welcome"
+                                    action:^{ ApolloIPadLayoutWelcomePresentForDebug(weakSelf); }];
+    iPadWelcomeDebug.visible = ^BOOL {
+        return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad &&
+            ApolloPaneLayoutSupported() && [NSUserDefaults.standardUserDefaults boolForKey:UDKeyEnableFLEX];
+    };
+    iPadWelcomeDebug.iconSystemName = @"ipad.landscape";
+    iPadWelcomeDebug.iconTileColor = UIColor.systemGrayColor;
+
+    return [ApolloSettingsSection sectionWithTitle:@"Advanced"
+                                            footer:@"Notification backend, developer tools and diagnostics."
+                                              rows:@[ backend, flex, exportLogs, loginPersistenceDebug, whatsNewDebug, iPadWelcomeDebug ]];
+}
+
+- (ApolloSettingsSection *)buildDataSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *backup =
+        [ApolloSettingsRow buttonRowWithID:@"data.backup"
+                                     title:@"Backup Settings"
+                                    action:^{
+            ApolloAutomaticBackupViewController *controller = [[ApolloAutomaticBackupViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            [weakSelf.navigationController pushViewController:controller animated:YES];
+        }];
+    backup.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+    if (!IsLiquidGlass()) {
+        // This configure block only adds a chevron; it does not need the
+        // automatic sizing reserved for custom cell layouts in the form.
+        __weak ApolloSettingsRow *weakBackup = backup;
+        backup.height = ^CGFloat {
+            return ApolloSettingsClassicRowHeight(weakSelf.tableView, @"Backup Settings", nil,
+                                                  weakBackup.iconSystemName != nil, 24.0);
+        };
+    }
+
+    ApolloSettingsRow *restore =
+        [ApolloSettingsRow buttonRowWithID:@"data.restore"
+                                     title:@"Restore Settings"
+                                    action:^{ [weakSelf restoreSettings]; }];
+
+    ApolloSettingsRow *clearCaches =
+        [ApolloSettingsRow buttonRowWithID:@"data.clearCaches"
+                                     title:@"Clear Tweak Caches"
+                                    action:^{
+            [weakSelf promptClearAllCachesFromSourceView:[weakSelf cellForRowID:@"data.clearCaches"]];
+        }];
+
+    ApolloSettingsRow *clearBanners =
+        [ApolloSettingsRow buttonRowWithID:@"data.clearBanners"
+                                     title:@"Clear Custom Banners & Icons"
+                                    action:^{
+            [weakSelf promptClearCustomSubredditBannersFromSourceView:[weakSelf cellForRowID:@"data.clearBanners"]];
+        }];
+
+    backup.iconSystemName       = @"square.and.arrow.up.fill";    backup.iconTileColor       = [UIColor systemBlueColor];
+    restore.iconSystemName      = @"square.and.arrow.down.fill";  restore.iconTileColor      = [UIColor systemGreenColor];
+    clearCaches.iconSystemName  = @"trash.fill";                  clearCaches.iconTileColor  = [UIColor systemRedColor];
+    clearBanners.iconSystemName = @"photo.fill";                  clearBanners.iconTileColor = [UIColor systemOrangeColor];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Data"
+                                            footer:@"Back up or restore your Reborn settings and API keys, or clear cached data."
+                                              rows:@[ backup, restore, clearCaches, clearBanners ]];
+}
+
+// The API-key/source text fields wrap the existing stacked/text-field cell
+// builders as custom rows; editing still flows through the tag-based
+// UITextFieldDelegate machinery, which is index-immune by design.
+// These four sections form the Accounts & API Keys screen (see
+// ApolloAccountsAPIKeysViewController at the bottom of this file).
+- (ApolloSettingsSection *)buildAPIKeysDefaultSection {
+    __weak typeof(self) weakSelf = self;
+
+    // The Reddit API Key/Secret/Redirect URI fields below are the DEFAULT
+    // credentials, used by any account that has no per-account override.
+    // Per-account overrides (a different account using a different Reddit
+    // API client) are set from the account switcher's per-account editor
+    // (ApolloAccountSwitcherViewController), not here — see
+    // ApolloAccountCredentials.{h,m} for the resolution precedence.
+    // Stacked (label above, full-width field below) rather than the
+    // inline label-left/field-right layout — "Reddit API Key (Default)"
+    // and "Reddit API Secret (Default)" are long enough to crowd the
+    // field at the inline layout's fixed 0.55 width.
+    ApolloSettingsRow *redditKey =
+        [ApolloSettingsRow customRowWithID:@"api.redditKey"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_Reddit"
+                                                                           label:@"Reddit API Key"
+                                                                     placeholder:@"Reddit API Key"
+                                                                            text:sRedditClientId
+                                                                             tag:TagRedditClientId];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *redditSecret =
+        [ApolloSettingsRow customRowWithID:@"api.redditSecret"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_RedditSecret"
+                                                                           label:@"Reddit API Secret"
+                                                                     placeholder:@"Required for \"Web app\" clients; empty otherwise"
+                                                                            text:sRedditClientSecret
+                                                                             tag:TagRedditClientSecret];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *imgurKey =
+        [ApolloSettingsRow customRowWithID:@"api.imgurKey"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_Imgur"
+                                                                           label:@"Imgur API Key"
+                                                                     placeholder:@"Imgur API Key"
+                                                                            text:sImgurClientId
+                                                                             tag:TagImgurClientId];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *imgChestKey =
+        [ApolloSettingsRow customRowWithID:@"api.imgChestKey"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_ImageChest"
+                                                                           label:@"Image Chest API Key"
+                                                                     placeholder:@"Image Chest API Key"
+                                                                            text:sImageChestAPIToken
+                                                                             tag:TagImageChestAPIToken];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *giphyKey =
+        [ApolloSettingsRow customRowWithID:@"api.giphyKey"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_Giphy"
+                                                                           label:@"Giphy API Key"
+                                                                     placeholder:@"Giphy API Key"
+                                                                            text:[[NSUserDefaults standardUserDefaults] stringForKey:UDKeyGiphyAPIKey] ?: @""
+                                                                             tag:TagGiphyAPIKey
+                                                                          detail:@"Required for GIF picker. Get one at developers.giphy.com"];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *redirectURI =
+        [ApolloSettingsRow customRowWithID:@"api.redirectURI"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_Redirect"
+                                                                           label:@"Redirect URI"
+                                                                     placeholder:defaultRedirectURI
+                                                                            text:sRedirectURI
+                                                                             tag:TagRedirectURI
+                                                                          detail:[weakSelf apollo_redirectURIDetailText]];
+            [weakSelf apollo_applyRedirectURITextColorToCell:cell];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *userAgent =
+        [ApolloSettingsRow customRowWithID:@"api.userAgent"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_UserAgent"
+                                                          label:@"User Agent"
+                                                    placeholder:defaultUserAgent
+                                                           text:sUserAgent
+                                                            tag:TagUserAgent]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Default API Keys"
+                                            footer:@"Default credentials, used by any account without a per-account override. Reddit is required to sign in; the rest enable image uploads and the GIF picker."
+                                              rows:@[ redditKey, redditSecret, imgurKey, imgChestKey, giphyKey,
+                                                      redirectURI, userAgent ]];
+}
+
+// The Search tab's Kagi mode (ApolloKagiSearch.m). The Session Link lives in
+// the Keychain, not NSUserDefaults; the Search tab asks for it the first time
+// Kagi is picked, and this field changes or removes it.
+- (ApolloSettingsSection *)buildAPIKeysKagiSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *kagiLink =
+        [ApolloSettingsRow customRowWithID:@"api.kagiSessionLink"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_API_KagiSessionLink"
+                                                                           label:@"Kagi Session Link"
+                                                                     placeholder:@"https://kagi.com/search?token=…"
+                                                                            text:ApolloKagiSessionToken() ?: @""
+                                                                             tag:TagKagiSessionLink
+                                                                          detail:@"Search Reddit with Kagi from the Search tab's magnifier. Copy it from Kagi → Settings → Account → Session Link."];
+            [weakSelf apollo_applySecureTextEntry:YES toCell:cell];
+            [weakSelf apollo_textFieldInCell:cell].keyboardType = UIKeyboardTypeURL;
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Kagi Search"
+                                            footer:@"For Kagi subscribers. Each page of Kagi results counts as one search on your Kagi plan. Clear the field to remove the link."
+                                              rows:@[ kagiLink ]];
+}
+
+// Saves (or removes) the Kagi Session Link typed into the settings field.
+// Anything that isn't a Session Link is refused and the saved one shown again.
+- (void)apollo_saveKagiSessionLinkFromField:(UITextField *)textField {
+    NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *current = ApolloKagiSessionToken();
+    if (trimmed.length == 0) {
+        textField.text = @"";
+        if (current.length) ApolloKagiSetSessionToken(nil);
+        return;
+    }
+    NSString *token = ApolloKagiNormalizeSessionToken(trimmed);
+    if (!token) {
+        textField.text = current ?: @"";
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Not a Session Link"
+                                                                        message:@"Paste the whole Session Link from Kagi → Settings → Account. It starts with https://kagi.com/search?token="
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    textField.text = token;
+    if ([token isEqualToString:current]) return;
+    if (!ApolloKagiSetSessionToken(token)) {
+        textField.text = current ?: @"";
+        return;
+    }
+    // Saved either way; warn if Kagi turns it away, so a bad paste doesn't
+    // only show up later as "Kagi Session Expired" in the Search tab.
+    __weak typeof(self) weakSelf = self;
+    ApolloKagiCheckSessionToken(token, ^(ApolloKagiSessionCheck result, __unused NSError *error) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || result != ApolloKagiSessionCheckRejected || !strongSelf.view.window) return;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Kagi Didn't Accept This Link"
+                                                                        message:@"It may have expired or been reset. Copy a fresh Session Link from Kagi → Settings → Account."
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [strongSelf presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+- (ApolloSettingsSection *)buildAPIKeysSignInSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *universalOAuth =
+        [ApolloSettingsRow customRowWithID:@"api.universalOAuth"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_API_CustomOAuth"
+                                                label:@"Universal OAuth Sign-In"
+                                               detail:@"Signs in with an in-app web view so any Redirect URI works, including http/https (\"Web app\" Reddit API clients). Turn off for Apollo's native sign-in."
+                                                   on:[weakSelf apollo_usesCustomOAuthSignIn]
+                                               action:@selector(customOAuthSignInSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    // reddit.com web sign-in, surfaced outside the Polls screen (issue #847):
+    // the session powers polls, approximate vote breakdowns, and future
+    // web-only features, so it belongs where accounts live. The Polls screen
+    // keeps its own entry; both drive the same per-account session.
+    ApolloSettingsRow *webSignIn =
+        [ApolloSettingsRow customRowWithID:@"api.webSignIn"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 0;
+            NSString *username = ApolloActiveAccountUsername();
+            if (username.length == 0) {
+                cell.textLabel.text = @"reddit.com Web Sign-In";
+                cell.textLabel.textColor = [UIColor secondaryLabelColor];
+                cell.detailTextLabel.text = @"Sign in to a Reddit account first.";
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                return cell;
+            }
+            if (ApolloWebSessionPollFor(username).cookieHeader.length > 0) {
+                cell.textLabel.text = @"reddit.com Web Sign-In";
+                cell.detailTextLabel.text =
+                    [NSString stringWithFormat:@"Connected for u/%@ — powers polls and vote breakdowns.", username];
+                UIImageView *check = [[UIImageView alloc] initWithImage:
+                    [UIImage systemImageNamed:@"checkmark.circle.fill"]];
+                check.tintColor = [UIColor systemGreenColor];
+                [check sizeToFit];
+                cell.accessoryView = check;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+                [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+                return cell;
+            }
+            cell.textLabel.text = @"Set Up reddit.com Web Sign-In";
+            cell.textLabel.textColor = [weakSelf apollo_themeAccentColor];
+            cell.detailTextLabel.text =
+                [NSString stringWithFormat:@"One quick sign-in for u/%@ — powers polls and vote breakdowns.", username];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf webSignInRowTapped]; }];
+
+    ApolloSettingsRow *troubleshooting =
+        [ApolloSettingsRow customRowWithID:@"api.troubleshooting"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Troubleshooting"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Troubleshooting"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            }
+            cell.textLabel.text = @"Can't sign in?";
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf pushTroubleshootingViewController]; }];
+
+    ApolloSettingsRow *setupGuide =
+        [ApolloSettingsRow customRowWithID:@"api.setupGuide"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Instructions"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Instructions"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.textLabel.numberOfLines = 0;
+            }
+            cell.textLabel.text = @"Giphy & Image Chest API Key Setup";
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf pushInstructionsViewController]; }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Sign-In"
+                                            footer:@"Choose how accounts sign in, or get help setting up your keys. "
+                                                    "The reddit.com web sign-in unlocks features Reddit's API doesn't offer, "
+                                                    "like polls and approximate vote breakdowns."
+                                              rows:@[ universalOAuth, webSignIn, troubleshooting, setupGuide ]];
+}
+
+#pragma mark - reddit.com web sign-in (issue #847)
+
+// Same flow as the Polls screen's entry: sign in the ACTIVE Apollo account,
+// confirm before replacing a working session.
+- (void)webSignInRowTapped {
+    NSString *username = ApolloActiveAccountUsername();
+    if (username.length == 0) return;
+    if (ApolloWebSessionPollFor(username).cookieHeader.length == 0) {
+        [self startWebSignInForUsername:username];
+        return;
+    }
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:[NSString stringWithFormat:@"u/%@ is signed in", username]
+                         message:@"Sign in again only if web-session features (polls, vote breakdowns) have stopped working."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Sign In Again" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        [self startWebSignInForUsername:username];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UITableViewCell *cell = [self cellForRowID:@"api.webSignIn"];
+    sheet.popoverPresentationController.sourceView = cell ?: self.view;
+    sheet.popoverPresentationController.sourceRect = (cell ?: self.view).bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)startWebSignInForUsername:(NSString *)username {
+    __weak typeof(self) weakSelf = self;
+    ApolloWebSessionLoginViewController *login = [ApolloWebSessionLoginViewController
+        loginControllerForUsername:username completion:^(BOOL success) {
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf reloadRowWithID:@"api.webSignIn"];
+            if (success && ApolloWebSessionPollFor(username).cookieHeader.length > 0) {
+                UINotificationFeedbackGenerator *feedback = [UINotificationFeedbackGenerator new];
+                [feedback notificationOccurred:UINotificationFeedbackTypeSuccess];
+            }
+        }];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:login];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (ApolloSettingsSection *)buildAPIKeysExperimentalSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *webJSON =
+        [ApolloSettingsRow customRowWithID:@"api.webJSON"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_API_WebJSON"
+                                                label:@"API-Key-Free Mode"
+                                               detail:@"Master switch: lets accounts sign in to reddit.com instead of using API keys (OAuth). Add or manage individual web-session accounts from the account switcher."
+                                                   on:sWebJSONEnabled
+                                               action:@selector(webJSONSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *webSessionLogin =
+        [ApolloSettingsRow customRowWithID:@"api.webSessionLogin"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            // Subtitle style so we can surface the harvested account / status.
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_API_WebSessionLogin"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell_API_WebSessionLogin"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            }
+            cell.textLabel.text = @"Web Session Accounts";
+            BOOL pendingRestart = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart];
+            NSString *pendingUsername = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyWebJSONPendingRestartUsername];
+            NSUInteger sessionCount = ApolloWebSessionUsernames().count;
+            if (pendingRestart) {
+                // Mid-session login synthesized an account AccountManager hasn't
+                // loaded yet — nudge the user to quit & reopen so it activates.
+                cell.detailTextLabel.text = pendingUsername.length > 0
+                    ? [NSString stringWithFormat:@"Signed in as u/%@ — quit & reopen Apollo to activate", pendingUsername]
+                    : @"Signed in — quit & reopen Apollo to activate";
+                cell.detailTextLabel.textColor = [UIColor systemOrangeColor];
+            } else if (sessionCount > 0) {
+                // Sessions are per-account now (the switcher is where you add/
+                // remove/re-auth individual ones) — this row just summarizes how
+                // many are configured and offers a quick way to add another.
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+                cell.detailTextLabel.text = sessionCount == 1
+                    ? @"1 account signed in — manage from the account switcher"
+                    : [NSString stringWithFormat:@"%lu accounts signed in — manage from the account switcher", (unsigned long)sessionCount];
+            } else {
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+                cell.detailTextLabel.text = @"Not signed in — tap to add a web-session account";
+            }
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{
+            if ([[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONPendingRestart]) {
+                [weakSelf promptQuitToActivateWebSession];
+            } else {
+                [weakSelf presentWebSessionLoginViewController];
+            }
+        }];
+    // Only exists while API-Key-Free Mode is on (see -_applyWebJSONEnabled:).
+    webSessionLogin.visible = ^BOOL { return sWebJSONEnabled; };
+
+    // Reddit gives API-key-free accounts a much smaller request budget, so this
+    // trades a little polish for fewer requests while one is active (see
+    // ApolloReduceRateLimiting.h). Offered once at the first API-key-free sign-in.
+    ApolloSettingsRow *reduceRateLimiting =
+        [ApolloSettingsRow customRowWithID:@"api.reduceRateLimiting"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_API_ReduceRateLimiting"
+                                                label:@"Reduce Rate Limiting"
+                                               detail:@"Reddit limits API-key-free accounts more tightly. This uses fewer requests: profile pictures load in batches (without frames), Community Highlights refresh every 30 minutes, and your sign-in is checked less often."
+                                                   on:sReduceRateLimiting
+                                               action:@selector(reduceRateLimitingSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+    reduceRateLimiting.visible = ^BOOL { return sWebJSONEnabled; };
+
+    // Which routes API-key-free reads are taking, what Reddit has blocked
+    // since launch, and the Use Route Updates switch
+    // (ApolloKeylessRouteStatusViewController).
+    ApolloSettingsRow *routeStatus =
+        [ApolloSettingsRow disclosureRowWithID:@"api.routeStatus"
+                                         title:@"Routes"
+                                        detail:^NSString *{ return ApolloWebJSONRouteStatusHeadline(); }
+                                          push:^UIViewController *{
+            return [[ApolloKeylessRouteStatusViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    routeStatus.visible = ^BOOL { return sWebJSONEnabled; };
+
+    // Modern Reddit Chat / Moderator Mail. Both work for API-key and
+    // API-key-free accounts alike, so both are a plain choice that stays
+    // switchable for everyone. These preferences are app-wide, like the rest of
+    // Apollo's settings, which is the other reason not to derive their state
+    // from whichever account happens to be active: they used to lock as soon as
+    // ONE signed-in account looked API-key-free, taking the choice away from the
+    // keyed accounts sharing the same device.
+    ApolloSettingsRow *modernChat =
+        [ApolloSettingsRow customRowWithID:@"api.modernChat"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_API_ModernChat"
+                                                label:@"Use Modern Reddit Chat"
+                                               detail:@"On uses Reddit's current Chat — requests, group chats and media — for every account, and needs a web-session sign-in. Off keeps Apollo's own Direct Chat, which only works for accounts signed in with an API key."
+                                                   on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseModernRedditChat]
+                                              enabled:YES
+                                               action:@selector(modernRedditChatSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *modernModmail =
+        [ApolloSettingsRow customRowWithID:@"api.modernModmail"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_API_ModernModmail"
+                                                label:@"Use Modern Moderator Mail"
+                                               detail:@"On uses Reddit's current Modmail with the active web-session account. Off keeps Apollo's native Moderator Mail."
+                                                   on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseModernRedditModmail]
+                                              enabled:YES
+                                               action:@selector(modernRedditModmailSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Experimental"
+                                            footer:@"Sign in to reddit.com instead of using API keys."
+                                              rows:@[ webJSON, webSessionLogin, reduceRateLimiting, routeStatus, modernChat, modernModmail ]];
+}
+
+- (ApolloSettingsSection *)buildAPIKeysExtrasSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *widgetSetupCode =
+        [ApolloSettingsRow customRowWithID:@"api.widgetSetupCode"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_WidgetSetupCode"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_WidgetSetupCode"];
+                cell.accessoryType = UITableViewCellAccessoryNone;
+            }
+            cell.textLabel.text = @"Copy Widget Setup Code";
+            cell.textLabel.textColor = [weakSelf apollo_themeAccentColor];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf copyWidgetSetupCode]; }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Extras"
+                                            footer:@"Copy a code to set up Apollo's home-screen widgets. Include your account for Home and multireddit feeds."
+                                              rows:@[ widgetSetupCode ]];
+}
+
+// The Comments group screen (ApolloCommentsSettingsViewController) —
+// mirrors native General → Comments taxonomy.
+- (ApolloSettingsSection *)buildCommentsSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *collapsePinned =
+        [ApolloSettingsRow switchRowWithID:@"gen.collapsePinned"
+                                     title:@"Collapse Pinned Comments"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCollapsePinnedComments]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf collapsePinnedCommentsSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *deletedComments =
+        [ApolloSettingsRow customRowWithID:@"gen.deletedComments"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Gen_DeletedComments"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_Gen_DeletedComments"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Deleted Comments";
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf openDeletedCommentsSettings]; }];
+
+    ApolloSettingsRow *liveCommentsFollow =
+        [ApolloSettingsRow customRowWithID:@"gen.liveCommentsFollow"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_Gen_LiveCommentsFollow"
+                                                label:@"Follow New Live Comments"
+                                               detail:@"During Live Update comment sort, keep the newest at the top and show a jump button when you've scrolled down."
+                                                   on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyLiveCommentsFollow]
+                                               action:@selector(liveCommentsFollowSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:nil
+                                            footer:@"Options for reading comment threads, including viewing removed comments."
+                                              rows:@[ collapsePinned, liveCommentsFollow, deletedComments ]];
+}
+
+// Posts & Feeds group screen (ApolloPostsFeedsViewController), two sections.
+- (ApolloSettingsSection *)buildPostsRecentlyReadSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *readPostMax =
+        [ApolloSettingsRow customRowWithID:@"gen.readPostMax"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            NSString *readPostMaxStr = sReadPostMaxCount > 0 ? [NSString stringWithFormat:@"%ld", (long)sReadPostMaxCount] : @"";
+            return [weakSelf textFieldCellWithIdentifier:@"Cell_Gen_ReadMax"
+                                                   label:@"Recently Read Posts Limit"
+                                             placeholder:@"Unlimited"
+                                                    text:readPostMaxStr
+                                                     tag:TagReadPostMaxCount
+                                               numerical:YES]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *filterNSFWRR =
+        [ApolloSettingsRow switchRowWithID:@"gen.filterNSFWRR"
+                                     title:@"Hide NSFW Posts"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFilterNSFWRecentlyRead]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf filterNSFWRecentlyReadSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *iCloudReadState =
+        [ApolloSettingsRow switchRowWithID:@"gen.iCloudReadState"
+                                     title:@"Sync Read State with iCloud"
+                                      isOn:^BOOL { return ApolloICloudReadState.sharedManager.enabled; }
+                                  onToggle:^(UISwitch *sender) {
+        if (sender.isOn) {
+            [sender setOn:NO animated:YES];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sync Read History with iCloud?"
+                message:@"Apollo will store read post IDs, view times, and new-comment baselines in a separate Apollo Reborn Sync file inside the iCloud Drive folder already selected in Backup Settings. It never reads or uploads your credential-bearing backups. The read-state file is protected by that folder's access controls, not by a separate Apollo encryption key. Select the same folder on each device."
+                preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Enable Sync" style:UIAlertActionStyleDefault
+                handler:^(__unused UIAlertAction *action) {
+                    NSError *enableError = nil;
+                    if (![ApolloICloudReadState.sharedManager setEnabled:YES error:&enableError]) {
+                        [weakSelf showAlertWithTitle:@"iCloud Sync Unavailable"
+                                             message:enableError.localizedDescription ?: @"This build cannot access iCloud."];
+                    }
+                    [weakSelf reloadRowWithID:@"gen.iCloudReadState"];
+                    [weakSelf reloadRowWithID:@"gen.iCloudReadStateStatus"];
+                }]];
+            [weakSelf presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+        NSError *error = nil;
+        if (![ApolloICloudReadState.sharedManager setEnabled:sender.isOn error:&error]) {
+            [sender setOn:NO animated:YES];
+            [weakSelf showAlertWithTitle:@"iCloud Sync Unavailable"
+                                 message:error.localizedDescription ?: @"This build cannot access iCloud."];
+        }
+        [weakSelf reloadRowWithID:@"gen.iCloudReadState"];
+        [weakSelf reloadRowWithID:@"gen.iCloudReadStateStatus"];
+    }];
+
+    ApolloSettingsRow *iCloudReadStateStatus =
+        [ApolloSettingsRow valueRowWithID:@"gen.iCloudReadStateStatus"
+                                    title:@"iCloud Sync Status"
+                                   detail:^NSString * {
+        ApolloICloudReadState *manager = ApolloICloudReadState.sharedManager;
+        if (!manager.enabled) return manager.availabilityMessage ?: @"Off";
+        return manager.availabilityMessage ?: (manager.available ? @"Active" : @"Unavailable");
+    } onSelect:nil];
+    iCloudReadStateStatus.enabled = ^BOOL { return NO; };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Recently Read"
+                                             footer:@"Cap how many read posts Apollo remembers. Folder sync is optional and reuses the iCloud Drive folder selected in Backup Settings; stale or revoked access requires reconnecting that folder. Read state retries after offline periods; native comment highlighting uses received baselines after the next cold start."
+                                               rows:@[ readPostMax, filterNSFWRR, iCloudReadState, iCloudReadStateStatus ]];
+}
+
+// The "Open in App" screen now lives in native General → Open Links — see
+// ApolloSettingsNativeInjections.xm. Besides the Bluesky / GitHub / Steam
+// toggles it mirrors Apollo's own YouTube switch and "Open Links in" browser
+// picker against their native keys; the native General → Other rows are
+// hidden (registration in the same file).
+
+// Compact state shown below the Info Row disclosure. This is derived from the
+// same globals as the destination form, so returning from that screen only
+// needs an identity-based reload of the hub row.
+- (NSString *)infoRowSummaryText {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    [parts addObject:sIconRowMagnifier ? @"Magnifier on" : @"Magnifier off"];
+    [parts addObject:sInfoRowOverlayMode ? @"Overlays" : sInfoRowPopupMode ? @"Popups" : @"Info taps off"];
+
+    NSMutableArray<NSString *> *disabled = [NSMutableArray array];
+    if (!sInfoRowTapUpvote) [disabled addObject:@"Upvote"];
+    if (!sInfoRowTapComments) [disabled addObject:@"Comments"];
+    BOOL translationAvailable = sTapToTranslate || sShowTranslationTitleDetails || sShowTranslationDetails;
+    if (translationAvailable && !sInfoRowTapTranslation) [disabled addObject:@"Translation"];
+    if (disabled.count > 0) {
+        [parts addObject:[NSString stringWithFormat:@"%@ off", [disabled componentsJoinedByString:@", "]]];
+    }
+    return [parts componentsJoinedByString:@" · "];
+}
+
+- (ApolloSettingsSection *)buildPostsFeedSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *textPostThumbnails =
+        [ApolloSettingsRow switchRowWithID:@"media.textPostThumbnails"
+                                     title:@"Text Post Thumbnails"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedTextPostThumbnails]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf textPostThumbnailsSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *infoRow =
+        [self hubValueDisclosureRowWithID:@"feat.infoRow"
+                                    title:@"Info Row"
+                                    value:^NSString * { return [weakSelf infoRowSummaryText]; }
+                                     push:^UIViewController * {
+            return [[InfoRowSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+
+    ApolloSettingsRow *feedScrubber =
+        [ApolloSettingsRow switchRowWithID:@"media.feedScrubber"
+                                     title:@"Feed Video Scrubber"
+                                      isOn:^BOOL { return sFeedVideoScrubber; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf feedVideoScrubberSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *videoScrollSmoothing =
+        [ApolloSettingsRow switchRowWithID:@"media.videoScrollSmoothing"
+                                     title:@"Smoother Video Scrolling"
+                                      isOn:^BOOL { return sFeedVideoScrollSmoothing; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf videoScrollSmoothingSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *forwardSwipeForget =
+        [ApolloSettingsRow switchRowWithID:@"gen.forwardSwipeForget"
+                                     title:@"Forget Forward Swipe After Scrolling"
+                                      isOn:^BOOL { return sForwardSwipeForgetAfterScrolling; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf forwardSwipeForgetSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *blockAnnouncements =
+        [ApolloSettingsRow switchRowWithID:@"gen.blockAnnouncements"
+                                     title:@"Block Announcements"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBlockAnnouncements]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf blockAnnouncementsSwitchToggled:sender]; }];
+
+    // Named for the whole class of Reddit Developer Platform posts, not the
+    // sports ones it was first built against: the same widget mechanism carries
+    // r/wallstreetbets' live market dashboard, brackets, polls and community
+    // games. Settings search indexes row TITLES only, so the footer below spells
+    // the range out for anyone who lands on this screen.
+    ApolloSettingsRow *devvitPosts =
+        [ApolloSettingsRow switchRowWithID:@"gen.devvitPosts"
+                                     title:@"Live Interactive Posts"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf devvitPostsSwitchToggled:sender]; }];
+
+    // Feed cards are the surface where the widget's cost multiplies — its own
+    // escape hatch, without losing the widget in comments. Sits directly
+    // under the master row, so the short title reads in context.
+    ApolloSettingsRow *devvitFeedPosts =
+        [ApolloSettingsRow switchRowWithID:@"gen.devvitFeedPosts"
+                                     title:@"Show in Feed"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitFeedWidgets]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf devvitFeedPostsSwitchToggled:sender]; }];
+    devvitFeedPosts.visible = ^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyDevvitInteractivePosts]; };
+
+    ApolloSettingsRow *hideInteractiveForYou =
+        [ApolloSettingsRow switchRowWithID:@"gen.hideInteractiveForYou"
+                                     title:@"Hide Interactive Posts in For You"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyHomeFeedHideInteractivePosts]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf hideInteractiveForYouSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *restoreReadingSession =
+        [ApolloSettingsRow switchRowWithID:@"media.restoreReadingSession"
+                                     title:@"Restore Reading Session"
+                                      isOn:^BOOL { return sRestoreReadingSession; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf restoreReadingSessionSwitchToggled:sender]; }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Feed"
+                                            footer:@"Feed Video Scrubber: drag the bar under a feed video to scrub it.\n\nSmoother Video Scrolling: prepares feed videos in the background and lets video posts finish drawing right after they scroll in instead of holding the frame for them. Turn off to get Apollo's original behavior back.\n\nForget Forward Swipe After Scrolling: once you've scrolled a few posts on, a forward swipe won't reopen the post you came back from.\n\nLive Interactive Posts: shows live scores, polls, brackets and other interactive posts instead of placeholder text. Show in Feed adds them to the feed as well as comments.\n\nHide Interactive Posts in For You: removes Devvit games, interactive polls, brackets and live-score posts from For You only. It does not hide ordinary Reddit polls or affect other feeds and comments.\n\nRestore Reading Session: after iOS evicts Apollo, reopen the last feed, post and reading position on the next normal launch. Turn it off to delete the saved session immediately."
+                                              rows:@[ textPostThumbnails, infoRow, feedScrubber, videoScrollSmoothing, forwardSwipeForget, blockAnnouncements, devvitPosts, devvitFeedPosts, hideInteractiveForYou, restoreReadingSession ]];
+}
+
+// All+ r/all: NSFW posts blended into r/all by rank (see ApolloAllPlusNSFW.xm /
+// ApolloAllPlusMerge.m). Grouped with Posts & Feeds since it shapes a feed.
+- (ApolloSettingsSection *)buildPostsAllPlusSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *allPlusNSFW =
+        [ApolloSettingsRow customRowWithID:@"gen.allPlusNSFW"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_Gen_AllPlusNSFW"
+                                                label:@"Show NSFW in r/all"
+                                               detail:@"Blends NSFW posts into the r/all feed."
+                                                   on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAllPlusNSFWEnabled]
+                                               action:@selector(allPlusNSFWSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *allPlusNSFWBoost =
+        [ApolloSettingsRow customRowWithID:@"gen.allPlusNSFWBoost"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf sliderCellWithIdentifier:@"Cell_Gen_AllPlusNSFWBoost"
+                                                label:@"NSFW boost"
+                                                  min:0.0
+                                                  max:2.0
+                                                 step:0.05
+                                                value:(float)[[NSUserDefaults standardUserDefaults] doubleForKey:UDKeyAllPlusNSFWBoost]
+                                              enabled:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAllPlusNSFWEnabled]
+                                               action:@selector(allPlusNSFWBoostChanged:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return [ApolloSettingsSection sectionWithTitle:@"All+"
+                                            footer:@"Shows r/all the way old Reddit did, with NSFW posts placed by the same hot ranking as everything else. Applies to the hot, best and rising sorts; top, new and controversial are left as Reddit sends them. NSFW boost moves the NSFW posts up."
+                                              rows:@[ allPlusNSFW, allPlusNSFWBoost ]];
+}
+
+- (ApolloSettingsSection *)buildPostsFloatingTabsSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *floatingTabs =
+        [ApolloSettingsRow switchRowWithID:@"gen.floatingPostTabs"
+                                     title:@"Floating Post Tabs"
+                                      isOn:^BOOL { return sFloatingPostTabs; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf floatingPostTabsSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *magnet =
+        [ApolloSettingsRow switchRowWithID:@"gen.floatingPostTabsMagnet"
+                                     title:@"Magnetic Stacking"
+                                      isOn:^BOOL { return sFloatingPostTabsMagnet; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf floatingPostTabsMagnetSwitchToggled:sender]; }];
+    magnet.visible = ^BOOL { return sFloatingPostTabs; };
+
+    ApolloSettingsRow *preview =
+        [ApolloSettingsRow switchRowWithID:@"gen.floatingPostTabsPreview"
+                                     title:@"Hold to Preview"
+                                      isOn:^BOOL { return sFloatingPostTabsPreview; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf floatingPostTabsPreviewSwitchToggled:sender]; }];
+    preview.visible = ^BOOL { return sFloatingPostTabs; };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Floating Tabs"
+                                            footer:@"Keep up to 5 posts open as floating bubbles. In a post, choose Keep in Floating Tab from the ••• menu. Tap a bubble to jump back to the post, or drag it onto the ✕ to close it. Magnetic Stacking piles bubbles together when you drop one on another. Hold to Preview shows the post while you hold a bubble down, and opens it when you let go."
+                                              rows:@[ floatingTabs, magnet, preview ]];
+}
+
+// Interface group screen (ApolloInterfaceSettingsViewController) — appearance,
+// tab-bar controls, and global display/navigation options.
+- (ApolloSettingsSection *)buildInterfaceLiquidGlassSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *liquidGlass =
+        [ApolloSettingsRow switchRowWithID:@"interface.liquidGlassEnabled"
+                                     title:@"Liquid Glass"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyLiquidGlassEnabled]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf liquidGlassSwitchToggled:sender]; }];
+
+    ApolloSettingsSection *section =
+        [ApolloSettingsSection sectionWithTitle:@"Appearance"
+                                         footer:@"Turn off for the classic appearance. Requires a restart."
+                                           rows:@[ liquidGlass ]];
+    // This is a build capability, not the active appearance: keep the switch
+    // available after a relaunch into classic mode so glass can be re-enabled.
+    section.visible = ^BOOL { return ApolloLiquidGlassCanToggle(); };
+    return section;
+}
+
+- (ApolloSettingsSection *)buildInterfaceTabBarSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *profileTabAvatar =
+        [ApolloSettingsRow switchRowWithID:@"interface.profileTabAvatar"
+                                     title:@"Profile Picture Tab Icon"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf profileTabAvatarSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *iconOnlyTabBar =
+        [ApolloSettingsRow switchRowWithID:@"interface.iconOnlyTabBar"
+                                     title:@"Icon-Only Tab Bar"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyHideTabBarTitles]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf iconOnlyTabBarSwitchToggled:sender]; }];
+
+    // iPad horizontal bars deliberately preserve labels in both positions.
+    iconOnlyTabBar.visible = ^BOOL {
+        return !(IsLiquidGlass() && UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad);
+    };
+
+    // Icon-Only already hides every tab label. Hide the narrower profile-only
+    // option while it is active, then reinsert it with its remembered value.
+    ApolloSettingsRow *hideUsernameTab =
+        [ApolloSettingsRow switchRowWithID:@"interface.hideUsernameTab"
+                                     title:@"Hide Username on Tab Bar"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyNativeHideUsernameOnTabBar]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf hideUsernameTabSwitchToggled:sender]; }];
+    hideUsernameTab.visible = ^BOOL { return !sHideTabBarTitles; };
+
+    ApolloSettingsRow *hideBarsOnScroll =
+        [ApolloSettingsRow switchRowWithID:@"interface.hideBarsOnScroll"
+                                     title:ApolloDuoUsesAdaptiveBars() ? @"Hide Tab Bar on Scroll" : @"Hide Bars on Scroll"
+                                      isOn:^BOOL { return ApolloTabBarHideBarsEnabled(); }
+                                  onToggle:^(UISwitch *sender) {
+            ApolloTabBarHideBarsSetEnabled(sender.isOn);
+            [weakSelf visibilityDidChange];
+        }];
+    hideBarsOnScroll.visible = ^BOOL {
+        return ApolloInterfaceSupportsBarScrollSettings();
+    };
+
+    ApolloSettingsRow *hideStyle =
+        [ApolloSettingsRow customRowWithID:@"interface.hideStyle"
+                                      cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:@"ApolloHideStyleMenu"];
+            if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                                      reuseIdentifier:@"ApolloHideStyleMenu"];
+            cell.textLabel.text = @"Hide Style";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.accessoryView = ApolloSettingsMenuButton(@"Hide Style", ApolloTabBarHideStyleCurrentTitle(),
+                ApolloTabBarHideStyleOptionTitles(), ApolloTabBarHideStyleCurrentOptionIndex(),
+                ^(NSInteger index) {
+                    ApolloTabBarHideStyleApplyOptionIndex(index);
+                    [weakSelf reloadRowWithID:@"interface.hideStyle"];
+                });
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        } onSelect:nil];
+    hideStyle.visible = ^BOOL {
+        return ApolloInterfaceSupportsBarScrollSettings() &&
+            ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled();
+    };
+
+    // On Duo the header has an independent preference in every pose. Phones
+    // keep their existing dependency on Hide Bars, including the stored choice.
+    ApolloSettingsRow *hideTopBarToo =
+        [ApolloSettingsRow switchRowWithID:@"interface.hideTopBarToo"
+                                     title:@"Hide Header on Scroll"
+                                      isOn:^BOOL { return sHideTopBarOnScroll; }
+                                  onToggle:^(UISwitch *sender) {
+            if (sHideTopBarOnScroll == sender.isOn) return;
+            sHideTopBarOnScroll = sender.isOn;
+            [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyHideTopBarOnScroll];
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:ApolloTabBarScrollBehaviorChangedNotification object:nil];
+        }];
+    hideTopBarToo.visible = ^BOOL {
+        return ApolloDuoUsesAdaptiveBars() ||
+            (ApolloInterfaceSupportsPhoneTabBarControls() &&
+             ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled());
+    };
+
+    // A single picker keeps the gesture models mutually exclusive and explicit.
+    ApolloSettingsRow *tabBarScrollBehavior =
+        [ApolloSettingsRow customRowWithID:@"interface.tabBarScrollBehavior"
+                                      cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:@"ApolloScrollBehaviorMenu"];
+            if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                                      reuseIdentifier:@"ApolloScrollBehaviorMenu"];
+            cell.textLabel.text = @"Scroll Behavior";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.accessoryView = ApolloSettingsMenuButton(@"Scroll Behavior",
+                sClassicTabBarScrollBehavior ? @"Classic" : @"Two-Gesture",
+                @[ @"Two-Gesture", @"Classic" ], sClassicTabBarScrollBehavior ? 1 : 0,
+                ^(NSInteger index) {
+                    [weakSelf setTabBarScrollBehaviorClassic:(index == 1)];
+                    [weakSelf reloadRowWithID:@"interface.tabBarScrollBehavior"];
+                });
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        } onSelect:nil];
+    tabBarScrollBehavior.visible = ^BOOL {
+        return ApolloInterfaceSupportsBarScrollSettings() &&
+            ApolloSupportsNativeTabBarScrollBehavior() && ApolloTabBarHideBarsEnabled();
+    };
+
+    // Temporary iPad stopgap (#387): only show it where the option can work.
+    ApolloSettingsRow *iPadTabBarBottom =
+        [ApolloSettingsRow valueRowWithID:@"gen.iPadTabBarBottom"
+                                   title:@"Tab Bar Position"
+                                  detail:^NSString * { return sIPadTabBarBottom ? @"Bottom" : @"Top"; }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"gen.iPadTabBarBottom"],
+                @"Tab Bar Position", @[@"Top", @"Bottom"], sIPadTabBarBottom ? 1 : 0,
+                ^(NSInteger index) {
+                    sIPadTabBarBottom = index == 1;
+                    [NSUserDefaults.standardUserDefaults setBool:sIPadTabBarBottom forKey:UDKeyIPadTabBarBottom];
+                    [NSNotificationCenter.defaultCenter postNotificationName:ApolloIPadTabBarBottomChangedNotification object:nil];
+                    [weakSelf reloadRowWithID:@"gen.iPadTabBarBottom"];
+                });
+        }];
+    iPadTabBarBottom.visible = ^BOOL {
+        return UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && IsLiquidGlass() &&
+               !ApolloPaneLayoutActive();
+    };
+
+    // See ApolloLiquidGlass.xm — either/or with drag-to-switch-tab.
+    ApolloSettingsRow *tabBarSwipeNavigation =
+        [ApolloSettingsRow switchRowWithID:@"gen.tabBarSwipeNavigation"
+                                     title:@"Swipe Tab Bar to Navigate"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarSwipeNavigation]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf tabBarSwipeNavigationSwitchToggled:sender]; }];
+    tabBarSwipeNavigation.visible = ^BOOL {
+        return IsLiquidGlass() && ApolloInterfaceSupportsBarScrollSettings();
+    };
+
+    NSString *footer = ApolloSupportsNativeTabBarScrollBehavior()
+        ? @"After the tab bar reappears, Two-Gesture hides it on the second downward gesture; Classic hides it on the first. Both re-expand after 30 seconds of inactivity."
+        : @"Hide Bars on Scroll uses the classic on/off behavior on this version of iOS.";
+    if (!ApolloInterfaceSupportsBarScrollSettings()) {
+        footer = nil;
+    } else if (IsLiquidGlass()) {
+        footer = [footer stringByAppendingString:@"\n\nSwipe Tab Bar to Navigate disables the native drag-to-switch-tab gesture."];
+    }
+    if (ApolloDuoUsesAdaptiveBars()) {
+        NSString *duoFooter = @"On iPhone Duo, Hide Tab Bar on Scroll, Hide Style, and Scroll Behavior apply only while open in portrait. The side rail always stays visible. Hide Header on Scroll works independently in every pose. On the side rail, Swipe Tab Bar to Navigate goes back with a swipe down and forward with a swipe up.";
+        footer = footer.length > 0
+            ? [footer stringByAppendingFormat:@"\n\n%@", duoFooter]
+            : duoFooter;
+    }
+    return [ApolloSettingsSection sectionWithTitle:@"Tab Bar"
+                                            footer:footer
+                                              rows:@[ profileTabAvatar, iconOnlyTabBar, hideUsernameTab,
+                                                      hideBarsOnScroll, hideStyle, hideTopBarToo, tabBarScrollBehavior,
+                                                      iPadTabBarBottom, tabBarSwipeNavigation,
+                                                      [ApolloSettingsRow disclosureRowWithID:@"interface.settingsShortcuts" title:@"Settings Shortcuts" detail:nil push:^UIViewController *{
+                                                          return [[ApolloSettingsShortcutsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+                                                      }] ]];
+}
+
+// Interface → Unread Badges: how the Inbox's unread badges look. Apollo still
+// decides what is unread; see ApolloUnreadBadges.h for where each one is drawn.
+- (ApolloSettingsSection *)buildInterfaceUnreadBadgesSection {
+    ApolloSettingsRow *compactTabBar =
+        [ApolloSettingsRow switchRowWithID:@"interface.unreadBadgeCompactTabBar"
+                                     title:@"Compact Dot on Tab Bar"
+                                      isOn:^BOOL { return sUnreadBadgeCompactTabBar; }
+                                  onToggle:^(UISwitch *sender) { ApolloUnreadBadgesSetCompactTabBar(sender.isOn); }];
+
+    // The Notifications / Chat switcher (and its Requests badge) only exists
+    // with modern Chat on, so the row would do nothing without it.
+    BOOL inboxSwitcher = ApolloModernChatShouldOpen();
+    ApolloSettingsRow *compactInbox =
+        [ApolloSettingsRow switchRowWithID:@"interface.unreadBadgeCompactInbox"
+                                     title:@"Compact Dot in Inbox"
+                                      isOn:^BOOL { return sUnreadBadgeCompactInbox; }
+                                  onToggle:^(UISwitch *sender) { ApolloUnreadBadgesSetCompactInbox(sender.isOn); }];
+    compactInbox.visible = ^BOOL { return ApolloModernChatShouldOpen(); };
+
+    ApolloSettingsRow *themeColor =
+        [ApolloSettingsRow switchRowWithID:@"interface.unreadBadgeThemeColor"
+                                     title:@"Theme Color"
+                                      isOn:^BOOL { return sUnreadBadgeThemeColor; }
+                                  onToggle:^(UISwitch *sender) { ApolloUnreadBadgesSetThemeColor(sender.isOn); }];
+
+    NSString *footer = inboxSwitcher
+        ? @"A small dot replaces the unread count on the Inbox tab, or on the Notifications and Chat tabs in the Inbox. Theme Color uses your theme's accent instead of red."
+        : @"A small dot replaces the unread count on the Inbox tab. Theme Color uses your theme's accent instead of red.";
+    return [ApolloSettingsSection sectionWithTitle:@"Unread Badges"
+                                            footer:footer
+                                              rows:@[ compactTabBar, compactInbox, themeColor ]];
+}
+
+// Interface → Menus: the ••• menus' item order and visibility live on their own
+// screen (ApolloActionMenuSettingsViewController).
+- (ApolloSettingsSection *)buildInterfaceMenusSection {
+    ApolloSettingsRow *actionMenus =
+        [self hubDisclosureRowWithID:@"interface.actionMenus"
+                               title:@"Customize Action Menus"
+                            subtitle:nil
+                                push:^UIViewController * {
+            return [[ApolloActionMenuSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    return [ApolloSettingsSection
+        sectionWithTitle:@"Menus"
+        footer:@"Reorder or hide items in feed, post, comment, and moderator menus."
+        rows:@[ actionMenus ]];
+}
+
+- (ApolloSettingsSection *)buildUserProfilesLayoutSection {
+    ApolloSettingsRow *layout =
+        [ApolloSettingsRow disclosureRowWithID:@"profiles.layout"
+                                        title:@"Profile Layout"
+                                       detail:^NSString * {
+            if (!sShowDetailedProfiles) return @"Native";
+            return sProfileHeaderImmersive ? @"Immersive" : @"Compact";
+        }
+                                         push:^UIViewController * {
+            return [[ApolloProfileLayoutViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    return [ApolloSettingsSection sectionWithTitle:nil footer:nil rows:@[ layout ]];
+}
+
+- (ApolloSettingsSection *)buildUserProfilePicturesSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *preview = [ApolloSettingsRow customRowWithID:@"profiles.picturesPreview"
+        cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:@"ProfilePicturesPreview"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"ProfilePicturesPreview"];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                ApolloProfilePicturesPreview *sample = [ApolloProfilePicturesPreview new];
+                sample.tag = 7302;
+                sample.translatesAutoresizingMaskIntoConstraints = NO;
+                [cell.contentView addSubview:sample];
+                [NSLayoutConstraint activateConstraints:@[
+                    [sample.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor],
+                    [sample.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor],
+                    [sample.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor],
+                    [sample.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor]
+                ]];
+            }
+            [(ApolloProfilePicturesPreview *)[cell.contentView viewWithTag:7302] refresh];
+            return cell;
+        } onSelect:nil];
+    preview.height = ^CGFloat { return 214; };
+
+    ApolloSettingsRow *userAvatars =
+        [ApolloSettingsRow switchRowWithID:@"interface.userAvatars"
+                                     title:@"Show User Profile Pictures"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf userAvatarsSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *avatarShape =
+        [ApolloSettingsRow valueRowWithID:@"interface.avatarShape"
+                                    title:@"Profile Picture Shape"
+                                   detail:^NSString * { return [weakSelf profilePictureShapeText]; }
+                                 onSelect:^{
+            [weakSelf presentProfilePictureShapePickerFromSourceView:
+                [weakSelf cellForRowID:@"interface.avatarShape"]];
+        }];
+    avatarShape.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+    return [ApolloSettingsSection sectionWithTitle:@"Preview"
+                                            footer:@"Show user profile pictures beside usernames in posts, comments, messages, inbox rows, and moderator lists. Shape also applies to profile headers and the profile tab icon."
+                                              rows:@[ preview, userAvatars, avatarShape ]];
+}
+
+- (ApolloSettingsSection *)buildInterfaceDisplayNavigationSection {
+    __weak typeof(self) weakSelf = self;
+
+    // "Color Flairs" now rides Appearance → Flair (native injection) —
+    // -flairColorsSwitchToggled: below stays as the shared toggle handler.
+
+    // Keep the opt-in visible even in a narrow supported phone window. The
+    // saved choice is read on launch; resizing then adapts the same hierarchy.
+    ApolloSettingsRow *iPadPaneLayout =
+        [ApolloSettingsRow customRowWithID:@"gen.iPadPaneLayout"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf switchCellWithIdentifier:@"Cell_Gen_IPadPaneLayout"
+                                                                 label:@"iPad Layout"
+                                                                detail:ApolloIPadPaneLayoutSettingDetail()
+                                                                    on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadPaneLayout] && ApolloPaneLayoutSupported()
+                                                               enabled:ApolloPaneLayoutSupported()
+                                                                action:@selector(iPadPaneLayoutSwitchToggled:)];
+            UILabel *title = [cell.contentView viewWithTag:7001];
+            title.attributedText = ApolloIPadLayoutBetaTitle(title.font, weakSelf.traitCollection);
+            title.accessibilityLabel = @"iPad Layout, Beta";
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+    iPadPaneLayout.visible = ^BOOL {
+        return ApolloPaneLayoutDeviceSupported();
+    };
+
+    // Overrides the top scroll-edge glass under the nav bar (iOS 26+). Liquid
+    // Glass only — hidden otherwise rather than shown-disabled, since the row
+    // has nothing to preview/explain on a non-Glass device.
+    ApolloSettingsRow *scrollEdgeEffect =
+        [ApolloSettingsRow customRowWithID:@"gen.scrollEdgeEffect"
+                                      cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:@"ApolloHeaderStyleMenu"];
+            if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                                      reuseIdentifier:@"ApolloHeaderStyleMenu"];
+            BOOL blurAvailable = ApolloProgressiveBlurAvailable();
+            NSMutableArray<NSString *> *titles = [NSMutableArray arrayWithObjects:@"Soft", @"Hard", nil];
+            if (blurAvailable) [titles addObject:@"Blur"];
+            [titles addObject:@"Hidden"];
+            NSInteger currentIndex = 0;
+            NSInteger currentStyle = ApolloResolvedScrollEdgeEffectStyle();
+            for (NSInteger index = 0; index < (NSInteger)titles.count; index++) {
+                if (ApolloHeaderStylePickerValue(index, blurAvailable) == currentStyle) {
+                    currentIndex = index;
+                    break;
+                }
+            }
+            cell.textLabel.text = @"Header Style";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.accessoryView = ApolloSettingsMenuButton(@"Header Style", [weakSelf scrollEdgeEffectStyleText],
+                titles, currentIndex, ^(NSInteger index) {
+                    [weakSelf setScrollEdgeEffectStyle:ApolloHeaderStylePickerValue(index, blurAvailable)];
+                });
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        } onSelect:nil];
+    scrollEdgeEffect.visible = ^BOOL { return IsLiquidGlass(); };
+
+    ApolloSettingsRow *scrollReturnButton = [ApolloSettingsRow switchRowWithID:@"interface.scrollReturnButton"
+        title:@"Return Button"
+        isOn:^BOOL { return sScrollReturnButton; }
+        onToggle:^(UISwitch *sender) {
+            sScrollReturnButton = sender.on;
+            [NSUserDefaults.standardUserDefaults setBool:sender.on forKey:UDKeyScrollReturnButton];
+            ApolloScrollReturnButtonSettingChanged();
+        }];
+
+    ApolloSettingsRow *collapseActions = [ApolloSettingsRow switchRowWithID:@"interface.CollapseNavigationActions"
+        title:@"Collapse Navigation Actions"
+        isOn:^BOOL { return sCollapseNavigationActions; }
+        onToggle:^(UISwitch *sender) {
+            sCollapseNavigationActions = sender.on;
+            [NSUserDefaults.standardUserDefaults setBool:sender.on forKey:UDKeyCollapseNavigationActions];
+            [weakSelf visibilityDidChange];
+            ApolloNavigationTitlesRefresh();
+        }];
+    collapseActions.visible = ^BOOL { return IsLiquidGlass(); };
+
+    ApolloSettingsRow *centerBetween = [ApolloSettingsRow switchRowWithID:@"interface.CenterTitleBetweenButtons"
+        title:@"Center Title Between Buttons"
+        isOn:^BOOL { return sCenterTitleBetweenButtons; }
+        onToggle:^(UISwitch *sender) {
+            sCenterTitleBetweenButtons = sender.on;
+            [NSUserDefaults.standardUserDefaults setBool:sender.on forKey:UDKeyCenterTitleBetweenButtons];
+            ApolloNavigationTitlesRefresh();
+        }];
+    centerBetween.visible = ^BOOL {
+        return IsLiquidGlass() && !sCollapseNavigationActions && ApolloInterfaceSupportsPhoneTabBarControls();
+    };
+
+    NSString *displayNavigationFooter =
+    @"Spelling applies to screens as they open; reopen Apollo to update everything. True Black Keyboard paints the keyboard background pure black in the chosen appearance and takes effect the next time the keyboard appears. Return Button puts an arrow beside Back after a status bar tap scrolls to the top; tap it, the navigation bar, or the status bar again to go back to where you were. Multi-Column Layout is an experimental, restart-applied option on supported iPad and expanded iOS 27 windows.";
+
+    if (IsLiquidGlass()) {
+        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:
+            @"\n\nIn Liquid Glass, navigation titles stay centered unless expanded actions need room. Collapse Navigation Actions hides the actions behind an ellipsis until tapped; scrolling collapses them again. With it off, actions stay expanded. Center Title Between Buttons centers the title in the space between the back button and actions. Both options default to off. Header Style: Soft is the iOS 26 default; Hard is the iOS 27 default. Hidden removes the header edge effect entirely."];
+    }
+    // Feed title tap and Posts tab long press open the tweak's Modern search
+    // sheet or Apollo's Classic inline popup. Read live, so no relaunch is needed.
+    ApolloSettingsRow *switcherStyle =
+        [ApolloSettingsRow valueRowWithID:@"interface.subredditSwitcher"
+                                   title:@"Subreddit Switcher"
+                                  detail:^NSString * {
+            return sSubredditSwitcherSheetEnabled ? @"Modern" : @"Classic";
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.subredditSwitcher"],
+                @"Subreddit Switcher", @[ @"Classic", @"Modern" ],
+                sSubredditSwitcherSheetEnabled ? 1 : 0, ^(NSInteger picked) {
+                    BOOL sheetEnabled = picked == 1;
+                    if (sSubredditSwitcherSheetEnabled == sheetEnabled) return;
+                    sSubredditSwitcherSheetEnabled = sheetEnabled;
+                    [NSUserDefaults.standardUserDefaults setBool:sheetEnabled
+                        forKey:UDKeySubredditSwitcherSheetEnabled];
+                    [weakSelf reloadRowWithID:@"interface.subredditSwitcher"];
+                });
+        }];
+
+    NSArray<NSString *> *spellingTitles = @[ @"American", @"British" ];
+    void (^applySpelling)(NSInteger) = ^(NSInteger picked) {
+        ApolloSpellingSetStyle(picked == 1 ? ApolloSpellingStyleBritish : ApolloSpellingStyleAmerican);
+        // Other loaded lists (the subreddit list in another tab) pick it up now too.
+        ApolloSpellingReloadLoadedTables(weakSelf.tableView);
+        // Rebuild so this screen's own labels pick up the new spelling. Cell labels skip
+        // a set whose text matches what they show, so clear them first.
+        [weakSelf performUpdateKeepingVisibleRowsInPlace:^{
+            for (UITableViewCell *cell in weakSelf.tableView.visibleCells) {
+                cell.textLabel.text = nil;
+                cell.detailTextLabel.text = nil;
+            }
+            [weakSelf rebuildForm];
+        }];
+    };
+    // Liquid Glass uses the native pull-down like the other Interface pickers; the
+    // standard build keeps the action sheet.
+    ApolloSettingsRow *spelling = IsLiquidGlass()
+        ? [ApolloSettingsRow customRowWithID:@"interface.spelling"
+                                        cell:^UITableViewCell *(UITableView *table, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:@"ApolloSpellingMenu"];
+            if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
+                                                      reuseIdentifier:@"ApolloSpellingMenu"];
+            NSInteger current = ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0;
+            cell.textLabel.text = @"Spelling";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.accessoryView = ApolloSettingsMenuButton(@"Spelling", spellingTitles[current],
+                                                          spellingTitles, current, applySpelling);
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        } onSelect:nil]
+        : [ApolloSettingsRow valueRowWithID:@"interface.spelling"
+                                      title:@"Spelling"
+                                     detail:^NSString * {
+            return spellingTitles[ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0];
+        }
+                                   onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.spelling"],
+                @"Spelling", spellingTitles, ApolloSpellingCurrentStyle() == ApolloSpellingStyleBritish ? 1 : 0,
+                applySpelling);
+        }];
+
+    NSArray<NSString *> *trueBlackTitles = @[ @"Off", @"Dark Mode Only", @"Light Mode Only", @"Always" ];
+    ApolloSettingsRow *trueBlackKeyboard =
+        [ApolloSettingsRow valueRowWithID:@"interface.trueBlackKeyboard"
+                                    title:@"True Black Keyboard"
+                                   detail:^NSString * {
+            NSInteger mode = [NSUserDefaults.standardUserDefaults integerForKey:UDKeyTrueBlackKeyboardMode];
+            return trueBlackTitles[MAX(0, MIN(mode, (NSInteger)trueBlackTitles.count - 1))];
+        }
+                                 onSelect:^{
+            NSInteger mode = [NSUserDefaults.standardUserDefaults integerForKey:UDKeyTrueBlackKeyboardMode];
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.trueBlackKeyboard"],
+                @"True Black Keyboard", trueBlackTitles, MAX(0, MIN(mode, (NSInteger)trueBlackTitles.count - 1)),
+                ^(NSInteger picked) {
+                    [NSUserDefaults.standardUserDefaults setInteger:picked forKey:UDKeyTrueBlackKeyboardMode];
+                    [weakSelf reloadRowWithID:@"interface.trueBlackKeyboard"];
+                });
+        }];
+
+    NSArray<NSString *> *searchBarTitles = @[ @"On", @"Hidden", @"Off" ];
+    ApolloSettingsRow *searchBars =
+        [ApolloSettingsRow valueRowWithID:@"interface.searchBars"
+                                    title:@"Search Bars"
+                                   detail:^NSString * {
+            if (!sSearchBarModeExplicit && sShowFeedSearchBar != sShowFindInCommentsBar) return @"Custom";
+            return searchBarTitles[ApolloSearchBarModeForComments(NO)];
+        }
+                                 onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"interface.searchBars"],
+                @"Search Bars", searchBarTitles, ApolloSearchBarModeForComments(NO),
+                ^(NSInteger picked) {
+                    ApolloSaveSearchBarMode(NSUserDefaults.standardUserDefaults, (ApolloSearchBarMode)picked);
+                    [weakSelf reloadRowWithID:@"interface.searchBars"];
+                });
+        }];
+    BOOL searchBarsRow = NO;
+    if (@available(iOS 26.0, *)) searchBarsRow = IsLiquidGlass();
+    searchBars.visible = ^BOOL { return searchBarsRow; };
+
+    if (searchBarsRow) {
+        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:@"\n\nSearch Bars: the search field under a feed's title and Find in Comments on threads. Hidden keeps them out of the way until you pull down at the top of the list. Off removes them; Find in Comments stays in the thread's ••• menu. Existing per-screen choices are kept until you choose a mode here. Custom means feed and thread choices differ."];
+    }
+
+    ApolloSettingsRow *duoRailReply =
+        [ApolloSettingsRow switchRowWithID:@"interface.duoRailReply"
+                                     title:@"Reply Button in Side Rail"
+                                      isOn:^BOOL { return sDuoRailReplyButton; }
+                                  onToggle:^(UISwitch *sender) {
+            sDuoRailReplyButton = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyDuoRailReplyButton];
+        }];
+    duoRailReply.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+
+    if (ApolloDuoUsesAdaptiveBars()) {
+        displayNavigationFooter = [displayNavigationFooter stringByAppendingString:@"\n\nReply Button in Side Rail: on iPhone Duo, threads show Reply beside the other actions in the side rail instead of only in the ••• menu."];
+    }
+    return [ApolloSettingsSection sectionWithTitle:@"Display & Navigation"
+                                            footer:displayNavigationFooter
+                                              rows:@[ spelling, scrollReturnButton, trueBlackKeyboard, collapseActions, centerBetween, switcherStyle, iPadPaneLayout, scrollEdgeEffect, searchBars, duoRailReply ]];
+}
+
+// Display order differs from stored values; Blur is optional, while Hidden
+// always remains the last choice. Map picker indices explicitly.
+static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailable) {
+    const NSInteger values[] = {
+        ApolloScrollEdgeEffectStyleSoft,
+        ApolloScrollEdgeEffectStyleHard,
+        blurAvailable ? ApolloScrollEdgeEffectStyleBlur : ApolloScrollEdgeEffectStyleHidden,
+        ApolloScrollEdgeEffectStyleHidden,
+    };
+    NSInteger count = blurAvailable ? 4 : 3;
+    if (index < 0 || index >= count) return ApolloScrollEdgeEffectStyleSoft;
+    return values[index];
+}
+
+- (NSString *)scrollEdgeEffectStyleText {
+    switch (ApolloResolvedScrollEdgeEffectStyle()) {
+        case ApolloScrollEdgeEffectStyleSoft: return @"Soft";
+        case ApolloScrollEdgeEffectStyleHard: return @"Hard";
+        case ApolloScrollEdgeEffectStyleBlur: return @"Blur";
+        case ApolloScrollEdgeEffectStyleHidden: return @"Hidden";
+        default: return @"Soft";
+    }
+}
+
+- (void)setScrollEdgeEffectStyle:(NSInteger)style {
+    sScrollEdgeEffectStyle = style;
+    [[NSUserDefaults standardUserDefaults] setInteger:sScrollEdgeEffectStyle forKey:UDKeyScrollEdgeEffectStyle];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloScrollEdgeEffectStyleChangedNotification object:nil];
+    [self reloadRowWithID:@"gen.scrollEdgeEffect"];
+}
+
+- (void)presentScrollEdgeEffectStyleSheetFromSourceView:(UIView *)sourceView {
+    // Blur needs the private variableBlur filter; never offer a mode that
+    // would render nothing.
+    BOOL blurAvailable = ApolloProgressiveBlurAvailable();
+    NSMutableArray<NSString *> *options =
+        [NSMutableArray arrayWithObjects:@"Soft", @"Hard", nil];
+    if (blurAvailable) [options addObject:@"Blur"];
+    [options addObject:@"Hidden"];
+
+    NSInteger currentIndex = 0;
+    NSInteger currentStyle = ApolloResolvedScrollEdgeEffectStyle();
+    for (NSInteger i = 0; i < (NSInteger)options.count; i++) {
+        if (ApolloHeaderStylePickerValue(i, blurAvailable) == currentStyle) {
+            currentIndex = i;
+            break;
+        }
+    }
+
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Header Style",
+                                options, currentIndex, ^(NSInteger pickedIndex) {
+        [weakSelf setScrollEdgeEffectStyle:ApolloHeaderStylePickerValue(pickedIndex, blurAvailable)];
+    });
+}
+
+- (ApolloSettingsRow *)buildApolloAIRow {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *aiSettings =
+        [ApolloSettingsRow customRowWithID:@"ai.settings"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_ApolloAI"];
+            if (!cell) {
+                // Match the standard disclosure-row behavior used by API setup and
+                // other navigable settings: UIKit owns the chevron and the full row.
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
+                                              reuseIdentifier:@"Cell_ApolloAI"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Apollo AI";
+            NSString *activeProviderName = @"On-device";
+            if ([sAISummaryProvider isEqualToString:@"openrouter"]) activeProviderName = @"OpenRouter";
+            else if ([sAISummaryProvider isEqualToString:@"gemini"]) activeProviderName = @"Gemini";
+            else if ([sAISummaryProvider isEqualToString:@"custom"]) activeProviderName = @"Custom";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@",
+                                         sEnableAISummaries ? @"On" : @"Off",
+                                         activeProviderName];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 1;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf openApolloAISettings]; }];
+
+    return aiSettings;
+}
+
+- (ApolloSettingsRow *)buildInlineMediaRow {
+    __weak typeof(self) weakSelf = self;
+
+    // Status subtitle mirrors the sub-screen's master toggle / autoplay mode /
+    // size so the state is visible without drilling in.
+    ApolloSettingsRow *inlineMedia =
+        [ApolloSettingsRow customRowWithID:@"inlineMedia.settings"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_InlineMedia"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell_InlineMedia"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Inline Media Settings";
+            NSString *detail;
+            if (!sEnableInlineImages) {
+                detail = @"Off";
+            } else {
+                NSString *autoplay;
+                switch (sAutoplayInlineGIFMode) {
+                    case ApolloAutoplayInlineGIFModeTapToPlay: autoplay = @"Tap to Play"; break;
+                    case ApolloAutoplayInlineGIFModeWiFiOnly:  autoplay = @"WiFi Only"; break;
+                    case ApolloAutoplayInlineGIFModeAlways:    autoplay = @"Always"; break;
+                    case ApolloAutoplayInlineGIFModeNever:
+                    default:                                   autoplay = @"Never"; break;
+                }
+                detail = [NSString stringWithFormat:@"On \u00b7 Autoplay %@ \u00b7 Size %ld%%",
+                          autoplay, (long)sInlineMediaSizePercent];
+            }
+            cell.detailTextLabel.text = detail;
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 0;
+            cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf openInlineMediaSettings]; }];
+
+    return inlineMedia;
+}
+
+- (void)openInlineMediaSettings {
+    InlineMediaSettingsViewController *vc =
+        [[InlineMediaSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
+- (ApolloSettingsRow *)buildLinkPreviewsRow {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *linkPreviews =
+        [ApolloSettingsRow customRowWithID:@"linkPreviews.settings"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_LinkPreviews"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell_LinkPreviews"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Rich Link Previews";
+            NSString *colorText = (sLinkPreviewCardColorHex.length > 0)
+                ? [NSString stringWithFormat:@"#%@", [sLinkPreviewCardColorHex uppercaseString]]
+                : @"Default color";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"Body %@ · Comments %@ · %@",
+                                         [weakSelf linkPreviewModeTextForMode:sLinkPreviewBodyMode],
+                                         [weakSelf linkPreviewModeTextForMode:sLinkPreviewCommentsMode],
+                                         colorText];
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 0;
+            cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf openLinkPreviewSettings]; }];
+
+    return linkPreviews;
+}
+
+- (ApolloSettingsRow *)buildPollsRow {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *polls =
+        [ApolloSettingsRow customRowWithID:@"polls.settings"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_Polls"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"Cell_Polls"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Polls";
+            cell.detailTextLabel.text = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPollsEnabled] ? @"On" : @"Off";
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+            cell.detailTextLabel.numberOfLines = 1;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf openPollSettings]; }];
+
+    return polls;
+}
+
+- (void)openPollSettings {
+    ApolloPollSettingsViewController *vc =
+        [[ApolloPollSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
+// Media group screen (ApolloMediaSettingsViewController), five sections:
+// Browsing / Playback / Inline Media / Uploads / Network.
+- (ApolloSettingsSection *)buildMediaBrowsingSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *feedGalleries =
+        [ApolloSettingsRow switchRowWithID:@"media.feedGalleryCarousel"
+                                     title:@"Swipe Through Feed Galleries"
+                                      isOn:^BOOL { return sFeedGalleryCarousel; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf feedGalleryCarouselSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *edgeSwipeNav =
+        [ApolloSettingsRow switchRowWithID:@"media.feedGalleryEdgeSwipeNav"
+                                     title:@"Swipe Past Gallery to Navigate"
+                                      isOn:^BOOL { return sFeedGalleryEdgeSwipeNav; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf feedGalleryEdgeSwipeNavSwitchToggled:sender]; }];
+    edgeSwipeNav.visible = ^BOOL { return sFeedGalleryCarousel; };
+
+    ApolloSettingsRow *swipeComments =
+        [ApolloSettingsRow switchRowWithID:@"media.swipeUpComments"
+                                     title:@"Swipe Up for Comments"
+                                      isOn:^BOOL { return sSwipeUpForComments; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf swipeUpCommentsSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *galleryAutoplayVideos =
+        [ApolloSettingsRow switchRowWithID:@"media.galleryAutoplayVideos"
+                                     title:@"Play Videos in Gallery View"
+                                      isOn:^BOOL { return sGalleryAutoplayVideos; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf galleryAutoplayVideosSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *galleryAutoplayGIFs =
+        [ApolloSettingsRow switchRowWithID:@"media.galleryAutoplayGIFs"
+                                     title:@"Play GIFs in Gallery View"
+                                      isOn:^BOOL { return sGalleryAutoplayGIFs; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf galleryAutoplayGIFsSwitchToggled:sender]; }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Browsing"
+                                            footer:@"Swipe Through Feed Galleries: page through a gallery post's images without leaving the feed.\n\nSwipe Past Gallery to Navigate: at the first or last image, keep swiping to use your normal post swipes (vote, save, back or forward) instead of bouncing. From any image, a swipe that starts at the screen edge goes back or forward. Off by default.\n\nSwipe Up for Comments: in the fullscreen media viewer, swipe up or tap the comments button to open comments over the media. Off by default.\n\nPlay Videos / GIFs in Gallery View: video and GIF tiles play silently while they're on screen; tap one for the full-size viewer with sound. Paused in Low Power Mode."
+                                              rows:@[ feedGalleries, edgeSwipeNav, swipeComments, galleryAutoplayVideos, galleryAutoplayGIFs ]];
+}
+
+// NSFW Media. Lives here rather than in Apollo's native Filters & Blocks screen:
+// these are tweak settings, and tweak settings belong on the tweak's own screens
+// (Apollo's tables are only ever modified through the ApolloSettingsGeneralTable
+// registry).
+- (ApolloSettingsSection *)buildMediaNSFWSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *blur =
+        [ApolloSettingsRow valueRowWithID:@"media.nsfwBlurOverride"
+                                    title:@"Blur NSFW Media"
+                                   detail:^NSString * { return ApolloNSFWBlurOverrideTitle(sNSFWBlurOverride); }
+                                 onSelect:^{ [weakSelf nsfwBlurOverrideRowSelected]; }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"NSFW Media"
+                                            footer:@"\"Reddit Setting\" follows your account's \"Blur mature (18+) images and media\" preference; Always and Never override it on this device only."
+                                              rows:@[ blur ]];
+}
+
+- (void)nsfwBlurOverrideRowSelected {
+    ApolloSettingsPresentPicker(self, nil, @"Blur NSFW Media",
+                                @[ ApolloNSFWBlurOverrideTitle(0),
+                                   ApolloNSFWBlurOverrideTitle(1),
+                                   ApolloNSFWBlurOverrideTitle(2) ],
+                                sNSFWBlurOverride,
+                                ^(NSInteger picked) {
+        sNSFWBlurOverride = picked;
+        [[NSUserDefaults standardUserDefaults] setInteger:picked forKey:UDKeyNSFWBlurOverride];
+        ApolloTagFiltersNSFWBlurOverrideChanged();
+    });
+}
+
+- (ApolloSettingsSection *)buildMediaPlaybackSection {
+    __weak typeof(self) weakSelf = self;
+
+    // The old Value1 picker cells all carried a chevron; value rows don't by
+    // default, so each picker row re-adds it here.
+    void (^disclosure)(UITableViewCell *) = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
+    ApolloSettingsRow *gifFallback =
+        [ApolloSettingsRow valueRowWithID:@"media.gifFallback"
+                                    title:@"Preferred GIF Fallback Format"
+                                   detail:^NSString * { return [weakSelf preferredGIFFallbackFormatText]; }
+                                 onSelect:^{
+            [weakSelf presentPreferredGIFFallbackFormatSheetFromSourceView:[weakSelf cellForRowID:@"media.gifFallback"]];
+        }];
+    gifFallback.configure = disclosure;
+
+    ApolloSettingsRow *unmuteFeed =
+        [ApolloSettingsRow valueRowWithID:@"media.unmuteFeed"
+                                    title:@"Unmute Videos in Feed"
+                                   detail:^NSString * { return [weakSelf unmuteFeedVideosModeText]; }
+                                 onSelect:^{
+            [weakSelf presentUnmuteFeedVideosModeSheetFromSourceView:[weakSelf cellForRowID:@"media.unmuteFeed"]];
+        }];
+    unmuteFeed.configure = disclosure;
+
+    ApolloSettingsRow *unmuteComments =
+        [ApolloSettingsRow valueRowWithID:@"media.unmuteComments"
+                                    title:@"Unmute Videos in Comments"
+                                   detail:^NSString * { return [weakSelf unmuteCommentsVideosModeText]; }
+                                 onSelect:^{
+            [weakSelf presentUnmuteCommentsVideosModeSheetFromSourceView:[weakSelf cellForRowID:@"media.unmuteComments"]];
+        }];
+    unmuteComments.configure = disclosure;
+
+    // Master toggle for "Hold for Video Speed". When on, the hold-speed
+    // picker row is shown below; when off, the right side of a fullscreen
+    // video keeps Apollo's normal long-press menu.
+    ApolloSettingsRow *holdSpeed =
+        [ApolloSettingsRow switchRowWithID:@"media.holdSpeed"
+                                     title:@"Hold for Video Speed"
+                                      isOn:^BOOL { return sVideoHoldSpeedEnabled; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf videoHoldSpeedSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *holdSpeedValue =
+        [ApolloSettingsRow valueRowWithID:@"media.holdSpeedValue"
+                                    title:@"Hold Speed"
+                                   detail:^NSString * { return [weakSelf videoHoldSpeedText]; }
+                                 onSelect:^{
+            [weakSelf presentVideoHoldSpeedSheetFromSourceView:[weakSelf cellForRowID:@"media.holdSpeedValue"]];
+        }];
+    holdSpeedValue.configure = disclosure;
+    // Only shown while Hold for Video Speed is on (see -videoHoldSpeedSwitchToggled:).
+    holdSpeedValue.visible = ^BOOL { return sVideoHoldSpeedEnabled; };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Playback"
+                                            footer:@"Unmute Videos in Feed: Never keeps feed videos silent, Always plays every one with sound, and Remember follows the last video you muted or unmuted yourself. Only one feed video plays sound at a time. Hold for Video Speed: press and hold the right side of a fullscreen video to play it at the chosen speed."
+                                              rows:@[ gifFallback, unmuteFeed, unmuteComments, holdSpeed, holdSpeedValue ]];
+}
+
+- (ApolloSettingsSection *)buildMediaInlineSection {
+    return [ApolloSettingsSection sectionWithTitle:@"Inline Media"
+                                            footer:@"Show images and play GIFs inline in the feed."
+                                              rows:@[ [self buildInlineMediaRow] ]];
+}
+
+- (ApolloSettingsSection *)buildMediaSharingSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *shareLinkHost =
+        [ApolloSettingsRow valueRowWithID:@"media.shareLinkHost"
+                                    title:@"Share Link Host"
+                                   detail:^NSString * {
+            return [weakSelf shareLinkHostText];
+        }
+                                 onSelect:^{
+            [weakSelf presentShareLinkHostSheetFromSourceView:
+                [weakSelf cellForRowID:@"media.shareLinkHost"]];
+        }];
+
+    shareLinkHost.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Sharing"
+                                            footer:@"Choose which Reddit host Apollo uses for shared post and comment links, including Copy Link and links included with shared media. fxReddit uses fxddit.com."
+                                              rows:@[ shareLinkHost ]];
+}
+
+- (ApolloSettingsSection *)buildMediaUploadsSection {
+    __weak typeof(self) weakSelf = self;
+
+    void (^disclosure)(UITableViewCell *) = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
+    ApolloSettingsRow *uploadHost =
+        [ApolloSettingsRow valueRowWithID:@"media.uploadHost"
+                                    title:@"Media Upload Host"
+                                   detail:^NSString * { return [weakSelf mediaUploadProviderText]; }
+                                 onSelect:^{
+            [weakSelf presentImageUploadProviderSheetFromSourceView:[weakSelf cellForRowID:@"media.uploadHost"]];
+        }];
+    uploadHost.configure = disclosure;
+
+    ApolloSettingsRow *commentLinkHost =
+        [ApolloSettingsRow valueRowWithID:@"media.commentLinkHost"
+                                    title:@"Comment Link Host"
+                                   detail:^NSString * { return [weakSelf commentLinkHostText]; }
+                                 onSelect:^{
+            [weakSelf presentCommentLinkHostSheetFromSourceView:[weakSelf cellForRowID:@"media.commentLinkHost"]];
+        }];
+    commentLinkHost.configure = disclosure;
+
+    ApolloSettingsRow *commentLinkAuto =
+        [ApolloSettingsRow switchRowWithID:@"media.commentLinkAuto"
+                                     title:@"Prefer Native Images"
+                                      isOn:^BOOL { return sCommentLinkPreferNative; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf commentLinkPreferNativeSwitchToggled:sender]; }];
+    // Auto mode only means something while a link host is set (see -setCommentLinkHost:).
+    commentLinkAuto.visible = ^BOOL { return sCommentLinkHost != CommentLinkHostOff; };
+
+    // NOTE: the rendered footer for this section is the attributed one in
+    // -footerAttributedTextForSection: (matched by the "Uploads" title) — keep
+    // the two in sync when editing either.
+    return [ApolloSettingsSection sectionWithTitle:@"Uploads"
+                                            footer:@"Media Upload Host chooses where images you attach to posts and comments are uploaded.\n\nComment Link Host uploads comment images to Imgur or Image Chest and inserts a plain link, so they work in subreddits that don't allow image comments. Prefer Native Images uses Reddit's own image upload wherever the subreddit allows it, and the link host only where it doesn't.\n\nManage past uploads under Settings → General → Media → Manage Uploads."
+                                              rows:@[ uploadHost, commentLinkHost, commentLinkAuto ]];
+}
+
+- (ApolloSettingsSection *)buildMediaNetworkSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *proxyImgur =
+        [ApolloSettingsRow switchRowWithID:@"media.proxyImgur"
+                                     title:@"Proxy Imgur via DuckDuckGo"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyProxyImgurDDG]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf proxyImgurDDGSwitchToggled:sender]; }];
+
+    ApolloSettingsRow *albumFallback =
+        [ApolloSettingsRow switchRowWithID:@"media.imgurAlbumFallback"
+                                     title:@"Album Fallback Proxies"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyImgurAlbumFallbackProxies]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf imgurAlbumFallbackSwitchToggled:sender]; }];
+    albumFallback.visible = ^BOOL { return sProxyImgurDDG; };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Network"
+                                            footer:@"Proxy Imgur via DuckDuckGo loads Imgur images through DuckDuckGo's image cache, so they still show where Imgur is blocked (like the UK).\n\nDuckDuckGo can't fetch an album's list of images, so Album Fallback Proxies gets it through public text proxies (r.jina.ai, allorigins.win, codetabs.com) instead. Only the album's Imgur address is sent to them. Turn it off and albums won't load while Imgur is blocked.\n\nVideos and uploads can't be proxied."
+                                              rows:@[ proxyImgur, albumFallback ]];
+}
+
+- (NSString *)profilePictureShapeText {
+    switch (sProfileAvatarStyle) {
+        case 1:  return @"Circle";
+        case 2:  return @"Square";
+        default: return @"Full";
+    }
+}
+
+- (void)presentProfilePictureShapePickerFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, nil,
+                                @[@"Full", @"Circle", @"Square"],
+                                sProfileAvatarStyle, ^(NSInteger pickedIndex) {
+        if (pickedIndex < 0 || pickedIndex > 2) return;
+        sProfileAvatarStyle = pickedIndex;
+        [[NSUserDefaults standardUserDefaults] setInteger:pickedIndex
+                                                   forKey:UDKeyProfileAvatarStyle];
+        [weakSelf reloadRowWithID:@"interface.avatarShape"];
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"ApolloUserAvatarsToggleChangedNotification"
+                          object:@"ApolloProfileAvatarStyleChanged"];
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification"
+                          object:nil];
+    });
+}
+
+// Shared with the Duo page while retaining the existing contextual entrance.
+- (ApolloSettingsRow *)buildDuoPanelStyleRow {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *panelStyle =
+        [ApolloSettingsRow valueRowWithID:@"sub.panelStyle"
+                                   title:@"Subreddit Panel Style"
+                                  detail:^NSString * {
+            return sDuoSubredditPanelGlassEnabled ? @"Liquid Glass" : @"Standard";
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"sub.panelStyle"],
+                @"Subreddit Panel Style", @[ @"Standard", @"Liquid Glass" ],
+                sDuoSubredditPanelGlassEnabled ? 1 : 0, ^(NSInteger picked) {
+                    BOOL glassEnabled = picked == 1;
+                    if (sDuoSubredditPanelGlassEnabled == glassEnabled) return;
+                    sDuoSubredditPanelGlassEnabled = glassEnabled;
+                    [NSUserDefaults.standardUserDefaults setBool:glassEnabled
+                        forKey:UDKeyDuoSubredditPanelGlassEnabled];
+                    [weakSelf reloadRowWithID:@"sub.panelStyle"];
+                    ApolloDuoSplitScheduleUpdate();
+                });
+        }];
+    panelStyle.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+
+    return panelStyle;
+}
+
+- (ApolloSettingsSection *)buildSubredditsMainSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *feedShortcuts =
+        [ApolloSettingsRow disclosureRowWithID:@"sub.feedShortcuts"
+                               title:@"Feed Shortcuts"
+                            detail:^NSString * {
+            return [NSString stringWithFormat:@"%@ · %@",
+                    [weakSelf subredditFeedIconStyleText],
+                    [weakSelf subredditFeedLayoutText]];
+        }
+                                push:^UIViewController * {
+            return ApolloSettingsRouteInstantiate(@"feed-shortcuts");
+        }];
+
+    ApolloSettingsRow *panelStyle = [self buildDuoPanelStyleRow];
+
+    // Pushes the dedicated Subreddit Sections screen: the FOLLOWING section
+    // for followed users, drag-to-reorder for the special sections, and a
+    // live preview of the list layout (see ApolloSubredditSectionsViewController).
+    ApolloSettingsRow *subredditSections =
+        [ApolloSettingsRow disclosureRowWithID:@"sub.sections"
+                                title:@"Subreddit List Sections"
+                             detail:nil
+                                 push:^UIViewController * {
+            return [[ApolloSubredditSectionsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+
+    ApolloSettingsRow *perAccountFavorites =
+        [ApolloSettingsRow switchRowWithID:@"sub.perAccountFavorites"
+                                     title:@"Per-Account Favorites"
+                                      isOn:^BOOL { return sPerAccountFavoritesEnabled; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf perAccountFavoritesSwitchToggled:sender]; }];
+    ApolloSettingsRow *sortFavoritesAlphabetically =
+        [ApolloSettingsRow switchRowWithID:@"sub.sortFavoritesAlphabetically"
+                                     title:@"Sort Favorites Alphabetically"
+                                      isOn:^BOOL { return sSortFavoritesAlphabetically; }
+                                  onToggle:^(UISwitch *sender) {
+                                      ApolloFavoritesSortingSetEnabled(sender.isOn);
+                                      if (sender.isOn != sSortFavoritesAlphabetically) {
+                                          [sender setOn:sSortFavoritesAlphabetically animated:YES];
+                                      }
+                                  }];
+    sortFavoritesAlphabetically.enabled = ^BOOL { return ApolloFavoritesSortingIsAvailable(); };
+    ApolloSettingsRow *confirmFavoriteToggle =
+        [ApolloSettingsRow switchRowWithID:@"sub.confirmFavoriteToggle"
+                                     title:@"Confirm Favorite Changes"
+                                      isOn:^BOOL { return sConfirmFavoriteToggle; }
+                                  onToggle:^(UISwitch *sender) {
+                                      sConfirmFavoriteToggle = sender.isOn;
+                                      [[NSUserDefaults standardUserDefaults] setBool:sender.isOn
+                                                                              forKey:UDKeyConfirmFavoriteToggle];
+                                  }];
+    return [ApolloSettingsSection sectionWithTitle:@"Subreddit List"
+                                            footer:nil
+                                              rows:@[ feedShortcuts, subredditSections, panelStyle,
+                                                      perAccountFavorites, sortFavoritesAlphabetically, confirmFavoriteToggle ]];
+}
+
+- (ApolloSettingsSection *)buildSubredditsLayoutSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *subredditLayout =
+        [ApolloSettingsRow disclosureRowWithID:@"sub.layout"
+                                title:@"Subreddit Layout"
+                             detail:^NSString * { return [weakSelf subredditLayoutSummaryText]; }
+                                 push:^UIViewController * {
+            return [[ApolloSubredditLayoutViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Subreddit Appearance"
+                                            footer:nil
+                                              rows:@[ subredditLayout ]];
+}
+
+- (ApolloSettingsSection *)buildFeedShortcutsVisibilitySection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *showPopular =
+        [ApolloSettingsRow switchRowWithID:@"sub.showPopularShortcut"
+                                     title:@"Show Popular"
+                                      isOn:^BOOL {
+            return ![NSUserDefaults.standardUserDefaults boolForKey:UDKeyHideRPopularRedditList];
+        }
+                                  onToggle:^(UISwitch *sender) {
+            [weakSelf setFeedShortcutVisible:sender.isOn defaultsKey:UDKeyHideRPopularRedditList];
+        }];
+    ApolloSettingsRow *showAll =
+        [ApolloSettingsRow switchRowWithID:@"sub.showAllShortcut"
+                                     title:@"Show All Posts"
+                                      isOn:^BOOL {
+            return ![NSUserDefaults.standardUserDefaults boolForKey:UDKeyHideRAllRedditList];
+        }
+                                  onToggle:^(UISwitch *sender) {
+            [weakSelf setFeedShortcutVisible:sender.isOn defaultsKey:UDKeyHideRAllRedditList];
+        }];
+    ApolloSettingsRow *showModerator =
+        [ApolloSettingsRow switchRowWithID:@"sub.showModeratorShortcut"
+                                     title:@"Show Moderator Posts"
+                                      isOn:^BOOL {
+            return ![NSUserDefaults.standardUserDefaults boolForKey:UDKeyHideModeratorRedditList];
+        }
+                                  onToggle:^(UISwitch *sender) {
+            [weakSelf setFeedShortcutVisible:sender.isOn defaultsKey:UDKeyHideModeratorRedditList];
+        }];
+    ApolloSettingsRow *showPalHome =
+        [ApolloSettingsRow switchRowWithID:@"sub.showPalHomeShortcut"
+                                     title:@"Show Pal Home"
+                                      isOn:^BOOL {
+            return ![NSUserDefaults.standardUserDefaults boolForKey:UDKeyHidePalHomeShortcut];
+        }
+                                  onToggle:^(UISwitch *sender) {
+            [weakSelf setFeedShortcutVisible:sender.isOn defaultsKey:UDKeyHidePalHomeShortcut];
+        }];
+    // Only offered while Pal Home is on (it's where the shortcut goes).
+    showPalHome.visible = ^BOOL { return ApolloPalHomeStore.isPalHomeEnabled; };
+    return [ApolloSettingsSection sectionWithTitle:@"Visible Shortcuts"
+                                            footer:nil
+                                              rows:@[ showPopular, showAll, showModerator, showPalHome ]];
+}
+
+- (ApolloSettingsSection *)buildFeedShortcutsControlsSection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *feedIconStyle =
+        [ApolloSettingsRow valueRowWithID:@"sub.feedIconStyle"
+                                    title:@"Icon Style"
+                                   detail:^NSString * { return [weakSelf subredditFeedIconStyleText]; }
+                                 onSelect:^{
+            [weakSelf presentSubredditFeedIconStylePickerFromSourceView:[weakSelf cellForRowID:@"sub.feedIconStyle"]];
+        }];
+    feedIconStyle.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
+    ApolloSettingsRow *feedLayout =
+        [ApolloSettingsRow valueRowWithID:@"sub.feedLayout"
+                                    title:@"Feed Layout"
+                                   detail:^NSString * { return [weakSelf subredditFeedLayoutText]; }
+                                 onSelect:^{
+            [weakSelf presentSubredditFeedLayoutPickerFromSourceView:[weakSelf cellForRowID:@"sub.feedLayout"]];
+        }];
+    feedLayout.configure = ^(UITableViewCell *cell) {
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    };
+
+    // Only the Rows layout has room for a subtitle under each shortcut, so
+    // the descriptions switch rides along with the layout picker (it hides
+    // with any other layout). Hide Multireddit Descriptions lives on the
+    // Subreddit List screen beside its preview.
+    ApolloSettingsRow *hideFeedDescriptions =
+        [ApolloSettingsRow switchRowWithID:@"sub.hideFeedDescriptions"
+                                     title:@"Hide Feed Descriptions"
+                                      isOn:^BOOL { return sHideSubredditListDescriptions; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf hideSubredditListDescriptionsSwitchToggled:sender]; }];
+    hideFeedDescriptions.visible = ^BOOL {
+        return sSubredditFeedLayout == ApolloSubredditFeedLayoutRows;
+    };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Appearance"
+                                            footer:nil
+                                              rows:@[ feedIconStyle, feedLayout, hideFeedDescriptions ]];
+}
+
+- (NSString *)subredditFeedIconStyleText {
+    switch (sSubredditFeedIconStyle) {
+        case ApolloSubredditFeedIconStyleCircle: return @"Circle";
+        case ApolloSubredditFeedIconStyleTinted: return @"Tinted";
+        case ApolloSubredditFeedIconStyleSoftTile: return @"Soft Tile";
+        case ApolloSubredditFeedIconStyleSolidTile: return @"Solid Tile";
+        default: return @"Classic";
+    }
+}
+
+- (NSString *)subredditFeedLayoutText {
+    switch (sSubredditFeedLayout) {
+        case ApolloSubredditFeedLayoutSideBySide: return @"Side-by-Side";
+        case ApolloSubredditFeedLayoutGrid: return @"Grid";
+        case ApolloSubredditFeedLayoutIconDock: return @"Icon Dock";
+        default: return @"Rows";
+    }
+}
+
+- (void)setSubredditFeedIconStyle:(NSInteger)iconStyle {
+    if (iconStyle < ApolloSubredditFeedIconStyleClassic ||
+        iconStyle > ApolloSubredditFeedIconStyleSolidTile) {
+        iconStyle = ApolloSubredditFeedIconStyleClassic;
+    }
+    sSubredditFeedIconStyle = iconStyle;
+    [[NSUserDefaults standardUserDefaults] setInteger:iconStyle forKey:UDKeySubredditFeedIconStyle];
+    [self reloadRowWithID:@"sub.feedIconStyle"];
+    [self apollo_refreshFeedShortcutsPreviewAnimated:YES];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFeedShortcutsChangedNotification object:nil];
+}
+
+- (void)setSubredditFeedLayout:(NSInteger)layout {
+    if (layout < ApolloSubredditFeedLayoutRows ||
+        layout > ApolloSubredditFeedLayoutIconDock) {
+        layout = ApolloSubredditFeedLayoutRows;
+    }
+    sSubredditFeedLayout = layout;
+    [[NSUserDefaults standardUserDefaults] setInteger:layout forKey:UDKeySubredditFeedLayout];
+    [self reloadRowWithID:@"sub.feedLayout"];
+    [self visibilityDidChange];
+    [self apollo_refreshFeedShortcutsPreviewAnimated:YES];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFeedShortcutsChangedNotification object:nil];
+}
+
+- (void)presentSubredditFeedIconStylePickerFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Icon Style",
+                                @[@"Classic", @"Circle", @"Tinted", @"Soft Tile", @"Solid Tile"],
+                                sSubredditFeedIconStyle,
+                                ^(NSInteger pickedIndex) {
+        [weakSelf setSubredditFeedIconStyle:pickedIndex];
+    });
+}
+
+- (void)presentSubredditFeedLayoutPickerFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsPresentPicker(self, sourceView, @"Feed Layout",
+                                @[@"Rows", @"Grid", @"Side-by-Side", @"Icon Dock"],
+                                sSubredditFeedLayout,
+                                ^(NSInteger pickedIndex) {
+        [weakSelf setSubredditFeedLayout:pickedIndex];
+    });
+}
+
+- (NSString *)subredditSectionsSummaryText {
+    BOOL separate = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySeparateFollowedUsers];
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSString *token in ApolloSubredditSectionsResolvedOrder()) {
+        if (!separate && [token isEqualToString:ApolloSubredditSectionTokenFollowing]) continue;
+        [parts addObject:ApolloSubredditSectionDisplayName(token)];
+    }
+    return [parts componentsJoinedByString:@" · "];
+}
+
+- (ApolloSettingsSection *)buildSubredditsFavoritesSection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *perAccountFavorites =
+        [ApolloSettingsRow switchRowWithID:@"sub.perAccountFavorites"
+                                     title:@"Per-Account Favorites"
+                                      isOn:^BOOL { return sPerAccountFavoritesEnabled; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf perAccountFavoritesSwitchToggled:sender]; }];
+    ApolloSettingsRow *sortFavoritesAlphabetically =
+        [ApolloSettingsRow switchRowWithID:@"sub.sortFavoritesAlphabetically"
+                                     title:@"Sort Favorites Alphabetically"
+                                      isOn:^BOOL { return sSortFavoritesAlphabetically; }
+                                  onToggle:^(UISwitch *sender) {
+                                      ApolloFavoritesSortingSetEnabled(sender.isOn);
+                                      [sender setOn:sSortFavoritesAlphabetically animated:YES];
+                                  }];
+    sortFavoritesAlphabetically.enabled = ^BOOL { return ApolloFavoritesSortingIsAvailable(); };
+    ApolloSettingsRow *confirmFavoriteToggle =
+        [ApolloSettingsRow switchRowWithID:@"sub.confirmFavoriteToggle"
+                                     title:@"Confirm Favorite Changes"
+                                      isOn:^BOOL { return sConfirmFavoriteToggle; }
+                                  onToggle:^(UISwitch *sender) {
+                                      sConfirmFavoriteToggle = sender.isOn;
+                                      [[NSUserDefaults standardUserDefaults] setBool:sender.isOn
+                                                                              forKey:UDKeyConfirmFavoriteToggle];
+                                  }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Favorites"
+                                            footer:@"Per-Account Favorites keeps a separate favorites list for each account. Turning it off restores the shared list.\nConfirm Favorite Changes asks before adding or removing favorites."
+                                              rows:@[ perAccountFavorites, sortFavoritesAlphabetically, confirmFavoriteToggle ]];
+}
+
+- (NSString *)subredditLayoutSummaryText {
+    if (!sShowSubredditHeaders) return @"Native";
+    return sSubredditHeaderImmersive ? @"Immersive" : @"Compact";
+}
+
+- (NSArray<ApolloSettingsSection *> *)buildSubredditsSearchSections {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *trendingLimit =
+        [ApolloSettingsRow customRowWithID:@"sub.trendingLimit"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf textFieldCellWithIdentifier:@"Cell_Sub_TrendLimit"
+                                                   label:@"Trending Subreddits Limit"
+                                             placeholder:@"Unlimited"
+                                                    text:sTrendingSubredditsLimit
+                                                     tag:TagTrendingLimit
+                                               numerical:YES]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *recentlyVisitedLimit =
+        [ApolloSettingsRow customRowWithID:@"sub.recentlyVisitedLimit"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf textFieldCellWithIdentifier:@"Cell_Sub_RecentLimit"
+                                                   label:@"Recently Visited Limit"
+                                             placeholder:@"Unlimited"
+                                                    text:sRecentlyVisitedSubredditsLimit
+                                                     tag:TagRecentlyVisitedLimit
+                                               numerical:YES]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    NSDictionary<NSString *, NSString *> *sectionTitles = @{
+        ApolloSearchLandingSectionTrending: @"Trending Subreddits",
+        ApolloSearchLandingSectionRandom: @"Random Subreddit",
+        ApolloSearchLandingSectionRecent: @"Recently Visited",
+    };
+    NSMutableArray<ApolloSettingsRow *> *searchRows = [NSMutableArray array];
+    for (NSString *token in ApolloSearchLandingSectionOrder()) {
+        [searchRows addObject:[ApolloSettingsRow valueRowWithID:token
+                                                        title:sectionTitles[token]
+                                                       detail:nil
+                                                     onSelect:nil]];
+    }
+
+    ApolloSettingsRow *trendingSource =
+        [ApolloSettingsRow customRowWithID:@"sub.trendingSource"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_Sub_Trending"
+                                                          label:@"Trending Source"
+                                                    placeholder:defaultTrendingSubredditsSource
+                                                           text:sTrendingSubredditsSource
+                                                            tag:TagTrendingSubredditsSource]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *randomSource =
+        [ApolloSettingsRow customRowWithID:@"sub.randomSource"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_Sub_Random"
+                                                          label:@"Random Source"
+                                                    placeholder:defaultRandomSubredditsSource
+                                                           text:sRandomSubredditsSource
+                                                            tag:TagRandomSubredditsSource]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *randNSFW =
+        [ApolloSettingsRow switchRowWithID:@"sub.randNSFW"
+                                     title:@"Show RandNSFW in Search"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRandNsfw]; }
+                                  onToggle:^(UISwitch *sender) { [weakSelf randNsfwSwitchToggled:sender]; }];
+    [searchRows addObject:randNSFW];
+
+    ApolloSettingsRow *randNSFWSource =
+        [ApolloSettingsRow customRowWithID:@"sub.randNSFWSource"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_Sub_RandNSFW_Source"
+                                                          label:@"RandNSFW Source"
+                                                    placeholder:@"(empty)"
+                                                           text:sRandNsfwSubredditsSource
+                                                            tag:TagRandNsfwSubredditsSource]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    return @[
+        [ApolloSettingsSection sectionWithTitle:@"Search Tab"
+                                         footer:nil
+                                           rows:searchRows],
+        [ApolloSettingsSection sectionWithTitle:@"Section Limits"
+                                         footer:@"Recently Visited clears on restart or account change."
+                                           rows:@[ trendingLimit, recentlyVisitedLimit ]],
+        [ApolloSettingsSection sectionWithTitle:@"Subreddit Sources"
+                                         footer:nil
+                                           rows:@[ trendingSource, randomSource, randNSFWSource ]],
+    ];
+}
+
+- (ApolloSettingsSection *)buildNotificationBackendSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *backendURL =
+        [ApolloSettingsRow customRowWithID:@"notif.url"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            NSString *currentURL = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyNotificationBackendURL] ?: @"";
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_NotifBackend_URL"
+                                                                           label:@"Backend URL"
+                                                                     placeholder:@"https://apollo.example.com"
+                                                                            text:currentURL
+                                                                             tag:TagNotificationBackendURL
+                                                                          detail:@"Self-hosted only. Leave empty to disable."];
+            for (UIView *subview in cell.contentView.subviews) {
+                if ([subview isKindOfClass:[UITextField class]]) {
+                    UITextField *tf = (UITextField *)subview;
+                    tf.keyboardType = UIKeyboardTypeURL;
+                    tf.textColor = [weakSelf isNotificationBackendURLValid:currentURL] ? [UIColor labelColor] : [UIColor systemRedColor];
+                    break;
+                }
+            }
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *registrationToken =
+        [ApolloSettingsRow customRowWithID:@"notif.token"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            NSString *currentToken = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyNotificationBackendRegistrationToken] ?: @"";
+            return [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_NotifBackend_Token"
+                                                          label:@"Registration Token"
+                                                    placeholder:@"(optional)"
+                                                           text:currentToken
+                                                            tag:TagNotificationBackendRegistrationToken
+                                                         detail:@"Required only if the backend has REGISTRATION_SECRET set."]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    // The Bark rows are always visible: on builds without a push entitlement
+    // Bark is the only delivery path, and on entitled builds it's an optional
+    // alternative transport (the backend flips the device row between apns and
+    // bark on re-registration).
+    ApolloSettingsRow *barkSwitch =
+        [ApolloSettingsRow customRowWithID:@"notif.barkSwitch"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf switchCellWithIdentifier:@"Cell_NotifBackend_BarkSwitch"
+                                                label:@"Bark Delivery"
+                                               detail:@"Deliver notifications through the free Bark app instead of native push. Works without a push entitlement."
+                                                   on:[[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBarkNotificationsEnabled]
+                                               action:@selector(barkNotificationsSwitchToggled:)]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *barkURL =
+        [ApolloSettingsRow customRowWithID:@"notif.barkURL"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            NSString *currentURL = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkPushURL] ?: @"";
+            UITableViewCell *cell = [weakSelf stackedTextFieldCellWithIdentifier:@"Cell_NotifBackend_BarkURL"
+                                                                           label:@"Bark Push URL"
+                                                                     placeholder:@"https://api.day.app/yourdevicekey"
+                                                                            text:currentURL
+                                                                             tag:TagBarkPushURL
+                                                                          detail:@"From the Bark app's server list. Treat the key like a password."];
+            for (UIView *subview in cell.contentView.subviews) {
+                if ([subview isKindOfClass:[UITextField class]]) {
+                    UITextField *tf = (UITextField *)subview;
+                    tf.keyboardType = UIKeyboardTypeURL;
+                    tf.textColor = [weakSelf isNotificationBackendURLValid:currentURL] ? [UIColor labelColor] : [UIColor systemRedColor];
+                    break;
+                }
+            }
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:nil];
+
+    ApolloSettingsRow *testBark =
+        [ApolloSettingsRow customRowWithID:@"notif.testBark"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_NotifBackend_TestBark"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_NotifBackend_TestBark"];
+                cell.textLabel.textAlignment = NSTextAlignmentCenter;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Test Bark Notification";
+            [weakSelf apollo_applyAccentActionTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf testBarkNotification]; }];
+
+    // Custom rather than a button row: the label is centered, which the shared
+    // button-row cell doesn't do.
+    ApolloSettingsRow *testConnection =
+        [ApolloSettingsRow customRowWithID:@"notif.test"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_NotifBackend_Test"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_NotifBackend_Test"];
+                cell.textLabel.textAlignment = NSTextAlignmentCenter;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            }
+            cell.textLabel.text = @"Test Connection";
+            [weakSelf apollo_applyAccentActionTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf testNotificationBackendConnection]; }];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Notification Backend"
+                                            footer:nil
+                                              rows:@[ backendURL, registrationToken, barkSwitch, barkURL,
+                                                      testConnection, testBark ]];
+}
+
+- (ApolloSettingsSection *)buildPrivacySection {
+    __weak typeof(self) weakSelf = self;
+
+    // The anonymous usage heartbeat opt-out. The stored flag is a *disable*
+    // flag (default NO = enabled), so the switch shows the inverse. The
+    // explanatory text (with the tappable privacy-policy link) is the section
+    // footer — see -footerAttributedTextForSection:.
+    ApolloSettingsRow *heartbeat =
+        [ApolloSettingsRow switchRowWithID:@"privacy.heartbeat"
+                                     title:@"Anonymous Install Count"
+                                      isOn:^BOOL { return !ApolloUsageHeartbeatIsDisabled(); }
+                                  onToggle:^(UISwitch *sender) { [weakSelf usageHeartbeatSwitchToggled:sender]; }];
+
+    heartbeat.iconSystemName = @"waveform.path.ecg";
+    heartbeat.iconTileColor = [UIColor systemPinkColor];
+
+    ApolloSettingsRow *updateChecks =
+        [ApolloSettingsRow switchRowWithID:@"privacy.updateChecks"
+                                     title:@"Automatic Update Checks"
+                                      isOn:^BOOL { return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutomaticUpdateChecks]; }
+                                  onToggle:^(UISwitch *sender) {
+            [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyAutomaticUpdateChecks];
+            ApolloUpdateCheckIfNeeded();
+        }];
+    updateChecks.iconSystemName = @"arrow.down.circle";
+    updateChecks.iconTileColor = [UIColor systemBlueColor];
+    updateChecks.visible = ^BOOL { return ApolloUpdateChecksAvailable(); };
+
+    // Local crash recording (src/crash/). The pending count re-reads on every
+    // configure, so returning from the sub-screen after a delete/submit shows
+    // the fresh number without any manual reload plumbing.
+    ApolloSettingsRow *crashReports =
+        [ApolloSettingsRow disclosureRowWithID:@"privacy.crashReports"
+                                         title:@"Crash Reports"
+                                        detail:^NSString * {
+            NSInteger count = ApolloCrashManager.sharedManager.pendingReportCount;
+            return count > 0 ? [NSString stringWithFormat:@"%ld", (long)count] : nil;
+        }
+                                          push:^UIViewController * {
+            return [[ApolloCrashReportsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    crashReports.iconSystemName = @"bandage";
+    crashReports.iconTileColor = [UIColor systemOrangeColor];
+
+    return [ApolloSettingsSection sectionWithTitle:@"Privacy" footer:nil rows:@[ heartbeat, updateChecks, crashReports ]];
+}
+
+// An opt-in integration belongs near Setup, with its own explanation rather
+// than below crash reports and the unrelated anonymous-heartbeat footer.
+- (ApolloSettingsSection *)buildSiriSection {
+    ApolloSettingsRow *siri = [ApolloSettingsRow disclosureRowWithID:@"siri.settings" title:@"Siri & Spotlight"
+        detail:^NSString * {
+            return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySiriContentIndexing] ? @"On" : @"Off";
+        } push:^UIViewController * {
+            return ApolloSettingsRouteInstantiate(@"siri-spotlight");
+        }];
+    siri.iconSystemName = @"sparkle.magnifyingglass";
+    siri.iconTileColor = UIColor.systemPurpleColor;
+    ApolloSettingsSection *section = [ApolloSettingsSection sectionWithTitle:nil
+        footer:@"Find Apollo posts and communities with Siri, Spotlight and Shortcuts. Content indexing is off until you enable it."
+        rows:@[siri]];
+    section.visible = ^BOOL { return NSClassFromString(@"ApolloContentBridge") != Nil; };
+    return section;
+}
+
+- (ApolloSettingsSection *)buildAboutSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *github =
+        [ApolloSettingsRow customRowWithID:@"about.github"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            return [weakSelf subtitleCellWithIdentifier:@"Cell_About_GitHub"
+                                                  title:@"Open Source on GitHub"
+                                               subtitle:@"@Apollo-Reborn"
+                                               b64Image:B64Github]
+                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:^{
+            [weakSelf presentURLInApolloBrowser:[NSURL URLWithString:@"https://github.com/Apollo-Reborn/Apollo-Reborn"]];
+        }];
+
+    // Custom subtitle row with the bundled adaptive Helios icon.
+    ApolloSettingsRow *subreddit =
+        [ApolloSettingsRow customRowWithID:@"about.subreddit"
+                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [weakSelf subtitleCellWithIdentifier:@"Cell_About_Reddit"
+                                                                   title:@"Apollo Reborn Subreddit"
+                                                                subtitle:@"r/ApolloReborn"
+                                                                b64Image:nil];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            cell.imageView.image = ApolloAboutHeliosIcon(tableView.traitCollection);
+            return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        }
+                                  onSelect:^{
+            NSURL *subredditURL = [NSURL URLWithString:@"https://reddit.com/r/ApolloReborn/"];
+            if (!ApolloRouteResolvedURLViaApolloScheme(subredditURL)) {
+                [weakSelf presentURLInApolloBrowser:subredditURL];
+            }
+        }];
+
+    ApolloSettingsRow *thanksTo =
+        [ApolloSettingsRow customRowWithID:@"about.thanksTo"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_About_ThanksTo"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_About_ThanksTo"];
+            }
+            cell.textLabel.text = @"Thanks To";
+            cell.imageView.image = ApolloEmojiSettingsIcon(@"🙏", [UIColor systemIndigoColor], 29.0);
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{ [weakSelf pushThanksToViewController]; }];
+
+    // Apollo Reborn's own feature-request board (Fider). Kept prominent at the
+    // top of About; the archived Apollo board is reachable via a chooser on the
+    // native About > Feature Requests row (see ApolloSettings.xm).
+    ApolloSettingsRow *featureRequests =
+        [ApolloSettingsRow customRowWithID:@"about.featureRequests"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_About_FeatureRequests"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell_About_FeatureRequests"];
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+                cell.detailTextLabel.numberOfLines = 0;
+            }
+            cell.textLabel.text = @"Feature Requests";
+            cell.detailTextLabel.text = @"Suggest and vote on ideas for Apollo Reborn";
+            cell.imageView.image = ApolloEmojiSettingsIcon(@"\U0001F4A1", [UIColor systemYellowColor], 29.0);
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{
+            [weakSelf presentURLInApolloBrowser:[NSURL URLWithString:@"https://apolloreborn.fider.io/"]];
+        }];
+
+    ApolloSettingsRow *bugReports =
+        [ApolloSettingsRow customRowWithID:@"about.bugReports"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_About_BugReports"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"Cell_About_BugReports"];
+                cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+                cell.detailTextLabel.numberOfLines = 0;
+            }
+            cell.textLabel.text = @"Bug Reports";
+            cell.detailTextLabel.text = @"Report a problem. Your Reborn debug log is attached automatically";
+            cell.imageView.image = ApolloEmojiSettingsIcon(@"\U0001F41B", [UIColor systemRedColor], 29.0);
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{
+            ApolloReportViewController *controller = [[ApolloReportViewController alloc] init];
+            [weakSelf.navigationController pushViewController:controller animated:YES];
+        }];
+
+    ApolloSettingsRow *privacyPolicy =
+        [ApolloSettingsRow customRowWithID:@"about.privacyPolicy"
+                                      cell:^UITableViewCell *(UITableView *tableView, __unused ApolloSettingsRow *row) {
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Cell_About_Privacy"];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Cell_About_Privacy"];
+            }
+            cell.textLabel.text = @"Privacy Policy";
+            cell.imageView.image = ApolloEmojiSettingsIcon(@"\U0001F512", [UIColor systemGreenColor], 29.0);
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+            [weakSelf apollo_applyPrimaryTextColorToCell:cell];
+            return cell;
+        }
+                                  onSelect:^{
+            [weakSelf presentURLInApolloBrowser:[NSURL URLWithString:@"https://apolloreborn.app/privacy"]];
+        }];
+
+    ApolloSettingsRow *version =
+        [ApolloSettingsRow valueRowWithID:@"about.version"
+                                    title:@"Version"
+                                   detail:^NSString * { return @TWEAK_VERSION; }
+                                 onSelect:nil];
+    version.iconSystemName = @"number";
+    version.iconTileColor = [UIColor systemGrayColor];
+
+    // Sideloaded builds can't replace themselves, so this reports the newest
+    // release and hands off to the user's sideloader (ApolloUpdateChecker.m).
+    ApolloSettingsRow *updates =
+        [ApolloSettingsRow valueRowWithID:@"about.updates"
+                                    title:@"Check for Updates"
+                                   detail:^NSString * { return ApolloUpdateStatusText(); }
+                                 onSelect:^{
+            ApolloUpdateCheckNow(^{ [weakSelf reloadRowWithID:@"about.updates"]; });
+        }];
+    updates.iconSystemName = @"arrow.triangle.2.circlepath";
+    updates.iconTileColor = [UIColor systemBlueColor];
+    updates.visible = ^BOOL { return ApolloUpdateChecksAvailable(); };
+
+    return [ApolloSettingsSection sectionWithTitle:@"About"
+                                            footer:@"Request features, report bugs, or browse the source. Apollo Reborn is free and open source."
+                                              rows:@[ featureRequests, bugReports, github, subreddit, thanksTo, privacyPolicy, version, updates ]];
+}
+
+#pragma mark - Cell Builders
+
+- (UITableViewCell *)textFieldCellWithIdentifier:(NSString *)identifier
+                                           label:(NSString *)label
+                                     placeholder:(NSString *)placeholder
+                                            text:(NSString *)text
+                                             tag:(NSInteger)tag
+                                       numerical:(BOOL)numerical {
+    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:identifier];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.text = nil;
+
+        UILabel *titleLabel = [[UILabel alloc] init];
+        titleLabel.text = label;
+        titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        titleLabel.adjustsFontForContentSizeCategory = YES;
+        titleLabel.numberOfLines = 0;
+        titleLabel.lineBreakMode = NSLineBreakByWordWrapping;
+        titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UITextField *textField = [[UITextField alloc] init];
+        textField.placeholder = placeholder;
+        textField.tag = tag;
+        textField.delegate = self;
+        textField.textAlignment = NSTextAlignmentRight;
+        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+        textField.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCallout];
+        textField.adjustsFontForContentSizeCategory = YES;
+        textField.autocorrectionType = UITextAutocorrectionTypeNo;
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        textField.returnKeyType = UIReturnKeyDone;
+        if (numerical) {
+            textField.keyboardType = UIKeyboardTypeNumberPad;
+
+            if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone) {
+                UIToolbar *toolbar = [[UIToolbar alloc] init];
+                [toolbar sizeToFit];
+
+                UIBarButtonItem *flexibleSpace =
+                    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
+                                                                target:nil
+                                                                action:nil];
+
+                UIBarButtonItem *done =
+                    [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                                target:textField
+                                                                action:@selector(resignFirstResponder)];
+
+                toolbar.items = @[flexibleSpace, done];
+                textField.inputAccessoryView = toolbar;
+            }
+        }
+
+        NSLayoutConstraint *widthConstraint =
+            [textField.widthAnchor constraintEqualToConstant:0];
+        widthConstraint.active = YES;
+        objc_setAssociatedObject(textField, @selector(widthAnchor),
+                                 widthConstraint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        textField.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell.contentView addSubview:titleLabel];
+        [cell.contentView addSubview:textField];
+
+        UILayoutGuide *margins = cell.contentView.layoutMarginsGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [titleLabel.leadingAnchor constraintEqualToAnchor:margins.leadingAnchor],
+            [titleLabel.topAnchor constraintEqualToAnchor:margins.topAnchor],
+            [titleLabel.bottomAnchor constraintEqualToAnchor:margins.bottomAnchor],
+
+            [textField.leadingAnchor constraintGreaterThanOrEqualToAnchor:titleLabel.trailingAnchor constant:8.0],
+            [textField.trailingAnchor constraintEqualToAnchor:margins.trailingAnchor],
+            [textField.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+        ]];
+    }
+
+    UITextField *textField = nil;
+    for (UIView *subview in cell.contentView.subviews) {
+        if ([subview isKindOfClass:[UITextField class]]) {
+            textField = (UITextField *)subview;
+            break;
+        }
+    }
+
+    textField.text = text;
+    textField.placeholder = placeholder;
+    textField.accessibilityLabel = label;
+
+    UIFont *valueFont = ApolloSettingsFont(UIFontTextStyleCallout, self.traitCollection);
+    CGFloat placeholderWidth = ceil([placeholder sizeWithAttributes:@{
+        NSFontAttributeName: valueFont
+    }].width);
+    CGFloat digitsWidth = ceil([@"99999" sizeWithAttributes:@{
+        NSFontAttributeName: valueFont
+    }].width);
+    CGFloat valueWidth = MAX(placeholderWidth, digitsWidth) + 16.0;
+
+    NSLayoutConstraint *widthConstraint =
+        objc_getAssociatedObject(textField, @selector(widthAnchor));
+    NSCAssert(widthConstraint != nil, @"Missing numeric field width constraint");
+    widthConstraint.constant = valueWidth;
+
+    [self apollo_applyPrimaryTextColorToCell:cell];
+
+    return cell;
+}
+
+- (UITableViewCell *)stackedTextFieldCellWithIdentifier:(NSString *)identifier
+                                                  label:(NSString *)label
+                                            placeholder:(NSString *)placeholder
+                                                   text:(NSString *)text
+                                                    tag:(NSInteger)tag {
+    return [self stackedTextFieldCellWithIdentifier:identifier label:label placeholder:placeholder text:text tag:tag detail:nil];
+}
+
+- (UITableViewCell *)stackedTextFieldCellWithIdentifier:(NSString *)identifier
+                                                  label:(NSString *)label
+                                            placeholder:(NSString *)placeholder
+                                                   text:(NSString *)text
+                                                    tag:(NSInteger)tag
+                                                 detail:(NSString *)detail {
+    static const NSInteger kLabelTag = 9000;
+    static const NSInteger kDetailTag = 9002;
+
+    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:identifier];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.hidden = YES;
+
+        UILabel *captionLabel = [[UILabel alloc] init];
+        captionLabel.tag = kLabelTag;
+        captionLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        captionLabel.adjustsFontForContentSizeCategory = YES;
+        captionLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UITextField *textField = [[UITextField alloc] init];
+        textField.tag = tag;
+        textField.delegate = self;
+        textField.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCallout];
+        textField.adjustsFontForContentSizeCategory = YES;
+        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+        textField.autocorrectionType = UITextAutocorrectionTypeNo;
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        textField.returnKeyType = UIReturnKeyDone;
+        textField.translatesAutoresizingMaskIntoConstraints = NO;
+
+        [cell.contentView addSubview:captionLabel];
+        [cell.contentView addSubview:textField];
+
+        UILayoutGuide *margins = cell.contentView.layoutMarginsGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [captionLabel.topAnchor constraintEqualToAnchor:margins.topAnchor],
+            [captionLabel.leadingAnchor constraintEqualToAnchor:margins.leadingAnchor],
+            [captionLabel.trailingAnchor constraintEqualToAnchor:margins.trailingAnchor],
+
+            [textField.topAnchor constraintEqualToAnchor:captionLabel.bottomAnchor constant:4],
+            [textField.leadingAnchor constraintEqualToAnchor:margins.leadingAnchor],
+            [textField.trailingAnchor constraintEqualToAnchor:margins.trailingAnchor],
+        ]];
+
+        if (detail) {
+            UILabel *detailLabel = [[UILabel alloc] init];
+            detailLabel.tag = kDetailTag;
+            detailLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+            detailLabel.adjustsFontForContentSizeCategory = YES;
+            detailLabel.textColor = [UIColor secondaryLabelColor];
+            detailLabel.numberOfLines = 0;
+            detailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+
+            [cell.contentView addSubview:detailLabel];
+            [NSLayoutConstraint activateConstraints:@[
+                [detailLabel.topAnchor constraintEqualToAnchor:textField.bottomAnchor constant:4],
+                [detailLabel.leadingAnchor constraintEqualToAnchor:margins.leadingAnchor],
+                [detailLabel.trailingAnchor constraintEqualToAnchor:margins.trailingAnchor],
+                [detailLabel.bottomAnchor constraintEqualToAnchor:margins.bottomAnchor],
+            ]];
+        } else {
+            [textField.bottomAnchor constraintEqualToAnchor:margins.bottomAnchor].active = YES;
+        }
+    }
+
+    UILabel *captionLabel = [cell.contentView viewWithTag:kLabelTag];
+    captionLabel.text = label;
+
+    UILabel *detailLabel = [cell.contentView viewWithTag:kDetailTag];
+    if (detailLabel) {
+        detailLabel.text = detail;
+    }
+
+    UITextField *textField = nil;
+    for (UIView *subview in cell.contentView.subviews) {
+        if ([subview isKindOfClass:[UITextField class]]) {
+            textField = (UITextField *)subview;
+            break;
+        }
+    }
+    textField.text = text;
+    textField.placeholder = placeholder;
+    textField.accessibilityLabel = label;   // VoiceOver: tie the field to its caption
+    if (tag == TagImageChestAPIToken) {
+        textField.textAlignment = NSTextAlignmentLeft;
+        textField.adjustsFontSizeToFitWidth = NO;
+    } else {
+        textField.adjustsFontSizeToFitWidth = YES;
+        textField.minimumFontSize = 12;
+    }
+
+    return cell;
+}
+
+// Detail-carrying switch cell (subtitle style). Title-only switches use the
+// form layer's switch rows; these stay custom because the shared switch cell
+// has no subtitle line.
+- (UITableViewCell *)switchCellWithIdentifier:(NSString *)identifier
+                                        label:(NSString *)label
+                                       detail:(NSString *)detail
+                                           on:(BOOL)on
+                                       action:(SEL)action {
+    return [self switchCellWithIdentifier:identifier label:label detail:detail on:on enabled:YES action:action];
+}
+
+// A title + optional multi-line subtitle + trailing switch. Hand-laid with Auto
+// Layout (not UITableViewCellStyleSubtitle nor a content-configuration + switch
+// accessory): both of those measure the labels at the full cell width — the
+// switch accessory isn't reserved during self-sizing — so a wrapping subtitle
+// under-measures and its last line clips against the cell's bottom edge. Here
+// the switch is constrained inline, so the labels wrap at the true available
+// width and the cell height is exact.
+- (UITableViewCell *)switchCellWithIdentifier:(NSString *)identifier
+                                        label:(NSString *)label
+                                       detail:(NSString *)detail
+                                           on:(BOOL)on
+                                      enabled:(BOOL)enabled
+                                       action:(SEL)action {
+    static const NSInteger kTitleTag = 7001, kDetailTag = 7002, kSwitchTag = 7003;
+    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:identifier];
+    UILabel *titleLabel; UILabel *detailLabel; UISwitch *toggleSwitch;
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        titleLabel = [[UILabel alloc] init];
+        titleLabel.tag = kTitleTag;
+        titleLabel.numberOfLines = 0;
+        titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        titleLabel.adjustsFontForContentSizeCategory = YES;
+
+        detailLabel = [[UILabel alloc] init];
+        detailLabel.tag = kDetailTag;
+        detailLabel.numberOfLines = 0;
+        detailLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+        detailLabel.adjustsFontForContentSizeCategory = YES;
+
+        UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[ titleLabel, detailLabel ]];
+        stack.axis = UILayoutConstraintAxisVertical;
+        stack.spacing = 3.0;
+        stack.translatesAutoresizingMaskIntoConstraints = NO;
+
+        toggleSwitch = [[UISwitch alloc] init];
+        toggleSwitch.tag = kSwitchTag;
+        [toggleSwitch addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+        toggleSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+        [toggleSwitch setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [toggleSwitch setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+        [cell.contentView addSubview:stack];
+        [cell.contentView addSubview:toggleSwitch];
+        UILayoutGuide *m = cell.contentView.layoutMarginsGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [stack.leadingAnchor constraintEqualToAnchor:m.leadingAnchor],
+            [stack.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:11.0],
+            [stack.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-11.0],
+            [toggleSwitch.leadingAnchor constraintEqualToAnchor:stack.trailingAnchor constant:12.0],
+            [toggleSwitch.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
+            [toggleSwitch.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+        ]];
+    } else {
+        titleLabel = [cell.contentView viewWithTag:kTitleTag];
+        detailLabel = [cell.contentView viewWithTag:kDetailTag];
+        toggleSwitch = (UISwitch *)[cell.contentView viewWithTag:kSwitchTag];
+    }
+
+    titleLabel.text = label;
+    titleLabel.textColor = enabled ? [UIColor labelColor] : [UIColor tertiaryLabelColor];
+    detailLabel.text = detail;
+    detailLabel.textColor = enabled ? [UIColor secondaryLabelColor] : [UIColor tertiaryLabelColor];
+    detailLabel.hidden = (detail.length == 0);
+    toggleSwitch.on = on;
+    toggleSwitch.enabled = enabled;
+    toggleSwitch.onTintColor = [self apollo_themeAccentColor];
+    return cell;
+}
+
+// A single-row settings slider: [title] [slider fills the middle] [%.2f value].
+// Single row (not stacked) so it fits the settings table's default row height --
+// the table doesn't self-size, and a stacked layout gets clipped to ~44pt,
+// which cramps the slider's touch target. Tags: title 7700, slider 7701,
+// value 7702. The step is stashed on the slider's accessibilityIdentifier so
+// the handlers can snap without extra state. `enabled` greys the control+labels.
+- (UITableViewCell *)sliderCellWithIdentifier:(NSString *)identifier
+                                        label:(NSString *)label
+                                          min:(float)min
+                                          max:(float)max
+                                         step:(float)step
+                                        value:(float)value
+                                      enabled:(BOOL)enabled
+                                       action:(SEL)action {
+    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:identifier];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        UILabel *title = [[UILabel alloc] init];
+        title.tag = 7700;
+        title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        title.translatesAutoresizingMaskIntoConstraints = NO;
+        [title setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [title setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+        UISlider *slider = [[ApolloAPSlider alloc] init];
+        slider.tag = 7701;
+        slider.continuous = YES;
+        // valueChanged fires live during the drag (updates label + stored value);
+        // the thumb is snapped to the step only on release, so dragging stays
+        // smooth instead of the handler yanking the thumb mid-drag.
+        [slider addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+        [slider addTarget:self action:@selector(apolloSliderSnapOnRelease:)
+         forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+        slider.translatesAutoresizingMaskIntoConstraints = NO;
+        [slider setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+
+        UILabel *valueLabel = [[UILabel alloc] init];
+        valueLabel.tag = 7702;
+        valueLabel.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightRegular];
+        valueLabel.textColor = [UIColor secondaryLabelColor];
+        valueLabel.textAlignment = NSTextAlignmentRight;
+        valueLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        [valueLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [valueLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+        [cell.contentView addSubview:title];
+        [cell.contentView addSubview:slider];
+        [cell.contentView addSubview:valueLabel];
+        UILayoutGuide *g = cell.contentView.layoutMarginsGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [title.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+            [title.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+            [slider.leadingAnchor constraintEqualToAnchor:title.trailingAnchor constant:12],
+            [slider.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+            [valueLabel.leadingAnchor constraintEqualToAnchor:slider.trailingAnchor constant:12],
+            [valueLabel.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+            [valueLabel.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+            [valueLabel.widthAnchor constraintGreaterThanOrEqualToConstant:40],  // stable width so slider doesn't jump
+            [title.topAnchor constraintGreaterThanOrEqualToAnchor:g.topAnchor],
+            [title.bottomAnchor constraintLessThanOrEqualToAnchor:g.bottomAnchor],
+        ]];
+    }
+    UILabel *title = [cell.contentView viewWithTag:7700];
+    UILabel *valueLabel = [cell.contentView viewWithTag:7702];
+    UISlider *slider = [cell.contentView viewWithTag:7701];
+    title.text = label;
+    slider.minimumValue = min;
+    slider.maximumValue = max;
+    slider.value = value;
+    slider.enabled = enabled;
+    slider.accessibilityIdentifier = [NSString stringWithFormat:@"%.4f", step];  // step, read back on change
+    valueLabel.text = [NSString stringWithFormat:@"%.2f", value];
+    valueLabel.enabled = enabled;
+    title.enabled = enabled;
+    return cell;
+}
+
+// Ease the thumb to the nearest step when the drag ends. Kept off the live
+// valueChanged path on purpose -- reassigning value mid-drag fights the finger.
+- (void)apolloSliderSnapOnRelease:(UISlider *)sender {
+    float step = sender.accessibilityIdentifier.floatValue;
+    if (step <= 0) return;
+    float snapped = roundf(sender.value / step) * step;
+    snapped = fmaxf(sender.minimumValue, fminf(sender.maximumValue, snapped));
+    [sender setValue:snapped animated:YES];
+}
+
+- (BOOL)isNotificationBackendURLValid:(NSString *)urlString {
+    if (urlString.length == 0) return YES; // empty = disabled, treated as valid
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) return NO;
+    NSString *scheme = url.scheme.lowercaseString;
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+    return url.host.length > 0;
+}
+
+- (UITableViewCell *)subtitleCellWithIdentifier:(NSString *)identifier
+                                          title:(NSString *)title
+                                       subtitle:(NSString *)subtitle
+                                       b64Image:(NSString *)b64Image {
+    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:identifier];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:identifier];
+    }
+    cell.textLabel.text = title;
+    cell.detailTextLabel.text = subtitle;
+    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    [self apollo_applyPrimaryTextColorToCell:cell];
+    if (b64Image.length > 0) {
+        UIImage *artwork = [self decodeBase64ToImage:b64Image];
+        UIImage *githubIcon = [identifier isEqualToString:@"Cell_About_GitHub"]
+            ? ApolloGitHubSettingsArtwork(artwork, ApolloAboutGitHubMark(artwork), self.tableView.traitCollection)
+            : nil;
+        cell.imageView.image = githubIcon ?: [self roundedImage:artwork size:29 cornerRadius:6.5];
+    } else if (!cell.imageView.image) {
+        cell.imageView.image = nil;
+    }
+    return cell;
+}
+
+#pragma mark - Footer View (sections with tappable links)
+
+// These footers carry links/attributed text, which the form model's plain
+// string footers can't express — so they ride the viewForFooterInSection
+// override below. Sections are identified by their header title (identity,
+// not position) so a buildForm reorder can never misfile a footer.
+- (NSAttributedString *)footerAttributedTextForSection:(NSInteger)section {
+    NSString *sectionTitle = [self tableView:self.tableView titleForHeaderInSection:section];
+    NSDictionary *plainAttrs = @{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [UIColor secondaryLabelColor]};
+    NSMutableAttributedString *text;
+
+    if ([sectionTitle isEqualToString:@"Setup"]) {
+        // Onboarding nudge (replaces the old Get Started card): with no Reddit
+        // key, sign-in can't happen, and the key field is now one level down
+        // under Accounts & API Keys — so point new users there. Collapses to
+        // no footer once a key is set. Only shown on the hub's own Setup
+        // section (group screens don't carry it).
+        if (sRedditClientId.length > 0) return nil;
+        text = [[NSMutableAttributedString alloc]
+            initWithString:@"Apollo needs a Reddit API key to sign in. Open Accounts & API Keys to add one — Imgur, Giphy, and Image Chest keys there are optional and only enable extra upload features."
+            attributes:plainAttrs];
+    } else if ([sectionTitle isEqualToString:@"Data"]) {
+        text = [[NSMutableAttributedString alloc]
+            initWithString:@"Restore also signs you back into the accounts saved in the backup. The backup file contains your login credentials — anyone with the file can sign in as you, so keep it private. It also includes an accounts.txt listing the saved usernames."
+            attributes:plainAttrs];
+    } else if ([sectionTitle isEqualToString:@"Default API Keys"]) {
+        text = [[NSMutableAttributedString alloc]
+            initWithString:@"Reddit and Imgur no longer allow new API key creation. Existing keys still work if you have access. Image Chest is optional and improves album metadata when a personal token is configured. You may be able to use credentials from another 3rd-party app ("
+            attributes:plainAttrs];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"more info"
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/Apollo-Reborn/Apollo-Reborn?tab=readme-ov-file#dont-have-an-api-key"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"). The Reddit API Key/Secret/Redirect URI above are the default, used by any signed-in account that doesn't have its own key — set a different key per account from the account switcher."
+            attributes:plainAttrs]];
+    } else if ([sectionTitle isEqualToString:@"Subreddit Sources"]) {
+        text = [[NSMutableAttributedString alloc]
+            initWithString:@"Configure custom subreddit sources by providing a URL to a plaintext file with line-separated subreddit names (without /r/). "
+            attributes:plainAttrs];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Example file"
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://jeffreyca.github.io/subreddits/popular.txt"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" ("
+            attributes:plainAttrs]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"GitHub repo"
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/JeffreyCA/subreddits"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@")"
+            attributes:plainAttrs]];
+    } else if ([sectionTitle isEqualToString:@"Uploads"]) {
+        text = [[NSMutableAttributedString alloc]
+            initWithString:@"Media Upload Host chooses where images you attach to posts and comments are uploaded.\n\nComment Link Host uploads comment images to Imgur or Image Chest and inserts a plain link, so they work in subreddits that don't allow image comments. Prefer Native Images uses Reddit's own image upload wherever the subreddit allows it, and the link host only where it doesn't.\n\nManage past uploads under Settings → General → Media → Manage Uploads."
+            attributes:plainAttrs];
+    } else if ([sectionTitle isEqualToString:@"Network"]) {
+        text = [[NSMutableAttributedString alloc]
+            initWithString:@"Proxy Imgur via DuckDuckGo loads Imgur images through DuckDuckGo's image cache, so they still show where Imgur is blocked (like the UK).\n\nDuckDuckGo can't fetch an album's list of images, so Album Fallback Proxies gets it through public text proxies (r.jina.ai, allorigins.win, codetabs.com) instead. Only the album's Imgur address is sent to them. Turn it off and albums won't load while Imgur is blocked.\n\nVideos and uploads can't be proxied."
+            attributes:plainAttrs];
+    } else if ([sectionTitle isEqualToString:@"Notification Backend"]) {
+        text = [[NSMutableAttributedString alloc]
+            initWithString:@"For users running their own "
+            attributes:plainAttrs];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"forked apollo-backend"
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSLinkAttributeName: [NSURL URLWithString:@"https://github.com/nickclyde/apollo-backend"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" instance. APNs delivery requires a paid Apple Developer account on the signing side. Leave empty to disable."
+            attributes:plainAttrs]];
+        NSString *barkLead = ApolloPushNotificationsSupported()
+            ? @"\n\nThis build has working native push, but Bark Delivery can reroute notifications through the free "
+            : @"\n\nThis build has no push entitlement, so APNs can never deliver — Bark Delivery works around that: install the free ";
+        NSString *barkTail = ApolloPushNotificationsSupported()
+            ? @" instead; toggling flips the delivery transport immediately, and native push resumes when turned off. Note: notification content passes through the Bark relay unencrypted."
+            : @", copy its push URL, and notifications arrive via Bark with a tap-through back into Apollo (after setup, open Apollo's Notifications settings once to finish registering). Note: notification content passes through the Bark relay unencrypted.";
+        barkTail = [barkTail stringByAppendingString:@" Notifications show your selected app icon automatically; to also hear Apollo's notification sounds, import the matching .caf from the project's assets/bark-sounds via the Bark app's Service tab → Alert Sound → view all sounds → Upload Sound."];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkLead attributes:plainAttrs]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"Bark app"
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSLinkAttributeName: [NSURL URLWithString:@"https://apps.apple.com/us/app/bark-custom-notifications/id1403753865"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:barkTail attributes:plainAttrs]];
+    } else if ([sectionTitle isEqualToString:@"Privacy"]) {
+        text = [[NSMutableAttributedString alloc]
+            initWithString:(ApolloUpdateChecksAvailable()
+                ? @"Sends one anonymous heartbeat so we can estimate active Apollo Reborn installs. No Reddit activity, account details, or feature usage is collected. Update checks read the latest release info from GitHub every 15 minutes while Apollo is active, and the update sheet reads its release notes from there too. Later silences reminders for that version for 24 hours. GitHub only sees your IP address. More details can be found in our "
+                : @"Sends one anonymous heartbeat so we can estimate active Apollo Reborn installs. No Reddit activity, account details, or feature usage is collected. More details can be found in our ")
+            attributes:plainAttrs];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"privacy policy"
+            attributes:@{NSFontAttributeName: ApolloSettingsFont(UIFontTextStyleFootnote, self.traitCollection), NSForegroundColorAttributeName: [self apollo_themeAccentColor], NSLinkAttributeName: [NSURL URLWithString:@"https://apolloreborn.app/privacy"]}]];
+        [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"."
+            attributes:plainAttrs]];
+    } else {
+        return nil;
+    }
+
+    return text;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    // UIKit installs this title on a returned UITableViewHeaderFooterView,
+    // even when that view already has our link-bearing text content.
+    if ([self footerAttributedTextForSection:section]) return nil;
+    return [super tableView:tableView titleForFooterInSection:section];
+}
+
+// A link footer's text, fonts and colours exactly as the table shows them.
+// -tableView:heightForFooterInSection: measures a footer styled here and
+// -apollo_refreshFooterTextViews restyles the shown ones here, so everything
+// that sizes the text happens here. The settings base styles every footer again
+// in willDisplayFooterView:, after the table has taken the footer's height; a
+// view that got that styling only there was measured in one font and shown in
+// another (13pt text shown at 17pt under a Rounded, Serif or Mono theme font),
+// and the lines that didn't fit were cut off. Styled here, that second pass
+// changes nothing.
+- (void)apollo_styleFooterLinkTextView:(UITextView *)textView withText:(NSAttributedString *)text {
+    textView.tintColor = [self apollo_themeAccentColor];
+    textView.linkTextAttributes = @{NSForegroundColorAttributeName: [self apollo_themeAccentColor]};
+    textView.attributedText = text;
+    // The styling reads -font and -textColor, and once they have been set a
+    // UITextView keeps answering with those values rather than the new text's:
+    // restyling a shown footer after a theme change kept the old theme's font
+    // and never recoloured the text. Every run shares one font, and the styling
+    // gives the whole text one colour anyway (links draw in linkTextAttributes),
+    // so setting both from the first character changes nothing else.
+    if (text.length > 0) {
+        textView.font = [text attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
+        textView.textColor = [text attribute:NSForegroundColorAttributeName atIndex:0 effectiveRange:NULL];
+    }
+    ApolloSettingsApplyFooterTypography(textView);
+}
+
+// The width UIKit lays a footer view out at: insetGrouped places it inside the
+// section inset, which follows the table's layout margins.
+- (CGFloat)apollo_footerLinkWidthInTableView:(UITableView *)tableView {
+    CGFloat tableWidth = tableView.bounds.size.width;
+    if (tableWidth <= 0) tableWidth = [UIScreen mainScreen].bounds.size.width;
+
+    // Account for insetGrouped horizontal insets — footer is narrower than the table view
+    UIEdgeInsets margins = tableView.layoutMargins;
+    CGFloat footerWidth = tableWidth - margins.left - margins.right;
+    if (footerWidth <= 0) footerWidth = tableWidth - 40.0;
+    return footerWidth;
+}
+
+- (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
+    NSAttributedString *text = [self footerAttributedTextForSection:section];
+    if (!text) return nil;
+    static NSString *const reuseID = @"ApolloSettingsLinkFooter";
+    ApolloSettingsLinkFooterView *footer =
+        (ApolloSettingsLinkFooterView *)[tableView dequeueReusableHeaderFooterViewWithIdentifier:reuseID];
+    if (!footer) footer = [[ApolloSettingsLinkFooterView alloc] initWithReuseIdentifier:reuseID];
+    [self apollo_styleFooterLinkTextView:footer.linkTextView withText:text];
+    return footer;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
+    NSAttributedString *text = [self footerAttributedTextForSection:section];
+    if (!text) {
+        // No attributed footer for this section. If the form model supplies a
+        // plain string footer, the form base sizes it from the footer's own
+        // view (a hard-coded small height would clip multi-line hint text — the
+        // very regression this screen had). Otherwise return a small
+        // inter-section spacer so back-to-back sections don't crowd.
+        NSString *plainFooter = [self tableView:tableView titleForFooterInSection:section];
+        return plainFooter.length > 0 ? [super tableView:tableView heightForFooterInSection:section] : 12.0;
+    }
+
+    CGFloat footerWidth = [self apollo_footerLinkWidthInTableView:tableView];
+    UITextView *measureView = [[ApolloFooterLinkTextView alloc] initWithFrame:CGRectMake(0, 0, footerWidth, 0)];
+    [self apollo_styleFooterLinkTextView:measureView withText:text];
+    CGSize size = [measureView sizeThatFits:CGSizeMake(footerWidth, CGFLOAT_MAX)];
+    return ceil(size.height);
+}
+
+#pragma mark - Row Actions
+
+- (void)openApolloAISettings {
+    ApolloLog(@"[ApolloAISettings] opening settings screen navigationController=%@",
+              self.navigationController ? @"yes" : @"no");
+    ApolloAISettingsViewController *vc =
+        [[ApolloAISettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *navigation =
+            [[UINavigationController alloc] initWithRootViewController:vc];
+        [self presentViewController:navigation animated:YES completion:nil];
+    }
+}
+
+// The signed-in account's OAuth refresh token plus the client id it was issued
+// under, for the "with account" widget setup code. Nil when nobody is signed
+// in, when the active account is a web-session (keyless) one — those carry a
+// synthetic bearer and no refresh token — or when the credential is missing.
+// Each nil path logs why (never the token or the name), so an exported log
+// answers "why is there no Copy with Account?".
+static NSDictionary *ApolloWidgetAccountCredentials(void) {
+    id client = ApolloActiveAccountClient();
+    if (!client) {
+        ApolloLog(@"[WidgetSetup] No account option: no signed-in account");
+        return nil;
+    }
+
+    id refreshToken = nil, accessToken = nil, credentialClientId = nil, clientUsername = nil;
+    @try {
+        id credential = [client valueForKey:@"authorizationCredential"];
+        id token = [credential valueForKey:@"accessToken"];
+        refreshToken = [token valueForKey:@"refreshToken"];
+        accessToken = [token valueForKey:@"accessToken"];
+        credentialClientId = [credential valueForKey:@"clientIdentifier"];
+        clientUsername = [client valueForKeyPath:@"currentUser.username"];
+    } @catch (__unused NSException *e) {
+        ApolloLog(@"[WidgetSetup] No account option: couldn't read the account's credential");
+        return nil;
+    }
+    // Name the account from the same live client the token comes from; the
+    // persisted account index is a separate read, so it's only the fallback.
+    NSString *username = ([clientUsername isKindOfClass:[NSString class]] && [clientUsername length] > 0)
+        ? clientUsername : ApolloActiveAccountUsername();
+    if (username.length > 0 && ApolloWebSessionFor(username) != nil) {
+        ApolloLog(@"[WidgetSetup] No account option: the active account signs in with a web session (API-key-free)");
+        return nil;
+    }
+    if (![refreshToken isKindOfClass:[NSString class]] || [refreshToken length] == 0) {
+        ApolloLog(@"[WidgetSetup] No account option: the active account has no refresh token");
+        return nil;
+    }
+    if ([accessToken isKindOfClass:[NSString class]] && ApolloWebJSONBearerIsSynthetic(accessToken)) {
+        ApolloLog(@"[WidgetSetup] No account option: the active account has a web-session credential");
+        return nil;
+    }
+
+    // Reddit binds a refresh token to the client id that issued it, and the
+    // credential's own id is what RedditKit presents on every refresh — so
+    // that's the id the widget must present too. Fall back to the effective
+    // (per-account, then global) key only when the credential carries none.
+    NSString *clientId = ([credentialClientId isKindOfClass:[NSString class]] && [credentialClientId length] > 0)
+        ? credentialClientId : (ApolloEffectiveRedditClientId() ?: sRedditClientId);
+    if (clientId.length == 0) {
+        ApolloLog(@"[WidgetSetup] No account option: no client id for the account's credential");
+        return nil;
+    }
+
+    NSMutableDictionary *account = [@{ @"clientID": clientId, @"refreshToken": refreshToken } mutableCopy];
+    if (username.length > 0) account[@"username"] = username;
+    ApolloLog(@"[WidgetSetup] Offering Copy with Account (credential client id %@ the global key)",
+              [clientId isEqualToString:(sRedditClientId ?: @"")] ? @"matches" : @"differs from");
+    return account;
+}
+
+- (void)copyWidgetSetupCode {
+    NSString *clientID = sRedditClientId ?: @"";
+    if (clientID.length == 0) {
+        ApolloLog(@"[WidgetSetup] No API key set, so no setup code to copy");
+        [self showAlertWithTitle:@"No API Key"
+                         message:@"Enter your Reddit API Key above first, then copy the widget setup code."];
+        return;
+    }
+
+    // With a signed-in API-key account the code can carry its login, which is
+    // what the widgets need for Home and private multireddits — but that's the
+    // user's choice, so ask. Keyless/no account: the plain code, as before.
+    NSDictionary *account = ApolloWidgetAccountCredentials();
+    if (!account) {
+        [self copyWidgetSetupCodeWithAccount:nil];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"Widget Setup Code"
+                         message:@"Include your account so widgets can show Home and your private multireddits."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Copy with Account" style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [weakSelf copyWidgetSetupCodeWithAccount:account];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Copy without Account" style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [weakSelf copyWidgetSetupCodeWithAccount:nil];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UITableViewCell *cell = [self cellForRowID:@"api.widgetSetupCode"];
+    sheet.popoverPresentationController.sourceView = cell ?: self.view;
+    sheet.popoverPresentationController.sourceRect = (cell ?: self.view).bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)copyWidgetSetupCodeWithAccount:(NSDictionary *)account {
+    // base64( JSON { v, clientID, userAgent[, clientSecret][, refreshToken,
+    // username] } ) — decoded by the widget's SetupCode parser. userAgent is
+    // included so the widget's Reddit requests carry the same identity as the
+    // configured (spoofed) app. clientSecret only exists for "web app" keys,
+    // whose token endpoint refuses the empty password installed apps use.
+    // With an account the code is v2 and carries the OAuth refresh token —
+    // that is what lets the widget read Home and private multireddits. Reddit
+    // does not rotate refresh tokens on use, so the widget minting its own
+    // access tokens never invalidates the app's session. `issued` (unix
+    // seconds) lets the widgets treat the most recently copied code as the
+    // one that wins everywhere — so copying "without account" and pasting it
+    // into any widget is how account access is removed again.
+    NSString *clientID = account[@"clientID"] ?: (sRedditClientId ?: @"");
+    NSMutableDictionary *payload = [@{ @"v": account ? @2 : @1,
+                                       @"clientID": clientID,
+                                       @"issued": @((long long)[NSDate date].timeIntervalSince1970) } mutableCopy];
+    if (sUserAgent.length > 0) payload[@"userAgent"] = sUserAgent;
+    NSString *secret = ApolloSecretForClientId(clientID);
+    if (secret.length > 0) payload[@"clientSecret"] = secret;
+    // Pal Home rides along, so one paste sets up the Pal Home widget too.
+    NSString *palCode = [[ApolloPalHomeStore new] widgetCodeWithRoom:nil];
+    if (palCode.length) payload[@"palHome"] = palCode;
+    if (account) {
+        payload[@"refreshToken"] = account[@"refreshToken"];
+        if ([account[@"username"] length] > 0) payload[@"username"] = account[@"username"];
+    }
+
+    NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL];
+    if (!json) {
+        [self showAlertWithTitle:@"Error" message:@"Couldn't build the setup code."];
+        return;
+    }
+    NSString *code = [json base64EncodedStringWithOptions:0];
+    NSDictionary *item = @{ @"public.utf8-plain-text": code };
+    NSDictionary *options = @{
+        UIPasteboardOptionLocalOnly: @YES,
+        UIPasteboardOptionExpirationDate: [NSDate dateWithTimeIntervalSinceNow:10 * 60],
+    };
+    [[UIPasteboard generalPasteboard] setItems:@[item] options:options];
+    ApolloLog(@"[WidgetSetup] Copied a v%@ setup code %@", payload[@"v"], account ? @"with account" : @"without account");
+
+    NSString *how = @"Long-press an Apollo widget → Edit Widget and paste it into Setup Code. One paste covers every widget";
+    [self showAlertWithTitle:@"Copied"
+                     message:account
+                         ? [NSString stringWithFormat:@"Setup code copied. %@. It includes your account login, so don't share it.", how]
+                         : [NSString stringWithFormat:@"Setup code copied. %@ and removes any account you added before.", how]];
+}
+
+- (void)testNotificationBackendConnection {
+    if (!ApolloIsNotificationBackendConfigured()) {
+        [self showAlertWithTitle:@"Backend URL Required" message:@"Enter a self-hosted apollo-backend URL above before testing."];
+        return;
+    }
+
+    UIAlertController *spinner = [UIAlertController alertControllerWithTitle:@"Testing connection…"
+                                                                     message:@"\n"
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *indicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    indicator.translatesAutoresizingMaskIntoConstraints = NO;
+    [indicator startAnimating];
+    [spinner.view addSubview:indicator];
+    [NSLayoutConstraint activateConstraints:@[
+        [indicator.centerXAnchor constraintEqualToAnchor:spinner.view.centerXAnchor],
+        [indicator.bottomAnchor constraintEqualToAnchor:spinner.view.bottomAnchor constant:-20],
+    ]];
+
+    [self presentViewController:spinner animated:YES completion:^{
+        ApolloTestNotificationBackendConnection(^(BOOL ok, NSString *message) {
+            [spinner dismissViewControllerAnimated:YES completion:^{
+                [self showAlertWithTitle:ok ? @"Success" : @"Failed" message:message];
+            }];
+        });
+    }];
+}
+
+#pragma mark - Export Logs
+
+// A .log file rather than a raw string, so it can be saved to Files and
+// attached to a GitHub bug report or the web report form as a file (GitHub
+// caps issue text at 64K characters, far below a session log). One fixed
+// folder, emptied per export, so repeated exports don't accumulate in tmp.
+// Returns nil if the file couldn't be written.
+static NSURL *ApolloWriteExportedLogFile(NSString *logs) {
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSURL *folder = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+                        URLByAppendingPathComponent:@"ApolloRebornLogExport" isDirectory:YES];
+    [fileManager removeItemAtURL:folder error:nil];
+    NSError *error = nil;
+    if (![fileManager createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&error]) {
+        ApolloLogError(@"[ExportLogs] couldn't create the export folder: %@", error.localizedDescription);
+        return nil;
+    }
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.dateFormat = @"yyyy-MM-dd-HHmmss";
+    NSString *filename = [NSString stringWithFormat:@"apollo-reborn-%@.log", [formatter stringFromDate:[NSDate date]]];
+    NSURL *fileURL = [folder URLByAppendingPathComponent:filename isDirectory:NO];
+    if (![logs writeToURL:fileURL atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+        ApolloLogError(@"[ExportLogs] couldn't write the log file: %@", error.localizedDescription);
+        return nil;
+    }
+    return fileURL;
+}
+
+- (void)exportLogs {
+    UIAlertController *spinner = [UIAlertController alertControllerWithTitle:@"Collecting logs…"
+                                                                    message:@"\n"
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *indicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    indicator.translatesAutoresizingMaskIntoConstraints = NO;
+    [indicator startAnimating];
+    [spinner.view addSubview:indicator];
+    [NSLayoutConstraint activateConstraints:@[
+        [indicator.centerXAnchor constraintEqualToAnchor:spinner.view.centerXAnchor],
+        [indicator.bottomAnchor constraintEqualToAnchor:spinner.view.bottomAnchor constant:-20],
+    ]];
+
+    [self presentViewController:spinner animated:YES completion:^{
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSString *logs = ApolloCollectLogs();
+            NSURL *logFile = ApolloWriteExportedLogFile(logs);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [spinner dismissViewControllerAnimated:YES completion:^{
+                    // Fall back to sharing the text if the file write failed.
+                    NSArray *items = logFile ? @[ logFile ] : @[ logs ];
+                    UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
+
+                    UIPopoverPresentationController *popover = activityVC.popoverPresentationController;
+                    if (popover) {
+                        UITableViewCell *cell = [self cellForRowID:@"about.exportLogs"];
+                        popover.sourceView = cell ?: self.view;
+                        popover.sourceRect = cell ? cell.bounds : CGRectZero;
+                    }
+
+                    [self presentViewController:activityVC animated:YES completion:nil];
+                }];
+            });
+        });
+    }];
+}
+
+#pragma mark - Login Persistence Debug (dev-only, FLEX-gated)
+
+- (NSString *)loginPersistenceDebugStatusText {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL forceMiss = [defaults boolForKey:UDKeyDebugForceAccountReadMiss];
+    BOOL noRecover = [defaults boolForKey:UDKeyDebugDisableKeychainRecovery];
+    return [NSString stringWithFormat:@"force-miss %@ · recovery %@",
+            forceMiss ? @"ON" : @"off", noRecover ? @"OFF" : @"on"];
+}
+
+- (void)presentLoginPersistenceDebugResult:(NSString *)text title:(NSString *)title {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:text preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIPasteboard.generalPasteboard.string = text;
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)presentLoginPersistenceDebugSheetFromSourceView:(UIView *)sourceView {
+    __weak typeof(self) weakSelf = self;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL forceMiss = [defaults boolForKey:UDKeyDebugForceAccountReadMiss];
+    BOOL noRecover = [defaults boolForKey:UDKeyDebugDisableKeychainRecovery];
+
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"Login Persistence Debug"
+                         message:@"Dev-only fault injection. This simulates the broken-keychain read on THIS device to exercise the fix — a pass here is a regression check, not field confirmation. \"Disable recovery\" + \"force read-miss\" will actually sign you out (reproduces the bug)."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:(forceMiss ? @"✓ Force account read-miss (ON)" : @"Force account read-miss (off)")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [defaults setBool:!forceMiss forKey:UDKeyDebugForceAccountReadMiss];
+        [weakSelf reloadRowWithID:@"adv.loginPersistenceDebug"];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:(noRecover ? @"✓ Disable recovery — watch the wipe (ON)" : @"Disable recovery — watch the wipe (off)")
+                                              style:(noRecover ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault)
+                                            handler:^(UIAlertAction *a) {
+        [defaults setBool:!noRecover forKey:UDKeyDebugDisableKeychainRecovery];
+        [weakSelf reloadRowWithID:@"adv.loginPersistenceDebug"];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Dump account keychain report"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf presentLoginPersistenceDebugResult:ApolloDebugAccountKeychainReport() title:@"Account keychain report"];
+    }]];
+
+    // Rewrites the account item's protection class to WhenUnlocked, keeping the blob byte-for-byte
+    // so the OAuth token stays valid. Toggles: run it once to poison, again to restore.
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Poison account protection class (real -25300)"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf presentLoginPersistenceDebugResult:ApolloDebugPoisonAccountAccessibility() title:@"Poison protection class"];
+    }]];
+
+    if (forceMiss || noRecover) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Clear all fault flags"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+            [defaults setBool:NO forKey:UDKeyDebugForceAccountReadMiss];
+            [defaults setBool:NO forKey:UDKeyDebugDisableKeychainRecovery];
+            [weakSelf reloadRowWithID:@"adv.loginPersistenceDebug"];
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+#pragma mark - Troubleshooting VC
+
+- (void)pushTroubleshootingViewController {
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.title = @"Can't sign in?";
+    vc.view.backgroundColor = self.tableView.backgroundColor;
+    vc.view.tintColor = self.view.tintColor;
+
+    UITextView *textView = [[UITextView alloc] init];
+    textView.adjustsFontForContentSizeCategory = YES;
+    textView.editable = NO;
+    textView.backgroundColor = [UIColor clearColor];
+    textView.translatesAutoresizingMaskIntoConstraints = NO;
+
+    if (@available(iOS 15.0, *)) {
+        NSString *troubleshootingText =
+            @"**If you're having trouble signing in, try the following:**\n\n"
+            @"**1. Accept cookies first**\n"
+            @"Tap the X in the upper-right corner of the sign-in page to return to Reddit homepage. Accept the cookies prompt, then tap back to return to the sign-in page and refresh.\n\n"
+            @"**2. Rotate to landscape**\n"
+            @"If the email/password fields aren't responding, rotate your device to landscape. The cookies banner may appear in the bottom-right. Accept it, then try inputting your credentials again.\n\n"
+            @"**3. Request Desktop Website**\n"
+            @"While on the sign-in page, tap the page settings icon in the upper-right of the toolbar and tap \"Request Desktop Website\". This can fix issues where sign-in appears to succeed but the account never appears.\n\n"
+            @"**4. Clear reddit.com cookies in Safari**\n"
+            @"Go to Settings → Apps → Safari → Advanced → Website Data, search for \"reddit\", and delete the cookies. Then try signing in again.";
+
+        NSAttributedStringMarkdownParsingOptions *markdownOptions = [[NSAttributedStringMarkdownParsingOptions alloc] init];
+        markdownOptions.interpretedSyntax = NSAttributedStringMarkdownInterpretedSyntaxInlineOnly;
+        textView.attributedText = [[NSAttributedString alloc] initWithMarkdownString:troubleshootingText options:markdownOptions baseURL:nil error:nil];
+
+        NSMutableAttributedString *attributedText = [textView.attributedText mutableCopy];
+        [attributedText enumerateAttribute:NSFontAttributeName inRange:NSMakeRange(0, attributedText.length) options:0 usingBlock:^(id value, NSRange range, BOOL *stop) {
+            UIFont *oldFont = (UIFont *)value;
+            // Re-set at 15pt (preserving the markdown bold), then wrap in
+            // UIFontMetrics so the text tracks Dynamic Type.
+            UIFont *baseFont = oldFont ? [oldFont fontWithSize:15] : [UIFont systemFontOfSize:15];
+            UIFont *newFont = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleSubheadline] scaledFontForFont:baseFont];
+            [attributedText addAttribute:NSFontAttributeName value:newFont range:range];
+        }];
+        textView.attributedText = attributedText;
+    } else {
+        textView.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+        textView.text =
+            @"If you're having trouble signing in, try the following:\n\n"
+            @"1. Accept cookies first\n"
+            @"Tap the X in the upper-right corner of the sign-in page to return to Reddit homepage. Accept the cookies prompt, then tap back to return to the sign-in page and refresh.\n\n"
+            @"2. Rotate to landscape\n"
+            @"If the email/password fields aren't responding, rotate your device to landscape. The cookies banner may appear in the bottom-right. Accept it, then try inputting your credentials again.\n\n"
+            @"3. Request Desktop Website\n"
+            @"While on the sign-in page, tap the page settings icon in the upper-right of the toolbar and tap \"Request Desktop Website\". This can fix issues where sign-in appears to succeed but the account never appears.\n\n"
+            @"4. Clear reddit.com cookies in Safari\n"
+            @"Go to Settings → Apps → Safari → Advanced → Website Data, search for \"reddit\", and delete the cookies. Then try signing in again.";
+    }
+    textView.textColor = UIColor.labelColor;
+    textView.textContainerInset = UIEdgeInsetsMake(16, 16, 16, 16);
+
+    [vc.view addSubview:textView];
+    [NSLayoutConstraint activateConstraints:@[
+        [textView.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor],
+        [textView.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor],
+        [textView.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor],
+        [textView.bottomAnchor constraintEqualToAnchor:vc.view.bottomAnchor],
+    ]];
+
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+#pragma mark - API Key Setup Instructions
+
+- (void)pushInstructionsViewController {
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.title = @"Giphy & Image Chest API Key Setup";
+    vc.view.backgroundColor = self.tableView.backgroundColor;
+    vc.view.tintColor = self.view.tintColor;
+
+    UITextView *textView = [[UITextView alloc] init];
+    textView.adjustsFontForContentSizeCategory = YES;
+    textView.editable = NO;
+    textView.selectable = YES;
+    textView.delegate = self;
+    textView.backgroundColor = [UIColor clearColor];
+    textView.translatesAutoresizingMaskIntoConstraints = NO;
+    textView.linkTextAttributes = @{
+        NSForegroundColorAttributeName: [self apollo_themeAccentColor],
+        NSUnderlineStyleAttributeName: @(NSUnderlineStyleSingle),
+    };
+
+    if (@available(iOS 15.0, *)) {
+        NSString *instructionsText =
+            @"**Giphy API Key**\n\n"
+            @"1. Go to [developers.giphy.com](https://developers.giphy.com/) and create an account if you do not have one.\n"
+            @"2. After signing in, click **Create an API Key** at the top of the page.\n"
+            @"3. Choose **SDK** (not API).\n"
+            @"4. Fill in the form:\n"
+            @"\t- **App name:** Apollo Reborn *(any name is fine)*\n"
+            @"\t- **Platform:** iOS\n"
+            @"\t- **App description:** Apollo API Key *(or anything brief)*\n"
+            @"5. Check the box to agree to the terms, then click **Create API Key**.\n"
+            @"6. On your dashboard, click your new API key to copy it.\n"
+            @"7. Paste it into **Giphy API Key** under Apollo Reborn → Accounts & API Keys.\n\n"
+            @"**Image Chest API Key**\n\n"
+            @"1. Go to [imgchest.com](https://imgchest.com/) and click **Register** to create an account.\n"
+            @"2. After signing in, open the menu from your profile picture and choose **API**.\n"
+            @"3. Click **Create API Token**, give it a name, then click **Create**.\n"
+            @"4. Copy the token and paste it into **Image Chest API Key** under Apollo Reborn → Accounts & API Keys.";
+
+        NSAttributedStringMarkdownParsingOptions *markdownOptions = [[NSAttributedStringMarkdownParsingOptions alloc] init];
+        markdownOptions.interpretedSyntax = NSAttributedStringMarkdownInterpretedSyntaxInlineOnly;
+        textView.attributedText = [[NSAttributedString alloc] initWithMarkdownString:instructionsText options:markdownOptions baseURL:nil error:nil];
+
+        NSMutableAttributedString *attributedText = [textView.attributedText mutableCopy];
+        [attributedText enumerateAttribute:NSFontAttributeName inRange:NSMakeRange(0, attributedText.length) options:0 usingBlock:^(id value, NSRange range, BOOL *stop) {
+            UIFont *oldFont = (UIFont *)value;
+            // Re-set at 15pt (preserving the markdown bold), then wrap in
+            // UIFontMetrics so the text tracks Dynamic Type.
+            UIFont *baseFont = oldFont ? [oldFont fontWithSize:15] : [UIFont systemFontOfSize:15];
+            UIFont *newFont = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleSubheadline] scaledFontForFont:baseFont];
+            [attributedText addAttribute:NSFontAttributeName value:newFont range:range];
+        }];
+        textView.attributedText = attributedText;
+    } else {
+        textView.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+        textView.dataDetectorTypes = UIDataDetectorTypeLink;
+        textView.text =
+            @"Giphy API Key\n\n"
+            @"1. Go to https://developers.giphy.com/ and create an account if you do not have one.\n"
+            @"2. After signing in, click Create an API Key at the top of the page.\n"
+            @"3. Choose SDK (not API).\n"
+            @"4. Fill in the form:\n"
+            @"   - App name: Apollo Reborn (any name is fine)\n"
+            @"   - Platform: iOS\n"
+            @"   - App description: Apollo API Key (or anything brief)\n"
+            @"5. Check the box to agree to the terms, then click Create API Key.\n"
+            @"6. On your dashboard, click your new API key to copy it.\n"
+            @"7. Paste it into Giphy API Key under Apollo Reborn → Accounts & API Keys.\n\n"
+            @"Image Chest API Key\n\n"
+            @"1. Go to https://imgchest.com/ and click Register to create an account.\n"
+            @"2. After signing in, open the menu from your profile picture and choose API.\n"
+            @"3. Click Create API Token, give it a name, then click Create.\n"
+            @"4. Copy the token and paste it into Image Chest API Key under Apollo Reborn → Accounts & API Keys.";
+    }
+    textView.textColor = UIColor.labelColor;
+    textView.textContainerInset = UIEdgeInsetsMake(16, 16, 16, 16);
+
+    [vc.view addSubview:textView];
+    [NSLayoutConstraint activateConstraints:@[
+        [textView.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor],
+        [textView.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor],
+        [textView.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor],
+        [textView.bottomAnchor constraintEqualToAnchor:vc.view.bottomAnchor],
+    ]];
+
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+#pragma mark - UITextFieldDelegate
+
+- (BOOL)textField:(UITextField *)textField
+shouldChangeCharactersInRange:(NSRange)range
+replacementString:(NSString *)string {
+    if (textField.tag == TagReadPostMaxCount ||
+        textField.tag == TagTrendingLimit ||
+        textField.tag == TagRecentlyVisitedLimit) {
+        NSString *updated = [textField.text stringByReplacingCharactersInRange:range
+                                                                    withString:string];
+        NSCharacterSet *nonDigits =
+            [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+        return updated.length <= 5 &&
+               [updated rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
+    }
+
+    return YES;
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return YES;
+}
+
+- (void)textFieldDidBeginEditing:(UITextField *)textField {
+    if ([self apollo_isMaskedAPIKeyTag:textField.tag]) {
+        textField.secureTextEntry = NO;
+    }
+}
+
+- (void)textFieldDidEndEditing:(UITextField *)textField {
+    if (textField.tag == TagRedditClientId) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sRedditClientId = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sRedditClientId forKey:UDKeyRedditClientId];
+    } else if (textField.tag == TagRedditClientSecret) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sRedditClientSecret = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sRedditClientSecret forKey:UDKeyRedditClientSecret];
+    } else if (textField.tag == TagImgurClientId) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sImgurClientId = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sImgurClientId forKey:UDKeyImgurClientId];
+    } else if (textField.tag == TagImageChestAPIToken) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        sImageChestAPIToken = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sImageChestAPIToken forKey:UDKeyImageChestAPIToken];
+    } else if (textField.tag == TagGiphyAPIKey) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        [[NSUserDefaults standardUserDefaults] setValue:textField.text ?: @"" forKey:UDKeyGiphyAPIKey];
+    } else if (textField.tag == TagKagiSessionLink) {
+        [self apollo_saveKagiSessionLinkFromField:textField];
+    } else if (textField.tag == TagRedirectURI) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sRedirectURI = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sRedirectURI forKey:UDKeyRedirectURI];
+        textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
+    } else if (textField.tag == TagUserAgent) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sUserAgent = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sUserAgent forKey:UDKeyUserAgent];
+    } else if (textField.tag == TagTrendingSubredditsSource) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (textField.text.length == 0) {
+            textField.text = defaultTrendingSubredditsSource;
+        }
+        sTrendingSubredditsSource = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sTrendingSubredditsSource forKey:UDKeyTrendingSubredditsSource];
+    } else if (textField.tag == TagRandomSubredditsSource) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (textField.text.length == 0) {
+            textField.text = defaultRandomSubredditsSource;
+        }
+        sRandomSubredditsSource = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sRandomSubredditsSource forKey:UDKeyRandomSubredditsSource];
+    } else if (textField.tag == TagRandNsfwSubredditsSource) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sRandNsfwSubredditsSource = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sRandNsfwSubredditsSource forKey:UDKeyRandNsfwSubredditsSource];
+    } else if (textField.tag == TagTrendingLimit) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sTrendingSubredditsLimit = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sTrendingSubredditsLimit forKey:UDKeyTrendingSubredditsLimit];
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSearchLandingSettingsDidChangeNotification object:nil];
+    } else if (textField.tag == TagRecentlyVisitedLimit) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sRecentlyVisitedSubredditsLimit = textField.text;
+        [[NSUserDefaults standardUserDefaults] setValue:sRecentlyVisitedSubredditsLimit forKey:UDKeyRecentlyVisitedSubredditsLimit];
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSearchLandingSettingsDidChangeNotification object:nil];
+    } else if (textField.tag == TagReadPostMaxCount) {
+        textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        sReadPostMaxCount = [textField.text integerValue];
+        [[NSUserDefaults standardUserDefaults] setInteger:sReadPostMaxCount forKey:UDKeyReadPostMaxCount];
+    } else if (textField.tag == TagNotificationBackendURL) {
+        NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        while ([trimmed hasSuffix:@"/"]) {
+            trimmed = [trimmed substringToIndex:trimmed.length - 1];
+        }
+        textField.text = trimmed;
+        [[NSUserDefaults standardUserDefaults] setValue:trimmed forKey:UDKeyNotificationBackendURL];
+        textField.textColor = [self isNotificationBackendURLValid:trimmed] ? [UIColor labelColor] : [UIColor systemRedColor];
+    } else if (textField.tag == TagNotificationBackendRegistrationToken) {
+        NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        textField.text = trimmed;
+        [[NSUserDefaults standardUserDefaults] setValue:trimmed forKey:UDKeyNotificationBackendRegistrationToken];
+    } else if (textField.tag == TagBarkPushURL) {
+        NSString *trimmed = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        while ([trimmed hasSuffix:@"/"]) {
+            trimmed = [trimmed substringToIndex:trimmed.length - 1];
+        }
+        textField.text = trimmed;
+        [[NSUserDefaults standardUserDefaults] setValue:trimmed forKey:UDKeyBarkPushURL];
+        textField.textColor = [self isNotificationBackendURLValid:trimmed] ? [UIColor labelColor] : [UIColor systemRedColor];
+        if (ApolloBarkModeActive()) {
+            // Bark is on and the URL is usable — sync the backend device row
+            // so the (new) endpoint applies immediately. Covers both
+            // first-time setup (toggle flipped before the URL existed) and
+            // endpoint edits on an already-registered device.
+            ApolloBarkSyncBackendDeviceTransport();
+        }
+    }
+
+    if ([self apollo_isMaskedAPIKeyTag:textField.tag]) {
+        textField.secureTextEntry = YES;
+    }
+
+}
+
+#pragma mark - Switch Actions
+
+- (void)barkNotificationsSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyBarkNotificationsEnabled];
+
+    if (sender.isOn) {
+        // Flip the backend device row to transport=bark right away. With no
+        // valid Bark URL yet, Bark mode is inactive and this would register
+        // an undeliverable row — skip; saving the URL syncs instead.
+        if (ApolloBarkModeActive()) {
+            ApolloBarkSyncBackendDeviceTransport();
+        }
+        return;
+    }
+
+    if (ApolloPushNotificationsSupported()) {
+        // Entitled build turning Bark off: same device row (the real APNs
+        // token), flip it back to transport=apns — native push resumes
+        // immediately.
+        ApolloBarkSyncBackendDeviceTransport();
+        return;
+    }
+
+    // Unentitled build turning Bark off: nothing can deliver to this build
+    // anymore, and Bark send failures never delete device rows server-side
+    // (by design), so retiring the synthetic registration explicitly is the
+    // only way to stop the backend pushing to the Bark app forever.
+    NSString *synthetic = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyBarkSyntheticDeviceToken];
+    if (synthetic.length > 0 && ApolloIsNotificationBackendConfigured()) {
+        ApolloBarkDeleteBackendDevice(synthetic);
+    }
+}
+
+- (void)usageHeartbeatSwitchToggled:(UISwitch *)sender {
+    // Mirror the opt-out into both NSUserDefaults and the durable heartbeat plist
+    // so a sign-in / settings restore can't silently re-enable it. on = NOT disabled.
+    ApolloSetUsageHeartbeatDisabled(!sender.isOn);
+}
+
+- (void)testBarkNotification {
+    if (!ApolloBarkConfigured()) {
+        NSString *why = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBarkNotificationsEnabled]
+            ? @"Enter a valid Bark push URL (from the Bark app's server list) before testing."
+            : @"Turn on Bark Delivery and enter your Bark push URL before testing.";
+        [self showAlertWithTitle:@"Bark Not Configured" message:why];
+        return;
+    }
+
+    UIAlertController *spinner = [UIAlertController alertControllerWithTitle:@"Sending test notification…"
+                                                                     message:@"\n"
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *indicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    indicator.translatesAutoresizingMaskIntoConstraints = NO;
+    [indicator startAnimating];
+    [spinner.view addSubview:indicator];
+    [NSLayoutConstraint activateConstraints:@[
+        [indicator.centerXAnchor constraintEqualToAnchor:spinner.view.centerXAnchor],
+        [indicator.bottomAnchor constraintEqualToAnchor:spinner.view.bottomAnchor constant:-20],
+    ]];
+
+    [self presentViewController:spinner animated:YES completion:^{
+        ApolloBarkSendTestNotification(^(BOOL ok, NSString *message) {
+            [spinner dismissViewControllerAnimated:YES completion:^{
+                NSString *finalMessage = message;
+                if (ok && !ApolloIsNotificationBackendConfigured()) {
+                    finalMessage = [message stringByAppendingString:
+                        @"\n\nNote: Bark delivery also needs a Backend URL above — without one there is no server watching your Reddit account."];
+                }
+                [self showAlertWithTitle:ok ? @"Success" : @"Failed" message:finalMessage];
+            }];
+        });
+    }];
+}
+
+- (void)blockAnnouncementsSwitchToggled:(UISwitch *)sender {
+    sBlockAnnouncements = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sBlockAnnouncements forKey:UDKeyBlockAnnouncements];
+}
+
+- (void)flexSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyEnableFLEX];
+    // The Login Persistence Debug and What's New Debug rows only exist while
+    // developer mode is on.
+    [self visibilityDidChange];
+}
+
+- (void)webJSONSwitchToggled:(UISwitch *)sender {
+    // A stored web session IS that account's sign-in, so launch turns this
+    // back on while one exists (Tweak.xm %ctor). Turning it off alone never
+    // stuck (#1581), and until the relaunch every request for that account
+    // hung. Off therefore means moving those accounts to an API key first,
+    // through the same switch the account switcher offers.
+    NSArray<NSString *> *webSessionUsers = ApolloWebSessionUsernames().allObjects;
+    if (sender.isOn == NO && sWebJSONEnabled && webSessionUsers.count > 0) {
+        [sender setOn:YES animated:YES]; // stays on while a web session is left
+        if (webSessionUsers.count > 1) {
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"Turn Off API-Key-Free Mode?"
+                                 message:[NSString stringWithFormat:
+                                     @"%lu accounts sign in without an API key. Switch each one to an API key from the account switcher first.",
+                                     (unsigned long)webSessionUsers.count]
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+        __weak typeof(self) weakSelf = self;
+        __weak UISwitch *weakSender = sender;
+        ApolloPresentSwitchToAPIKeyFlow(self, webSessionUsers.firstObject, ^(BOOL switched) {
+            if (!switched || ApolloWebSessionUsernames().count > 0) return;
+            [weakSender setOn:NO animated:YES];
+            [weakSelf _applyWebJSONEnabled:NO];
+        });
+        return;
+    }
+    [self _applyWebJSONEnabled:sender.isOn];
+}
+
+- (void)_applyWebJSONEnabled:(BOOL)enabled {
+    BOOL wasOn = sWebJSONEnabled;
+    sWebJSONEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:sWebJSONEnabled forKey:UDKeyWebJSONEnabled];
+    if (sWebJSONEnabled == wasOn) return;
+
+    // The Web Session Login row only exists while the mode is on.
+    [self visibilityDidChange];
+}
+
+- (void)reduceRateLimitingSwitchToggled:(UISwitch *)sender {
+    ApolloReduceRateLimitingSetEnabled(sender.isOn);
+}
+
+// Modern Chat / Modmail are a plain app-wide choice for every account.
+- (void)modernRedditChatSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyUseModernRedditChat];
+    if (!sender.isOn) ApolloMessageDraftStoreMarkAllPendingDelete();
+    // The combined Inbox tab badge gates its chat contribution on this key —
+    // re-render it now so switching modern Chat off immediately drops any
+    // chat-inflated count back to Apollo's native value.
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloModernChatStatusDidChangeNotification object:nil];
+}
+
+- (void)modernRedditModmailSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyUseModernRedditModmail];
+}
+
+// This row is "manage/refresh my web login", NOT "add another account", so it
+// must NOT clear the shared WKWebView cookie jar: the jar usually holds the
+// live, server-rotated login this account depends on (and that the silent
+// re-harvest recovers from). The plain login flow detects an existing jar
+// login and offers Keep (re-harvest it) / Re-authenticate — exactly the right
+// choices here. Only account-ADD flows (switcher/chooser) clear the jar first.
+- (void)presentWebSessionLoginViewController {
+    ApolloWebSessionLoginViewController *vc = [ApolloWebSessionLoginViewController new];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+// A mid-session web login synthesized an account that AccountManager only loads at
+// launch. Offer to quit & reopen so it activates; "Re-sign In" falls back to the
+// login flow. The pending flag (+ username) clears itself on the next launch
+// (Tweak.xm %ctor).
+- (void)promptQuitToActivateWebSession {
+    NSString *username = [[NSUserDefaults standardUserDefaults] stringForKey:UDKeyWebJSONPendingRestartUsername];
+    NSString *who = username.length > 0 ? [NSString stringWithFormat:@"u/%@", username] : @"your account";
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Quit & Reopen to Activate"
+                         message:[NSString stringWithFormat:
+                             @"You're signed in as %@, but Apollo needs to quit and reopen to load the account and enable voting and commenting.", who]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit Apollo" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        exit(0);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Re-sign In" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self presentWebSessionLoginViewController];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)flairColorsSwitchToggled:(UISwitch *)sender {
+    BOOL on = sender.isOn;
+    sEnableFlairColors = on;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:UDKeyEnableFlairColors];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFlairColorsChangedNotification object:nil];
+}
+
+- (void)randNsfwSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyShowRandNsfw];
+}
+
+- (void)allPlusNSFWSwitchToggled:(UISwitch *)sender {
+    sAllPlusNSFWEnabled = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyAllPlusNSFWEnabled];
+    // Either way, start clean: off must stop a search already in flight from
+    // publishing or re-asking; on must not resume from whatever was buffered.
+    ApolloAllPlusInvalidate();
+    // Reload the boost slider row so it enables/disables to match the toggle.
+    [self reloadRowWithID:@"gen.allPlusNSFWBoost"];
+}
+
+- (void)allPlusNSFWBoostChanged:(UISlider *)sender {
+    float step = sender.accessibilityIdentifier.floatValue;   // stashed by sliderCellWithIdentifier:
+    if (step <= 0) step = 0.05f;
+    float snapped = roundf(sender.value / step) * step;
+    snapped = fmaxf(sender.minimumValue, fminf(sender.maximumValue, snapped));
+    // Do NOT write sender.value here -- reassigning the thumb mid-drag fights the
+    // finger. The thumb snaps on release (apolloSliderSnapOnRelease:); live we
+    // only update the label and the stored value.
+    UIView *v = sender.superview;
+    while (v && ![v isKindOfClass:[UITableViewCell class]]) v = v.superview;
+    UILabel *valueLabel = [((UITableViewCell *)v).contentView viewWithTag:7702];
+    valueLabel.text = [NSString stringWithFormat:@"%.2f", snapped];
+    sAllPlusNSFWBoost = snapped;
+    [[NSUserDefaults standardUserDefaults] setDouble:snapped forKey:UDKeyAllPlusNSFWBoost];
+}
+
+- (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyUseCustomOAuthSignIn];
+    // The Redirect URI row's explainer text and validity color both depend on this.
+    [self reloadRowWithID:@"api.redirectURI"];
+}
+
+// Subreddit List Enhancements, Modern Subreddit Dividers and Hide Multireddit
+// Descriptions live on the Subreddit List screen now
+// (ApolloSubredditSectionsViewController), beside the live preview that shows
+// what they change.
+
+// Keep the same UISwitch instances alive while their touch animations run.
+// Account changes still refresh their values and sorting availability in place.
+- (void)refreshFavoritesSwitches {
+    for (NSString *rowID in @[ @"sub.perAccountFavorites", @"sub.sortFavoritesAlphabetically" ]) {
+        UITableViewCell *cell = [self cellForRowID:rowID];
+        if (![cell.accessoryView isKindOfClass:UISwitch.class]) continue;
+        UISwitch *toggle = (UISwitch *)cell.accessoryView;
+        BOOL sorting = [rowID isEqualToString:@"sub.sortFavoritesAlphabetically"];
+        BOOL on = sorting ? sSortFavoritesAlphabetically : sPerAccountFavoritesEnabled;
+        BOOL enabled = !sorting || ApolloFavoritesSortingIsAvailable();
+        // Reapplying even the same value can interrupt the user's animation.
+        if (toggle.isOn != on) [toggle setOn:on animated:YES];
+        toggle.enabled = enabled;
+        cell.textLabel.enabled = enabled;
+    }
+}
+
+- (void)perAccountFavoritesSwitchToggled:(UISwitch *)sender {
+    ApolloPerAccountFavoritesSetResult result =
+        ApolloPerAccountFavoritesSetEnabled(sender.isOn);
+    if (result == ApolloPerAccountFavoritesSetResultApplied) {
+        [self refreshFavoritesSwitches];
+        return;
+    }
+
+    [sender setOn:sPerAccountFavoritesEnabled animated:YES];
+    if (result == ApolloPerAccountFavoritesSetResultUnsupportedStore) {
+        [self showAlertWithTitle:@"Newer Favorites Data Found"
+                         message:@"Per-Account Favorites stayed off because this data was created by a newer version of Apollo Reborn. Your favorites were not changed. Update Apollo Reborn before enabling it here."];
+    } else if (result == ApolloPerAccountFavoritesSetResultInvalidStore) {
+        [self showAlertWithTitle:@"Favorites Data Couldn’t Be Read"
+                         message:@"Per-Account Favorites stayed off and your current favorites were not changed. Restore a known-good settings backup before trying again."];
+    } else {
+        [self showAlertWithTitle:@"Account Still Loading"
+                         message:@"Apollo could not safely identify the active account yet, so Per-Account Favorites stayed off. Wait a moment, then try again."];
+    }
+}
+
+- (void)hideSubredditListDescriptionsSwitchToggled:(UISwitch *)sender {
+    sHideSubredditListDescriptions = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sHideSubredditListDescriptions forKey:UDKeyHideSubredditListDescriptions];
+    [self apollo_refreshFeedShortcutsPreviewAnimated:NO];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloHideSubredditListDescriptionsChangedNotification object:nil];
+}
+
+- (void)setFeedShortcutVisible:(BOOL)visible defaultsKey:(NSString *)defaultsKey {
+    [NSUserDefaults.standardUserDefaults setBool:!visible forKey:defaultsKey];
+    [self apollo_refreshFeedShortcutsPreviewAnimated:YES];
+    [NSNotificationCenter.defaultCenter postNotificationName:ApolloFeedShortcutsChangedNotification object:nil];
+}
+
+- (void)apollo_refreshFeedShortcutsPreviewAnimated:(BOOL)animated {
+    (void)animated;
+}
+
+- (void)collapsePinnedCommentsSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyCollapsePinnedComments];
+}
+
+- (void)filterNSFWRecentlyReadSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyFilterNSFWRecentlyRead];
+}
+
+- (void)setTabBarScrollBehaviorClassic:(BOOL)classic {
+    if (!ApolloSupportsNativeTabBarScrollBehavior() ||
+        ![self apollo_nativeHideBarsOnScrollEnabled]) return;
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL behaviorChanged = sClassicTabBarScrollBehavior != classic;
+    sClassicTabBarScrollBehavior = classic;
+    [defaults setBool:classic forKey:UDKeyClassicTabBarScrollBehavior];
+    if (behaviorChanged) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:ApolloTabBarScrollBehaviorChangedNotification object:nil];
+    }
+    [self reloadRowWithID:@"interface.tabBarScrollBehavior"];
+}
+
+// The split controllers are built during scene connect, which already happened
+// for this process, so there is no live path. Persist the desired state and
+// keep the current-process state unchanged until Apollo relaunches.
+- (void)iPadPaneLayoutSwitchToggled:(UISwitch *)sender {
+    BOOL on = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:UDKeyIPadPaneLayout];
+    [NSUserDefaults.standardUserDefaults setBool:YES forKey:UDKeyIPadLayoutWelcomeSeen];
+    // Dependent rows describe the hierarchy that is active in THIS process,
+    // while this switch and its pending subtitle describe the saved choice.
+    [self visibilityDidChange];
+    [self reloadRowWithID:@"gen.iPadPaneLayout"];
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Restart to Apply"
+                         message:on
+            ? @"iPad Layout is set up when Apollo launches, so it needs to quit and reopen to take effect."
+            : @"Apollo needs to quit and reopen to return to the single-column layout."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit Apollo"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        exit(0);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Later"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)apollo_presentRestartRequiredAlertAllowingLater:(BOOL)allowLater {
+    UIAlertController *alert = [UIAlertController
+        alertControllerWithTitle:@"Restart Required"
+                         message:@"Quit and reopen Apollo for this change to take effect."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    // A Liquid Glass change must be followed by a relaunch. With no cancel
+    // action, UIKit also keeps this alert up for outside taps or escape gestures.
+    alert.modalInPresentation = !allowLater;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Quit & Reopen"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        // exit(0) bypasses the normal lifecycle; flush the pending setting
+        // before quitting so the next launch reads the selected appearance.
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        exit(0);
+    }]];
+    if (allowLater) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+    }
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)liquidGlassSwitchToggled:(UISwitch *)sender {
+    // The current launch keeps its original appearance and hook selection.
+    // Only startup consumes this preference; do not refresh row visibility.
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyLiquidGlassEnabled];
+    [self apollo_presentRestartRequiredAlertAllowingLater:NO];
+}
+
+// Takes effect on next relaunch — see ApolloLiquidGlass.xm.
+- (void)tabBarSwipeNavigationSwitchToggled:(UISwitch *)sender {
+    sTabBarSwipeNavigation = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sTabBarSwipeNavigation forKey:UDKeyTabBarSwipeNavigation];
+    [self apollo_presentRestartRequiredAlertAllowingLater:YES];
+}
+
+- (void)proxyImgurDDGSwitchToggled:(UISwitch *)sender {
+    sProxyImgurDDG = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sProxyImgurDDG forKey:UDKeyProxyImgurDDG];
+    [self visibilityDidChange];
+}
+
+- (void)imgurAlbumFallbackSwitchToggled:(UISwitch *)sender {
+    sImgurAlbumFallbackProxies = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sImgurAlbumFallbackProxies forKey:UDKeyImgurAlbumFallbackProxies];
+}
+
+- (void)textPostThumbnailsSwitchToggled:(UISwitch *)sender {
+    sFeedTextPostThumbnails = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedTextPostThumbnails forKey:UDKeyFeedTextPostThumbnails];
+}
+
+- (void)feedGalleryCarouselSwitchToggled:(UISwitch *)sender {
+    sFeedGalleryCarousel = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedGalleryCarousel forKey:UDKeyFeedGalleryCarousel];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloFeedGalleryCarouselChangedNotification object:nil];
+    // The edge-swipe navigation row is only shown while the carousel is on.
+    [self visibilityDidChange];
+}
+
+- (void)restoreReadingSessionSwitchToggled:(UISwitch *)sender {
+    sRestoreReadingSession = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyRestoreReadingSession];
+    ApolloSessionRestorationSetEnabled(sender.isOn);
+}
+
+- (void)galleryAutoplayVideosSwitchToggled:(UISwitch *)sender {
+    sGalleryAutoplayVideos = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sGalleryAutoplayVideos forKey:UDKeyGalleryAutoplayVideos];
+    // A gallery already sitting in the nav stack stops or starts its tiles
+    // right away rather than on its next open.
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloGalleryAutoplayMediaChangedNotification object:nil];
+}
+
+- (void)galleryAutoplayGIFsSwitchToggled:(UISwitch *)sender {
+    sGalleryAutoplayGIFs = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sGalleryAutoplayGIFs forKey:UDKeyGalleryAutoplayGIFs];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloGalleryAutoplayMediaChangedNotification object:nil];
+}
+
+- (void)feedGalleryEdgeSwipeNavSwitchToggled:(UISwitch *)sender {
+    sFeedGalleryEdgeSwipeNav = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFeedGalleryEdgeSwipeNav forKey:UDKeyFeedGalleryEdgeSwipeNav];
+}
+
+- (void)swipeUpCommentsSwitchToggled:(UISwitch *)sender {
+    sSwipeUpForComments = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sSwipeUpForComments forKey:UDKeySwipeUpForComments];
+}
+
+- (void)floatingPostTabsSwitchToggled:(UISwitch *)sender {
+    sFloatingPostTabs = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFloatingPostTabs forKey:UDKeyFloatingPostTabs];
+    [self visibilityDidChange];  // drives the "Magnetic Stacking" sub-row
+    // Bubbles must not survive the feature being disabled.
+    if (!sFloatingPostTabs) ApolloFloatingTabsCloseAll();
+}
+
+- (void)floatingPostTabsMagnetSwitchToggled:(UISwitch *)sender {
+    sFloatingPostTabsMagnet = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFloatingPostTabsMagnet forKey:UDKeyFloatingPostTabsMagnet];
+    // Turning the magnet off fans existing piles apart.
+    ApolloFloatingTabsMagnetSettingChanged();
+}
+
+- (void)floatingPostTabsPreviewSwitchToggled:(UISwitch *)sender {
+    sFloatingPostTabsPreview = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sFloatingPostTabsPreview forKey:UDKeyFloatingPostTabsPreview];
+    // Read live at gesture time — nothing to tear down.
+}
+
+- (void)devvitPostsSwitchToggled:(UISwitch *)sender {
+    sDevvitInteractivePosts = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sDevvitInteractivePosts forKey:UDKeyDevvitInteractivePosts];
+    [self visibilityDidChange];  // drives the "Interactive Posts in Feed" sub-row
+    // Community Highlights hands a PINNED interactive post back to the feed while
+    // its widget renders there, so both toggles change what belongs in a carousel.
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloDevvitFeedOwnershipChangedNotification object:nil];
+}
+
+- (void)devvitFeedPostsSwitchToggled:(UISwitch *)sender {
+    sDevvitFeedWidgets = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sDevvitFeedWidgets forKey:UDKeyDevvitFeedWidgets];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloDevvitFeedOwnershipChangedNotification object:nil];
+}
+
+- (void)hideInteractiveForYouSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyHomeFeedHideInteractivePosts];
+    [[NSNotificationCenter defaultCenter] postNotificationName:ApolloForYouFeedFilterChangedNotification object:nil];
+}
+
+- (void)liveCommentsFollowSwitchToggled:(UISwitch *)sender {
+    sLiveCommentsFollow = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sLiveCommentsFollow forKey:UDKeyLiveCommentsFollow];
+}
+
+- (void)userAvatarsSwitchToggled:(UISwitch *)sender {
+    sShowUserAvatars = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sShowUserAvatars forKey:UDKeyShowUserAvatars];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
+}
+
+- (void)profileTabAvatarSwitchToggled:(UISwitch *)sender {
+    sUseProfileAvatarTabIcon = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sUseProfileAvatarTabIcon forKey:UDKeyUseProfileAvatarTabIcon];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloProfileTabAvatarIconChangedNotification" object:nil];
+}
+
+- (void)iconOnlyTabBarSwitchToggled:(UISwitch *)sender {
+    // Icon-Only temporarily supersedes the narrower profile-only choice.
+    // Preserve its preference while hiding the redundant row, then restore
+    // both when tab labels return.
+    ApolloSetHideTabBarTitlesEnabled(sender.isOn);
+    [self visibilityDidChange];
+}
+
+- (void)hideUsernameTabSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyNativeHideUsernameOnTabBar];
+    // Apollo natively observes this and relabels the profile tab immediately.
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:ApolloNativeHideUsernameOnTabBarChangedNotification object:nil];
+}
+
+- (void)promptClearAllCachesFromSourceView:(UIView *)sourceView {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear Tweak Caches?"
+                                                                   message:@"This removes cached profile pictures, banners, link previews, badge books, and remembered banned-profile dismissals."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        [[ApolloUserProfileCache sharedCache] clearAllCaches];
+        [[ApolloLinkPreviewCache sharedCache] flushCache];
+        // The learned per-host card-shape verdicts are derived from those same
+        // previews, so they go with them.
+        [[ApolloLinkPreviewShapeMemory sharedMemory] reset];
+        [[ApolloSubredditInfoCache sharedCache] clearAllCaches];
+        ApolloBadgeBookInvalidate(nil);   // per-user earned/trophy state, memory + disk
+        ApolloBannedProfileClearDismissedOverlays();
+        // Re-broadcast the avatars-toggle notification so visible profile headers reload immediately.
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"ApolloUserAvatarsToggleChangedNotification" object:nil];
+    }]];
+
+    UIPopoverPresentationController *popover = alert.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// Inline Media Previews / Alignment / Autoplay Inline GIFs UI moved to
+// InlineMediaSettingsViewController (see -buildInlineMediaSection).
+
+#pragma mark - Hold for Video Speed
+
+- (void)videoHoldSpeedSwitchToggled:(UISwitch *)sender {
+    BOOL wasOn = sVideoHoldSpeedEnabled;
+    sVideoHoldSpeedEnabled = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:sVideoHoldSpeedEnabled forKey:UDKeyVideoHoldSpeedEnabled];
+    if (sVideoHoldSpeedEnabled == wasOn) return;
+    // The "Hold Speed" picker row is shown only while this toggle is on.
+    [self visibilityDidChange];
+}
+
+- (NSString *)videoHoldSpeedText {
+    return ApolloVideoHoldSpeedTitle(sVideoHoldSpeed);
+}
+
+- (void)setVideoHoldSpeed:(float)speed {
+    sVideoHoldSpeed = ApolloSanitizedHoldSpeed(speed);
+    [[NSUserDefaults standardUserDefaults] setFloat:sVideoHoldSpeed forKey:UDKeyVideoHoldSpeed];
+    [self reloadRowWithID:@"media.holdSpeedValue"];
+}
+
+- (void)presentVideoHoldSpeedSheetFromSourceView:(UIView *)sourceView {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Hold Speed"
+                                                                   message:@"Speed applied while you hold the right side of a fullscreen video."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    for (size_t i = 0; i < sizeof(kVideoHoldSpeeds) / sizeof(kVideoHoldSpeeds[0]); i++) {
+        float speed = kVideoHoldSpeeds[i];
+        BOOL isCurrent = fabsf(sVideoHoldSpeed - speed) < 0.001f;
+        NSString *title = isCurrent ? [ApolloVideoHoldSpeedTitle(speed) stringByAppendingString:@" (Current)"]
+                                    : ApolloVideoHoldSpeedTitle(speed);
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [self setVideoHoldSpeed:speed];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover && sourceView) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)promptClearCustomSubredditBannersFromSourceView:(__unused UIView *)sourceView {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Clear Custom Banners & Icons?"
+                                                                   message:@"Locally saved custom subreddit banner and icon images will be removed. Official Reddit art will show again where available."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        [[ApolloSubredditCustomBannerCache sharedCache] clearAllCustomBanners];
+        [[ApolloSubredditCustomIconCache sharedCache] clearAllCustomIcons];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - Backup / Restore
+
+// The backup/restore engine lives in settings/ApolloBackupRestore.{h,m}; this VC only
+// wraps it in UI (alerts, document picker, the exit(0) restart prompt).
+
+- (void)backupSettings {
+    NSError *error = nil;
+    NSURL *zipURL = ApolloBackupRestoreCreateBackupZip(&error);
+    if (!zipURL) {
+        [self showAlertWithTitle:@"Backup Failed" message:(error.localizedDescription ?: @"Could not create backup archive.")];
+        return;
+    }
+
+    _isRestoreOperation = NO;
+    UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc] initForExportingURLs:@[zipURL] asCopy:YES];
+    documentPicker.delegate = self;
+    documentPicker.modalPresentationStyle = UIModalPresentationFormSheet;
+    [self presentViewController:documentPicker animated:YES completion:nil];
+}
+
+- (void)restoreSettings {
+    if (self.resolvingRestoreFolder || self.presentedViewController) return;
+    ApolloICloudBackupStore *iCloudStore = ApolloICloudBackupStore.sharedStore;
+    if (iCloudStore.availability == ApolloICloudBackupAvailabilityUnknown && !iCloudStore.isWorking) {
+        __weak typeof(self) weakSelf = self;
+        [iCloudStore refreshAvailabilityWithCompletion:^{ [weakSelf restoreSettings]; }];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Restore Settings"
+        message:@"Choose where the backup is stored."
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Local Backup"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            ApolloLocalBackupsViewController *controller =
+                [[ApolloLocalBackupsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            [weakSelf.navigationController pushViewController:controller animated:YES];
+        }]];
+    UIAlertAction *iCloud = [UIAlertAction actionWithTitle:@"iCloud Backup"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            ApolloICloudBackupsViewController *controller =
+                [[ApolloICloudBackupsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            [weakSelf.navigationController pushViewController:controller animated:YES];
+        }];
+    iCloud.enabled = iCloudStore.availability == ApolloICloudBackupAvailabilityAvailable;
+    [sheet addAction:iCloud];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Choose from Files"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf presentRestorePickerAtDirectory:nil];
+            });
+        }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UITableViewCell *source = [self cellForRowID:@"data.restore"];
+    sheet.popoverPresentationController.sourceView = source ?: self.view;
+    sheet.popoverPresentationController.sourceRect = source ? source.bounds
+        : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)presentRestorePickerAtDirectory:(NSURL *)folderURL {
+    _isRestoreOperation = YES;
+    // The custom extension carries the Files icon; old ZIP backups remain importable.
+    // Resolve by extension too, so a tweak-only installation without the IPA's
+    // exported declaration can still select a dynamically identified backup.
+    UTType *backupType = [UTType typeWithFilenameExtension:@"apollobackup"];
+    NSArray<UTType *> *types = backupType ? @[backupType, UTTypeZIP] : @[UTTypeZIP];
+    UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
+    documentPicker.delegate = self;
+    documentPicker.modalPresentationStyle = UIModalPresentationFormSheet;
+    documentPicker.allowsMultipleSelection = NO;
+    documentPicker.directoryURL = folderURL;
+    [self presentViewController:documentPicker animated:YES completion:nil];
+}
+
+#pragma mark - UIDocumentPickerDelegate
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    if (urls.count == 0) {
+        return;
+    }
+
+    if (!_isRestoreOperation) {
+        NSString *filename = urls.firstObject.lastPathComponent;
+        NSString *message = [NSString stringWithFormat:@"Settings saved as: %@\n\nThis file contains your logged-in account credentials. Keep it private.", filename];
+        [self showAlertWithTitle:@"Backup Complete" message:message];
+        return;
+    }
+
+    NSURL *selectedURL = urls.firstObject;
+    [self confirmRestoreWithURL:selectedURL];
+}
+
+- (void)confirmRestoreWithURL:(NSURL *)zipURL {
+    ApolloBackupPresentRestoreConfirmation(self, zipURL, nil);
+}
+
+#pragma mark - Thanks To VC
+
+- (void)pushThanksToViewController {
+    ApolloThanksToViewController *vc = [[ApolloThanksToViewController alloc] init];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+#pragma mark - In-App Browser
+
+- (BOOL)textView:(UITextView *)textView shouldInteractWithURL:(NSURL *)URL inRange:(NSRange)characterRange interaction:(UITextItemInteraction)interaction {
+    [self presentURLInApolloBrowser:URL];
+    return NO;
+}
+
+- (void)presentURLInApolloBrowser:(NSURL *)url {
+    ApolloPresentWebURLFromViewController(self, url);
+}
+
+@end
+
+#pragma mark - Group screens (settings IA restructure)
+
+// Each group screen is the hub class with a different form: the section
+// builders, row actions, text-field tags and header-keyed footers all live on
+// CustomAPIViewController, so rows behave identically wherever they render.
+
+@implementation ApolloAccountsAPIKeysViewController
+- (NSString *)apollo_screenTitle { return @"Accounts & API Keys"; }
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // The sign-in and rate-limit offers can turn Reduce Rate Limiting on while
+    // this screen stays on the stack (the sign-in sheet doesn't trigger
+    // another viewWillAppear), so follow the setting directly.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(apollo_reduceRateLimitingDidChange:)
+                                                 name:ApolloReduceRateLimitingDidChangeNotification
+                                               object:nil];
+}
+- (void)apollo_reduceRateLimitingDidChange:(NSNotification *)notification {
+    (void)notification;
+    // Update the switch in place: a reload here would cut short the switch's
+    // own animation when the change came from tapping it.
+    UITableViewCell *cell = [self cellForRowID:@"api.reduceRateLimiting"];
+    for (UIView *subview in cell.contentView.subviews) {
+        if (![subview isKindOfClass:[UISwitch class]]) continue;
+        UISwitch *toggle = (UISwitch *)subview;
+        if (toggle.isOn != sReduceRateLimiting) [toggle setOn:sReduceRateLimiting animated:YES];
+    }
+}
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildAPIKeysDefaultSection],
+              [self buildAPIKeysKagiSection],
+              [self buildAPIKeysSignInSection],
+              [self buildAPIKeysExperimentalSection],
+              [self buildAPIKeysExtrasSection] ];
+}
+@end
+
+@implementation ApolloSetupAPIKeyViewController
+- (NSString *)apollo_screenTitle { return @"Reddit API Key"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    ApolloSettingsSection *source = [self buildAPIKeysDefaultSection];
+    NSSet *ids = [NSSet setWithArray:@[@"api.redditKey", @"api.redditSecret", @"api.redirectURI"]];
+    NSMutableArray *fields = [NSMutableArray array];
+    for (ApolloSettingsRow *row in source.rows) {
+        if ([ids containsObject:row.rowID]) [fields addObject:row];
+    }
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *signIn = [ApolloSettingsRow buttonRowWithID:@"setup.apiSignIn" title:@"Sign In with Reddit"
+        action:^{
+            [weakSelf.view endEditing:YES];
+            if (!sRedditClientId.length) {
+                [weakSelf showAlertWithTitle:@"Reddit API Key Required" message:@"Enter your Reddit API key above before signing in."];
+                return;
+            }
+            if (!ApolloStartAPIKeySignIn()) {
+                [weakSelf showAlertWithTitle:@"Unable to Start Sign-In" message:@"Return to setup and try again once Apollo has finished loading."];
+            }
+        }];
+    ApolloSettingsRow *help = [ApolloSettingsRow buttonRowWithID:@"setup.apiHelp" title:@"Help with Reddit Sign-In"
+        action:^{ [weakSelf pushTroubleshootingViewController]; }];
+    return @[
+        [ApolloSettingsSection sectionWithTitle:@"Reddit Credentials"
+            footer:@"Enter the client ID from your Reddit app as the API key. Installed-app clients do not need a secret. Leave Redirect URI empty to use the Apollo default. Credentials are saved as you edit; your feature preset is applied only when you finish setup."
+            rows:fields],
+        [ApolloSettingsSection sectionWithTitle:nil footer:@"After signing in, return to Setup Assistant to choose your preferences. Optional upload and GIF keys can be added later."
+            rows:@[signIn, help]],
+    ];
+}
+@end
+
+@implementation ApolloPostsFeedsViewController
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self reloadRowWithID:@"gen.iCloudReadState"];
+    [self reloadRowWithID:@"gen.iCloudReadStateStatus"];
+}
+- (NSString *)apollo_screenTitle { return @"Posts & Feeds"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildPostsRecentlyReadSection],
+              [self buildPostsFeedSection],
+              [self buildPostsFloatingTabsSection],
+              [self buildPostsAllPlusSection] ];
+}
+@end
+
+@implementation ApolloCommentsSettingsViewController
+- (NSString *)apollo_screenTitle { return @"Comments"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildCommentsSection] ];
+}
+@end
+
+@implementation ApolloMediaSettingsViewController
+- (NSString *)apollo_screenTitle { return @"Media"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildMediaBrowsingSection],
+              [self buildMediaNSFWSection],
+              [self buildMediaPlaybackSection],
+              [self buildMediaInlineSection],
+              [self buildMediaSharingSection],
+              [self buildMediaUploadsSection],
+              [self buildMediaNetworkSection] ];
+}
+@end
+
+@implementation ApolloSubredditsSettingsViewController
+- (NSString *)apollo_screenTitle { return @"Subreddits"; }
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // Keep native handles available beside the three Search sections without
+    // making the rest of this settings page behave like an edit-only list.
+    self.tableView.allowsSelectionDuringEditing = YES;
+    [self setEditing:YES animated:NO];
+    // Own the gap above this untitled first section. UIKit's implicit grouped
+    // top spacing depends on the navigation bar's scroll observation and can
+    // collapse after a child page is popped, visibly moving the whole form.
+    // A real table header keeps the gap stable before and after navigation.
+    UIView *topSpacing = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, 1.0, 16.0)];
+    topSpacing.userInteractionEnabled = NO;
+    topSpacing.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.tableView.tableHeaderView = topSpacing;
+    // Native handles keep Search section order editable on this page.
+    self.tableView.allowsSelectionDuringEditing = YES;
+    [self setEditing:YES animated:NO];
+    // The quick account switcher leaves this controller on screen, so it does
+    // not get another viewWillAppear. Also refresh when a loading account's
+    // identity resolves and the sorting control becomes available again.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(apollo_favoritesSortingStateDidChange:)
+                                                 name:ApolloFavoritesSortingStateDidChangeNotification
+                                               object:nil];
+}
+- (void)apollo_favoritesSortingStateDidChange:(NSNotification *)notification {
+    (void)notification;
+    [self refreshFavoritesSwitches];
+}
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return [@[ [self buildSubredditsMainSection],
+               [self buildSubredditsLayoutSection] ]
+        arrayByAddingObjectsFromArray:[self buildSubredditsSearchSections]];
+}
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
+    // UIKit normally substitutes editing accessories while handles are shown.
+    // Preserve the existing switches, menu buttons and disclosure indicators.
+    cell.editingAccessoryView = cell.accessoryView;
+    cell.editingAccessoryType = cell.accessoryType;
+    return cell;
+}
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    return [ApolloSearchLandingSectionOrder() containsObject:[self rowAtIndexPath:indexPath].rowID];
+}
+- (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return UITableViewCellEditingStyleNone;
+}
+- (BOOL)tableView:(UITableView *)tableView shouldIndentWhileEditingRowAtIndexPath:(NSIndexPath *)indexPath {
+    return NO;
+}
+- (BOOL)tableView:(UITableView *)tableView canMoveRowAtIndexPath:(NSIndexPath *)indexPath {
+    return [self tableView:tableView canEditRowAtIndexPath:indexPath];
+}
+- (NSIndexPath *)tableView:(UITableView *)tableView
+    targetIndexPathForMoveFromRowAtIndexPath:(NSIndexPath *)source
+                       toProposedIndexPath:(NSIndexPath *)proposed {
+    NSArray<NSString *> *order = ApolloSearchLandingSectionOrder();
+    if (![order containsObject:[self rowAtIndexPath:source].rowID]) return source;
+    if ([order containsObject:[self rowAtIndexPath:proposed].rowID]) return proposed;
+    NSIndexPath *first = [self indexPathForRowID:order.firstObject];
+    NSIndexPath *last = [self indexPathForRowID:order.lastObject];
+    if (!first || !last) return source;
+    // Resolve the allowed range from row identities, including when preceding
+    // settings are hidden. Neither the toggle nor another section can move.
+    return [proposed compare:first] == NSOrderedAscending ? first : last;
+}
+- (void)tableView:(UITableView *)tableView moveRowAtIndexPath:(NSIndexPath *)source toIndexPath:(NSIndexPath *)destination {
+    NSMutableArray<NSString *> *order = [ApolloSearchLandingSectionOrder() mutableCopy];
+    NSString *token = [self rowAtIndexPath:source].rowID;
+    NSString *target = [self rowAtIndexPath:destination].rowID;
+    NSUInteger targetIndex = [order indexOfObject:target];
+    if (![order containsObject:token] || targetIndex == NSNotFound) return;
+    [order removeObject:token];
+    [order insertObject:token atIndex:targetIndex];
+    ApolloSearchLandingSetSectionOrder(order);
+    // UIKit owns the drop animation; only reconcile the form's row snapshot.
+    [self noteRowMovedFromIndexPath:source toIndexPath:destination];
+}
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // Account changes can select a different alphabetical-sorting preference.
+    [self refreshFavoritesSwitches];
+}
+@end
+
+@interface ApolloFeedShortcutsFormViewController : CustomAPIViewController
+@property (nonatomic, weak) ApolloFeedShortcutsSettingsViewController *previewContainer;
+@end
+
+@interface ApolloFeedShortcutsSettingsViewController ()
+@property (nonatomic) UITableViewStyle tableStyle;
+@property (nonatomic, strong) ApolloFeedShortcutsFormViewController *formViewController;
+@property (nonatomic, strong) UIView *previewHost;
+@property (nonatomic, strong) UILabel *previewTitleLabel;
+@property (nonatomic, strong) UIView *previewCardView;
+@property (nonatomic, strong) UIView *scrollBoundaryView;
+@property (nonatomic, strong) NSLayoutConstraint *previewContentHeightConstraint;
+@property (nonatomic, strong) NSLayoutConstraint *previewHostTrailingConstraint;
+@property (nonatomic, strong) ApolloFeedShortcutsPreviewView *currentPreviewView;
+@property (nonatomic, strong) UIViewPropertyAnimator *previewAnimator;
+@property (nonatomic) NSUInteger previewTransitionGeneration;
+@property (nonatomic) BOOL previewRefreshPending;
+- (void)apollo_refreshPreviewAnimated:(BOOL)animated;
+- (void)apollo_formDidScroll:(UIScrollView *)scrollView;
+@end
+
+@implementation ApolloFeedShortcutsFormViewController
+- (NSString *)apollo_screenTitle { return @"Feed Shortcuts"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildFeedShortcutsVisibilitySection],
+              [self buildFeedShortcutsControlsSection] ];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self reloadRowWithID:@"sub.showPopularShortcut"];
+    [self reloadRowWithID:@"sub.showAllShortcut"];
+    [self reloadRowWithID:@"sub.showModeratorShortcut"];
+}
+
+- (void)apollo_refreshFeedShortcutsPreviewAnimated:(BOOL)animated {
+    [self.previewContainer apollo_refreshPreviewAnimated:animated];
+}
+
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+    [self.previewContainer apollo_formDidScroll:scrollView];
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    if (section != 0) return [super tableView:tableView heightForHeaderInSection:section];
+    UIFont *font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote
+                           compatibleWithTraitCollection:self.traitCollection];
+    return ceil(font.lineHeight) + 20.0;
+}
+@end
+
+@implementation ApolloFeedShortcutsSettingsViewController
+
+- (instancetype)init {
+    return [self initWithStyle:UITableViewStyleInsetGrouped];
+}
+
+- (instancetype)initWithStyle:(UITableViewStyle)style {
+    self = [super initWithNibName:nil bundle:nil];
+    if (!self) return nil;
+    _tableStyle = style;
+    return self;
+}
+
+- (void)loadView {
+    self.view = [UIView new];
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Feed Shortcuts";
+    BOOL liquidGlass = IsLiquidGlass();
+
+    UIView *previewHost = [UIView new];
+    previewHost.translatesAutoresizingMaskIntoConstraints = NO;
+    previewHost.layoutMargins = UIEdgeInsetsMake(0.0, 20.0, 0.0, 20.0);
+    self.previewHost = previewHost;
+    [self.view addSubview:previewHost];
+
+    UILabel *titleLabel = [UILabel new];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    if (liquidGlass) {
+        titleLabel.text = @"Preview";
+        // Match the semibold inset-grouped section titles beneath the preview.
+        UIFont *titleFont = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
+        titleLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody]
+            scaledFontForFont:titleFont];
+    } else {
+        titleLabel.text = @"PREVIEW";
+        titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    }
+    titleLabel.adjustsFontForContentSizeCategory = YES;
+    ApolloSettingsApplySectionHeaderTypography(titleLabel);
+    titleLabel.isAccessibilityElement = YES;
+    titleLabel.accessibilityTraits = UIAccessibilityTraitHeader;
+    self.previewTitleLabel = titleLabel;
+    [previewHost addSubview:titleLabel];
+
+    UIView *previewCard = [UIView new];
+    previewCard.translatesAutoresizingMaskIntoConstraints = NO;
+    previewCard.userInteractionEnabled = NO;
+    previewCard.clipsToBounds = YES;
+    previewCard.layer.cornerRadius = liquidGlass ? 20.0 : 10.0;
+    previewCard.layer.cornerCurve = kCACornerCurveContinuous;
+    self.previewCardView = previewCard;
+    [previewHost addSubview:previewCard];
+
+    UIView *scrollBoundary = [UIView new];
+    scrollBoundary.translatesAutoresizingMaskIntoConstraints = NO;
+    scrollBoundary.userInteractionEnabled = NO;
+    scrollBoundary.alpha = 0.0;
+    self.scrollBoundaryView = scrollBoundary;
+
+    ApolloFeedShortcutsFormViewController *form =
+        [[ApolloFeedShortcutsFormViewController alloc] initWithStyle:self.tableStyle];
+    form.previewContainer = self;
+    self.formViewController = form;
+    [self addChildViewController:form];
+    form.view.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:form.view];
+    [form didMoveToParentViewController:self];
+    [self.view bringSubviewToFront:previewHost];
+    [self.view addSubview:scrollBoundary];
+
+    NSLayoutConstraint *contentHeight =
+        [previewCard.heightAnchor constraintEqualToConstant:1.0];
+    self.previewContentHeightConstraint = contentHeight;
+    NSLayoutConstraint *previewTrailing =
+        [previewHost.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor];
+    self.previewHostTrailingConstraint = previewTrailing;
+    [NSLayoutConstraint activateConstraints:@[
+        [previewHost.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [previewHost.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor],
+        previewTrailing,
+
+        [titleLabel.topAnchor constraintEqualToAnchor:previewHost.topAnchor constant:15.0],
+        [titleLabel.leadingAnchor constraintEqualToAnchor:previewHost.layoutMarginsGuide.leadingAnchor constant:16.0],
+        [titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:previewHost.layoutMarginsGuide.trailingAnchor constant:-16.0],
+
+        [previewCard.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:7.0],
+        [previewCard.leadingAnchor constraintEqualToAnchor:previewHost.leadingAnchor constant:20.0],
+        [previewCard.trailingAnchor constraintEqualToAnchor:previewHost.trailingAnchor constant:-20.0],
+        [previewCard.bottomAnchor constraintEqualToAnchor:previewHost.bottomAnchor constant:-2.0],
+        contentHeight,
+
+        [scrollBoundary.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [scrollBoundary.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [scrollBoundary.topAnchor constraintEqualToAnchor:previewHost.bottomAnchor],
+        [scrollBoundary.heightAnchor constraintEqualToConstant:1.0 / UIScreen.mainScreen.scale],
+
+        [form.view.topAnchor constraintEqualToAnchor:previewHost.bottomAnchor],
+        [form.view.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [form.view.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [form.view.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+
+    [self apollo_applyPreviewTheme];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    UITabBarController *tabs = self.tabBarController;
+    UITabBar *tabBar = tabs.tabBar;
+    CGFloat trailingInset = 0.0;
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone
+        && tabs.isViewLoaded && tabBar.window && !tabBar.hidden) {
+        CGRect railFrame = [self.view convertRect:tabBar.bounds fromView:tabBar];
+        if (CGRectGetWidth(railFrame) < 100.0
+            && CGRectGetHeight(railFrame) > 400.0
+            && CGRectGetMidX(railFrame) > CGRectGetMidX(self.view.bounds)) {
+            trailingInset = MAX(0.0, CGRectGetWidth(self.view.bounds) - CGRectGetMinX(railFrame));
+        }
+    }
+    CGFloat wantedConstant = -trailingInset;
+    if (fabs(self.previewHostTrailingConstraint.constant - wantedConstant) > 0.5) {
+        self.previewHostTrailingConstraint.constant = wantedConstant;
+    }
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self apollo_applyPreviewTheme];
+    [self apollo_refreshPreviewAnimated:NO];
+    [self apollo_formDidScroll:self.formViewController.tableView];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [self apollo_finishPreviewTransition];
+    [super viewWillDisappear:animated];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    BOOL appearanceChanged = !previousTraitCollection ||
+        [self.traitCollection hasDifferentColorAppearanceComparedToTraitCollection:previousTraitCollection];
+    BOOL contentSizeChanged = !previousTraitCollection ||
+        ![self.traitCollection.preferredContentSizeCategory
+            isEqualToString:previousTraitCollection.preferredContentSizeCategory];
+    if (!appearanceChanged && !contentSizeChanged) return;
+
+    [self apollo_applyPreviewTheme];
+    [self apollo_refreshPreviewAnimated:NO];
+}
+
+- (void)viewWillTransitionToSize:(CGSize)size
+       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    __weak typeof(self) weakSelf = self;
+    [coordinator animateAlongsideTransition:nil completion:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
+        [weakSelf apollo_refreshPreviewAnimated:NO];
+    }];
+}
+
+- (void)apollo_applyPreviewTheme {
+    UIColor *backgroundColor = ApolloThemePageBackgroundColor()
+        ?: UIColor.systemGroupedBackgroundColor;
+    self.view.backgroundColor = backgroundColor;
+    self.previewHost.backgroundColor = backgroundColor;
+    self.previewCardView.backgroundColor = ApolloThemeCardBackgroundColor()
+        ?: UIColor.secondarySystemGroupedBackgroundColor;
+    self.previewTitleLabel.textColor =
+        ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryLabel)
+        ?: UIColor.secondaryLabelColor;
+    // This heading lives outside the form table, so table reloads do not
+    // refresh it. Reapply the effective text size and native theme palette
+    // on appearance and Dynamic Type changes, before preview measurement.
+    ApolloSettingsApplySectionHeaderTypography(self.previewTitleLabel);
+    self.scrollBoundaryView.backgroundColor = ApolloThemeSeparatorColor()
+        ?: self.formViewController.tableView.separatorColor
+        ?: UIColor.separatorColor;
+    self.view.tintColor = ApolloThemeAccentColor() ?: self.view.tintColor;
+}
+
+- (void)apollo_formDidScroll:(UIScrollView *)scrollView {
+    if (scrollView != self.formViewController.tableView) return;
+    CGFloat restingOffset = -scrollView.adjustedContentInset.top;
+    CGFloat targetAlpha = scrollView.contentOffset.y > restingOffset + 0.5 ? 1.0 : 0.0;
+    if (fabs(self.scrollBoundaryView.alpha - targetAlpha) < 0.01) return;
+    [UIView animateWithDuration:0.15
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState |
+                                UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        self.scrollBoundaryView.alpha = targetAlpha;
+    } completion:nil];
+}
+
+- (ApolloFeedShortcutsPreviewView *)apollo_previewViewForState:(ApolloFeedShortcutsPreviewState *)state {
+    ApolloFeedShortcutsPreviewView *preview = [[ApolloFeedShortcutsPreviewView alloc] initWithFrame:CGRectZero];
+    preview.translatesAutoresizingMaskIntoConstraints = NO;
+    preview.hostTableView = self.formViewController.tableView;
+    preview.previewState = state;
+    [preview apollo_configurePreview];
+    return preview;
+}
+
+- (void)apollo_addPreviewView:(ApolloFeedShortcutsPreviewView *)preview
+                       height:(CGFloat)height {
+    [self.previewCardView addSubview:preview];
+    [NSLayoutConstraint activateConstraints:@[
+        [preview.topAnchor constraintEqualToAnchor:self.previewCardView.topAnchor],
+        [preview.leadingAnchor constraintEqualToAnchor:self.previewCardView.leadingAnchor],
+        [preview.trailingAnchor constraintEqualToAnchor:self.previewCardView.trailingAnchor],
+        [preview.heightAnchor constraintEqualToConstant:height]
+    ]];
+}
+
+- (void)apollo_finishPreviewTransition {
+    UIViewPropertyAnimator *animator = self.previewAnimator;
+    if (!animator) return;
+    [animator stopAnimation:NO];
+    [animator finishAnimationAtPosition:UIViewAnimatingPositionEnd];
+}
+
+- (void)apollo_replacePreviewImmediately:(ApolloFeedShortcutsPreviewView *)preview
+                                   state:(ApolloFeedShortcutsPreviewState *)state {
+    [self apollo_finishPreviewTransition];
+    for (UIView *subview in self.previewCardView.subviews) [subview removeFromSuperview];
+    [self apollo_addPreviewView:preview height:state.previewHeight];
+    preview.alpha = 1.0;
+    self.currentPreviewView = preview;
+    self.previewContentHeightConstraint.constant = state.previewHeight;
+    [UIView performWithoutAnimation:^{
+        [self.view layoutIfNeeded];
+    }];
+}
+
+- (void)apollo_refreshPreviewAnimated:(BOOL)animated {
+    if (animated && self.previewAnimator.state == UIViewAnimatingStateActive) {
+        self.previewRefreshPending = YES;
+        return;
+    }
+    [self apollo_finishPreviewTransition];
+
+    CGFloat availableWidth = CGRectGetWidth(self.previewCardView.bounds);
+    if (availableWidth <= 0.0) {
+        CGFloat containerWidth = CGRectGetWidth(self.view.bounds);
+        if (containerWidth <= 0.0) containerWidth = CGRectGetWidth(UIScreen.mainScreen.bounds);
+        availableWidth = MAX(0.0, containerWidth - 40.0);
+    }
+    ApolloFeedShortcutsPreviewState *state =
+        ApolloFeedShortcutsCurrentPreviewState(self.traitCollection, availableWidth);
+    ApolloFeedShortcutsPreviewView *incoming = [self apollo_previewViewForState:state];
+    ApolloFeedShortcutsPreviewView *outgoing = self.currentPreviewView;
+    if (!animated || UIAccessibilityIsReduceMotionEnabled() || !outgoing) {
+        [self apollo_replacePreviewImmediately:incoming state:state];
+        return;
+    }
+
+    [self.view layoutIfNeeded];
+    [self apollo_addPreviewView:incoming height:state.previewHeight];
+    [self.previewCardView layoutIfNeeded];
+    [incoming layoutIfNeeded];
+    self.previewContentHeightConstraint.constant = state.previewHeight;
+    self.currentPreviewView = incoming;
+
+    BOOL animatesItems = outgoing.previewState.layout == state.layout &&
+        outgoing.previewState.iconStyle == state.iconStyle;
+    NSMutableArray<UIView *> *departingItems = [NSMutableArray array];
+    if (animatesItems) {
+        NSDictionary<NSNumber *, UIView *> *oldItems = outgoing.shortcutItemViewsByIndex;
+        NSDictionary<NSNumber *, UIView *> *newItems = incoming.shortcutItemViewsByIndex;
+        for (NSNumber *index in newItems) {
+            UIView *newItem = newItems[index];
+            UIView *oldItem = oldItems[index];
+            if (oldItem) {
+                CGRect oldFrame = [oldItem convertRect:oldItem.bounds toView:self.previewCardView];
+                CGRect newFrame = [newItem convertRect:newItem.bounds toView:self.previewCardView];
+                newItem.transform = CGAffineTransformMakeTranslation(CGRectGetMidX(oldFrame) - CGRectGetMidX(newFrame),
+                                                                      CGRectGetMidY(oldFrame) - CGRectGetMidY(newFrame));
+                oldItem.alpha = 0.0;
+            } else {
+                newItem.alpha = 0.0;
+                newItem.transform = CGAffineTransformMakeScale(0.88, 0.88);
+            }
+        }
+        for (NSNumber *index in oldItems) {
+            if (!newItems[index]) [departingItems addObject:oldItems[index]];
+        }
+        for (UIView *separator in incoming.shortcutSeparators) separator.alpha = 0.0;
+    } else {
+        incoming.alpha = 0.0;
+    }
+
+    NSUInteger generation = ++self.previewTransitionGeneration;
+    UISpringTimingParameters *timing = [[UISpringTimingParameters alloc] initWithDampingRatio:0.88];
+    UIViewPropertyAnimator *animator = [[UIViewPropertyAnimator alloc] initWithDuration:0.34
+                                                                      timingParameters:timing];
+    __weak typeof(self) weakSelf = self;
+    __weak UIViewPropertyAnimator *weakAnimator = animator;
+    [animator addAnimations:^{
+        if (animatesItems) {
+            for (UIView *item in incoming.shortcutItemViewsByIndex.allValues) {
+                item.alpha = 1.0;
+                item.transform = CGAffineTransformIdentity;
+            }
+            for (UIView *item in departingItems) {
+                item.alpha = 0.0;
+                item.transform = CGAffineTransformMakeScale(0.88, 0.88);
+            }
+            for (UIView *separator in incoming.shortcutSeparators) separator.alpha = 1.0;
+            for (UIView *separator in outgoing.shortcutSeparators) separator.alpha = 0.0;
+        } else {
+            incoming.alpha = 1.0;
+            outgoing.alpha = 0.0;
+        }
+        [weakSelf.view layoutIfNeeded];
+    }];
+    [animator addCompletion:^(__unused UIViewAnimatingPosition finalPosition) {
+        [outgoing removeFromSuperview];
+        incoming.alpha = 1.0;
+        if (weakSelf.previewTransitionGeneration == generation &&
+            weakSelf.previewAnimator == weakAnimator) {
+            weakSelf.previewAnimator = nil;
+        }
+        if (weakSelf.previewRefreshPending) {
+            weakSelf.previewRefreshPending = NO;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf apollo_refreshPreviewAnimated:YES];
+            });
+        }
+    }];
+    self.previewAnimator = animator;
+    [animator startAnimation];
+}
+
+@end
+
+@implementation ApolloUserProfilesSettingsViewController
+- (NSString *)apollo_screenTitle { return @"User Profiles"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildUserProfilesLayoutSection],
+              [self buildUserProfilePicturesSection] ];
+}
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self reloadRowWithID:@"profiles.layout"];
+    // Appearance can change Apollo's independent comment text-size slider
+    // while this controller remains on the navigation stack.
+    [self reloadRowWithID:@"profiles.picturesPreview"];
+}
+@end
+
+@implementation ApolloInterfaceSettingsViewController
+- (NSString *)apollo_screenTitle { return @"Interface"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildInterfaceTabBarSection],
+              [self buildInterfaceUnreadBadgesSection],
+              [self buildInterfaceDisplayNavigationSection],
+              [self buildInterfaceLiquidGlassSection],
+              [self buildInterfaceMenusSection] ];
+}
+@end
+
+@implementation ApolloNotificationBackendViewController
+- (NSString *)apollo_screenTitle { return @"Notification Backend"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    return @[ [self buildNotificationBackendSection] ];
+}
+@end
+
+// A stable hardware gate keeps this page available on both Duo displays and
+// through posture changes; ordinary iPhones and iPads never index its rows.
+@implementation ApolloDuoSettingsViewController
+- (NSString *)apollo_screenTitle { return @"iPhone Duo"; }
+- (NSArray<ApolloSettingsSection *> *)buildForm {
+    if (!ApolloDuoDeviceDetected()) return @[];
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *tabletop = [ApolloSettingsRow switchRowWithID:@"duo.tabletopVideo"
+        title:@"Tabletop Video Controls"
+        isOn:^BOOL { return sDuoTabletopVideoEnabled; }
+        onToggle:^(UISwitch *sender) {
+            sDuoTabletopVideoEnabled = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyDuoTabletopVideoEnabled];
+            [NSNotificationCenter.defaultCenter postNotificationName:ApolloDuoVideoLayoutDidChangeNotification object:nil];
+        }];
+    ApolloSettingsRow *landscape = [ApolloSettingsRow valueRowWithID:@"duo.landscapeFeed"
+        title:@"Landscape Feed Layout"
+        detail:^NSString * { return sDuoUnfoldedFeedLayout == 2 ? @"Focused" : @"Original"; }
+        onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.landscapeFeed"],
+                @"Landscape Feed Layout", @[@"Original", @"Focused"], sDuoUnfoldedFeedLayout == 2 ? 1 : 0,
+                ^(NSInteger picked) {
+                    NSInteger layout = picked == 1 ? 2 : 0;
+                    if (layout == sDuoUnfoldedFeedLayout) return;
+                    sDuoUnfoldedFeedLayout = layout;
+                    [NSUserDefaults.standardUserDefaults setInteger:layout forKey:UDKeyDuoUnfoldedFeedLayout];
+                    [weakSelf reloadRowWithID:@"duo.landscapeFeed"];
+                    [NSNotificationCenter.defaultCenter postNotificationName:@"ApolloDuoFeedLayoutDidChange" object:nil];
+                });
+        }];
+    landscape.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+    ApolloSettingsSection *openDisplay = [ApolloSettingsSection sectionWithTitle:@"Open Display"
+        footer:@"Focused centers the landscape feed in a narrower column. Subreddit Panel Style controls the open display's subreddit panel. These options also remain available from their existing controls."
+        rows:@[landscape, [self buildDuoPanelStyleRow]]];
+    openDisplay.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+    return @[
+        [ApolloSettingsSection sectionWithTitle:@"Video Playback"
+            footer:@"When enabled, partly folding the open portrait display puts fullscreen video above the fold and playback controls below it. Off by default."
+            rows:@[tabletop]],
+        openDisplay
+    ];
+}
+@end

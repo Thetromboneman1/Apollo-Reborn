@@ -1,0 +1,3124 @@
+#import "ApolloDuoSplitView.h"
+#import "ApolloDuoUIKitCompatibility.h"
+#import "ApolloNavigationActions.h"
+#import "ApolloNavigationActionsDiscovery.h"
+#import "ApolloNativeActionMenus.h"
+#import "ApolloActionMenu.h"
+#import "ApolloTranslation.h"
+#import "ApolloCommon.h"
+#import "ApolloDuoCompatibility.h"
+#import "ApolloDuoRail.h"
+#import "ApolloState.h"
+#import "ApolloThemeRuntime.h"
+#import "ApolloSearchNativeBar.h"
+#import "UserDefaultConstants.h"
+#import <objc/message.h>
+#import <objc/runtime.h>
+#import <dlfcn.h>
+#import <QuartzCore/QuartzCore.h>
+#import "ApolloClasses.h"
+
+extern NSArray<UIBarButtonItem *> *ApolloDuoPageLayoutItems(UINavigationItem *item, NSArray<UIBarButtonItem *> *items);
+
+// Use the pill's spring for glyphs without changing button frames,
+// which translation measures when inserting its globe.
+// UIBarButtonItem.hidden is iOS 16 / macCatalyst 16 API. The explicit
+// macCatalyst clause keeps the Mac build (macCatalyst 15 floor) from sending
+// a selector macOS 12 does not implement; iOS 16+ behaviour is unchanged.
+static char kActionsDuoOverflowHiddenKey;
+static inline BOOL ApolloActionsBarItemHidden(UIBarButtonItem *item) {
+    NSNumber *nativeHidden = objc_getAssociatedObject(item, &kActionsDuoOverflowHiddenKey);
+    if (nativeHidden) return nativeHidden.boolValue;
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) return item.hidden;
+    return NO;
+}
+static inline void ApolloActionsSetBarItemHidden(UIBarButtonItem *item, BOOL hidden) {
+    if (@available(iOS 16.0, macCatalyst 16.0, *)) item.hidden = hidden;
+}
+
+static const NSTimeInterval kActionsAnimationDuration = 0.36;
+static CASpringAnimation *ApolloActionsSpring(NSString *keyPath) {
+    CASpringAnimation *spring = [CASpringAnimation animationWithKeyPath:keyPath];
+    spring.mass = 1;
+    spring.stiffness = 644;
+    spring.damping = 2 * 0.78 * sqrt(spring.stiffness);
+    spring.duration = kActionsAnimationDuration;
+    return spring;
+}
+
+// Each page owns one strip and glass surface. Never hide native ancestors,
+// save their transient alpha, or duplicate the More glyph.
+static char kActionsOwnerKey;
+static char kActionsControllerKey;
+static char kActionsRefreshKey;
+static char kActionsStandardItemKey;
+static char kActionsStandardMoreKey;
+static char kActionsScrollOwnerKey;
+static char kActionsChromeKey;
+static char kActionsBlueDoneKey;
+static char kActionsNativeEditAccentKey;
+static char kActionsAccentSubmitKey;
+static char kActionsApprovedLayoutKey;
+static char kActionsDuoOriginalItemsKey;
+static char kActionsDuoNativeItemsKey;
+static char kActionsDuoSourceButtonKey;
+static char kActionsDuoMirroredItemsKey;
+static char kActionsDuoOverflowMenuKey;
+static char kActionsDuoOverflowItemsKey;
+static char kActionsDuoOverflowElementKey;
+static char kActionsDuoMirroredImageKey;
+static char kActionsDuoRefreshScheduledKey;
+static char kActionsDuoProfileAppliedKey;
+static char kActionsDuoProfileRefreshKey;
+static char kActionsDuoProfileCellColorKey;
+static char kActionsDuoProfileCellBackgroundKey;
+static char kActionsDuoProfileBackgroundColorKey;
+static char kActionsDuoProfileSelectionMaskKey;
+static char kActionsDuoProfileOriginalSelectionMaskKey;
+static char kActionsDuoBackItemKey;
+static char kActionsDuoBackGlassKey;
+static __thread NSUInteger sActionsBackMeasurementDepth;
+static NSUInteger sActionsModelWriteDepth;
+@class ApolloNavigationActionsOwner;
+static void ApolloActionsResetBeforeNavigation(UIViewController *controller);
+static void ApolloActionsRestoreDuoOverflow(UINavigationItem *item);
+
+// The customization is glass-only, but public refresh helpers can still be
+// called on the iOS 14 deployment floor. Keep newer item state access guarded.
+static BOOL ApolloActionsItemHidden(UIBarButtonItem *item) {
+    return ApolloActionsBarItemHidden(item);
+}
+
+static void ApolloActionsSetItemHidden(UIBarButtonItem *item, BOOL hidden) {
+    ApolloActionsSetBarItemHidden(item, hidden);
+}
+
+// The post composer's Post and Done buttons keep Done's prominent style, whose
+// tint is its fill: neutral chrome painted a labelColor (white in dark mode)
+// pill. Fill it with the theme accent; UIKit picks a readable title for it.
+// One provider for the process: dynamic colors compare by provider identity,
+// so a fresh ApolloThemeAccentColor() per pass would never match the pin
+// guards and would re-tint the button on every preparation.
+static UIColor *ApolloActionsAccentSubmitColor(void) {
+    static UIColor *color;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        color = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+            UIColor *accent = ApolloThemeAccentColor() ?: UIColor.systemBlueColor;
+            return [accent resolvedColorWithTraitCollection:traits];
+        }];
+    });
+    return color;
+}
+
+// Accent Navigation Buttons: the color pinned navigation buttons take. The
+// accent provider is rebuilt when the theme changes, or the buttons would
+// keep the old provider's last render. Providers built from one block compare
+// equal, so each captures its own generation for the pins to see a new color.
+static UIColor *sActionsButtonAccent;
+static NSUInteger sActionsButtonAccentGeneration;
+static NSHashTable *sActionsPinned;   // weak; everything ApolloActionsPinChrome tinted
+
+NSNotificationName const ApolloNavigationButtonColorDidChangeNotification = @"ApolloNavigationButtonColorDidChangeNotification";
+
+UIColor *ApolloNavigationButtonAccentColor(void) {
+    if (!sAccentNavigationButtons || !IsLiquidGlass()) return nil;
+    if (!sActionsButtonAccent) {
+        NSUInteger generation = ++sActionsButtonAccentGeneration;
+        sActionsButtonAccent = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traits) {
+            (void)generation;
+            return [(ApolloThemeAccentColor() ?: UIColor.systemBlueColor) resolvedColorWithTraitCollection:traits];
+        }];
+    }
+    return sActionsButtonAccent;
+}
+
+static UIColor *ApolloActionsButtonColor(void) {
+    return ApolloNavigationButtonAccentColor() ?: ApolloNavigationChromeColor();
+}
+
+// Keep right-item chrome neutral before it appears, including lone actions on
+// profile feeds. Mark only the actual item content, never the whole nav bar.
+static UIColor *ApolloActionsChromeColor(id object) {
+    if ([objc_getAssociatedObject(object, &kActionsNativeEditAccentKey) boolValue]) {
+        return ApolloActionsAccentSubmitColor();
+    }
+    if (@available(iOS 26.0, *)) {
+        if ([object isKindOfClass:UIBarButtonItem.class]
+            && ([((UIBarButtonItem *)object).identifier isEqualToString:@"ApolloReborn.subreddits.edit"]
+                || [((UIBarButtonItem *)object).identifier isEqualToString:@"ApolloReborn.filters.edit"])
+            && ((UIBarButtonItem *)object).style == UIBarButtonItemStyleProminent) {
+            return UIColor.systemBlueColor;
+        }
+    }
+    if ([objc_getAssociatedObject(object, &kActionsAccentSubmitKey) boolValue]) {
+        return ApolloActionsAccentSubmitColor();
+    }
+    return [objc_getAssociatedObject(object, &kActionsBlueDoneKey) boolValue]
+        ? UIColor.systemBlueColor : ApolloActionsButtonColor();
+}
+
+static void ApolloActionsPinChrome(id object) {
+    if (!sActionsPinned) sActionsPinned = [NSHashTable weakObjectsHashTable];
+    [sActionsPinned addObject:object];
+    UIColor *chrome = ApolloActionsChromeColor(object);
+    if (!objc_getAssociatedObject(object, &kActionsChromeKey) ||
+        ![[object tintColor] isEqual:chrome]) {
+        [object setTintColor:chrome];
+        objc_setAssociatedObject(object, &kActionsChromeKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+void ApolloNavigationActionsSetNativeEditingAccent(UIBarButtonItem *item, BOOL enabled) {
+    if (!item) return;
+    BOOL wasEnabled = [objc_getAssociatedObject(item, &kActionsNativeEditAccentKey) boolValue];
+    if (!enabled && !wasEnabled) return;
+    if (wasEnabled != enabled) {
+        objc_setAssociatedObject(item, &kActionsNativeEditAccentKey,
+                                 enabled ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Use the shared tint owner so later Apollo theme/chrome writes cannot
+    // turn the native prominent Done circle back into a label-colored fill.
+    ApolloActionsPinChrome(item);
+}
+
+static UIImage *ApolloActionsTemplateImage(UIImage *image) {
+    return image && image.renderingMode != UIImageRenderingModeAlwaysTemplate
+        ? [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] : image;
+}
+
+static BOOL ApolloActionsIsAutoModClose(UIBarButtonItem *item) {
+    return item.action == @selector(cancelBarButtonItemTappedWithSender:) &&
+        [NSStringFromClass([item.target class]) isEqualToString:@"Apollo.AutoModeratorViewController"];
+}
+
+static BOOL ApolloActionsUsesPlainSubmitStyle(UIBarButtonItem *item) {
+    return item.action == @selector(updateBarButtonItemTappedWithSender:) &&
+        [NSStringFromClass([item.target class]) isEqualToString:@"Apollo.FlairSelectorViewController"];
+}
+
+// The post composer's storyboard Post item (style Done), the Poll tab's
+// replacement for it (ApolloPollCompose.xm), the Done checkmark that
+// replaces Post in its body editors (ApolloPhotoPostComposerScrollFix.xm),
+// and the comment/message composer's Post.
+static BOOL ApolloActionsUsesAccentSubmitStyle(UIBarButtonItem *item) {
+    NSString *targetClass = NSStringFromClass([item.target class]);
+    SEL action = item.action;
+    if ([targetClass isEqualToString:@"Apollo.ComposePostViewController"]) {
+        return action == @selector(postButtonTapped:);
+    }
+    if ([targetClass isEqualToString:@"Apollo.ComposeViewController"]) {
+        return action == @selector(submitBarButtonTapped:) ||
+            action == @selector(apollo_mediaBodyDoneButtonTapped:) ||
+            action == @selector(apollo_textBodyDoneButtonTapped:);
+    }
+    return action == @selector(postTapped) &&
+        [targetClass isEqualToString:@"ApolloPollComposeViewController"];
+}
+
+static void ApolloActionsPrepareApprovedContent(UIView *content) {
+    if (!content || objc_getAssociatedObject(content, &kActionsApprovedLayoutKey)) return;
+    NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
+    for (UIView *child in content.subviews) {
+        if ([child isKindOfClass:UIButton.class]) [buttons addObject:(UIButton *)child];
+    }
+    if (buttons.count != 2) return;
+    [buttons sortUsingComparator:^NSComparisonResult(UIButton *a, UIButton *b) {
+        return CGRectGetMinX(a.frame) < CGRectGetMinX(b.frame) ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    // Apollo's compact legacy frames put the plus below its 24pt container.
+    // Keep the original controls/actions, with equal centered glass slots.
+    const CGFloat slotWidth = 36.0;
+    for (NSUInteger index = 0; index < buttons.count; index++) {
+        UIButton *button = buttons[index];
+        button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+        button.contentVerticalAlignment = UIControlContentVerticalAlignmentCenter;
+        button.contentEdgeInsets = UIEdgeInsetsZero;
+        button.imageEdgeInsets = UIEdgeInsetsZero;
+        button.frame = CGRectMake(index * slotWidth, 0, slotWidth, 44);
+    }
+    CGRect frame = content.frame;
+    frame.size = CGSizeMake(buttons.count * slotWidth, 44);
+    content.frame = frame;
+    content.bounds = CGRectMake(0, 0, frame.size.width, 44);
+    objc_setAssociatedObject(content, &kActionsApprovedLayoutKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloActionsApplyChromeToView(UIView *view, BOOL blueDone) {
+    if (!view) return;
+    objc_setAssociatedObject(view, &kActionsBlueDoneKey, @(blueDone), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloActionsPinChrome(view);
+    if ([view isKindOfClass:UIButton.class]) {
+        UIButton *button = (id)view;
+        const UIControlState states[] = { UIControlStateNormal, UIControlStateSelected,
+            UIControlStateHighlighted, UIControlStateDisabled };
+        for (NSUInteger i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
+            UIImage *image = [button imageForState:states[i]];
+            UIImage *templated = ApolloActionsTemplateImage(image);
+            if (templated != image) [button setImage:templated forState:states[i]];
+        }
+    }
+    for (UIView *child in view.subviews) ApolloActionsApplyChromeToView(child, blueDone);
+}
+
+@interface ApolloNavigationActionsControllerBox : NSObject
+@property (nonatomic, weak) UIViewController *controller;
+@end
+@implementation ApolloNavigationActionsControllerBox
+@end
+
+@interface ApolloNavigationActionsScrollOwnerBox : NSObject
+@property (nonatomic, weak) ApolloNavigationActionsOwner *owner;
+@end
+@implementation ApolloNavigationActionsScrollOwnerBox
+@end
+
+// The item's customView contains its glass and original buttons/targets/menus.
+// Its trailing-anchored viewport resizes while More stays fixed in the window.
+@interface ApolloNavigationActionsStrip : UIControl
+@property (nonatomic, strong) UIView *content;
+@property (nonatomic, strong) UIVisualEffectView *surface;
+@property (nonatomic, weak) UIButton *more;
+@property (nonatomic, weak) ApolloNavigationActionsOwner *owner;
+@property (nonatomic, weak) UIBarButtonItem *barItem;
+@property (nonatomic, strong) NSLayoutConstraint *widthConstraint;
+@property (nonatomic) CGFloat expandedWidth;
+@property (nonatomic) CGFloat moreMidX;
+@property (nonatomic) BOOL expanded;
+@property (nonatomic) BOOL originalAccessibilityHidden;
+@property (nonatomic, strong) NSHashTable<CALayer *> *animatedIconLayers;
+@property (nonatomic, copy) NSString *iconMotionKey;
+@property (nonatomic, copy) NSString *iconOpacityKey;
+- (instancetype)initWithContent:(UIView *)content more:(UIButton *)more;
+- (void)remeasure;
+- (void)applyExpanded:(BOOL)expanded;
+- (void)publishSize;
+- (void)displayExpanded:(BOOL)expanded;
+- (void)animateIconsExpanded:(BOOL)expanded entering:(BOOL)entering;
+- (void)removeIconAnimations;
+@end
+
+@interface ApolloNavigationActionsStandardItem : NSObject
+@property (nonatomic, weak) UIBarButtonItem *item;
+@property (nonatomic, weak) ApolloNavigationActionsOwner *owner;
+@property (nonatomic) BOOL hidden;
+// Values the rail's vertical styling replaced, put back when the rail goes;
+// a leftover VerticalPreferred/shared item draws its own platter in portrait.
+@property (nonatomic) BOOL railStyled;
+@property (nonatomic) BOOL originalSharesBackground;
+@property (nonatomic) BOOL originalHidesSharedBackground;
+@property (nonatomic) NSInteger originalAxisBehavior;
+@end
+@implementation ApolloNavigationActionsStandardItem
+- (void)applyRailStyleToItem:(UIBarButtonItem *)item {
+    if (!item) return;
+    if (!self.railStyled) {
+        self.railStyled = YES;
+        if (@available(iOS 26.0, *)) {
+            self.originalSharesBackground = item.sharesBackground;
+            self.originalHidesSharedBackground = item.hidesSharedBackground;
+        }
+        if (@available(iOS 27.1, *)) self.originalAxisBehavior = item.axisBehavior;
+    }
+    if (@available(iOS 26.0, *)) {
+        item.hidesSharedBackground = NO;
+        item.sharesBackground = YES;
+    }
+    if (@available(iOS 27.1, *)) item.axisBehavior = UIBarButtonItemAxisBehaviorVerticalPreferred;
+}
+- (void)restoreRailStyleOfItem:(UIBarButtonItem *)item {
+    if (!item || !self.railStyled) return;
+    if (@available(iOS 26.0, *)) {
+        item.sharesBackground = self.originalSharesBackground;
+        item.hidesSharedBackground = self.originalHidesSharedBackground;
+    }
+    if (@available(iOS 27.1, *)) item.axisBehavior = (UIBarButtonItemAxisBehavior)self.originalAxisBehavior;
+    self.railStyled = NO;
+}
+@end
+
+@interface ApolloNavigationActionsOwner : NSObject
+@property (nonatomic, weak) UINavigationItem *item;
+@property (nonatomic, weak) UIViewController *controller;
+@property (nonatomic, strong) NSArray<ApolloNavigationActionsStrip *> *strips;
+@property (nonatomic, strong) NSMutableArray<ApolloNavigationActionsStandardItem *> *standardItems;
+@property (nonatomic, weak) UIBarButtonItem *moreItem;
+@property (nonatomic, strong) UIBarButtonItem *inboxDisclosure;
+@property (nonatomic, copy) UIAction *nativePrimaryAction;
+@property (nonatomic, copy) UIMenu *nativeMenu;
+@property (nonatomic, strong) UIViewPropertyAnimator *animator;
+@property (nonatomic, strong) NSHashTable<UIPanGestureRecognizer *> *pans;
+@property (nonatomic, weak) UIView *scrollRegistrationRoot;
+@property (nonatomic, weak) UIGestureRecognizer *backGesture;
+@property (nonatomic, strong) id resignObserver;
+@property (nonatomic) BOOL expanded;
+@property (nonatomic) BOOL preparing;
+@property (nonatomic) BOOL collapsePreference;
+@property (nonatomic) BOOL needsGeometryTransition;
+@property (nonatomic) BOOL geometryDeferred;
+@property (nonatomic) BOOL needsAnimationSettlement;
+@property (nonatomic) BOOL collapseWhenAnimationEnds;
+- (BOOL)collapseEnabled;
+- (void)prepareItems:(NSArray<UIBarButtonItem *> *)items;
+- (BOOL)deferGeometryUpdate;
+- (void)publishExpandedState;
+- (void)settleAnimationIfNeeded;
+- (void)setExpanded:(BOOL)expanded animated:(BOOL)animated;
+- (void)watchScrollViews;
+- (void)scrolled:(UIPanGestureRecognizer *)pan;
+- (void)restoreStandardItems;
+- (void)applyStandardExpanded:(BOOL)expanded;
+- (NSArray<UIBarButtonItem *> *)duoStandardItemsForExpanded:(BOOL)expanded;
+@end
+
+static BOOL ApolloActionsMoreName(NSString *name) {
+    NSString *lower = name.lowercaseString;
+    // Matching "options" would mistake moderatorOptionsButtonTapped for More.
+    return [lower containsString:@"more"] || [lower containsString:@"ellipsis"];
+}
+
+static BOOL ApolloActionsModeratorItem(UIBarButtonItem *item) {
+    NSString *label = item.accessibilityLabel.lowercaseString;
+    NSString *action = NSStringFromSelector(item.action).lowercaseString;
+    return [label containsString:@"moderator"] || [action containsString:@"moderator"];
+}
+
+static UIButton *ApolloActionsFindMore(UIView *root) {
+    if ([root isKindOfClass:UIButton.class]) {
+        UIButton *button = (UIButton *)root;
+        if (ApolloActionsMoreName(button.accessibilityLabel)) return button;
+        for (id target in button.allTargets) {
+            for (NSString *action in [button actionsForTarget:target forControlEvent:UIControlEventTouchUpInside]) {
+                if (ApolloActionsMoreName(action)) return button;
+            }
+        }
+    }
+    for (UIView *child in root.subviews) {
+        UIButton *more = ApolloActionsFindMore(child);
+        if (more) return more;
+    }
+    return nil;
+}
+
+static NSUInteger ApolloActionsControlCount(UIView *root) {
+    if ([root isKindOfClass:UIControl.class]) return 1;
+    NSUInteger count = 0;
+    for (UIView *child in root.subviews) count += ApolloActionsControlCount(child);
+    return count;
+}
+
+static BOOL ApolloActionsIsPickerCancel(UIBarButtonItem *item) {
+    SEL cancel = @selector(cancelBarButtonItemTappedWithSender:);
+    if (item.action == cancel) return YES;
+    UIView *view = item.customView;
+    if (![view isKindOfClass:UIButton.class]) return NO;
+    UIButton *button = (UIButton *)view;
+    for (id target in button.allTargets) {
+        if ([[button actionsForTarget:target forControlEvent:UIControlEventTouchUpInside]
+                containsObject:NSStringFromSelector(cancel)]) return YES;
+    }
+    return NO;
+}
+
+static BOOL ApolloActionsHasStrip(NSArray<UIBarButtonItem *> *items) {
+    for (UIBarButtonItem *item in items) {
+        if ([item.customView isKindOfClass:ApolloNavigationActionsStrip.class]) return YES;
+        UIView *content = item.customView;
+        if (ApolloActionsFindMore(content) && ApolloActionsControlCount(content) > 1) return YES;
+    }
+    return NO;
+}
+
+static BOOL ApolloActionsHasPickerCancel(NSArray<UIBarButtonItem *> *items) {
+    for (UIBarButtonItem *item in items) if (ApolloActionsIsPickerCancel(item)) return YES;
+    return NO;
+}
+
+static BOOL ApolloActionsReplacingPickerControl(UINavigationItem *item,
+                                                NSArray<UIBarButtonItem *> *incoming) {
+    if (!IsLiquidGlass()) return NO;
+    NSArray *outgoing = item.rightBarButtonItems;
+    // The picker replaces our glass-owning custom view with UIKit's Cancel
+    // item. UIKit's animated replacement snapshots/morphs both glass owners,
+    // briefly drawing two lenses. Commit only this structural swap without
+    // animation; normal pill expansion and page transitions retain animation.
+    return (ApolloActionsHasStrip(outgoing) && ApolloActionsHasPickerCancel(incoming)) ||
+           (ApolloActionsHasPickerCancel(outgoing) && ApolloActionsHasStrip(incoming));
+}
+
+static void ApolloActionsSetPrimaryAction(UIBarButtonItem *item, UIAction *action) {
+    // Preserve Apollo's artwork/title when UIKit copies the action's metadata.
+    UIImage *image = item.image;
+    NSString *title = item.title;
+    item.primaryAction = action;
+    item.image = image;
+    item.title = title;
+}
+
+UIView *ApolloNavigationActionsContentView(UIBarButtonItem *item) {
+    UIView *view = item.customView;
+    return [view isKindOfClass:ApolloNavigationActionsStrip.class]
+        ? ((ApolloNavigationActionsStrip *)view).content : view;
+}
+
+UIView *ApolloNavigationActionsMenuSourceView(UIView *action) {
+    for (UIView *view = action; view; view = view.superview) {
+        if ([view isKindOfClass:ApolloNavigationActionsStrip.class]) {
+            return ((ApolloNavigationActionsStrip *)view).surface;
+        }
+    }
+    return nil;
+}
+
+@implementation ApolloNavigationActionsStrip
+- (instancetype)initWithContent:(UIView *)content more:(UIButton *)more {
+    self = [super initWithFrame:CGRectMake(0, 0, 44, 44)];
+    if (!self) return nil;
+    _content = content;
+    _more = more;
+    _originalAccessibilityHidden = content.accessibilityElementsHidden;
+    _animatedIconLayers = [NSHashTable weakObjectsHashTable];
+    _iconMotionKey = [NSString stringWithFormat:@"ApolloReborn.actions.motion.%p", self];
+    _iconOpacityKey = [NSString stringWithFormat:@"ApolloReborn.actions.opacity.%p", self];
+    self.clipsToBounds = NO;
+    Class effectClass = ApolloClassUIGlassEffect;
+    UIVisualEffect *effect = ((id (*)(id, SEL, NSInteger))objc_msgSend)(effectClass, @selector(effectWithStyle:), 0);
+    self.surface = [[UIVisualEffectView alloc] initWithEffect:effect];
+    self.surface.frame = self.bounds;
+    self.surface.clipsToBounds = YES;
+    self.surface.layer.cornerRadius = 22;
+    Class cornerClass = ApolloClassUICornerConfiguration;
+    SEL capsule = @selector(capsuleConfiguration);
+    SEL setter = @selector(setCornerConfiguration:);
+    if ([cornerClass respondsToSelector:capsule] && [self.surface respondsToSelector:setter]) {
+        id configuration = ((id (*)(id, SEL))objc_msgSend)(cornerClass, capsule);
+        ((void (*)(id, SEL, id))objc_msgSend)(self.surface, setter, configuration);
+    }
+    [self addSubview:self.surface];
+    self.widthConstraint = [self.widthAnchor constraintEqualToConstant:44];
+    self.widthConstraint.active = YES;
+    [self addTarget:self action:@selector(reveal:) forControlEvents:UIControlEventTouchUpInside];
+    self.accessibilityLabel = @"Show navigation actions";
+    self.accessibilityHint = @"Expands the page's buttons. Scrolling closes them.";
+    [self remeasure];
+    [self applyExpanded:NO];
+    return self;
+}
+- (BOOL)deferGeometryForNativeMenu {
+    if (!ApolloNativeActionMenuOwnsNavigationSurface(self.surface)) return NO;
+    [self.owner deferGeometryUpdate];
+    return YES;
+}
+- (void)remeasure {
+    if ([self deferGeometryForNativeMenu]) return;
+    // Measure the full source, including late globes, not the clipped viewport.
+    CGRect moreFrame = [self.more convertRect:self.more.bounds toView:self.content];
+    BOOL changed = fabs(self.moreMidX - CGRectGetMidX(moreFrame)) > 0.01;
+    self.moreMidX = CGRectGetMidX(moreFrame);
+    self.expandedWidth = MAX(44, ceil(self.moreMidX + 22));
+    CGFloat width = self.expanded ? self.expandedWidth : 44;
+    if (fabs(self.widthConstraint.constant - width) > 0.01) {
+        self.widthConstraint.constant = width;
+        [self invalidateIntrinsicContentSize];
+        changed = YES;
+    }
+    if (changed) [self setNeedsLayout];
+}
+- (CGSize)intrinsicContentSize {
+    return CGSizeMake(self.expanded ? self.expandedWidth : 44, 44);
+}
+- (CGSize)sizeThatFits:(CGSize)size { return self.intrinsicContentSize; }
+- (CGSize)systemLayoutSizeFittingSize:(CGSize)size { return self.intrinsicContentSize; }
+- (CGSize)systemLayoutSizeFittingSize:(CGSize)size withHorizontalFittingPriority:(UILayoutPriority)horizontal verticalFittingPriority:(UILayoutPriority)vertical {
+    return self.intrinsicContentSize;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    if ([self deferGeometryForNativeMenu]) return;
+    // Async host resizing must preserve the surface's right edge and animated width.
+    CGRect glassFrame = self.surface.frame;
+    glassFrame.origin = CGPointMake(self.bounds.size.width - glassFrame.size.width, (self.bounds.size.height - 44) / 2);
+    if (!CGRectEqualToRect(self.surface.frame, glassFrame)) self.surface.frame = glassFrame;
+    [self layoutContent];
+}
+- (void)layoutContent {
+    if ([self deferGeometryForNativeMenu]) return;
+    CGSize size = self.content.bounds.size;
+    CGRect frame = CGRectMake(self.surface.bounds.size.width - 22 - self.moreMidX,
+        (44 - size.height) / 2, size.width, size.height);
+    if (!CGRectEqualToRect(self.content.frame, frame)) self.content.frame = frame;
+}
+- (void)publishSize {
+    if ([self deferGeometryForNativeMenu]) return;
+    self.barItem.width = self.intrinsicContentSize.width;
+    CGRect frame = self.frame;
+    frame.size = self.intrinsicContentSize;
+    self.frame = frame;
+    [self layoutIfNeeded];
+}
+- (void)displayExpanded:(BOOL)expanded {
+    if ([self deferGeometryForNativeMenu]) return;
+    CGFloat width = expanded ? self.expandedWidth : 44;
+    self.surface.frame = CGRectMake(self.bounds.size.width - width, (self.bounds.size.height - 44) / 2, width, 44);
+    [self layoutContent];
+}
+- (void)animateIconsExpanded:(BOOL)expanded entering:(BOOL)entering {
+    NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:self.content];
+    NSHashTable<CALayer *> *liveLayers = [NSHashTable weakObjectsHashTable];
+    for (NSUInteger i = 0; i < queue.count; i++) {
+        UIView *view = queue[i];
+        if (view == self.more) continue; // The one original More never animates.
+        if (![view isKindOfClass:UIButton.class]) {
+            [queue addObjectsFromArray:view.subviews];
+            continue;
+        }
+        UIButton *button = (id)view;
+        UIImageView *glyph = button.imageView;
+        if (!glyph.image) continue;
+        CALayer *layer = glyph.layer;
+        [liveLayers addObject:layer];
+        CGFloat distance = self.moreMidX - CGRectGetMidX([button convertRect:button.bounds toView:self.content]);
+        // Drift from the disclosure side, but don't cross into the More glyph.
+        CGFloat offset = MIN(18, MAX(0, distance - 32));
+        BOOL continuing = [layer animationForKey:self.iconMotionKey] != nil;
+        CALayer *presentation = layer.presentationLayer;
+        CGFloat fromX = (expanded && entering) ? offset : 0;
+        CGFloat fromOpacity = (expanded && entering) ? -1 : 0;
+        if (continuing && presentation) {
+            fromX = [[presentation valueForKeyPath:@"transform.translation.x"] doubleValue] -
+                [[layer valueForKeyPath:@"transform.translation.x"] doubleValue];
+            fromOpacity = presentation.opacity - layer.opacity;
+        }
+        CASpringAnimation *motion = ApolloActionsSpring(@"transform.translation.x");
+        motion.additive = YES;
+        motion.fromValue = @(fromX);
+        motion.toValue = @(expanded ? 0 : offset);
+        CASpringAnimation *opacity = ApolloActionsSpring(@"opacity");
+        opacity.additive = YES;
+        opacity.fromValue = @(fromOpacity);
+        opacity.toValue = @(expanded ? 0 : -1);
+        // Hold until completion clips the strip, then remove both animations.
+        // Leave model visibility/transform untouched for navigation and app snapshots.
+        for (CAAnimation *animation in @[motion, opacity]) {
+            animation.fillMode = kCAFillModeForwards;
+            animation.removedOnCompletion = NO;
+        }
+        [layer addAnimation:motion forKey:self.iconMotionKey];
+        [layer addAnimation:opacity forKey:self.iconOpacityKey];
+    }
+    for (CALayer *layer in self.animatedIconLayers) {
+        if ([liveLayers containsObject:layer]) continue;
+        [layer removeAnimationForKey:self.iconMotionKey];
+        [layer removeAnimationForKey:self.iconOpacityKey];
+    }
+    self.animatedIconLayers = liveLayers;
+}
+- (void)removeIconAnimations {
+    for (CALayer *layer in self.animatedIconLayers) {
+        [layer removeAnimationForKey:self.iconMotionKey];
+        [layer removeAnimationForKey:self.iconOpacityKey];
+    }
+    [self.animatedIconLayers removeAllObjects];
+}
+- (void)applyExpanded:(BOOL)expanded {
+    if ([self deferGeometryForNativeMenu]) return;
+    self.expanded = expanded;
+    self.isAccessibilityElement = !expanded;
+    self.accessibilityTraits = UIAccessibilityTraitButton;
+    self.content.accessibilityElementsHidden = expanded ? self.originalAccessibilityHidden : YES;
+    [self remeasure];
+}
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    // Keep drawing the real More; route taps to Apollo only after expansion settles.
+    return hit && (!self.expanded || self.owner.animator) ? self : hit;
+}
+- (BOOL)accessibilityActivate { [self.owner setExpanded:YES animated:YES]; return YES; }
+- (void)reveal:(id)sender { [self.owner setExpanded:YES animated:YES]; }
+- (void)dealloc {
+    [self removeIconAnimations];
+    if (self.content.superview == self.surface.contentView) self.content.accessibilityElementsHidden = self.originalAccessibilityHidden;
+}
+@end
+
+static UINavigationController *ApolloActionsNavigation(UINavigationBar *bar) {
+    for (UIResponder *responder = bar.nextResponder; responder; responder = responder.nextResponder) {
+        if ([responder isKindOfClass:UINavigationController.class]) return (id)responder;
+    }
+    return nil;
+}
+
+static BOOL ApolloActionsAppController(UIViewController *controller) {
+    return [NSStringFromClass(controller.class) hasPrefix:@"Apollo."] ||
+        [NSStringFromClass(controller.navigationController.class) hasPrefix:@"Apollo."];
+}
+
+static ApolloNavigationActionsOwner *ApolloActionsOwner(UINavigationItem *item, BOOL create) {
+    if (!item) return nil;
+    ApolloNavigationActionsOwner *owner = objc_getAssociatedObject(item, &kActionsOwnerKey);
+    ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
+    if (!owner && create) {
+        owner = [ApolloNavigationActionsOwner new];
+        owner.item = item;
+        owner.controller = box.controller;
+        // Choose the initial state before native items are prepared. Applying
+        // the global expanded default first briefly publishes the whole Inbox
+        // group before the per-page disclosure policy can collapse it.
+        owner.collapsePreference = [owner collapseEnabled];
+        owner.expanded = !owner.collapsePreference;
+        objc_setAssociatedObject(item, &kActionsOwnerKey, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (box.controller) owner.controller = box.controller;
+    return owner;
+}
+
+static void ApolloActionsSetScrollOwner(UIPanGestureRecognizer *pan, ApolloNavigationActionsOwner *owner) {
+    ApolloNavigationActionsScrollOwnerBox *box = objc_getAssociatedObject(pan, &kActionsScrollOwnerKey);
+    ApolloNavigationActionsOwner *previous = box.owner;
+    if (previous == owner) return;
+    if (previous) {
+        [pan removeTarget:previous action:@selector(scrolled:)];
+        [previous.pans removeObject:pan];
+    }
+    if (owner) {
+        if (!box) box = [ApolloNavigationActionsScrollOwnerBox new];
+        box.owner = owner;
+        [pan addTarget:owner action:@selector(scrolled:)];
+        [owner.pans addObject:pan];
+    }
+    objc_setAssociatedObject(pan, &kActionsScrollOwnerKey, owner ? box : nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloActionsUpdateScrollOwner(UIScrollView *scrollView) {
+    ApolloNavigationActionsOwner *owner = nil;
+    if (scrollView.window) {
+        // Incoming pages can attach before becoming topViewController. Start
+        // at the first owning controller, then follow containment to support
+        // child pages without crossing a modal's responder chain into the
+        // presenting feed and collapsing its navigation actions.
+        for (UIResponder *responder = scrollView.nextResponder; responder; responder = responder.nextResponder) {
+            if (![responder isKindOfClass:UIViewController.class]) continue;
+            for (UIViewController *controller = (UIViewController *)responder;
+                 controller; controller = controller.parentViewController) {
+                owner = ApolloActionsOwner(controller.navigationItem, NO);
+                if (owner) break;
+            }
+            break;
+        }
+    }
+    ApolloActionsSetScrollOwner(scrollView.panGestureRecognizer, owner);
+}
+
+// Apollo's feed header exposes moderator, sort, and More as buttons inside one
+// custom UIBarButtonItem. That works across a horizontal navigation bar, but
+// UIKit cannot adapt the single 119pt custom view into Duo's vertical trailing
+// platter. Inbox uses separate native items, which UIKit automatically moves
+// above the right-side tab bar. Mirror that model on Closed Duo while retaining
+// Apollo's original button targets, images, accessibility labels, and menus.
+static void ApolloActionsCollectButtons(UIView *root, NSMutableArray<UIButton *> *buttons) {
+    if ([root isKindOfClass:UIButton.class]) [buttons addObject:(UIButton *)root];
+    for (UIView *child in root.subviews) ApolloActionsCollectButtons(child, buttons);
+}
+
+static BOOL ApolloActionsArraysIdentical(NSArray *a, NSArray *b) {
+    if (a == b) return YES;
+    if (a.count != b.count) return NO;
+    for (NSUInteger index = 0; index < a.count; index++) {
+        if (a[index] != b[index]) return NO;
+    }
+    return YES;
+}
+
+static BOOL ApolloActionsIsDuoFeedControl(UINavigationItem *item, UIBarButtonItem *candidate) {
+    if ([candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"] ||
+        [candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoPageLayoutControl"]) return YES;
+    if (@available(iOS 27.0, *)) return candidate == item.searchBarPlacementBarButtonItem;
+    return NO;
+}
+
+static NSArray<UIBarButtonItem *> *ApolloActionsWithoutDuoFeedControls(UINavigationItem *item, NSArray<UIBarButtonItem *> *items) {
+    NSMutableArray *actions = [NSMutableArray array];
+    for (UIBarButtonItem *candidate in items) {
+        if (!ApolloActionsIsDuoFeedControl(item, candidate)) [actions addObject:candidate];
+    }
+    return actions;
+}
+
+static BOOL ApolloActionsHasTrailingTabRail(void) {
+    if (UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return NO;
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    if (![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return NO;
+    UITabBar *bar = tabs.tabBar;
+    CGRect frame = [bar convertRect:bar.bounds toView:tabs.view];
+    return CGRectGetWidth(frame) < 100.0 && CGRectGetHeight(frame) > 400.0 &&
+        CGRectGetMaxX(frame) >= CGRectGetWidth(tabs.view.bounds) - 2.0;
+}
+
+// Use the target pose as well as live geometry while UIKit replaces the rail.
+static BOOL ApolloActionsUsesDuoOverflow(UIViewController *controller) {
+    return ApolloDeviceIsDuo() && controller && ApolloActionsHasTrailingTabRail()
+        && !ApolloDuoSplitIsUnfoldedPortrait() && !controller.presentingViewController
+        && !ApolloDuoSplitIsSidebarController(controller);
+}
+
+static NSString *ApolloActionsItemTitle(UIBarButtonItem *item) {
+    UIButton *button = objc_getAssociatedObject(item, &kActionsDuoSourceButtonKey);
+    for (NSString *title in @[item.accessibilityLabel ?: @"", item.title ?: @"",
+                              button.accessibilityLabel ?: @"", item.primaryAction.title ?: @""]) {
+        if (title.length) return title;
+    }
+    NSString *action = NSStringFromSelector(item.action);
+    if ([action containsString:@"markAllRead"]) return @"Mark All Read";
+    if ([action containsString:@"newMessage"]) return @"New Message";
+    return @"";
+}
+
+static UIBarButtonItem *ApolloActionsProfileItem(UIViewController *controller,
+                                                  const char *name) {
+    Ivar ivar = class_getInstanceVariable(controller.class, name);
+    id value = ivar ? object_getIvar(controller, ivar) : nil;
+    return [value isKindOfClass:UIBarButtonItem.class] ? value : nil;
+}
+
+static UIBarButtonItem *ApolloActionsProfileVisibleMoreItem(UIViewController *controller,
+                                                             UIBarButtonItem *accounts) {
+    // The signed-in profile installs Apollo Reborn's own UIMenu-backed
+    // ellipsis; other profiles install Apollo's stored moreOptions item.
+    // Prefer the live item already published by the navigation controller so
+    // moving it into the Duo rail cannot replace a working menu with Apollo's
+    // dormant own-profile item.
+    NSArray *items = [(controller.navigationItem.rightBarButtonItems ?: @[])
+        arrayByAddingObjectsFromArray:controller.navigationItem.leftBarButtonItems ?: @[]];
+    for (UIBarButtonItem *item in items) {
+        if (item == accounts) continue;
+        NSString *label = item.accessibilityLabel.lowercaseString;
+        BOOL looksLikeMore = item.menu != nil
+            || [label containsString:@"more"]
+            || item.action == NSSelectorFromString(@"moreOptionsBarButtonItemTappedWithSender:");
+        if (looksLikeMore) return item;
+    }
+    return ApolloActionsProfileItem(controller, "moreOptionsBarButtonItem");
+}
+
+static void ApolloActionsRemoveProfileAccountsItem(UIViewController *controller, UIBarButtonItem *accounts) {
+    if (!accounts) return;
+    UINavigationItem *item = controller.navigationItem;
+    // Apollo allocates this item even for visited profiles. Remove only that
+    // stored item, preserving native Back/More and any unrelated actions.
+    for (NSUInteger side = 0; side < 2; side++) {
+        NSArray *current = side ? item.rightBarButtonItems : item.leftBarButtonItems;
+        if (!current || [current indexOfObjectIdenticalTo:accounts] == NSNotFound) continue;
+        NSMutableArray *items = [current mutableCopy];
+        [items removeObjectIdenticalTo:accounts];
+        if (side) [item setRightBarButtonItems:items animated:NO];
+        else [item setLeftBarButtonItems:items animated:NO];
+    }
+}
+
+static void ApolloActionsApplyDuoProfileItems(UIViewController *controller) {
+    if (!IsLiquidGlass() || !controller) return;
+    // The Account sidebar has a horizontal bar of its own. Its controls do
+    // not belong to the detail pane's trailing rail: keep Accounts on the
+    // leading side so the scrolled profile title has room between the groups.
+    BOOL sidebar = ApolloDuoSplitIsSidebarController(controller);
+    BOOL trailingRail = ApolloActionsHasTrailingTabRail() && !ApolloDuoSplitIsUnfoldedPortrait() && !sidebar;
+    BOOL previouslyApplied = [objc_getAssociatedObject(controller, &kActionsDuoProfileAppliedKey) boolValue];
+    if (!trailingRail && !previouslyApplied && !sidebar) return;
+    UIBarButtonItem *accounts = ApolloActionsProfileItem(controller, "accountsBarButtonItem");
+    // A visited profile may be the root of a temporary Duo detail stack.
+    // Ownership belongs to the original Account tab, not that temporary root
+    // or a username that has not finished loading yet.
+    if (!ApolloDuoSplitIsOwnAccountController(controller)) {
+        ApolloActionsRemoveProfileAccountsItem(controller, accounts);
+        objc_setAssociatedObject(controller, &kActionsDuoProfileAppliedKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    UIBarButtonItem *more = ApolloActionsProfileVisibleMoreItem(controller, accounts);
+    if (!accounts || !more) return;
+
+    // The rail moves Accounts to the right and replaces its text with a glyph.
+    // Undo both changes when returning to a horizontal bar, including rotation
+    // to unfolded portrait without another viewWillAppear callback.
+    if (!trailingRail) {
+        // The fully open sidebar is narrower than the half-fold column. Use
+        // the existing Accounts glyph there, still on the leading side, so
+        // the username fits in the title bar. Pair More with Accounts on the
+        // leading side in this narrow column, balancing the sidebar toggle.
+        BOOL compactSidebar = sidebar && CGRectGetWidth(controller.viewIfLoaded.bounds) < 380.0;
+        UIImage *image = compactSidebar ? [UIImage systemImageNamed:@"person.2"
+            withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18.0
+                weight:UIImageSymbolWeightRegular]] : nil;
+        if (compactSidebar != (accounts.image != nil)) accounts.image = image;
+        NSString *title = compactSidebar ? nil : @"Accounts";
+        if (accounts.title != title && ![accounts.title isEqualToString:title]) accounts.title = title;
+        accounts.accessibilityLabel = @"Accounts";
+        if (@available(iOS 27.1, *)) {
+            accounts.axisBehavior = UIBarButtonItemAxisBehaviorAutomatic;
+            more.axisBehavior = UIBarButtonItemAxisBehaviorAutomatic;
+        }
+        if (@available(iOS 26.0, *)) {
+            accounts.sharesBackground = compactSidebar;
+            more.sharesBackground = compactSidebar;
+        }
+        NSMutableArray *right = [controller.navigationItem.rightBarButtonItems mutableCopy] ?: [NSMutableArray array];
+        [right removeObjectIdenticalTo:accounts];
+        [right removeObjectIdenticalTo:more];
+        if (!compactSidebar) [right addObject:more];
+        NSMutableArray *left = [controller.navigationItem.leftBarButtonItems mutableCopy] ?: [NSMutableArray array];
+        [left removeObjectIdenticalTo:accounts];
+        [left removeObjectIdenticalTo:more];
+        [left insertObject:accounts atIndex:0];
+        if (compactSidebar) [left insertObject:more atIndex:1];
+        if (!ApolloActionsArraysIdentical(controller.navigationItem.leftBarButtonItems, left)) {
+            [controller.navigationItem setLeftBarButtonItems:left animated:NO];
+        }
+        // Publish the leading placement first so the profile-menu normalizer
+        // recognizes the move when the trailing array is updated.
+        if (!ApolloActionsArraysIdentical(controller.navigationItem.rightBarButtonItems, right)) {
+            [controller.navigationItem setRightBarButtonItems:right animated:NO];
+        }
+        objc_setAssociatedObject(controller, &kActionsDuoProfileAppliedKey, sidebar ? @YES : nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+
+    if (previouslyApplied && accounts.image && accounts.title == nil &&
+        ![controller.navigationItem.leftBarButtonItems containsObject:accounts] &&
+        ApolloActionsArraysIdentical(controller.navigationItem.rightBarButtonItems, @[accounts, more])) return;
+
+    UIImageSymbolConfiguration *configuration =
+        [UIImageSymbolConfiguration configurationWithPointSize:18.0
+                                                        weight:UIImageSymbolWeightRegular];
+    UIImage *icon = [[UIImage systemImageNamed:@"person.2"
+                               withConfiguration:configuration]
+        imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    accounts.title = nil;
+    accounts.image = icon;
+    accounts.accessibilityLabel = @"Accounts";
+    if (@available(iOS 26.0, *)) {
+        accounts.identifier = @"ApolloReborn.duo-profile.accounts";
+        more.identifier = @"ApolloReborn.duo-profile.more";
+        accounts.hidesSharedBackground = NO;
+        more.hidesSharedBackground = NO;
+        accounts.sharesBackground = NO;
+        more.sharesBackground = NO;
+    }
+    if (@available(iOS 27.1, *)) {
+        accounts.axisBehavior = UIBarButtonItemAxisBehaviorVerticalPreferred;
+        more.axisBehavior = UIBarButtonItemAxisBehaviorVerticalPreferred;
+    }
+
+    NSMutableArray<UIBarButtonItem *> *left =
+        [controller.navigationItem.leftBarButtonItems mutableCopy] ?: [NSMutableArray array];
+    [left removeObjectIdenticalTo:accounts];
+    [left removeObjectIdenticalTo:more];
+    if (!ApolloActionsArraysIdentical(controller.navigationItem.leftBarButtonItems, left)) {
+        controller.navigationItem.leftBarButtonItems = left;
+    }
+
+    // rightBarButtonItems[0] occupies the bottom of iOS 27's vertical group.
+    // Accounts therefore comes first in the model so the visible order is
+    // More, then Accounts, directly above the tab rail.
+    NSArray<UIBarButtonItem *> *items = @[accounts, more];
+    if (!ApolloActionsArraysIdentical(controller.navigationItem.rightBarButtonItems, items)) {
+        [controller.navigationItem setRightBarButtonItems:items animated:NO];
+    }
+    objc_setAssociatedObject(controller, &kActionsDuoProfileAppliedKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloActionsClearDuoProfileTrailingCells(UIViewController *controller);
+
+static void ApolloActionsScheduleDuoProfileItems(UIViewController *controller) {
+    if (!controller || [objc_getAssociatedObject(controller, &kActionsDuoProfileRefreshKey) boolValue]) return;
+    objc_setAssociatedObject(controller, &kActionsDuoProfileRefreshKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIViewController *weakController = controller;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *strongController = weakController;
+        if (!strongController) return;
+        objc_setAssociatedObject(strongController, &kActionsDuoProfileRefreshKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloActionsApplyDuoProfileItems(strongController);
+        ApolloActionsClearDuoProfileTrailingCells(strongController);
+    });
+}
+
+static UITableView *ApolloActionsProfileTable(UIView *view, NSInteger depth) {
+    if (!view || depth < 0) return nil;
+    if ([view isKindOfClass:UITableView.class]) return (UITableView *)view;
+    for (UIView *subview in view.subviews) {
+        UITableView *table = ApolloActionsProfileTable(subview, depth - 1);
+        if (table) return table;
+    }
+    return nil;
+}
+
+static void ApolloActionsRestoreProfileSelection(UITableViewCell *cell) {
+    UIView *selection = cell.selectedBackgroundView;
+    CALayer *mask = objc_getAssociatedObject(selection, &kActionsDuoProfileSelectionMaskKey);
+    if (!mask) return;
+    if (selection.layer.mask == mask) {
+        id original = objc_getAssociatedObject(selection, &kActionsDuoProfileOriginalSelectionMaskKey);
+        selection.layer.mask = original == NSNull.null ? nil : original;
+    }
+    objc_setAssociatedObject(selection, &kActionsDuoProfileSelectionMaskKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(selection, &kActionsDuoProfileOriginalSelectionMaskKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static UIColor *ApolloActionsProfileCellNativeColor(UITableViewCell *cell) {
+    SEL nodeSelector = @selector(node);
+    id node = [cell respondsToSelector:nodeSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(cell, nodeSelector) : nil;
+    if ([node respondsToSelector:@selector(backgroundColor)]) {
+        // The UIKit wrapper is deliberately clear beside a Duo rail. Texture's
+        // current node color remains the source of truth, also after reuse or a
+        // theme change. Transparent headers must keep their transparency.
+        return ((UIColor *(*)(id, SEL))objc_msgSend)(node, @selector(backgroundColor))
+            ?: UIColor.clearColor;
+    }
+    return objc_getAssociatedObject(cell, &kActionsDuoProfileCellColorKey)
+        ?: cell.backgroundColor ?: UIColor.clearColor;
+}
+
+static void ApolloActionsClipProfileSelection(UITableViewCell *cell) {
+    UIView *selection = cell.selectedBackgroundView;
+    if (!selection) return;
+    SEL nodeSelector = @selector(node);
+    id node = [cell respondsToSelector:nodeSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(cell, nodeSelector) : nil;
+    if (!IsLiquidGlass() || !ApolloActionsHasTrailingTabRail()
+        || ![node isKindOfClass:ApolloClassProfileFeatureCellNode]
+        || CGRectGetWidth(cell.bounds) - CGRectGetWidth(cell.contentView.bounds) < 1.0) {
+        ApolloActionsRestoreProfileSelection(cell);
+        return;
+    }
+
+    // Apollo highlights the shortcut inside its narrowed content view, but
+    // UIKit also paints a full-width selected background behind the rail.
+    // Clip that background, retaining Apollo's highlight and touch handling.
+    CAShapeLayer *mask = objc_getAssociatedObject(selection, &kActionsDuoProfileSelectionMaskKey);
+    if (!mask) {
+        objc_setAssociatedObject(selection, &kActionsDuoProfileOriginalSelectionMaskKey,
+                                 selection.layer.mask ?: NSNull.null, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        mask = [CAShapeLayer layer];
+        objc_setAssociatedObject(selection, &kActionsDuoProfileSelectionMaskKey, mask, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    CGRect content = [selection convertRect:cell.contentView.bounds fromView:cell.contentView];
+    CGRect clip = selection.bounds;
+    clip.origin.x = CGRectGetMinX(content);
+    clip.size.width = CGRectGetWidth(content);
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    mask.frame = selection.bounds;
+    mask.path = [UIBezierPath bezierPathWithRect:clip].CGPath;
+    selection.layer.mask = mask;
+    [CATransaction commit];
+}
+
+static void ApolloActionsRestoreProfileCellBackground(UITableViewCell *cell) {
+    UIView *background = objc_getAssociatedObject(cell, &kActionsDuoProfileCellBackgroundKey);
+    if (!background) return;
+    cell.backgroundColor = ApolloActionsProfileCellNativeColor(cell);
+    id original = objc_getAssociatedObject(cell, &kActionsDuoProfileBackgroundColorKey);
+    cell.backgroundView.backgroundColor = original == NSNull.null ? nil : original;
+    [background removeFromSuperview];
+    objc_setAssociatedObject(cell, &kActionsDuoProfileCellBackgroundKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, &kActionsDuoProfileCellColorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, &kActionsDuoProfileBackgroundColorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloActionsClearDuoProfileTrailingCells(UIViewController *controller) {
+    if (!IsLiquidGlass() || !controller.isViewLoaded) return;
+    UITableView *table = ApolloActionsProfileTable(controller.view, 5);
+    for (UITableViewCell *cell in table.visibleCells) ApolloActionsClipProfileSelection(cell);
+    BOOL trailingRail = ApolloActionsHasTrailingTabRail();
+    BOOL sidebar = ApolloDuoSplitIsSidebarController(controller);
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    UITabBar *tabBar = [tabs isKindOfClass:UITabBarController.class] ? tabs.tabBar : nil;
+    for (UITableViewCell *cell in table.visibleCells) {
+        CGFloat cellWidth = CGRectGetWidth(cell.bounds);
+        CGFloat contentWidth = CGRectGetMaxX(cell.contentView.frame);
+        if (!trailingRail || cellWidth - contentWidth < 1.0 || contentWidth < 1.0) {
+            ApolloActionsRestoreProfileCellBackground(cell);
+            continue;
+        }
+
+        // Apollo's content view stops an extra grouped margin before the Duo
+        // rail. That made this wrapper end 15 points before the stat cards.
+        // Draw the wrapper to the same rail-relative edge as the header while
+        // leaving Apollo's labels, chevrons, and hit testing untouched.
+        CGFloat surfaceWidth = contentWidth;
+        if (!sidebar && tabBar.window && cell.window) {
+            CGRect tabBarFrame = [tabBar convertRect:tabBar.bounds toView:cell];
+            CGFloat railRelativeWidth = CGRectGetMinX(tabBarFrame) - 15.0;
+            if (railRelativeWidth > contentWidth && railRelativeWidth < cellWidth) {
+                surfaceWidth = railRelativeWidth;
+            }
+        }
+
+        UIColor *nativeColor = ApolloActionsProfileCellNativeColor(cell);
+        if (!objc_getAssociatedObject(cell, &kActionsDuoProfileCellColorKey)) {
+            objc_setAssociatedObject(cell, &kActionsDuoProfileCellColorKey, nativeColor,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(cell, &kActionsDuoProfileBackgroundColorKey,
+                                     cell.backgroundView.backgroundColor ?: NSNull.null,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        UIView *background = objc_getAssociatedObject(cell, &kActionsDuoProfileCellBackgroundKey);
+        if (!background) {
+            background = [[UIView alloc] initWithFrame:CGRectZero];
+            background.userInteractionEnabled = NO;
+            objc_setAssociatedObject(cell, &kActionsDuoProfileCellBackgroundKey, background,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [cell insertSubview:background atIndex:0];
+        }
+        background.backgroundColor = nativeColor;
+        background.frame = CGRectMake(0.0, 0.0, surfaceWidth, CGRectGetHeight(cell.bounds));
+        background.layer.cornerRadius = 16.0;
+        background.layer.masksToBounds = YES;
+        if (@available(iOS 13.0, *)) {
+            background.layer.cornerCurve = kCACornerCurveContinuous;
+        }
+        cell.backgroundColor = UIColor.clearColor;
+        cell.backgroundView.backgroundColor = UIColor.clearColor;
+    }
+}
+
+static UIBarButtonItem *ApolloActionsNativeItemForDuoButton(UIButton *button, NSUInteger index) {
+    UIImage *image = [button imageForState:UIControlStateNormal] ?: button.currentImage;
+    image = ApolloActionsTemplateImage(image);
+    id target = nil;
+    SEL action = NULL;
+    for (id candidate in button.allTargets) {
+        NSArray<NSString *> *actions = [button actionsForTarget:candidate
+                                                forControlEvent:UIControlEventTouchUpInside];
+        if (actions.count) {
+            target = candidate;
+            action = NSSelectorFromString(actions.firstObject);
+            break;
+        }
+    }
+
+    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithImage:image
+                                                               style:UIBarButtonItemStylePlain
+                                                              target:target
+                                                              action:action];
+    if (!target || !action) {
+        __weak UIButton *weakButton = button;
+        item.primaryAction = [UIAction actionWithTitle:button.accessibilityLabel ?: @""
+                                                image:image
+                                           identifier:nil
+                                              handler:^(__unused UIAction *nativeAction) {
+            [weakButton sendActionsForControlEvents:UIControlEventTouchUpInside];
+        }];
+    }
+    if (button.menu && button.showsMenuAsPrimaryAction) {
+        item.target = nil;
+        item.action = nil;
+        item.primaryAction = nil;
+        item.menu = button.menu;
+    }
+    item.enabled = button.enabled;
+    item.accessibilityLabel = button.accessibilityLabel;
+    item.accessibilityHint = button.accessibilityHint;
+    if (@available(iOS 26.0, *)) {
+        item.identifier = [NSString stringWithFormat:@"ApolloReborn.duo-navigation-action.%lu",
+                           (unsigned long)index];
+        item.hidesSharedBackground = NO;
+        item.sharesBackground = YES;
+    }
+    if (@available(iOS 27.1, *)) {
+        item.axisBehavior = UIBarButtonItemAxisBehaviorVerticalPreferred;
+    }
+    // The original composite item retains the button as well, but holding it
+    // here makes the forwarding relationship explicit across UIKit rebuilds.
+    objc_setAssociatedObject(item, &kActionsDuoSourceButtonKey, button,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Apollo changes the original sort UIButton in place. The generated
+    // native item must remain a live mirror, including while collapsed.
+    // Weak destinations avoid a cycle with the item's retained source button.
+    NSHashTable<UIBarButtonItem *> *mirrors = objc_getAssociatedObject(button, &kActionsDuoMirroredItemsKey);
+    if (!mirrors) {
+        mirrors = [NSHashTable weakObjectsHashTable];
+        objc_setAssociatedObject(button, &kActionsDuoMirroredItemsKey, mirrors,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [mirrors addObject:item];
+    objc_setAssociatedObject(item, &kActionsDuoMirroredImageKey, image, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return item;
+}
+
+BOOL ApolloNavigationActionsDuoMirrorsButton(UINavigationItem *item, UIView *button) {
+    if (!item || !button) return NO;
+    // The live items, plus the generated set: a collapsed rail publishes only
+    // More and keeps the other mirrors in its model.
+    NSArray *generated = objc_getAssociatedObject(item, &kActionsDuoNativeItemsKey) ?: @[];
+    for (UIBarButtonItem *candidate in [item.rightBarButtonItems ?: @[] arrayByAddingObjectsFromArray:generated]) {
+        if (objc_getAssociatedObject(candidate, &kActionsDuoSourceButtonKey) == button) return YES;
+    }
+    return NO;
+}
+
+static NSArray<UIBarButtonItem *> *ApolloActionsWithoutDuoMirrors(UINavigationItem *item,
+                                                                  NSArray<UIBarButtonItem *> *items,
+                                                                  NSArray<UIBarButtonItem *> *original) {
+    NSMutableArray<UIBarButtonItem *> *kept = [NSMutableArray array];
+    NSUInteger firstMirror = NSNotFound, dropped = 0;
+    for (UIBarButtonItem *candidate in items) {
+        if (objc_getAssociatedObject(candidate, &kActionsDuoSourceButtonKey)) {
+            if (firstMirror == NSNotFound) firstMirror = kept.count;
+            dropped++;
+            continue;
+        }
+        [kept addObject:candidate];
+    }
+    if (firstMirror == NSNotFound) return items;
+    // Only the mirrors were left: put the original composite back in their place.
+    BOOL hasComposite = NO;
+    for (UIBarButtonItem *candidate in kept) {
+        if (ApolloActionsFindMore(ApolloNavigationActionsContentView(candidate))) hasComposite = YES;
+    }
+    if (!hasComposite && original.count) {
+        // Only the composite: the page's other items are already in `kept`,
+        // and the cached copies may be gone from the page by now.
+        NSMutableArray *originalActions = [NSMutableArray array];
+        for (UIBarButtonItem *candidate in ApolloActionsWithoutDuoFeedControls(item, original)) {
+            if (ApolloActionsFindMore(ApolloNavigationActionsContentView(candidate))) [originalActions addObject:candidate];
+        }
+        [kept insertObjects:originalActions
+                  atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(firstMirror, originalActions.count)]];
+    }
+    ApolloLog(@"[NavigationActions] Dropped %lu leftover Duo rail mirror item(s) after leaving the rail",
+              (unsigned long)dropped);
+    return kept;
+}
+
+static BOOL ApolloActionsButtonActionContains(UIButton *button, NSString *needle) {
+    for (id target in button.allTargets) {
+        for (NSString *action in [button actionsForTarget:target forControlEvent:UIControlEventTouchUpInside]) {
+            if ([action.lowercaseString containsString:needle]) return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL ApolloActionsIsModeratorButton(UIButton *button) {
+    return [button.accessibilityLabel.lowercaseString containsString:@"moderator"]
+        || ApolloActionsButtonActionContains(button, @"moderator");
+}
+
+static BOOL ApolloActionsIsSortButton(UIButton *button) {
+    return ApolloActionsButtonActionContains(button, @"sort")
+        || [button.accessibilityLabel.lowercaseString containsString:@"sort"];
+}
+
+static NSArray<UIMenuElement *> *ApolloActionsDuoNestTimeRanges(NSArray<UIMenuElement *> *rows, id sortController,
+                                                                 UIView *source) {
+    if (@available(iOS 15.0, *)) {
+        NSMutableArray<UIMenuElement *> *nested = [rows mutableCopy];
+        for (NSUInteger index = 0; index < rows.count; index++) {
+            UIAction *row = [rows[index] isKindOfClass:UIAction.class] ? (UIAction *)rows[index] : nil;
+            NSUInteger kind = ApolloActionMenuNativeKindForElement(rows[index]);
+            if (!row || (kind != 87 && kind != 83)) continue;
+            __weak UIView *weakSource = source;
+            UIDeferredMenuElement *ranges = [UIDeferredMenuElement elementWithProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+                UIView *strongSource = weakSource;
+                if (!strongSource) {
+                    completion(@[ row ]);
+                    return;
+                }
+                // Apollo opens the time range sheet a moment after the row.
+                ApolloNativeActionMenuCaptureLateMenuController(strongSource, ^{
+                    ApolloNativeActionMenuInvokeAction(sortController, (uint16_t)kind);
+                }, ^(id controller) {
+                    UIMenu *menu = controller ? ApolloNativeActionMenuBuildCaptured(controller) : nil;
+                    ApolloLog(@"[NavigationActions] Duo: %@ submenu built %lu row(s)", row.title, (unsigned long)menu.children.count);
+                    completion(menu.children.count ? menu.children : @[ row ]);
+                });
+            }];
+            nested[index] = [UIMenu menuWithTitle:row.title image:row.image identifier:nil options:0 children:@[ ranges ]];
+        }
+        return nested;
+    }
+    return rows;
+}
+
+// Only the overflow representation changes; a visible rail button still
+// sends its original action. Weak owners let popped pages release normally.
+static void ApolloActionsUpdateOverflowRepresentation(UIBarButtonItem *item, UIButton *button, UINavigationItem *navItem) {
+    if (@available(iOS 16.0, *)) {
+        BOOL moderator = ApolloActionsIsModeratorButton(button);
+        BOOL sort = ApolloActionsIsSortButton(button);
+        if (!moderator && !sort) return;
+        NSString *title = moderator ? @"Moderator" : (button.accessibilityLabel ?: @"Sort");
+        item.title = title;
+        item.accessibilityLabel = title;
+        __weak UIButton *weakButton = button;
+        __weak UINavigationItem *weakItem = navItem;
+        UIDeferredMenuElement *rows = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+            UIButton *strongButton = weakButton;
+            UINavigationItem *navigationItem = weakItem;
+            UIViewController *page = [objc_getAssociatedObject(navigationItem, &kActionsControllerKey) controller];
+            if (!strongButton || !page.isViewLoaded || !page.view.window) {
+                completion(@[]);
+                return;
+            }
+            UIView *source = page.view;
+            id sender = navigationItem.overflowPresentationSource ?: source;
+            id controller = ApolloNativeActionMenuCaptureMenuController(source, ^{
+                for (id target in strongButton.allTargets) {
+                    NSString *action = [strongButton actionsForTarget:target forControlEvent:UIControlEventTouchUpInside].firstObject;
+                    if (!action) continue;
+                    [UIApplication.sharedApplication sendAction:NSSelectorFromString(action) to:target from:sender forEvent:nil];
+                    return;
+                }
+                [strongButton sendActionsForControlEvents:UIControlEventTouchUpInside];
+            });
+            UIMenu *menu = controller ? ApolloNativeActionMenuBuildCaptured(controller) : nil;
+            completion(sort ? ApolloActionsDuoNestTimeRanges(menu.children ?: @[], controller, source)
+                            : (menu.children ?: @[]));
+        }];
+        item.menuRepresentation = [UIMenu menuWithTitle:title image:item.image identifier:nil options:0 children:@[rows]];
+    }
+}
+
+// UIKit's overflow item on the vertical rail (iOS 26/27), found by its
+// accessibility identifier. If UIKit renames it, overflow still works but
+// keeps UIKit's default artwork until this identifier is updated.
+static NSString *const kActionsDuoRailOverflowIdentifier = @"BottomOverflowBarButtonItem";
+
+// System overflow owns the space calculation. Its uncached provider builds
+// Apollo's actions when opened, preserving current permissions and menu layout.
+// Neither the provider nor its state may retain the owning page or button.
+@interface ApolloDuoSystemOverflow : NSObject
+@property (nonatomic, weak) UIButton *button;
+@property (nonatomic, strong) UIDeferredMenuElement *provider;
+@property (nonatomic, strong) UIDeferredMenuElement *previous;
+@end
+@implementation ApolloDuoSystemOverflow
+@end
+static char kActionsDuoSystemOverflowKey;
+static UIImage *sApolloDuoMoreGlyph;
+
+static void ApolloActionsRemoveSystemOverflow(UINavigationItem *item) {
+    ApolloDuoSystemOverflow *state = objc_getAssociatedObject(item, &kActionsDuoSystemOverflowKey);
+    if (!state) return;
+    if (@available(iOS 16.0, *)) {
+        if (item.additionalOverflowItems == state.provider) item.additionalOverflowItems = state.previous;
+    }
+    objc_setAssociatedObject(item, &kActionsDuoSystemOverflowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL ApolloActionsInstallSystemOverflow(UINavigationItem *item, UIButton *more) {
+    if (@available(iOS 27.0, *)) {
+        if (!ApolloDeviceIsDuo()) return NO;
+        ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
+        if (ApolloActionsUsesDuoOverflow(box.controller)) return NO;
+        ApolloDuoSystemOverflow *state = objc_getAssociatedObject(item, &kActionsDuoSystemOverflowKey);
+        if (state && state.button == more && item.additionalOverflowItems == state.provider) return YES;
+        ApolloActionsRemoveSystemOverflow(item);
+        sApolloDuoMoreGlyph = ApolloActionsTemplateImage([UIImage imageNamed:@"option-more"]
+            ?: [more imageForState:UIControlStateNormal] ?: more.currentImage);
+        state = [ApolloDuoSystemOverflow new];
+        state.button = more;
+        state.previous = item.additionalOverflowItems;
+        __weak UINavigationItem *weakItem = item;
+        __weak UIButton *weakMore = more;
+        UIDeferredMenuElement *previous = state.previous;
+        state.provider = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+            UINavigationItem *navItem = weakItem;
+            UIButton *button = weakMore;
+            UIViewController *page = [objc_getAssociatedObject(navItem, &kActionsControllerKey) controller];
+            if (!navItem || !button || !page.isViewLoaded || !page.view.window) {
+                completion(previous ? @[previous] : @[]);
+                return;
+            }
+            if (button.menu && button.showsMenuAsPrimaryAction) {
+                NSMutableArray *elements = [button.menu.children mutableCopy];
+                if (previous) [elements addObject:previous];
+                completion(elements);
+                return;
+            }
+            // Use the visible system button as the sender, not the detached
+            // composite. Apollo's native handlers use the sender for popovers.
+            id anchor = navItem.overflowPresentationSource ?: page.view;
+            // The ••• tap arms the feed context (saved layout, the Moderator
+            // row's follow-up) and disarms it before this menu is built.
+            id captured = ApolloNativeActionMenuCaptureMenuController(page.view, ^{
+                for (id target in button.allTargets) {
+                    NSString *name = [button actionsForTarget:target forControlEvent:UIControlEventTouchUpInside].firstObject;
+                    if (!name) continue;
+                    [UIApplication.sharedApplication sendAction:NSSelectorFromString(name) to:target from:anchor forEvent:nil];
+                    return;
+                }
+                [button sendActionsForControlEvents:UIControlEventTouchUpInside];
+            });
+            UIMenu *menu = captured ? ApolloNativeActionMenuBuildCaptured(captured) : nil;
+            NSMutableArray *elements = [menu.children mutableCopy] ?: [NSMutableArray array];
+            if (previous) [elements addObject:previous];
+            ApolloLog(@"[NavigationActions] System overflow built %lu elements on %@", (unsigned long)elements.count, NSStringFromClass(page.class));
+            completion(elements);
+        }];
+        objc_setAssociatedObject(item, &kActionsDuoSystemOverflowKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        item.additionalOverflowItems = state.provider;
+        ApolloLog(@"[NavigationActions] Installed unified Duo overflow");
+        return YES;
+    }
+    return NO;
+}
+
+static NSArray<UIBarButtonItem *> *ApolloActionsDuoNativeItems(UINavigationItem *item,
+                                                               NSArray<UIBarButtonItem *> *items) {
+    items = ApolloNativeFeedSearchDuoTrailingItems(item, items);
+    items = ApolloDuoPageLayoutItems(item, items);
+    ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
+    // Inbox owns its reversible disclosure/expanded mapping below.
+    if ([NSStringFromClass(box.controller.class) isEqualToString:@"Apollo.InboxViewController"]) return items;
+    NSArray *generated = objc_getAssociatedObject(item, &kActionsDuoNativeItemsKey);
+    NSArray *original = objc_getAssociatedObject(item, &kActionsDuoOriginalItemsKey);
+    int duoMode = ApolloDuoCurrentMode();
+    // UIKit briefly publishes Phone while replacing a feed's navigation model.
+    // Keep native items across that transient. Portrait restores the compact
+    // composite so its original glyph spacing survives the axis change.
+    BOOL closedDuo = !ApolloDuoSplitIsUnfoldedPortrait()
+        && (duoMode == ApolloDuoModeClosed || ApolloActionsHasTrailingTabRail()
+            || (duoMode == ApolloDuoModePhone && generated != nil));
+    if (!closedDuo) {
+        ApolloActionsRestoreDuoOverflow(item);
+        ApolloActionsRemoveSystemOverflow(item);
+        ApolloNavigationActionsOwner *owner = ApolloActionsOwner(item, NO);
+        // A collapsed rail publishes only its generated More item, retaining
+        // the remaining actions in the owner. It is still our native model:
+        // restore its compact composite before discarding the mapping, or
+        // portrait keeps a VerticalPreferred rail item and loses the strip.
+        NSArray *actions = ApolloActionsWithoutDuoFeedControls(item, items);
+        NSArray *generatedActions = ApolloActionsWithoutDuoFeedControls(item, generated);
+        BOOL collapsedGenerated = actions.count == 1 && owner.standardItems.count > 0
+            && actions.firstObject == owner.moreItem && [generated containsObject:owner.moreItem];
+        if (generated && original &&
+            (ApolloActionsArraysIdentical(actions, generatedActions) || collapsedGenerated)) {
+            // Layout disappears in portrait. Changes to the host
+            // controls must not prevent restoring the composite,
+            // or its separate rail items keep UIKit's wider horizontal slots.
+            // Keep the live controls instead of resurrecting the cached ones.
+            NSArray *originalActions = ApolloActionsWithoutDuoFeedControls(item, original);
+            NSMutableArray *restored = [NSMutableArray array];
+            BOOL insertedActions = NO;
+            for (UIBarButtonItem *candidate in items) {
+                if (ApolloActionsIsDuoFeedControl(item, candidate)) {
+                    [restored addObject:candidate];
+                } else if (!insertedActions) {
+                    [restored addObjectsFromArray:originalActions];
+                    insertedActions = YES;
+                }
+            }
+            items = restored;
+        }
+        // Rail mirrors must not outlive the rail. If Apollo rebuilt its
+        // composite meanwhile, the branch above keeps them beside the new
+        // strip as a second globe/sort over the title. Drop them.
+        items = ApolloActionsWithoutDuoMirrors(item, items, original);
+        objc_setAssociatedObject(item, &kActionsDuoNativeItemsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(item, &kActionsDuoOriginalItemsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return items;
+    }
+    if (generated && ApolloActionsArraysIdentical(items, generated)) return items;
+
+    NSMutableArray<UIBarButtonItem *> *result = [NSMutableArray array];
+    BOOL converted = NO;
+    for (UIBarButtonItem *barItem in items) {
+        UIView *source = ApolloNavigationActionsContentView(barItem);
+        UIButton *more = ApolloActionsFindMore(source);
+        if (converted || !source || !more || ApolloActionsControlCount(source) < 2) {
+            [result addObject:barItem];
+            continue;
+        }
+
+        NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
+        ApolloActionsCollectButtons(source, buttons);
+        [buttons filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(UIButton *button,
+                                                                          __unused NSDictionary *bindings) {
+            return !button.hidden && button.alpha > 0.01 &&
+                ([button imageForState:UIControlStateNormal] || button.currentImage);
+        }]];
+        [buttons sortUsingComparator:^NSComparisonResult(UIButton *left, UIButton *right) {
+            CGFloat leftX = CGRectGetMidX([left convertRect:left.bounds toView:source]);
+            CGFloat rightX = CGRectGetMidX([right convertRect:right.bounds toView:source]);
+            if (leftX < rightX) return NSOrderedAscending;
+            if (leftX > rightX) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        if (buttons.count < 2 || ![buttons containsObject:more]) {
+            [result addObject:barItem];
+            continue;
+        }
+
+        BOOL systemOverflow = ApolloActionsInstallSystemOverflow(item, more);
+
+        // rightBarButtonItems[0] is the trailing item. On a vertical platter
+        // UIKit maps that edge to the bottom, so reverse the visual left-to-
+        // right order to keep moderator/sort above More.
+        for (NSUInteger reverse = buttons.count; reverse > 0; reverse--) {
+            UIButton *button = buttons[reverse - 1];
+            if (systemOverflow && button == more) continue;
+            UIBarButtonItem *native = ApolloActionsNativeItemForDuoButton(button, reverse - 1);
+            native.title = button.accessibilityLabel ?: @"Action";
+            // Resolve exported priorities at runtime: device releases still
+            // compile against SDK 26 with the iOS 14 deployment floor.
+            if (systemOverflow && [native respondsToSelector:@selector(setVisibilityPriority:)]) {
+                // Only Sort outranks the rest (the globe stays at the default),
+                // so the rail keeps the same button through a fold when only
+                // one fits.
+                const char *symbol = ApolloActionsIsModeratorButton(button) ? "UIBarButtonItemVisibilityPriorityLow"
+                    : ApolloActionsIsSortButton(button) ? "UIBarButtonItemVisibilityPriorityHigh" : NULL;
+                const NSInteger *priority = symbol ? (const NSInteger *)dlsym(RTLD_DEFAULT, symbol) : NULL;
+                if (priority) ((void (*)(id, SEL, NSInteger))objc_msgSend)(native, @selector(setVisibilityPriority:), *priority);
+            }
+            if (systemOverflow) ApolloActionsUpdateOverflowRepresentation(native, button, item);
+            [result addObject:native];
+        }
+        converted = YES;
+    }
+    if (!converted) {
+        // Search/edit modes replace the strip. Keep our provider only while
+        // an existing mirrored strip is still represented in the live model.
+        BOOL hasMirror = NO;
+        for (UIBarButtonItem *candidate in items) {
+            if (objc_getAssociatedObject(candidate, &kActionsDuoSourceButtonKey)) hasMirror = YES;
+        }
+        if (!hasMirror) ApolloActionsRemoveSystemOverflow(item);
+        return items;
+    }
+
+    NSArray *native = [result copy];
+    objc_setAssociatedObject(item, &kActionsDuoOriginalItemsKey, [items copy],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(item, &kActionsDuoNativeItemsKey, native,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloLog(@"[NavigationActions] Split composite actions into %lu native Duo items on %@",
+              (unsigned long)native.count,
+              NSStringFromClass([objc_getAssociatedObject(item, &kActionsControllerKey) controller].class));
+    return native;
+}
+
+static NSArray<UIBarButtonItem *> *ApolloActionsInboxItems(UINavigationItem *item, NSArray<UIBarButtonItem *> *items) {
+    ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
+    if (!IsLiquidGlass() || ![NSStringFromClass(box.controller.class) isEqual:@"Apollo.InboxViewController"]) return items;
+    ApolloNavigationActionsOwner *owner = ApolloActionsOwner(item, YES);
+    // The native Duo transition deliberately publishes @[More] while
+    // collapsed. Do not strip that disclosure during our guarded model write.
+    if (owner.preparing) return items;
+    // The collapsed native model intentionally contains only the disclosure.
+    // Preserve it during lifecycle refreshes instead of treating it as a lone
+    // action to remove.
+    if (ApolloActionsUsesDuoOverflow(box.controller) && items.count == 1 &&
+        items.firstObject == owner.inboxDisclosure && owner.standardItems.count) return items;
+    // A collapsed model retains sibling commands in the owner. Recover them
+    // before publishing the expanded items outside the rail.
+    if (!ApolloActionsUsesDuoOverflow(box.controller) && items.count == 1 &&
+        items.firstObject == owner.inboxDisclosure && owner.standardItems.count) {
+        NSMutableArray *restored = [NSMutableArray arrayWithObject:owner.inboxDisclosure];
+        for (ApolloNavigationActionsStandardItem *entry in owner.standardItems) {
+            if (entry.item) [restored addObject:entry.item];
+        }
+        items = restored;
+    }
+    NSMutableArray *native = [items mutableCopy] ?: [NSMutableArray array];
+    if (owner.inboxDisclosure) [native removeObjectIdenticalTo:owner.inboxDisclosure];
+    // Only a rail needs the synthetic Duo overflow anchor. Other poses expose
+    // the commands directly; regular phones retain their collapse preference.
+    if (ApolloDeviceIsDuo() ? !ApolloActionsUsesDuoOverflow(box.controller) : !sCollapseNavigationActions) return native;
+    // Inbox compose/selection modes and lone actions need no added disclosure.
+    if (box.controller.isEditing || native.count < 2) return native;
+    NSUInteger actionable = 0;
+    for (UIBarButtonItem *candidate in native) {
+        if (ApolloActionsMoreName(candidate.accessibilityLabel) ||
+            ApolloActionsMoreName(NSStringFromSelector(candidate.action))) return native;
+        if (candidate.customView || [candidate.title isEqualToString:@"Cancel"] ||
+            [candidate.title isEqualToString:@"Done"] || [candidate.title isEqualToString:@"Edit"]) return native;
+        ApolloNavigationActionsStandardItem *state = objc_getAssociatedObject(candidate, &kActionsStandardItemKey);
+        BOOL nativeHidden = state ? state.hidden : ApolloActionsItemHidden(candidate);
+        if (!nativeHidden && (candidate.action || candidate.primaryAction || candidate.menu)) actionable++;
+    }
+    if (actionable < 2) return native;
+    if (!owner.inboxDisclosure) {
+        UIImage *image = [[UIImage imageNamed:@"option-more" inBundle:NSBundle.mainBundle compatibleWithTraitCollection:box.controller.traitCollection]
+            imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        if (!image) return native;
+        __weak ApolloNavigationActionsOwner *weakOwner = owner;
+        owner.inboxDisclosure = [[UIBarButtonItem alloc] initWithImage:image style:UIBarButtonItemStylePlain target:nil action:nil];
+        owner.inboxDisclosure.accessibilityLabel = @"More Options";
+        // Inbox has no native More menu; this button closes the expanded group.
+        owner.inboxDisclosure.primaryAction = [UIAction actionWithTitle:@"" image:image identifier:nil handler:^(__unused UIAction *action) {
+            [weakOwner setExpanded:NO animated:YES];
+        }];
+        if (@available(iOS 26.0, *)) {
+            owner.inboxDisclosure.identifier = @"ApolloReborn.navigation-actions";
+            owner.inboxDisclosure.hidesSharedBackground = NO;
+            owner.inboxDisclosure.sharesBackground = YES;
+        }
+        if (@available(iOS 27.1, *)) {
+            owner.inboxDisclosure.axisBehavior = UIBarButtonItemAxisBehaviorVerticalPreferred;
+        }
+    }
+    [native insertObject:owner.inboxDisclosure atIndex:0];
+    return native;
+}
+
+@implementation ApolloNavigationActionsOwner
+- (BOOL)collapseEnabled {
+    // Duo exposes actions directly: in the rail menu or as expanded controls.
+    return ApolloDeviceIsDuo() ? NO : sCollapseNavigationActions;
+}
+- (instancetype)init {
+    self = [super init];
+    if (!self) return nil;
+    _collapsePreference = sCollapseNavigationActions;
+    _expanded = !sCollapseNavigationActions;
+    _standardItems = [NSMutableArray array];
+    _pans = [NSHashTable weakObjectsHashTable];
+    __weak typeof(self) weakSelf = self;
+    _resignObserver = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
+        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+            ApolloNavigationActionsOwner *owner = weakSelf;
+            if (owner.animator) {
+                // Never stop a running spring from this deactivation callout:
+                // on iOS 27.2 -stopAnimation: throws inside UIKit here (#1609),
+                // e.g. leaving the app while launch's late-slot spring runs.
+                // Let it land; its completion settles, then collapses.
+                owner.collapseWhenAnimationEnds = YES;
+                ApolloLog(@"[NavigationActions] %@ resigned active mid-spring; collapsing when it lands",
+                          NSStringFromClass(owner.controller.class));
+                return;
+            }
+            // Settle without retaining UIKit's transient hidden/alpha state.
+            [owner setExpanded:NO animated:NO];
+        }];
+    return self;
+}
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self.resignObserver];
+    for (UIPanGestureRecognizer *pan in self.pans) [pan removeTarget:self action:@selector(scrolled:)];
+    [self.backGesture removeTarget:self action:@selector(backGestureChanged:)];
+    [self restoreStandardItems];
+}
+- (void)restoreStandardItems {
+    sActionsModelWriteDepth++;
+    for (ApolloNavigationActionsStandardItem *state in self.standardItems) {
+        ApolloActionsSetItemHidden(state.item, state.hidden);
+        [state restoreRailStyleOfItem:state.item];
+        objc_setAssociatedObject(state.item, &kActionsStandardItemKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [self.standardItems removeAllObjects];
+    if (self.moreItem) {
+        ApolloNavigationActionsStandardItem *moreState = objc_getAssociatedObject(self.moreItem, &kActionsStandardMoreKey);
+        [moreState restoreRailStyleOfItem:self.moreItem];
+        objc_setAssociatedObject(self.moreItem, &kActionsStandardMoreKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloActionsSetPrimaryAction(self.moreItem, self.nativePrimaryAction);
+        self.moreItem.menu = self.nativeMenu;
+    }
+    self.moreItem = nil;
+    self.nativeMenu = nil;
+    self.nativePrimaryAction = nil;
+    sActionsModelWriteDepth--;
+}
+- (BOOL)deferGeometryUpdate {
+    for (ApolloNavigationActionsStrip *strip in self.strips) {
+        if (!ApolloNativeActionMenuOwnsNavigationSurface(strip.surface)) continue;
+        if (!self.geometryDeferred) {
+            self.geometryDeferred = YES;
+            __weak typeof(self) weakSelf = self;
+            ApolloNativeActionMenuDeferNavigationUpdate(strip.surface, @"navigation-actions.geometry", ^{
+                ApolloNavigationActionsOwner *owner = weakSelf;
+                if (!owner) return;
+                owner.geometryDeferred = NO;
+                // Setters may run during the menu; use the latest items on release.
+                [owner prepareItems:owner.item.rightBarButtonItems];
+                // A spring may have finished during native ownership; publish
+                // its final width and remove held glyph animations as well.
+                [owner settleAnimationIfNeeded];
+            });
+        }
+        return YES;
+    }
+    return NO;
+}
+- (void)prepareItems:(NSArray<UIBarButtonItem *> *)items {
+    if (self.preparing) return;
+    // Search and the host's List/Split/Layout buttons are independent native
+    // controls, never members of Apollo's expandable More action group.
+    items = ApolloActionsWithoutDuoFeedControls(self.item, items);
+    BOOL collapse = [self collapseEnabled];
+    // Freeze all geometry and icon cleanup while UIKit owns the surface,
+    // including late action insertion and overlapping menu sessions.
+    if ([self deferGeometryUpdate]) return;
+    // A collapsed native Duo group intentionally publishes only its More
+    // item. Lifecycle refreshes must not mistake that presentation model for
+    // a replacement and discard the retained actions needed to expand again.
+    // The rail can be detached while a fold reparents this page. This is
+    // still our collapsed model during that interval; testing rail geometry
+    // here discarded the retained actions, then stripped the lone disclosure
+    // on the next refresh, leaving Inbox with no buttons at all.
+    if (self.moreItem && !self.expanded
+        && self.standardItems.count > 0 && items.count == 1
+        && items.firstObject == self.moreItem) {
+        if (self.collapsePreference != collapse) {
+            self.collapsePreference = collapse;
+            [self setExpanded:!collapse animated:NO];
+        }
+        return;
+    }
+    self.preparing = YES;
+    for (UIBarButtonItem *item in items) {
+        if (item.action == @selector(cancelBarButtonItemTappedWithSender:) &&
+            [NSStringFromClass(self.controller.class) isEqualToString:@"Apollo.PostsViewController"]) {
+            // Search replaces these actions in the same update. Settle the old
+            // strip now so dismissal restores it collapsed, without a second spring.
+            [self setExpanded:NO animated:NO];
+            break;
+        }
+    }
+    BOOL retargetAnimation = NO;
+    NSMutableArray *strips = [NSMutableArray array];
+    ApolloNavigationActionsControllerBox *controllerBox = objc_getAssociatedObject(self.item, &kActionsControllerKey);
+    NSString *controllerClass = NSStringFromClass(controllerBox.controller.class);
+    BOOL approvedSubmitters = [controllerClass isEqualToString:@"Apollo.ModeratorApprovedSubmittersViewController"];
+    for (UIBarButtonItem *item in items) {
+        // Legacy Done buttons become filled/prominent on Liquid Glass.
+        if (ApolloActionsUsesPlainSubmitStyle(item) && item.style != UIBarButtonItemStylePlain) {
+            item.style = UIBarButtonItemStylePlain;
+        }
+        if (ApolloActionsUsesPlainSubmitStyle(item)) {
+            for (NSNumber *stateValue in @[@(UIControlStateNormal), @(UIControlStateDisabled)]) {
+                UIControlState state = stateValue.unsignedIntegerValue;
+                NSMutableDictionary *attributes = [[item titleTextAttributesForState:state] mutableCopy]
+                    ?: [NSMutableDictionary dictionary];
+                UIColor *color = ApolloActionsButtonColor();
+                if (state == UIControlStateDisabled) color = [color colorWithAlphaComponent:0.45];
+                if (![attributes[NSForegroundColorAttributeName] isEqual:color]) {
+                    attributes[NSForegroundColorAttributeName] = color;
+                    [item setTitleTextAttributes:attributes forState:state];
+                }
+            }
+        }
+        BOOL duoSubredditsDone = NO;
+        if (@available(iOS 26.0, *)) {
+            duoSubredditsDone = controllerBox.controller.isEditing
+                && [item.identifier isEqualToString:@"ApolloReborn.subreddits.edit"];
+        }
+        NSString *editingControllerClass = NSStringFromClass(controllerBox.controller.class);
+        BOOL blueDone = duoSubredditsDone || (controllerBox.controller.isEditing &&
+            ([editingControllerClass isEqualToString:@"Apollo.RedditListViewController"] ||
+             [editingControllerClass isEqualToString:@"ApolloSettingsShortcutsViewController"] ||
+             [editingControllerClass isEqualToString:@"Apollo.SettingsFiltersViewController"]));
+        objc_setAssociatedObject(item, &kActionsBlueDoneKey, @(blueDone), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        BOOL accentSubmit = ApolloActionsUsesAccentSubmitStyle(item);
+        if (accentSubmit && !objc_getAssociatedObject(item, &kActionsAccentSubmitKey)) {
+            ApolloLog(@"[NavigationActions] Accent-filled compose submit on %@ (target %@ action %@)",
+                NSStringFromClass(self.controller.class), NSStringFromClass([item.target class]),
+                NSStringFromSelector(item.action));
+        }
+        objc_setAssociatedObject(item, &kActionsAccentSubmitKey, @(accentSubmit), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // The comment composer's Post arrives plain; fill it like the others.
+        if (@available(iOS 26.0, *)) {
+            if (accentSubmit && IsLiquidGlass() && item.style != UIBarButtonItemStyleProminent) {
+                item.style = UIBarButtonItemStyleProminent;
+            }
+        }
+        ApolloActionsPinChrome(item);
+        UIImage *image = ApolloActionsTemplateImage(item.image);
+        if (ApolloActionsHasTrailingTabRail() && ApolloActionsModeratorItem(item)
+            && fabs(image.alignmentRectInsets.left - 2.0) > 0.1) {
+            // Apollo's shield asset has slightly heavier transparent space on
+            // its left edge. Center its visible artwork in the native pill.
+            image = [image imageWithAlignmentRectInsets:UIEdgeInsetsMake(0.0, 2.0, 0.0, 0.0)];
+        }
+        if (image != item.image) item.image = image;
+        UIView *source = ApolloNavigationActionsContentView(item);
+        if (approvedSubmitters) ApolloActionsPrepareApprovedContent(source);
+        ApolloActionsApplyChromeToView(source, blueDone);
+        ApolloNavigationActionsStrip *strip = [item.customView isKindOfClass:ApolloNavigationActionsStrip.class]
+            ? (id)item.customView : nil;
+        UIButton *more = strip.more ?: ApolloActionsFindMore(source);
+        if (!strip && more && ApolloActionsControlCount(source) > 1) {
+            // Apollo rebuilds its container using the same buttons on return.
+            // Keep the displayed surface alive while UIKit hands off the item.
+            for (ApolloNavigationActionsStrip *existing in self.strips) {
+                if (existing.more == more) { strip = existing; break; }
+            }
+            if (strip) {
+                [strip removeIconAnimations];
+                [strip.content removeFromSuperview];
+                strip.content = source;
+                strip.originalAccessibilityHidden = source.accessibilityElementsHidden;
+            } else {
+                strip = [[ApolloNavigationActionsStrip alloc] initWithContent:source more:more];
+            }
+            if (ApolloDuoSplitIsUnfoldedPortrait() && !self.animator) {
+                // The constructor starts at the collapsed 44pt width. Publish
+                // the actual width BEFORE UIKit adopts the custom view: the
+                // Duo host caches that first size when reserving the trailing
+                // status region. Expanding only the intrinsic constraint later
+                // lets a wider capsule overflow its original host allocation.
+                strip.owner = self;
+                strip.barItem = item;
+                [strip applyExpanded:self.expanded];
+                [strip publishSize];
+                if (@available(iOS 27.1, *)) {
+                    item.axisBehavior = UIBarButtonItemAxisBehaviorHorizontalOnly;
+                }
+            }
+            item.customView = strip;
+            // setCustomView: detaches the old view even if reparented; adopt it afterward.
+            [strip.surface.contentView addSubview:source];
+            // Hide the item's default glass, not ancestor views, to avoid double glass.
+            if (@available(iOS 26.0, *)) item.hidesSharedBackground = YES;
+            // Match native transitions without sharing views between pages.
+            if (@available(iOS 26.0, *)) {
+                if (!item.identifier) item.identifier = @"ApolloReborn.navigation-actions";
+            }
+            ApolloLog(@"[NavigationActions] Installed native item strip on %@", NSStringFromClass(self.controller.class));
+        }
+        if (strip) {
+            strip.owner = self;
+            strip.barItem = item;
+            if (ApolloDuoSplitIsUnfoldedPortrait()) {
+                // Restoring an existing strip skips the constructor path
+                // above. Normalize its axis before UIKit refits the group
+                // beside the portrait status region as well.
+                if (@available(iOS 27.1, *)) {
+                    if (item.axisBehavior != UIBarButtonItemAxisBehaviorHorizontalOnly) {
+                        item.axisBehavior = UIBarButtonItemAxisBehaviorHorizontalOnly;
+                    }
+                }
+            }
+            CGFloat previousWidth = strip.expandedWidth;
+            CGFloat previousMoreMidX = strip.moreMidX;
+            if (!self.animator) {
+                [strip applyExpanded:self.expanded];
+                // Animate late slots from the current pill/title presentation,
+                // rather than publishing the new width immediately.
+                if (self.expanded && fabs(previousWidth - strip.expandedWidth) > 0.01) {
+                    self.needsGeometryTransition = YES;
+                    retargetAnimation = YES;
+                } else {
+                    // Also settle an existing strip returning from the rail.
+                    // Keep item.width, bounds and intrinsic size identical so
+                    // UIKit positions the entire tight group before the status.
+                    if (ApolloDuoSplitIsUnfoldedPortrait()) [strip publishSize];
+                    [strip displayExpanded:self.expanded];
+                }
+            } else {
+                [strip remeasure];
+                retargetAnimation |= fabs(previousWidth - strip.expandedWidth) > 0.01 ||
+                    fabs(previousMoreMidX - strip.moreMidX) > 0.01 || ![self.strips containsObject:strip];
+            }
+            [strips addObject:strip];
+        }
+    }
+    retargetAnimation |= self.animator && self.strips.count != strips.count;
+    // Buttons may move to a new container while UIKit retains the outgoing strip.
+    // Remove their old effects immediately.
+    for (ApolloNavigationActionsStrip *oldStrip in self.strips) {
+        if (![strips containsObject:oldStrip]) [oldStrip removeIconAnimations];
+    }
+    self.strips = strips;
+    // Non-custom items use item.hidden; lone actions and pages without More stay native.
+    UIBarButtonItem *more = items.firstObject;
+    BOOL standard = strips.count == 0 && items.count > 1 && !more.customView &&
+        (ApolloActionsMoreName(more.accessibilityLabel) || ApolloActionsMoreName(NSStringFromSelector(more.action)));
+    BOOL same = standard && more == self.moreItem && self.standardItems.count == items.count - 1;
+    if (same) {
+        for (NSUInteger i = 1; i < items.count; i++) if (self.standardItems[i - 1].item != items[i]) same = NO;
+    }
+    if (!same) {
+        [self restoreStandardItems];
+        if (standard) {
+            self.moreItem = more;
+            self.nativeMenu = more.menu;
+            self.nativePrimaryAction = more.primaryAction;
+            ApolloNavigationActionsStandardItem *moreState = [ApolloNavigationActionsStandardItem new];
+            moreState.item = more; moreState.owner = self;
+            objc_setAssociatedObject(more, &kActionsStandardMoreKey, moreState, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            for (NSUInteger i = 1; i < items.count; i++) {
+                ApolloNavigationActionsStandardItem *state = [ApolloNavigationActionsStandardItem new];
+                state.item = items[i]; state.owner = self; state.hidden = ApolloActionsItemHidden(items[i]);
+                objc_setAssociatedObject(items[i], &kActionsStandardItemKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [self.standardItems addObject:state];
+            }
+            if (@available(iOS 26.0, *)) {
+                if (!more.identifier) more.identifier = @"ApolloReborn.navigation-actions";
+            }
+            if (ApolloActionsHasTrailingTabRail()) {
+                [moreState applyRailStyleToItem:more];
+                for (ApolloNavigationActionsStandardItem *state in self.standardItems) {
+                    [state applyRailStyleToItem:state.item];
+                }
+            }
+            [self applyStandardExpanded:self.expanded];
+        }
+    } else if (!ApolloActionsHasTrailingTabRail()) {
+        // Same items, but the rail is gone (unfolded to portrait): drop the
+        // vertical rail styling so they lay out as ordinary bar items again.
+        ApolloNavigationActionsStandardItem *moreState = objc_getAssociatedObject(self.moreItem, &kActionsStandardMoreKey);
+        [moreState restoreRailStyleOfItem:self.moreItem];
+        for (ApolloNavigationActionsStandardItem *state in self.standardItems) {
+            [state restoreRailStyleOfItem:state.item];
+        }
+    }
+    // Keep preparation guarded while publishing size: UIKit synchronously
+    // re-enters the item setters, which otherwise retarget the same expansion.
+    if (self.collapsePreference != collapse) {
+        self.collapsePreference = collapse;
+        [self setExpanded:!collapse animated:NO];
+    } else if (!collapse && !self.expanded) [self setExpanded:YES animated:NO];
+    else if (retargetAnimation) [self setExpanded:self.expanded animated:YES];
+    // prepareItems: runs both before and after UINavigationItem's original
+    // setter. Publishing the collapsed model while handling the first call is
+    // overwritten when that outer setter resumes. Reassert the desired model
+    // here on the post-setter pass as well, so the final state is @[More]
+    // whenever the collapse preference is enabled.
+    NSArray<UIBarButtonItem *> *duoVisibleItems = nil;
+    if (self.moreItem && self.strips.count == 0 && ApolloActionsHasTrailingTabRail()) {
+        duoVisibleItems = [self duoStandardItemsForExpanded:self.expanded];
+    }
+    self.preparing = NO;
+    if (duoVisibleItems &&
+        !ApolloActionsArraysIdentical(self.item.rightBarButtonItems, duoVisibleItems)) {
+        self.preparing = YES;
+        [self.item setRightBarButtonItems:duoVisibleItems animated:NO];
+        self.preparing = NO;
+    }
+    if (self.expanded) [self watchScrollViews];
+}
+- (void)applyStandardExpanded:(BOOL)expanded {
+    sActionsModelWriteDepth++;
+    BOOL nativeDuo = self.moreItem && self.strips.count == 0 && ApolloActionsHasTrailingTabRail();
+    for (ApolloNavigationActionsStandardItem *state in self.standardItems) {
+        // The native Duo path changes the navigation item's membership. Keep
+        // included actions visible so UIKit can animate them into the shared
+        // vertical glass; ordinary phones still collapse through item.hidden.
+        ApolloActionsSetItemHidden(state.item, state.hidden || (!nativeDuo && !expanded));
+    }
+    UIBarButtonItem *more = self.moreItem;
+    if (more) {
+        if (expanded) {
+            ApolloActionsSetPrimaryAction(more, self.nativePrimaryAction);
+            more.menu = self.nativeMenu;
+        } else {
+            UIImage *image = more.image;
+            NSString *title = more.title;
+            __weak typeof(self) weakSelf = self;
+            more.menu = nil;
+            ApolloActionsSetPrimaryAction(more, [UIAction actionWithTitle:title ?: @"" image:image identifier:nil
+                handler:^(__unused UIAction *action) { [weakSelf setExpanded:YES animated:YES]; }]);
+        }
+    }
+    sActionsModelWriteDepth--;
+}
+- (NSArray<UIBarButtonItem *> *)duoStandardItemsForExpanded:(BOOL)expanded {
+    if (!self.moreItem) return @[];
+    NSMutableArray<UIBarButtonItem *> *items = [NSMutableArray array];
+    for (UIBarButtonItem *candidate in self.item.rightBarButtonItems) {
+        if (ApolloActionsIsDuoFeedControl(self.item, candidate)) [items addObject:candidate];
+    }
+    [items addObject:self.moreItem];
+    if (expanded) {
+        for (ApolloNavigationActionsStandardItem *state in self.standardItems) {
+            if (!state.hidden) [items addObject:state.item];
+        }
+    }
+    return items;
+}
+- (void)setExpanded:(BOOL)expanded animated:(BOOL)animated {
+    // All collapse entry points share the per-page policy.
+    if (![self collapseEnabled]) expanded = YES;
+    if (self.expanded == expanded && !self.animator && !self.needsGeometryTransition &&
+        !self.needsAnimationSettlement) return;
+    if (!expanded) {
+        __weak typeof(self) weakSelf = self;
+        for (ApolloNavigationActionsStrip *strip in self.strips) {
+            if (ApolloNativeActionMenuDeferNavigationCollapse(strip.surface, ^{
+                ApolloNavigationActionsOwner *owner = weakSelf;
+                BOOL visible = owner.controller.navigationController.navigationBar.topItem == owner.item;
+                // A final pan Changed may already have started collapse; don't restart it.
+                if (owner.expanded) [owner setExpanded:NO animated:animated && visible];
+            })) return;
+        }
+    } else {
+        for (ApolloNavigationActionsStrip *strip in self.strips) {
+            __weak typeof(self) weakSelf = self;
+            if (ApolloNativeActionMenuDeferNavigationUpdate(strip.surface, @"navigation-actions.expansion", ^{
+                ApolloNavigationActionsOwner *owner = weakSelf;
+                BOOL visible = owner.controller.navigationController.navigationBar.topItem == owner.item;
+                [owner setExpanded:YES animated:animated && visible];
+            })) return;
+        }
+    }
+    self.needsGeometryTransition = NO;
+    // Supersede deferred settlement so it cannot snap or clean up this new transition.
+    self.needsAnimationSettlement = NO;
+    // A newer transition also replaces a collapse the resign observer deferred.
+    self.collapseWhenAnimationEnds = NO;
+    // Reversals begin from presentation state, not a guessed endpoint.
+    UIViewPropertyAnimator *previous = self.animator;
+    BOOL entering = !self.expanded || previous != nil;
+    self.animator = nil;
+    [previous stopAnimation:NO];
+    [previous finishAnimationAtPosition:UIViewAnimatingPositionCurrent];
+    if (self.strips.count == 0 && !self.moreItem) {
+        self.expanded = ![self collapseEnabled];
+        return;
+    }
+    UINavigationBar *bar = self.controller.navigationController.navigationBar;
+    // Resetting an outgoing item must not move or lay out the new page's title.
+    if (bar.topItem != self.item) bar = nil;
+    [bar layoutIfNeeded];
+    BOOL nativeDuo = self.moreItem && self.strips.count == 0 && ApolloActionsHasTrailingTabRail();
+    if (!nativeDuo) ApolloNavigationTitleActionsWillChange(bar);
+    self.expanded = expanded;
+    if (self.moreItem && self.strips.count == 0 && ApolloActionsHasTrailingTabRail()) {
+        // These are native items in UIKit's trailing vertical bar. Change the
+        // actual item membership, as Apollo's regular-phone Inbox does, so
+        // UIKit owns the insertion/removal and stretches one shared glass pill
+        // vertically. Re-publishing the same array with hidden flags does not
+        // produce the native Liquid Glass morph.
+        [self applyStandardExpanded:expanded];
+        NSArray<UIBarButtonItem *> *items = [self duoStandardItemsForExpanded:expanded];
+        self.preparing = YES;
+        [self.item setRightBarButtonItems:items
+                                animated:animated && bar.window &&
+                                         !UIAccessibilityIsReduceMotionEnabled()];
+        self.preparing = NO;
+        [bar setNeedsLayout];
+        // Do not call the horizontal title-centering completion here. It
+        // forces the entire bar through layoutIfNeeded inside
+        // performWithoutAnimation, swallowing UIKit's pending native glass
+        // morph whenever the title is visible (the first, unscrolled load).
+        // Duo's title stays centered independently of its vertical actions.
+        if (expanded) [self watchScrollViews];
+        ApolloLog(@"[NavigationActions] %@ %@ with native Duo glass transition",
+                  NSStringFromClass(self.controller.class),
+                  expanded ? @"expanded" : @"collapsed");
+        return;
+    }
+    if (animated && bar.window && !UIAccessibilityIsReduceMotionEnabled()) {
+        // Reserve hit-test space before reveal; shrink it only after collapse.
+        // Glass and content share a lightly underdamped spring, keeping More
+        // pinned throughout the bounce without exposing the host's width jump.
+        CASpringAnimation *spring = ApolloActionsSpring(nil);
+        UISpringTimingParameters *timing = [[UISpringTimingParameters alloc] initWithMass:spring.mass
+            stiffness:spring.stiffness damping:spring.damping initialVelocity:CGVectorMake(0, 0)];
+        UIViewPropertyAnimator *animator = [[UIViewPropertyAnimator alloc] initWithDuration:kActionsAnimationDuration
+            timingParameters:timing];
+        self.animator = animator;
+        if (expanded) [UIView performWithoutAnimation:^{ [self publishExpandedState]; }];
+        [animator addAnimations:^{
+            for (ApolloNavigationActionsStrip *strip in self.strips) [strip displayExpanded:expanded];
+            [self applyStandardExpanded:expanded];
+        }];
+        __weak typeof(self) weakSelf = self;
+        __weak UIViewPropertyAnimator *weakAnimator = animator;
+        [animator addCompletion:^(__unused UIViewAnimatingPosition position) {
+            ApolloNavigationActionsOwner *owner = weakSelf;
+            if (!owner || owner.animator != weakAnimator) return;
+            owner.animator = nil;
+            // A menu may acquire the source mid-spring; defer the entire settlement.
+            owner.needsAnimationSettlement = YES;
+            [owner settleAnimationIfNeeded];
+            if (owner.collapseWhenAnimationEnds) {
+                // The app resigned active mid-spring; apply that collapse now.
+                owner.collapseWhenAnimationEnds = NO;
+                [owner setExpanded:NO animated:NO];
+            }
+        }];
+        [animator startAnimation];
+        for (ApolloNavigationActionsStrip *strip in self.strips) [strip animateIconsExpanded:expanded entering:entering];
+        ApolloNavigationTitleActionsDidChange(bar, spring);
+    } else {
+        self.needsAnimationSettlement = YES;
+        [UIView performWithoutAnimation:^{
+            [self settleAnimationIfNeeded];
+            [self applyStandardExpanded:expanded];
+        }];
+        ApolloNavigationTitleActionsDidChange(bar, nil);
+    }
+    if (expanded) [self watchScrollViews];
+    ApolloLog(@"[NavigationActions] %@ %@", NSStringFromClass(self.controller.class), expanded ? @"expanded" : @"collapsed");
+}
+- (void)publishExpandedState {
+    if ([self deferGeometryUpdate]) return;
+    for (ApolloNavigationActionsStrip *strip in self.strips) {
+        [strip applyExpanded:self.expanded];
+        [strip publishSize];
+    }
+    // iOS 27's SwiftUI host caches custom-item width until the navigation model
+    // changes. Reuse current identities, including any late native replacement.
+    // During item replacement the caller is about to publish the new array.
+    // Republishing the outgoing array here lets translation upkeep pull the
+    // globe out of its new search host and merge it back into the old strip.
+    if (!self.preparing) {
+        [self.item setRightBarButtonItems:self.item.rightBarButtonItems animated:NO];
+    }
+    UINavigationBar *bar = self.controller.navigationController.navigationBar;
+    if (bar.topItem != self.item) return; // Never drive the page we navigated to.
+    [bar setNeedsLayout];
+    [bar layoutIfNeeded];
+}
+- (void)settleAnimationIfNeeded {
+    if (!self.needsAnimationSettlement || self.animator || [self deferGeometryUpdate]) return;
+    self.needsAnimationSettlement = NO;
+    [UIView performWithoutAnimation:^{
+        // Queued updates may replace items or start a spring; use live state.
+        [self publishExpandedState];
+        if (self.animator) return;
+        // Publishing can synchronously open another menu; defer cleanup again.
+        if ([self deferGeometryUpdate]) {
+            self.needsAnimationSettlement = YES;
+            return;
+        }
+        for (ApolloNavigationActionsStrip *strip in self.strips) {
+            [strip displayExpanded:self.expanded];
+            [strip removeIconAnimations];
+        }
+    }];
+}
+- (void)watchScrollViews {
+    if (!self.controller.isViewLoaded) return;
+    UIGestureRecognizer *backGesture = self.controller.navigationController.interactivePopGestureRecognizer;
+    if (backGesture != self.backGesture) {
+        [self.backGesture removeTarget:self action:@selector(backGestureChanged:)];
+        self.backGesture = backGesture;
+        [backGesture addTarget:self action:@selector(backGestureChanged:)];
+    }
+    UIView *root = self.controller.view;
+    if (root == self.scrollRegistrationRoot) return;
+    // Scan once per page; attachment hooks register later scroll views.
+    // Expanding must not rescan loaded post/comment cells.
+    for (UIPanGestureRecognizer *pan in self.pans.allObjects) {
+        ApolloActionsSetScrollOwner(pan, nil);
+    }
+    [self.pans removeAllObjects];
+    self.scrollRegistrationRoot = root;
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:root];
+    for (NSUInteger i = 0; i < queue.count; i++) {
+        UIView *view = queue[i];
+        if ([view isKindOfClass:UIScrollView.class]) {
+            ApolloActionsUpdateScrollOwner((UIScrollView *)view);
+        }
+        [queue addObjectsFromArray:view.subviews];
+    }
+}
+- (void)scrolled:(UIPanGestureRecognizer *)pan {
+    if (self.expanded && (pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged)) {
+        [self setExpanded:NO animated:YES];
+    }
+}
+- (void)backGestureChanged:(UIGestureRecognizer *)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan) ApolloActionsResetBeforeNavigation(self.controller);
+}
+@end
+
+static void ApolloActionsRestoreDuoOverflow(UINavigationItem *item) {
+    if (@available(iOS 16.0, *)) {
+        id owned = objc_getAssociatedObject(item, &kActionsDuoOverflowElementKey);
+        if (owned && item.additionalOverflowItems == owned) item.additionalOverflowItems = nil;
+        sActionsModelWriteDepth++;
+        for (UIBarButtonItem *entry in objc_getAssociatedObject(item, &kActionsDuoOverflowItemsKey)) {
+            NSNumber *nativeHidden = objc_getAssociatedObject(entry, &kActionsDuoOverflowHiddenKey);
+            objc_setAssociatedObject(entry, &kActionsDuoOverflowHiddenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (nativeHidden) entry.hidden = nativeHidden.boolValue;
+        }
+        sActionsModelWriteDepth--;
+        objc_setAssociatedObject(item, &kActionsDuoOverflowItemsKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(item, &kActionsDuoOverflowMenuKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(item, &kActionsDuoOverflowElementKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static UIBarButtonItem *ApolloActionsFindMoreItem(NSArray<UIBarButtonItem *> *items) {
+    UIBarButtonItem *menuFallback = nil;
+    for (UIBarButtonItem *item in items) {
+        if (!item.enabled || ApolloActionsBarItemHidden(item)) continue;
+        if (ApolloActionsMoreName(item.accessibilityLabel) || ApolloActionsMoreName(item.title) ||
+            ApolloActionsMoreName(NSStringFromSelector(item.action)) ||
+            ApolloActionsFindMore(ApolloNavigationActionsContentView(item))) return item;
+        if (!menuFallback && item.menu) menuFallback = item;
+    }
+    return menuFallback;
+}
+
+static void ApolloActionsInvokeItem(UIBarButtonItem *item) API_AVAILABLE(ios(16.0)) {
+    UIButton *button = objc_getAssociatedObject(item, &kActionsDuoSourceButtonKey)
+        ?: ApolloActionsFindMore(ApolloNavigationActionsContentView(item));
+    if (button) [button sendActionsForControlEvents:UIControlEventTouchUpInside];
+    else if (item.primaryAction) [item.primaryAction performWithSender:item target:nil];
+    else if (item.action) [UIApplication.sharedApplication sendAction:item.action to:item.target from:item forEvent:nil];
+}
+
+static UIMenu *ApolloActionsMenuForItem(UIBarButtonItem *item, UIView *source) API_AVAILABLE(ios(16.0)) {
+    UIButton *button = objc_getAssociatedObject(item, &kActionsDuoSourceButtonKey)
+        ?: ApolloActionsFindMore(ApolloNavigationActionsContentView(item));
+    UIMenu *menu = item.menu ?: (button.showsMenuAsPrimaryAction ? button.menu : nil);
+    if (menu) return menu;
+    id captured = ApolloNativeActionMenuCaptureController(source, ^{ ApolloActionsInvokeItem(item); });
+    return captured ? ApolloNativeActionMenuBuildCaptured(captured) : nil;
+}
+
+static NSArray<UIMenuElement *> *ApolloActionsOverflowElements(UINavigationItem *item,
+        UIBarButtonItem *more, UIView *source, ApolloNavigationActionsOwner *owner) API_AVAILABLE(ios(16.0)) {
+    // Inbox's synthetic disclosure publishes sibling commands, not its old toggle.
+    UIMenu *menu = more == owner.inboxDisclosure ? nil : ApolloActionsMenuForItem(more, source);
+    NSMutableArray<UIMenuElement *> *elements = [NSMutableArray array];
+    NSMutableArray<UIMenuElement *> *controls = [NSMutableArray array];
+    for (UIBarButtonItem *entry in ApolloActionsWithoutDuoFeedControls(item, item.rightBarButtonItems)) {
+        if (entry == more || !entry.enabled || ApolloActionsBarItemHidden(entry)) continue;
+        UIButton *button = objc_getAssociatedObject(entry, &kActionsDuoSourceButtonKey);
+        UIMenu *nativeMenu = entry.menu ?: (button.showsMenuAsPrimaryAction ? button.menu : nil);
+        if (nativeMenu) {
+            if (!nativeMenu.title.length && !(nativeMenu.options & UIMenuOptionsDisplayInline)) {
+                nativeMenu = [UIMenu menuWithTitle:ApolloActionsItemTitle(entry) image:entry.image
+                    identifier:nativeMenu.identifier options:nativeMenu.options children:nativeMenu.children];
+            }
+            [controls addObject:nativeMenu];
+        } else if (entry.primaryAction && !button) [controls addObject:entry.primaryAction];
+        else [controls addObject:[UIAction actionWithTitle:ApolloActionsItemTitle(entry)
+            image:entry.image identifier:nil handler:^(__unused UIAction *action) {
+                ApolloActionsInvokeItem(entry);
+            }]];
+    }
+    if (controls.count) [elements addObject:[UIMenu menuWithTitle:@"" image:nil identifier:nil
+        options:UIMenuOptionsDisplayInline children:controls]];
+    [elements addObjectsFromArray:menu.children ?: @[]];
+    return elements;
+}
+
+static void ApolloActionsPrepareDuoOverflowMenu(UINavigationItem *item) API_AVAILABLE(ios(16.0)) {
+    if (!ApolloDeviceIsDuo()) return;
+    ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
+    if (!ApolloActionsUsesDuoOverflow(box.controller)) {
+        ApolloActionsRestoreDuoOverflow(item);
+        return;
+    }
+    UIBarButtonItem *more = ApolloActionsFindMoreItem(item.rightBarButtonItems);
+    if (!more) { ApolloActionsRestoreDuoOverflow(item); return; }
+    NSArray *controls = ApolloActionsWithoutDuoFeedControls(item, item.rightBarButtonItems);
+    NSArray *previous = objc_getAssociatedObject(item, &kActionsDuoOverflowItemsKey);
+    if (!ApolloActionsArraysIdentical(controls, previous)) ApolloActionsRestoreDuoOverflow(item);
+    for (UIBarButtonItem *entry in controls) {
+        if (!objc_getAssociatedObject(entry, &kActionsDuoOverflowHiddenKey)) {
+            objc_setAssociatedObject(entry, &kActionsDuoOverflowHiddenKey,
+                @(ApolloActionsBarItemHidden(entry)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        sActionsModelWriteDepth++;
+        if (!entry.hidden) entry.hidden = YES;
+        sActionsModelWriteDepth--;
+    }
+    objc_setAssociatedObject(item, &kActionsDuoOverflowItemsKey, controls, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (objc_getAssociatedObject(item, &kActionsDuoOverflowMenuKey) == more &&
+        item.additionalOverflowItems == objc_getAssociatedObject(item, &kActionsDuoOverflowElementKey)) return;
+    __weak UIViewController *weakController = box.controller;
+    __weak UINavigationItem *weakItem = item;
+    __weak UIBarButtonItem *weakMore = more;
+    // additionalOverflowItems supplies the actual overflow contents even
+    // for legacy rightBarButtonItems; hidden originals retain their model.
+    UIDeferredMenuElement *element = [UIDeferredMenuElement elementWithUncachedProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+        UIViewController *controller = weakController;
+        id anchor = weakItem.overflowPresentationSource;
+        UIView *source = [anchor isKindOfClass:UIView.class] ? anchor :
+            ([anchor isKindOfClass:UIBarButtonItem.class] ? ApolloNavigationActionsContentView(anchor) : nil);
+        if (!source.window) source = controller.viewIfLoaded;
+        if (!source.window || !weakItem || !weakMore) { completion(@[]); return; }
+        completion(ApolloActionsOverflowElements(weakItem, weakMore, source, ApolloActionsOwner(weakItem, NO)));
+    }];
+    item.additionalOverflowItems = element;
+    objc_setAssociatedObject(item, &kActionsDuoOverflowElementKey, element, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(item, &kActionsDuoOverflowMenuKey, more, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloActionsPrepare(UINavigationItem *item, NSArray *items) {
+    if (!IsLiquidGlass()) return;
+    ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
+    if (!box.controller || !ApolloActionsAppController(box.controller)) return;
+    if (ApolloDuoSplitSuppressesFeedActions(box.controller)) {
+        ApolloActionsRestoreDuoOverflow(item);
+        return;
+    }
+    NSArray *nativeItems = ApolloActionsDuoNativeItems(item, items);
+    nativeItems = ApolloActionsInboxItems(item, nativeItems);
+    if (!ApolloActionsArraysIdentical(items, nativeItems)) {
+        [item setRightBarButtonItems:nativeItems animated:NO];
+        return;
+    }
+    [ApolloActionsOwner(item, YES) prepareItems:items];
+    if (@available(iOS 16.0, *)) ApolloActionsPrepareDuoOverflowMenu(item);
+}
+
+// Settle Inbox's native floating group before UIKit captures the outgoing
+// navigation chrome. The item setter's animated:NO alone does not suppress
+// the SwiftUI host's pending glass/layout animation on the Duo.
+static void ApolloActionsResetBeforeNavigation(UIViewController *controller) {
+    ApolloNavigationActionsOwner *owner = ApolloActionsOwner(controller.navigationItem, NO);
+    if (owner.expanded && owner.inboxDisclosure && owner.strips.count == 0 &&
+        ApolloActionsHasTrailingTabRail()) {
+        [UIView performWithoutAnimation:^{
+            [owner setExpanded:NO animated:NO];
+            [controller.tabBarController.view layoutIfNeeded];
+            [controller.navigationController.view layoutIfNeeded];
+        }];
+    } else {
+        [owner setExpanded:NO animated:NO];
+    }
+}
+
+static NSArray<UIBarButtonItem *> *ApolloActionsPresentedItems(UINavigationItem *item, NSArray<UIBarButtonItem *> *items) {
+    ApolloNavigationActionsControllerBox *feedBox = objc_getAssociatedObject(item, &kActionsControllerKey);
+    if (ApolloDuoSplitSuppressesFeedActions(feedBox.controller)) {
+        // Duo hides Apollo's feed actions while comments share the display,
+        // while keeping the host's independent feed controls available.
+        NSMutableArray<UIBarButtonItem *> *searchItems = [NSMutableArray array];
+        if (@available(iOS 27.0, *)) {
+            UIBarButtonItem *search = item.searchBarPlacementBarButtonItem;
+            for (UIBarButtonItem *candidate in items) {
+                if (candidate == search || ApolloActionsIsDuoFeedControl(item, candidate))
+                    [searchItems addObject:candidate];
+            }
+        }
+        return searchItems;
+    }
+    ApolloNavigationActionsOwner *owner = ApolloActionsOwner(item, NO);
+    if (owner.moreItem == owner.inboxDisclosure && owner.standardItems.count &&
+        [items containsObject:owner.moreItem] && ApolloActionsHasTrailingTabRail()) {
+        // Pass the final collapsed model through the outer UIKit setter too.
+        // A reentrant correction alone can leave its first rendered snapshot
+        // showing the expanded array supplied by Apollo.
+        return [owner duoStandardItemsForExpanded:owner.expanded];
+    }
+    return items;
+}
+
+static char kActionsLeadingAccentKey;
+
+// Leading items (the Subreddits list's +) are not otherwise pinned: glass draws
+// an untinted item in the label color. While Accent Navigation Buttons is on
+// they are pinned like the trailing actions; turning it off unpins only the
+// items pinned here. Custom views keep their own styling.
+void ApolloNavigationActionsAccentItem(UIBarButtonItem *item) {
+    if (!item || !IsLiquidGlass() || item.customView) return;
+    BOOL marked = [objc_getAssociatedObject(item, &kActionsLeadingAccentKey) boolValue];
+    if (sAccentNavigationButtons) {
+        if (!marked && objc_getAssociatedObject(item, &kActionsChromeKey)) return;   // pinned elsewhere
+        objc_setAssociatedObject(item, &kActionsLeadingAccentKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloActionsPinChrome(item);
+    } else if (marked) {
+        objc_setAssociatedObject(item, &kActionsLeadingAccentKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(item, &kActionsChromeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [sActionsPinned removeObject:item];
+        item.tintColor = nil;
+    }
+}
+
+static void ApolloActionsPrepareLeadingItems(UIViewController *controller) {
+    if (!IsLiquidGlass() || !controller || !ApolloActionsAppController(controller)) return;
+    for (UIBarButtonItem *item in controller.navigationItem.leftBarButtonItems) ApolloNavigationActionsAccentItem(item);
+}
+
+void ApolloNavigationActionsRefresh(UINavigationBar *bar) {
+    if (!bar || !IsLiquidGlass() || [objc_getAssociatedObject(bar, &kActionsRefreshKey) boolValue]) return;
+    objc_setAssociatedObject(bar, &kActionsRefreshKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UINavigationBar *weakBar = bar;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UINavigationBar *bar = weakBar;
+        if (!bar) return;
+        objc_setAssociatedObject(bar, &kActionsRefreshKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIViewController *top = ApolloActionsNavigation(bar).topViewController;
+        if (!top || bar.topItem != top.navigationItem) return;
+        ApolloActionsPrepare(top.navigationItem, top.navigationItem.rightBarButtonItems);
+        ApolloActionsPrepareLeadingItems(top);
+    });
+}
+
+static void ApolloActionsCollectNavigationBars(UIView *view, NSMutableArray<UINavigationBar *> *bars) {
+    if ([view isKindOfClass:UINavigationBar.class]) {
+        [bars addObject:(UINavigationBar *)view];
+        return;
+    }
+    for (UIView *subview in view.subviews) ApolloActionsCollectNavigationBars(subview, bars);
+}
+
+static void ApolloActionsUpdateBarButtonAccents(void);
+
+// Re-tints every pinned button (the pins compare and only write on change),
+// then lets each visible bar re-prepare its items, leading ones included.
+static void ApolloActionsRefreshButtonColors(void) {
+    for (id object in sActionsPinned.allObjects) {
+        if (objc_getAssociatedObject(object, &kActionsChromeKey)) ApolloActionsPinChrome(object);
+    }
+    NSMutableArray<UINavigationBar *> *bars = [NSMutableArray array];
+    for (UIWindow *window in ApolloAllWindows()) ApolloActionsCollectNavigationBars(window, bars);
+    for (UINavigationBar *bar in bars) ApolloNavigationActionsRefresh(bar);
+    ApolloActionsUpdateBarButtonAccents();
+}
+
+void ApolloNavigationActionsSetAccentButtons(BOOL enabled) {
+    if (sAccentNavigationButtons == enabled) return;
+    sAccentNavigationButtons = enabled;
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:UDKeyAccentNavigationButtons];
+    ApolloActionsRefreshButtonColors();
+    [NSNotificationCenter.defaultCenter postNotificationName:ApolloNavigationButtonColorDidChangeNotification object:nil];
+    ApolloLog(@"[NavigationActions] Accent navigation buttons %@", enabled ? @"on" : @"off");
+}
+
+void ApolloNavigationActionsCollapse(UINavigationItem *item) {
+    [ApolloActionsOwner(item, NO) setExpanded:NO animated:NO];
+}
+
+CGRect ApolloNavigationActionsCollapsedFrame(UINavigationBar *bar) {
+    ApolloNavigationActionsOwner *owner = ApolloActionsOwner(bar.topItem, NO);
+    for (ApolloNavigationActionsStrip *strip in owner.strips) {
+        if (![strip isDescendantOfView:bar]) continue;
+        CGRect rect = [strip convertRect:strip.bounds toView:bar];
+        return CGRectMake(CGRectGetMaxX(rect) - 44, CGRectGetMidY(rect) - 22, 44, 44);
+    }
+    if (owner.moreItem) {
+        UIView *view = ApolloNavigationActionsItemViewCandidates(owner.moreItem).lastObject;
+        if ([view isDescendantOfView:bar]) {
+            CGRect rect = [view convertRect:view.bounds toView:bar];
+            return CGRectMake(CGRectGetMidX(rect) - 22, CGRectGetMidY(rect) - 22, 44, 44);
+        }
+    }
+    return CGRectNull;
+}
+
+CGRect ApolloNavigationActionsExpandedFrame(UINavigationBar *bar) {
+    ApolloNavigationActionsOwner *owner = ApolloActionsOwner(bar.topItem, NO);
+    if (!owner.expanded) return CGRectNull;
+    CGRect result = CGRectNull;
+    for (ApolloNavigationActionsStrip *strip in owner.strips) {
+        if (![strip isDescendantOfView:bar]) continue;
+        CGRect rect = [strip convertRect:strip.bounds toView:bar];
+        // Model endpoint, not the spring's per-frame glass width. More is
+        // trailing-anchored in either state, including interrupted collapse.
+        rect = CGRectMake(CGRectGetMaxX(rect) - strip.expandedWidth,
+            CGRectGetMidY(rect) - 22, strip.expandedWidth, 44);
+        result = CGRectIsNull(result) ? rect : CGRectUnion(result, rect);
+    }
+    if (owner.moreItem) {
+        for (UIBarButtonItem *item in owner.item.rightBarButtonItems) {
+            if (ApolloActionsItemHidden(item)) continue;
+            UIView *view = ApolloNavigationActionsItemViewCandidates(item).lastObject;
+            if (![view isDescendantOfView:bar]) continue;
+            CGRect rect = [view convertRect:view.bounds toView:bar];
+            if (CGRectIsEmpty(rect)) continue;
+            result = CGRectIsNull(result) ? rect : CGRectUnion(result, rect);
+        }
+    }
+    return result;
+}
+
+NSArray<UIView *> *ApolloNavigationActionsManagedRoots(UINavigationBar *bar) {
+    ApolloNavigationActionsOwner *owner = ApolloActionsOwner(bar.topItem, NO);
+    if (owner.strips.count == 0 && !owner.moreItem) return @[];
+    return ApolloNavigationActionsDiscoverGroups(bar, bar.topItem);
+}
+
+BOOL ApolloNavigationActionsViewIsStaleForItem(UIView *view, UINavigationItem *item) {
+    if (![view isKindOfClass:ApolloNavigationActionsStrip.class]) return NO;
+    UIBarButtonItem *barItem = ((ApolloNavigationActionsStrip *)view).barItem;
+    return !barItem || !([item.rightBarButtonItems containsObject:barItem] ||
+                         [item.leftBarButtonItems containsObject:barItem]);
+}
+
+// UIKit puts the Back bubble and the vertical actions in one SwiftUI glass
+// container. Its collapse spring briefly joins those two surfaces even though
+// Back never changes. Give the existing native Back control its own native
+// glass surface; keep its chevron, target, accessibility and history menu.
+// Nothing in the Moderator / Sort / More group changes for this fix.
+static void ApolloActionsUpdateBackGlass(UIView *button, UIBarButtonItem *item) {
+    UIVisualEffectView *surface = objc_getAssociatedObject(button, &kActionsDuoBackGlassKey);
+    BOOL isolated = [objc_getAssociatedObject(item, &kActionsDuoBackItemKey) boolValue];
+    if (!isolated) {
+        [surface removeFromSuperview];
+        objc_setAssociatedObject(button, &kActionsDuoBackGlassKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    if (surface) {
+        [button sendSubviewToBack:surface];
+        return;
+    }
+    if (@available(iOS 26.0, *)) {
+        UIGlassEffect *effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+        effect.interactive = YES;
+        surface = [[UIVisualEffectView alloc] initWithEffect:effect];
+        surface.cornerConfiguration = [UICornerConfiguration capsuleConfiguration];
+        surface.userInteractionEnabled = NO;
+        surface.accessibilityElementsHidden = YES;
+        // The native rail has 48pt bubbles around 38pt button content. Use
+        // autoresizing margins so the surface cannot affect button fitting.
+        // Keep this decoration out of the control's Auto Layout fitting size.
+        surface.frame = CGRectMake((button.bounds.size.width - 48.0) / 2.0,
+                                   (button.bounds.size.height - 48.0) / 2.0, 48.0, 48.0);
+        surface.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                                   UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+        [button insertSubview:surface atIndex:0];
+        objc_setAssociatedObject(button, &kActionsDuoBackGlassKey, surface, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[NavigationActions] Isolated native Duo Back glass");
+    }
+}
+
+@interface _UIButtonBarButtonVisualProviderIOS : NSObject
+@property (nonatomic, readonly) UIBarButtonItem *barButtonItem;
+@property (nonatomic, readonly) UIView *backIndicatorView;
+@end
+@interface _UIButtonBarButton : UIView
+@property (nonatomic, readonly) _UIButtonBarButtonVisualProviderIOS *visualProvider;
+@end
+
+// Accent Navigation Buttons on Liquid Glass. UIKit draws bar glyphs (the
+// Back chevron, the Duo's own glass controls) through the same "monochromatic
+// treatment" as the tab icons, which replaces their tint with black or white.
+// While the setting is on, an accented glyph keeps the treatment off so its
+// tint shows; turning it off hands the glyph back to UIKit with the treatment
+// it had (else 2, as on unselected tab icons).
+static char kActionsAccentGlyphKey;       // an image view accented here
+static char kActionsAccentGlyphTintKey;   // ...whose tint was set here
+static char kActionsAccentGlyphPriorTintKey;   // ...the tint it had before the accent (NSNull when inherited)
+static char kActionsAccentGlyphUIKitKey;  // ...and UIKit's treatment before: @[mode, enabled]
+static char kActionsAccentContentKey;     // a control whose glyphs take the accent
+static char kActionsBackButtonKey;        // a _UIButtonBarButton configured as Back
+static BOOL sActionsAccentGlyphApplying;
+static BOOL sActionsHasAccentedControls;   // set once a control is accented; keeps the image view hooks cheap until then
+
+static BOOL ApolloActionsInAccentedControl(UIView *view) {
+    if (!sActionsHasAccentedControls) return NO;
+    NSInteger depth = 0;
+    for (UIView *ancestor = view.superview; ancestor && depth < 6; ancestor = ancestor.superview, depth++) {
+        if ([objc_getAssociatedObject(ancestor, &kActionsAccentContentKey) boolValue]) return YES;
+    }
+    return NO;
+}
+
+static BOOL ApolloActionsGlyphIsAccented(UIImageView *imageView) {
+    if (!sAccentNavigationButtons) return NO;
+    if ([objc_getAssociatedObject(imageView, &kActionsAccentGlyphKey) boolValue]) return YES;
+    // A glyph UIKit rebuilds inside an accented control (a new button configuration).
+    if (!ApolloActionsInAccentedControl(imageView)) return NO;
+    objc_setAssociatedObject(imageView, &kActionsAccentGlyphKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+// UIKit picks a glyph's treatment while the glyph is already accented (a button
+// built after the setting was on), and the hooks below then override it, so the
+// stock values would never be seen. Keep what UIKit asked for, to hand it back
+// when the setting turns off.
+static void ApolloActionsRecordUIKitTreatment(UIImageView *glyph, NSNumber *mode, NSNumber *enabled) {
+    NSArray *current = objc_getAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey);
+    NSNumber *newMode = mode ?: current[0] ?: @2;
+    NSNumber *newEnabled = enabled ?: current[1] ?: @YES;
+    objc_setAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey, @[ newMode, newEnabled ], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// With setTint, the glyph itself takes the accent (the Back chevron otherwise
+// inherits the bar's tint); a control that already draws in it passes NO.
+static void ApolloActionsSetGlyphAccent(UIImageView *glyph, UIColor *accent, BOOL setTint) {
+    SEL suppressSel = @selector(_setSuppressMonochromaticTreatment:);
+    SEL enableSel = @selector(_setEnableMonochromaticTreatment:);
+    SEL modeSel = @selector(_setMonochromaticTreatment:);
+    if (![glyph respondsToSelector:modeSel]) return;
+    BOOL on = accent != nil;
+    BOOL wasAccented = [objc_getAssociatedObject(glyph, &kActionsAccentGlyphKey) boolValue];
+    SEL modeGet = @selector(_monochromaticTreatment), enableGet = @selector(_enableMonochromaticTreatment);
+    if (on && !wasAccented && [glyph respondsToSelector:modeGet] && [glyph respondsToSelector:enableGet]) {
+        NSArray *uikit = @[ @(((long long (*)(id, SEL))objc_msgSend)(glyph, modeGet)),
+                            @(((BOOL (*)(id, SEL))objc_msgSend)(glyph, enableGet)) ];
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey, uikit, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSArray *uikit = on ? nil : objc_getAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey);
+    int64_t restoredMode = uikit ? [uikit[0] longLongValue] : 2;
+    // Always enabled: while a glyph is accented our own overrides turn the flag off, so
+    // a value read from it afterwards is ours, not UIKit's. Bar glyphs are enabled in stock.
+    BOOL restoredEnabled = YES;
+    if (!on) objc_setAssociatedObject(glyph, &kActionsAccentGlyphUIKitKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(glyph, &kActionsAccentGlyphKey, on ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    sActionsAccentGlyphApplying = YES;
+    if (on && setTint) {
+        if (![objc_getAssociatedObject(glyph, &kActionsAccentGlyphTintKey) boolValue]) {
+            // Remember what the chevron drew in before the accent. A chevron that
+            // only inherited its parent's tint goes back to inheriting; one UIKit
+            // or the Duo rail tinted itself (black, not the rail's blue) gets that
+            // color back. Clearing it blindly turned the Duo rail's Back blue.
+            UIColor *prior = glyph.tintColor;
+            BOOL inherited = !prior || [prior isEqual:glyph.superview.tintColor];
+            objc_setAssociatedObject(glyph, &kActionsAccentGlyphPriorTintKey, inherited ? (id)NSNull.null : prior,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (glyph.tintColor != accent) glyph.tintColor = accent;
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphTintKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if (!on && [objc_getAssociatedObject(glyph, &kActionsAccentGlyphTintKey) boolValue]) {
+        id prior = objc_getAssociatedObject(glyph, &kActionsAccentGlyphPriorTintKey);
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphTintKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(glyph, &kActionsAccentGlyphPriorTintKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        glyph.tintColor = [prior isKindOfClass:UIColor.class] ? prior : nil;
+    }
+    if ([glyph respondsToSelector:suppressSel]) ((void (*)(id, SEL, BOOL))objc_msgSend)(glyph, suppressSel, on);
+    ((void (*)(id, SEL, int64_t))objc_msgSend)(glyph, modeSel, on ? 0 : restoredMode);
+    if ([glyph respondsToSelector:enableSel]) ((void (*)(id, SEL, BOOL))objc_msgSend)(glyph, enableSel, on ? NO : restoredEnabled);
+    sActionsAccentGlyphApplying = NO;
+}
+
+static void ApolloActionsCollectGlyphs(UIView *view, NSMutableArray<UIImageView *> *glyphs) {
+    if ([view isKindOfClass:UIImageView.class]) [glyphs addObject:(UIImageView *)view];
+    for (UIView *subview in view.subviews) ApolloActionsCollectGlyphs(subview, glyphs);
+}
+
+void ApolloNavigationActionsAccentControl(UIView *control) {
+    if (!control || !IsLiquidGlass()) return;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    if (!accent && ![objc_getAssociatedObject(control, &kActionsAccentContentKey) boolValue]) return;
+    if (accent) sActionsHasAccentedControls = YES;
+    objc_setAssociatedObject(control, &kActionsAccentContentKey, accent ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSMutableArray<UIImageView *> *glyphs = [NSMutableArray array];
+    ApolloActionsCollectGlyphs(control, glyphs);
+    for (UIImageView *glyph in glyphs) {
+        if (accent || [objc_getAssociatedObject(glyph, &kActionsAccentGlyphKey) boolValue])
+            ApolloActionsSetGlyphAccent(glyph, accent, NO);
+    }
+}
+
+static void ApolloActionsUpdateBackAccent(UIView *button) {
+    if (![objc_getAssociatedObject(button, &kActionsBackButtonKey) boolValue]) return;
+    _UIButtonBarButtonVisualProviderIOS *provider = ((_UIButtonBarButton *)button).visualProvider;
+    if (![provider respondsToSelector:@selector(backIndicatorView)]) return;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    for (UIView *subview in provider.backIndicatorView.subviews) {
+        if (![subview isKindOfClass:UIImageView.class]) continue;
+        BOOL accented = [objc_getAssociatedObject(subview, &kActionsAccentGlyphKey) boolValue];
+        if (accent || accented) ApolloActionsSetGlyphAccent((UIImageView *)subview, accent, YES);
+    }
+}
+
+static BOOL ApolloActionsIsSystemMoreItem(UIBarButtonItem *item);
+
+// A split view's own sidebar toggle (Settings and Inbox on the Duo), which
+// UIKit targets at its private split implementation.
+static BOOL ApolloActionsIsSidebarToggle(UIBarButtonItem *item) {
+    static SEL toggle;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ toggle = sel_registerName("_handlePrimaryEdgeBarButtonItem:"); });
+    return item.action == toggle || [item.target isKindOfClass:UISplitViewController.class];
+}
+
+// UIKit's own items, which NavigationActions never pins: the Duo overflow •••
+// and the sidebar toggle. A changed tint reconfigures the button.
+static void ApolloActionsAccentSystemItem(UIBarButtonItem *item) {
+    if (!item || (!ApolloActionsIsSystemMoreItem(item) && !ApolloActionsIsSidebarToggle(item))) return;
+    UIColor *accent = ApolloNavigationButtonAccentColor();
+    if (item.tintColor != accent) item.tintColor = accent;
+}
+
+static void ApolloActionsCollectBarButtons(UIView *view, NSMutableArray<UIView *> *buttons) {
+    if ([view isKindOfClass:ApolloClassUIButtonBarButton]) {
+        [buttons addObject:view];
+        return;
+    }
+    for (UIView *subview in view.subviews) ApolloActionsCollectBarButtons(subview, buttons);
+}
+
+// Whole windows: the Duo rails host bar buttons outside UINavigationBar.
+static void ApolloActionsUpdateBarButtonAccents(void) {
+    if (!IsLiquidGlass() || !ApolloClassUIButtonBarButton) return;
+    NSMutableArray<UIView *> *buttons = [NSMutableArray array];
+    for (UIWindow *window in ApolloAllWindows()) ApolloActionsCollectBarButtons(window, buttons);
+    for (UIView *button in buttons) {
+        ApolloActionsUpdateBackAccent(button);
+        ApolloActionsAccentSystemItem(((_UIButtonBarButton *)button).visualProvider.barButtonItem);
+    }
+}
+
+// Accent Navigation Buttons, Back (every Liquid Glass version).
+%group ApolloNavigationActionsBackAccentHooks
+%hook _UIButtonBarButton
+- (void)_configureFromBarItem:(UIBarButtonItem *)item appearanceDelegate:(id)delegate isBackButton:(BOOL)back useBreadcrumbStyle:(BOOL)breadcrumb {
+    if (!back) ApolloActionsAccentSystemItem(item);
+    %orig(item, delegate, back, breadcrumb);
+    objc_setAssociatedObject(self, &kActionsBackButtonKey, back ? @YES : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloActionsUpdateBackAccent((UIView *)self);
+}
+- (void)willMoveToWindow:(UIWindow *)window {
+    %orig(window);
+    // The chevron is installed after the initial configuration.
+    if (window) ApolloActionsUpdateBackAccent((UIView *)self);
+}
+%end
+
+%end
+
+// UIKit re-derives a glyph's treatment (trait and tint changes, Control
+// Center, a rebuilt button); keep it off while the glyph carries the accent.
+%group ApolloNavigationActionsAccentGlyphHooks
+%hook UIImageView
+- (void)_applyMonochromaticInputsWithPreferredTreatment:(int64_t)treatment suppressTreatment:(BOOL)suppress {
+    if (!sActionsAccentGlyphApplying && ApolloActionsGlyphIsAccented(self)) {
+        if (treatment != 0) ApolloActionsRecordUIKitTreatment(self, @(treatment), nil);
+        suppress = YES;
+    }
+    %orig(treatment, suppress);
+}
+- (void)_setEnableMonochromaticTreatment:(BOOL)enable {
+    if (enable && !sActionsAccentGlyphApplying && ApolloActionsGlyphIsAccented(self)) {
+        ApolloActionsRecordUIKitTreatment(self, nil, @YES);
+        %orig(NO);
+        return;
+    }
+    %orig(enable);
+}
+- (void)_setMonochromaticTreatment:(int64_t)treatment {
+    if (treatment != 0 && !sActionsAccentGlyphApplying && ApolloActionsGlyphIsAccented(self)) {
+        ApolloActionsRecordUIKitTreatment(self, @(treatment), nil);
+        %orig(0);
+        return;
+    }
+    %orig(treatment);
+}
+// UIKit rebuilds the Back chevron on rotation and resets its tint, which
+// left the Duo rail's chevron in the inherited system blue. Keep the accent.
+- (void)setTintColor:(UIColor *)color {
+    if (!sActionsAccentGlyphApplying && sAccentNavigationButtons &&
+        [objc_getAssociatedObject(self, &kActionsAccentGlyphTintKey) boolValue]) {
+        // What UIKit wanted is the tint to give back when the setting turns off.
+        objc_setAssociatedObject(self, &kActionsAccentGlyphPriorTintKey, color ?: (id)NSNull.null,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        color = ApolloNavigationButtonAccentColor() ?: color;
+    }
+    %orig(color);
+}
+// A glyph added to an accented control after its treatment was chosen.
+- (void)didMoveToWindow {
+    %orig;
+    if (sAccentNavigationButtons && self.window && !sActionsAccentGlyphApplying &&
+        ![objc_getAssociatedObject(self, &kActionsAccentGlyphKey) boolValue] &&
+        ApolloActionsInAccentedControl(self)) {
+        ApolloActionsSetGlyphAccent(self, ApolloNavigationButtonAccentColor(), NO);
+    }
+}
+%end
+%end
+
+%group ApolloNavigationActionsBackGlassHooks
+%hook _UIButtonBarButton
+- (void)willMoveToWindow:(UIWindow *)window {
+    %orig(window);
+    // UIKit finishes installing its chevron/mask after initial configuration.
+    // Put the decoration behind those native subviews when the control mounts.
+    ApolloActionsUpdateBackGlass((UIView *)self, self.visualProvider.barButtonItem);
+}
+%end
+
+%hook _UIButtonBarButtonVisualProviderIOS
+- (CGFloat)_defaultHeightFromDelegate {
+    if (![objc_getAssociatedObject(self.barButtonItem, &kActionsDuoBackItemKey) boolValue]) return %orig;
+    // UIKit's delegate stops subtracting the glass padding when a shared
+    // background is hidden (38pt becomes 48pt on Duo). We still have that
+    // glass, just on a separate surface. Measure with the original native
+    // background metrics so all three actions fit, without hard-coding a
+    // replacement height or changing constraints during layout.
+    sActionsBackMeasurementDepth++;
+    CGFloat height = %orig;
+    sActionsBackMeasurementDepth--;
+    return height;
+}
+%end
+
+%hook UIBarButtonItem
+- (BOOL)hidesSharedBackground {
+    if (sActionsBackMeasurementDepth &&
+        [objc_getAssociatedObject(self, &kActionsDuoBackItemKey) boolValue]) return NO;
+    return %orig;
+}
+%end
+%end
+
+%group ApolloNavigationActionsHooks
+%hook _ASTableViewCell
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig(highlighted, animated);
+    ApolloActionsClipProfileSelection((UITableViewCell *)self);
+}
+- (void)setSelected:(BOOL)selected animated:(BOOL)animated {
+    %orig(selected, animated);
+    ApolloActionsClipProfileSelection((UITableViewCell *)self);
+}
+- (void)prepareForReuse {
+    ApolloActionsRestoreProfileSelection((UITableViewCell *)self);
+    ApolloActionsRestoreProfileCellBackground((UITableViewCell *)self);
+    %orig;
+}
+%end
+
+%hook UIViewController
+- (UINavigationItem *)navigationItem {
+    UINavigationItem *item = %orig;
+    if (!IsLiquidGlass()) return item;
+    ApolloNavigationActionsControllerBox *box = objc_getAssociatedObject(item, &kActionsControllerKey);
+    if (box.controller == self || !ApolloActionsAppController(self)) return item;
+    if (!box) {
+        box = [ApolloNavigationActionsControllerBox new];
+        objc_setAssociatedObject(item, &kActionsControllerKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    box.controller = self;
+    return item;
+}
+- (void)viewWillAppear:(BOOL)animated {
+    ApolloActionsPrepare(self.navigationItem, self.navigationItem.rightBarButtonItems);
+    %orig(animated);
+    ApolloActionsPrepare(self.navigationItem, self.navigationItem.rightBarButtonItems);
+}
+- (void)viewDidAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloActionsPrepare(self.navigationItem, self.navigationItem.rightBarButtonItems);
+}
+- (void)viewWillDisappear:(BOOL)animated {
+    ApolloActionsResetBeforeNavigation(self);
+    %orig(animated);
+}
+%end
+
+%hook _TtC6Apollo21ProfileViewController
+- (void)viewDidLoad {
+    %orig;
+    __weak UIViewController *weakController = (UIViewController *)self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *controller = weakController;
+        ApolloActionsApplyDuoProfileItems(controller);
+        ApolloActionsClearDuoProfileTrailingCells(controller);
+    });
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloActionsApplyDuoProfileItems((UIViewController *)self);
+    ApolloActionsClearDuoProfileTrailingCells((UIViewController *)self);
+}
+- (void)viewDidAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloActionsApplyDuoProfileItems((UIViewController *)self);
+    ApolloActionsClearDuoProfileTrailingCells((UIViewController *)self);
+}
+- (void)viewDidLayoutSubviews {
+    %orig;
+    ApolloActionsScheduleDuoProfileItems((UIViewController *)self);
+}
+- (void)scrollViewDidScroll:(id)scrollView {
+    %orig(scrollView);
+    // Only a trailing rail needs per-frame clipping; the rail-gone restore
+    // already runs from viewDidLayoutSubviews, so skip the cell walk otherwise.
+    if (!ApolloActionsHasTrailingTabRail()) return;
+    ApolloActionsClearDuoProfileTrailingCells((UIViewController *)self);
+}
+- (void)redditAccountChangedWithNotification:(id)notification {
+    %orig(notification);
+    __weak UIViewController *weakController = (UIViewController *)self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *controller = weakController;
+        ApolloActionsApplyDuoProfileItems(controller);
+        ApolloActionsClearDuoProfileTrailingCells(controller);
+    });
+}
+%end
+
+%hook UINavigationItem
+- (void)setRightBarButtonItems:(NSArray<UIBarButtonItem *> *)items {
+    items = ApolloActionsDuoNativeItems(self, items);
+    items = ApolloActionsInboxItems(self, items);
+    BOOL pickerSwap = ApolloActionsReplacingPickerControl(self, items);
+    void (^apply)(void) = ^{
+        ApolloActionsPrepare(self, items);
+        %orig(ApolloActionsPresentedItems(self, items));
+        ApolloActionsPrepare(self, self.rightBarButtonItems);
+    };
+    if (pickerSwap) [UIView performWithoutAnimation:apply]; else apply();
+}
+- (void)setRightBarButtonItems:(NSArray<UIBarButtonItem *> *)items animated:(BOOL)animated {
+    items = ApolloActionsDuoNativeItems(self, items);
+    items = ApolloActionsInboxItems(self, items);
+    BOOL pickerSwap = ApolloActionsReplacingPickerControl(self, items);
+    void (^apply)(void) = ^{
+        ApolloActionsPrepare(self, items);
+        %orig(ApolloActionsPresentedItems(self, items), pickerSwap ? NO : animated);
+        ApolloActionsPrepare(self, self.rightBarButtonItems);
+    };
+    if (pickerSwap) [UIView performWithoutAnimation:apply]; else apply();
+}
+- (void)setRightBarButtonItem:(UIBarButtonItem *)item {
+    NSArray *items = ApolloActionsDuoNativeItems(self, item ? @[item] : @[]);
+    if (items.count != (item ? 1 : 0)) {
+        [self setRightBarButtonItems:items];
+        return;
+    }
+    item = items.firstObject;
+    BOOL pickerSwap = ApolloActionsReplacingPickerControl(self, items);
+    void (^apply)(void) = ^{
+        ApolloActionsPrepare(self, items);
+        %orig(item);
+        ApolloActionsPrepare(self, self.rightBarButtonItems);
+    };
+    if (pickerSwap) [UIView performWithoutAnimation:apply]; else apply();
+}
+- (void)setRightBarButtonItem:(UIBarButtonItem *)item animated:(BOOL)animated {
+    NSArray *items = ApolloActionsDuoNativeItems(self, item ? @[item] : @[]);
+    if (items.count != (item ? 1 : 0)) {
+        [self setRightBarButtonItems:items animated:animated];
+        return;
+    }
+    item = items.firstObject;
+    BOOL pickerSwap = ApolloActionsReplacingPickerControl(self, items);
+    void (^apply)(void) = ^{
+        ApolloActionsPrepare(self, items);
+        %orig(item, pickerSwap ? NO : animated);
+        ApolloActionsPrepare(self, self.rightBarButtonItems);
+    };
+    if (pickerSwap) [UIView performWithoutAnimation:apply]; else apply();
+}
+%end
+
+%hook UIBarButtonItem
+- (void)setMenu:(UIMenu *)menu {
+    ApolloNavigationActionsStandardItem *state = sActionsModelWriteDepth ? nil : objc_getAssociatedObject(self, &kActionsStandardMoreKey);
+    if (state.owner) {
+        state.owner.nativeMenu = menu;
+        UIMenu *effectiveMenu = state.owner.expanded ? menu : nil;
+        %orig(effectiveMenu);
+    } else {
+        %orig(menu);
+    }
+}
+- (void)setPrimaryAction:(UIAction *)action {
+    ApolloNavigationActionsStandardItem *state = sActionsModelWriteDepth ? nil : objc_getAssociatedObject(self, &kActionsStandardMoreKey);
+    if (state.owner) state.owner.nativePrimaryAction = action;
+    %orig(action);
+    if (state.owner && !state.owner.expanded) [state.owner applyStandardExpanded:NO];
+}
+- (void)setHidden:(BOOL)hidden {
+    NSNumber *overflowHidden = objc_getAssociatedObject(self, &kActionsDuoOverflowHiddenKey);
+    if (overflowHidden && !sActionsModelWriteDepth) {
+        objc_setAssociatedObject(self, &kActionsDuoOverflowHiddenKey, @(hidden), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    ApolloNavigationActionsStandardItem *state = sActionsModelWriteDepth ? nil : objc_getAssociatedObject(self, &kActionsStandardItemKey);
+    if (state) {
+        state.hidden = hidden;
+        BOOL effectiveHidden = overflowHidden || hidden || !state.owner.expanded;
+        %orig(effectiveHidden);
+    } else {
+        %orig(overflowHidden ? YES : hidden);
+    }
+}
+%end
+
+%hook UIScrollView
+- (void)didMoveToWindow {
+    %orig;
+    if (IsLiquidGlass()) ApolloActionsUpdateScrollOwner(self);
+}
+- (void)didMoveToSuperview {
+    %orig;
+    // Reparenting inside the same window need not change window membership.
+    if (IsLiquidGlass()) ApolloActionsUpdateScrollOwner(self);
+}
+%end
+
+%hook UINavigationController
+- (void)pushViewController:(UIViewController *)controller animated:(BOOL)animated {
+    ApolloActionsResetBeforeNavigation(self.topViewController);
+    ApolloActionsPrepare(controller.navigationItem, controller.navigationItem.rightBarButtonItems);
+    %orig(controller, animated);
+}
+- (UIViewController *)popViewControllerAnimated:(BOOL)animated {
+    ApolloActionsResetBeforeNavigation(self.topViewController);
+    return %orig(animated);
+}
+- (NSArray *)popToViewController:(UIViewController *)controller animated:(BOOL)animated {
+    ApolloActionsResetBeforeNavigation(self.topViewController);
+    return %orig(controller, animated);
+}
+- (NSArray *)popToRootViewControllerAnimated:(BOOL)animated {
+    ApolloActionsResetBeforeNavigation(self.topViewController);
+    return %orig(animated);
+}
+- (void)setViewControllers:(NSArray *)controllers animated:(BOOL)animated {
+    ApolloActionsResetBeforeNavigation(self.topViewController);
+    for (UIViewController *controller in controllers) ApolloActionsPrepare(controller.navigationItem, controller.navigationItem.rightBarButtonItems);
+    %orig(controllers, animated);
+}
+%end
+
+%hook UITabBarController
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if (self != (id)ApolloMainTabBarController() ||
+        (ApolloDuoCurrentMode() != ApolloDuoModeClosed && !ApolloActionsHasTrailingTabRail()) ||
+        objc_getAssociatedObject(self, &kActionsDuoRefreshScheduledKey)) return;
+    objc_setAssociatedObject(self, &kActionsDuoRefreshScheduledKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UITabBarController *weakTabs = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITabBarController *tabs = weakTabs;
+        if (!tabs) return;
+        objc_setAssociatedObject(tabs, &kActionsDuoRefreshScheduledKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIViewController *selected = tabs.selectedViewController;
+        UINavigationController *navigation = [selected isKindOfClass:UINavigationController.class]
+            ? (UINavigationController *)selected : selected.navigationController;
+        // The selected tab owns a containment host after unfolding. Refresh
+        // the actual detail page, where the retained Inbox disclosure lives.
+        navigation = ApolloDuoSplitDetailNavigation(navigation);
+        UIViewController *top = navigation.topViewController;
+        if (top) ApolloActionsPrepare(top.navigationItem, top.navigationItem.rightBarButtonItems);
+    });
+}
+%end
+%end
+
+// Apollo can retint existing controls without replacing their navigation item.
+// Reject those accent writes at the setter, rather than correcting a visible
+// frame later. Menu elements and unrelated content remain untouched.
+%group ApolloNavigationActionsChromeHooks
+%hook UIView
+- (void)setTintColor:(UIColor *)color {
+    if (objc_getAssociatedObject(self, &kActionsChromeKey)) {
+        color = ApolloActionsChromeColor(self);
+        if ([self.tintColor isEqual:color]) return;
+    }
+    %orig(color);
+}
+%end
+
+%hook UIButton
+- (void)setImage:(UIImage *)image forState:(UIControlState)state {
+    if (objc_getAssociatedObject(self, &kActionsChromeKey)) image = ApolloActionsTemplateImage(image);
+    %orig(image, state);
+    NSHashTable<UIBarButtonItem *> *mirrors = objc_getAssociatedObject(self, &kActionsDuoMirroredItemsKey);
+    if (mirrors.count) {
+        UIImage *current = ApolloActionsTemplateImage([self imageForState:UIControlStateNormal] ?: self.currentImage);
+        for (UIBarButtonItem *item in mirrors) {
+            // Translation and Apollo both refresh their source buttons after
+            // navigation settles. Do not replay an image transition for an
+            // unchanged glyph, or invalidate its overflow representation.
+            // Compare the source, not the displayed image: Moderator's image
+            // has alignment insets applied later by prepareItems:.
+            if (objc_getAssociatedObject(item, &kActionsDuoMirroredImageKey) == current) continue;
+            objc_setAssociatedObject(item, &kActionsDuoMirroredImageKey, current, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            item.image = current;
+            if (@available(iOS 16.0, *)) {
+                UIMenu *menu = [item.menuRepresentation isKindOfClass:UIMenu.class] ? (UIMenu *)item.menuRepresentation : nil;
+                if (menu) item.menuRepresentation = [UIMenu menuWithTitle:item.title ?: menu.title image:current
+                    identifier:menu.identifier options:menu.options children:menu.children];
+            }
+        }
+    }
+}
+%end
+
+%hook UIBarButtonItem
+- (void)setTintColor:(UIColor *)color {
+    if (objc_getAssociatedObject(self, &kActionsChromeKey) || ApolloActionsIsAutoModClose(self)) {
+        color = ApolloActionsChromeColor(self);
+        if ([self.tintColor isEqual:color]) return;
+    }
+    %orig(color);
+}
+- (void)setImage:(UIImage *)image {
+    if (objc_getAssociatedObject(self, &kActionsChromeKey) || ApolloActionsIsAutoModClose(self)) image = ApolloActionsTemplateImage(image);
+    if ((objc_getAssociatedObject(self, &kActionsChromeKey) ||
+         objc_getAssociatedObject(self, &kActionsDuoBackItemKey)) && self.image == image) return;
+    %orig(image);
+}
+%end
+%end
+
+// UIKit uses distinct generated items for the top/inner-landscape and
+// bottom/cover overflow placements. Both belong to Apollo's action pill.
+static BOOL ApolloActionsIsSystemMoreItem(UIBarButtonItem *item) {
+    NSString *identifier = item.accessibilityIdentifier;
+    return sApolloDuoMoreGlyph &&
+        ([identifier isEqualToString:kActionsDuoRailOverflowIdentifier]
+         || [identifier isEqualToString:@"TopOverflowBarButtonItem"]);
+}
+
+%group ApolloNavigationActionsRailItemHooks
+%hook _UIButtonBarButton
+- (void)_configureFromBarItem:(UIBarButtonItem *)item appearanceDelegate:(id)delegate isBackButton:(BOOL)back useBreadcrumbStyle:(BOOL)breadcrumb {
+    // Keep Apollo's actual horizontal ellipsis artwork on UIKit's unified
+    // overflow button. Only touch the Duo trailing overflow item.
+    if (ApolloActionsIsSystemMoreItem(item)) {
+        if (item.image != sApolloDuoMoreGlyph) item.image = sApolloDuoMoreGlyph;
+        if (item.primaryAction.image != sApolloDuoMoreGlyph) item.primaryAction.image = sApolloDuoMoreGlyph;
+        // Any write reconfigures the button and re-enters this hook, so an
+        // unconditional one loops forever (a launch hang on the inner display).
+        if (![item.accessibilityLabel isEqualToString:@"More"]) item.accessibilityLabel = @"More";
+    }
+    BOOL decorate = NO;
+    if (@available(iOS 27.1, *)) decorate = IsLiquidGlass();
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    BOOL isolate = decorate && back && IsLiquidGlass() && sCollapseNavigationActions &&
+        ApolloActionsHasTrailingTabRail() && !tabs.presentedViewController;
+    BOOL managed = [objc_getAssociatedObject(item, &kActionsDuoBackItemKey) boolValue];
+    // Mark UIKit's generated Back item, rather than supplying a replacement
+    // navigation item (which would lose its native title/history behavior).
+    if (@available(iOS 26.0, *)) {
+        if (isolate && (managed || !item.hidesSharedBackground)) {
+            objc_setAssociatedObject(item, &kActionsDuoBackItemKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (!item.hidesSharedBackground) item.hidesSharedBackground = YES;
+        } else if (managed) {
+            objc_setAssociatedObject(item, &kActionsDuoBackItemKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            item.hidesSharedBackground = NO;
+        }
+    }
+    %orig(item, delegate, back, breadcrumb);
+    if (decorate) ApolloActionsUpdateBackGlass((UIView *)self, item);
+}
+%end
+%end
+
+%ctor {
+    if (@available(iOS 26.0, *)) {
+        %init(ApolloNavigationActionsHooks);
+        if (@available(iOS 27.1, *)) {
+            if (IsLiquidGlass()) %init(ApolloNavigationActionsBackGlassHooks);
+        }
+        if (IsLiquidGlass()) {
+            %init(ApolloNavigationActionsChromeHooks);
+            // Accent Navigation Buttons needs UIKit's glyph treatment setters.
+            if (class_getInstanceMethod(UIImageView.class, @selector(_setMonochromaticTreatment:))) {
+                %init(ApolloNavigationActionsAccentGlyphHooks);
+                SEL configure = @selector(_configureFromBarItem:appearanceDelegate:isBackButton:useBreadcrumbStyle:);
+                if (ApolloClassUIButtonBarButton && class_getInstanceMethod(ApolloClassUIButtonBarButton, configure))
+                    %init(ApolloNavigationActionsBackAccentHooks);
+                else ApolloLog(@"[NavigationActions] Back accent unavailable: no Back configuration hook");
+            } else {
+                ApolloLog(@"[NavigationActions] Accent glyphs unavailable: no treatment setters");
+            }
+            [NSNotificationCenter.defaultCenter addObserverForName:@"com.christianselig.ApolloSpecificThemeChanged"
+                                                            object:nil
+                                                             queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(__unused NSNotification *note) {
+                // Apollo finishes applying the theme after posting.
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    sActionsButtonAccent = nil;
+                    if (!sAccentNavigationButtons) return;
+                    ApolloActionsRefreshButtonColors();
+                    [NSNotificationCenter.defaultCenter postNotificationName:ApolloNavigationButtonColorDidChangeNotification object:nil];
+                });
+            }];
+        }
+        if (ApolloDeviceIsDuo()) {
+            if (ApolloClassUIButtonBarButton
+                && class_getInstanceMethod(ApolloClassUIButtonBarButton,
+                                           @selector(_configureFromBarItem:appearanceDelegate:isBackButton:useBreadcrumbStyle:))) {
+                %init(ApolloNavigationActionsRailItemHooks);
+            }
+        } else {
+            ApolloLog(@"[NavigationActions] not an iPhone Duo; rail item tracking and system overflow NOT installed");
+        }
+        ApolloLog(@"[NavigationActions] Page-owned native strip hooks installed");
+    }
+}

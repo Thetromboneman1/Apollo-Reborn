@@ -1,0 +1,731 @@
+#import "ipad/ApolloPaneChrome.h"
+#import "ApolloImmersiveHeaderBackground.h"
+#import "ApolloDuoSplitView.h"
+#import "ApolloDuoRail.h"
+
+#import <CoreImage/CoreImage.h>
+#import <QuartzCore/QuartzCore.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+
+#import "ApolloCommon.h"
+#import "ApolloMemoryDiagnostics.h"
+#import "ApolloThemeRuntime.h"
+#import "ApolloClasses.h"
+
+static CGFloat const ApolloImmersiveBackdropBlurSigma = 28.0;
+// Height of the alpha feather at the sharp banner's bottom edge, where it
+// melts into the blurred backdrop instead of ending in a hard seam.
+static CGFloat const ApolloImmersiveSharpFeatherHeight = 44.0;
+// Soft trailing edge for a banner that stops short of the extended backdrop.
+static CGFloat const ApolloImmersiveTrailingTipWidth = 4.0;
+
+static BOOL ApolloImmersiveColorProvidesSurface(UIColor *color, UITraitCollection *traits) {
+    if (!color) return NO;
+    // Callers must supply the host view's traits (every caller of
+    // ApolloImmersiveResolvedPageColor passes a view/VC traitCollection).
+    UIColor *resolved = [color resolvedColorWithTraitCollection:traits];
+    return resolved && CGColorGetAlpha(resolved.CGColor) > 0.01;
+}
+
+UIColor *ApolloImmersiveResolvedPageColor(UIColor *fallback, UITraitCollection *traits) {
+    // Prefer Apollo's page background for stock and custom themes. Ignore transparent
+    // candidates so layout switches cannot expose a stale Posts surface.
+    UIColor *themeBackground = ApolloThemePageBackgroundColor();
+    if (ApolloImmersiveColorProvidesSurface(themeBackground, traits)) return themeBackground;
+    if (ApolloImmersiveColorProvidesSurface(fallback, traits)) return fallback;
+    return UIColor.systemGroupedBackgroundColor;
+}
+
+UIVisualEffect *ApolloImmersiveGlassEffect(UIColor *tintColor, CGFloat tintAlpha, BOOL interactive) {
+    if (!IsLiquidGlass()) return nil;
+    Class glassClass = ApolloClassUIGlassEffect;
+    id effect = ((id (*)(id, SEL, NSInteger))objc_msgSend)(glassClass, @selector(effectWithStyle:), 0);
+    if (tintColor) {
+        ((void (*)(id, SEL, id))objc_msgSend)(effect, @selector(setTintColor:),
+                                               [tintColor colorWithAlphaComponent:tintAlpha]);
+    }
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(effect, @selector(setInteractive:), interactive);
+    return effect;
+}
+
+static const void *kApolloImmersiveBannerCacheKey = &kApolloImmersiveBannerCacheKey;
+
+static NSObject *ApolloImmersiveWorkLock(void) {
+    static NSObject *lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+void ApolloImmersiveSetBannerCacheKey(UIImage *banner, NSString *cacheKey) {
+    if (!banner || cacheKey.length == 0) return;
+    objc_setAssociatedObject(banner, kApolloImmersiveBannerCacheKey, cacheKey, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
+// A per-instance identity that (unlike the raw pointer) can never alias a
+// LATER image: heap addresses recycle the moment an image deallocates, so a
+// "%p" key can hand a freshly-allocated banner the dead banner's cached blur
+// and luminance verdict. This associated UUID lives and dies with the exact
+// instance it stamps, making that collision impossible while still letting
+// every consumer of the same instance coalesce.
+NSString *ApolloImmersiveBannerInstanceIdentity(UIImage *image) {
+    if (!image) return nil;
+    static const void *kApolloImmersiveInstanceIdentityKey = &kApolloImmersiveInstanceIdentityKey;
+    NSString *identity = objc_getAssociatedObject(image, kApolloImmersiveInstanceIdentityKey);
+    if (identity.length == 0) {
+        identity = [NSUUID UUID].UUIDString;
+        objc_setAssociatedObject(image, kApolloImmersiveInstanceIdentityKey, identity, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
+    return identity;
+}
+
+static NSString *ApolloImmersiveWorkKey(UIImage *banner) {
+    if (!banner) return nil;
+    NSString *logicalKey = objc_getAssociatedObject(banner, kApolloImmersiveBannerCacheKey);
+    if (logicalKey.length > 0) return logicalKey;
+    // Images with no known URL/custom-asset identity still coalesce for every
+    // consumer of this exact instance.
+    return [NSString stringWithFormat:@"image:%@", ApolloImmersiveBannerInstanceIdentity(banner)];
+}
+
+static NSCache<NSString *, NSNumber *> *ApolloImmersiveBrightnessCache(void) {
+    static NSCache<NSString *, NSNumber *> *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSCache new];
+        cache.countLimit = 64;
+    });
+    return cache;
+}
+
+static NSMutableDictionary<NSString *, NSMutableArray<void (^)(BOOL)> *> *ApolloImmersiveBrightnessWaiters(void) {
+    static NSMutableDictionary *waiters = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ waiters = [NSMutableDictionary dictionary]; });
+    return waiters;
+}
+
+// Reads every pixel of the top half of the source image (via the 1x1 downscale
+// trick) — cheap for a typical banner, but a visible hitch on the main thread
+// for a large custom one. Callers must not run this on the main thread except
+// through the cached fast path in ApolloImmersiveBannerIsLight.
+static BOOL ApolloImmersiveComputeBannerIsLight(UIImage *banner) {
+    CGImageRef cgImage = banner.CGImage;
+    if (!cgImage) return NO;
+    // Only the top strip matters — that's what sits under the status bar,
+    // nav title, and search chrome.
+    size_t fullWidth = CGImageGetWidth(cgImage);
+    size_t fullHeight = CGImageGetHeight(cgImage);
+    if (fullWidth == 0 || fullHeight == 0) return NO;
+    CGImageRef topStrip = CGImageCreateWithImageInRect(cgImage,
+        CGRectMake(0, 0, fullWidth, MAX((size_t)1, fullHeight / 2)));
+
+    // Downscale into a 1x1 RGBA bitmap; the scaler's filtering averages the
+    // region for us, which is all the precision this heuristic needs.
+    unsigned char pixel[4] = {0, 0, 0, 0};
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pixel, 1, 1, 8, 4, colorSpace,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(colorSpace);
+    BOOL light = NO;
+    if (context) {
+        CGContextSetInterpolationQuality(context, kCGInterpolationMedium);
+        CGContextDrawImage(context, CGRectMake(0, 0, 1, 1), topStrip ?: cgImage);
+        CGContextRelease(context);
+        CGFloat luminance = (0.299 * pixel[0] + 0.587 * pixel[1] + 0.114 * pixel[2]) / 255.0;
+        light = luminance > 0.62;
+    }
+    if (topStrip) CGImageRelease(topStrip);
+    return light;
+}
+
+BOOL ApolloImmersiveBannerIsLight(UIImage *banner) {
+    if (!banner) return NO;
+    NSNumber *cached = [ApolloImmersiveBrightnessCache() objectForKey:ApolloImmersiveWorkKey(banner)];
+    return cached.boolValue;
+}
+
+void ApolloImmersiveBannerIsLightAsync(UIImage *banner, void (^completion)(BOOL isLight)) {
+    if (!banner) {
+        if (completion) completion(NO);
+        return;
+    }
+    NSString *key = ApolloImmersiveWorkKey(banner);
+    NSNumber *cached = [ApolloImmersiveBrightnessCache() objectForKey:key];
+    if (cached) {
+        if (completion) completion(cached.boolValue);
+        return;
+    }
+
+    BOOL shouldStartWork = NO;
+    @synchronized (ApolloImmersiveWorkLock()) {
+        cached = [ApolloImmersiveBrightnessCache() objectForKey:key];
+        if (!cached) {
+            NSMutableArray<void (^)(BOOL)> *waiters = ApolloImmersiveBrightnessWaiters()[key];
+            if (waiters) {
+                if (completion) [waiters addObject:[completion copy]];
+            } else {
+                waiters = [NSMutableArray array];
+                if (completion) [waiters addObject:[completion copy]];
+                ApolloImmersiveBrightnessWaiters()[key] = waiters;
+                shouldStartWork = YES;
+            }
+        }
+    }
+    // Never invoke client code while holding the shared work lock; a completion
+    // is allowed to synchronously request another banner style.
+    if (cached) {
+        if (completion) completion(cached.boolValue);
+        return;
+    }
+    if (!shouldStartWork) return;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL light = ApolloImmersiveComputeBannerIsLight(banner);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSArray<void (^)(BOOL)> *waiters = nil;
+            @synchronized (ApolloImmersiveWorkLock()) {
+                [ApolloImmersiveBrightnessCache() setObject:@(light) forKey:key];
+                waiters = [ApolloImmersiveBrightnessWaiters()[key] copy];
+                [ApolloImmersiveBrightnessWaiters() removeObjectForKey:key];
+            }
+            for (void (^waiter)(BOOL) in waiters) waiter(light);
+        });
+    });
+}
+
+// The blur (sigma 28) destroys detail well beyond what a downsampled source
+// preserves, so blurring at full CDN/network resolution just burns memory and
+// CPU for no visible gain. Cap the longest side before handing off to Core
+// Image; the result is later scaled back up by the (aspect-fill) backdrop
+// image view same as any other bitmap.
+static CGFloat const ApolloImmersiveBackdropMaxDimension = 640.0;
+// Defense-in-depth alongside countLimit below — bounds the cache by actual
+// decoded bytes, not just entry count, so a handful of huge banners can't
+// blow past a reasonable memory budget. Every entry is downsampled to the
+// 640px cap above first (~1.6MB), so this holds five headers.
+static NSUInteger const ApolloImmersiveBackdropCacheByteBudget = 8 * 1024 * 1024;
+
+static UIImage *ApolloImmersiveDownsampledImage(UIImage *image, CGFloat maxDimension) {
+    CGSize size = image.size;
+    // The cap is a PIXEL budget (format.scale is forced to 1 below), so the
+    // comparison must be in pixels too — image.size is points, and a 600pt@3x
+    // banner is 1800px of blur work that must not slip past a 640 limit.
+    CGFloat imageScale = MAX((CGFloat)1.0, image.scale);
+    CGFloat maxSidePixels = MAX(size.width, size.height) * imageScale;
+    if (maxSidePixels <= maxDimension || maxSidePixels <= 0.0) return image;
+    CGFloat shrink = maxDimension / maxSidePixels;
+    CGSize targetSize = CGSizeMake(MAX(1.0, round(size.width * imageScale * shrink)),
+                                   MAX(1.0, round(size.height * imageScale * shrink)));
+    // alloc/init, NOT preferredFormat: this runs on a background queue and
+    // preferredFormat reads UIScreen/trait state (a main-thread UIKit read) only
+    // to hand back a scale we immediately overwrite with 1.0 anyway.
+    UIGraphicsImageRendererFormat *format = [[UIGraphicsImageRendererFormat alloc] init];
+    format.scale = 1.0; // blurred output doesn't need retina-density source data
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:targetSize format:format];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *rendererContext) {
+        [image drawInRect:CGRectMake(0.0, 0.0, targetSize.width, targetSize.height)];
+    }];
+}
+
+static UIImage *ApolloImmersiveGaussianBlurredImage(UIImage *image) {
+    if (!image) return nil;
+    UIImage *downsampled = ApolloImmersiveDownsampledImage(image, ApolloImmersiveBackdropMaxDimension);
+    CIImage *input = [[CIImage alloc] initWithImage:downsampled];
+    if (!input) return image;
+    CIImage *blurred = [[input imageByClampingToExtent]
+        imageByApplyingGaussianBlurWithSigma:ApolloImmersiveBackdropBlurSigma];
+    blurred = [blurred imageByCroppingToRect:input.extent];
+    static CIContext *context = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ context = [CIContext contextWithOptions:nil]; });
+    CGImageRef cgImage = [context createCGImage:blurred fromRect:input.extent];
+    if (!cgImage) return image;
+    // Tag with the metadata of the input that was ACTUALLY blurred: the
+    // downsample renders via drawInRect:, which bakes EXIF orientation into
+    // the pixels (output is .up/scale-1) — re-tagging that with the original's
+    // orientation would rotate a portrait camera photo a second time at
+    // display. When no downsample ran, `downsampled` IS `image`, preserving
+    // the original (self-cancelling) tagging for small banners.
+    UIImage *result = [UIImage imageWithCGImage:cgImage
+                                         scale:downsampled.scale
+                                   orientation:downsampled.imageOrientation];
+    CGImageRelease(cgImage);
+    return result;
+}
+
+static NSCache<NSString *, UIImage *> *ApolloImmersiveBackdropCache(void) {
+    static NSCache<NSString *, UIImage *> *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 8;
+        cache.totalCostLimit = ApolloImmersiveBackdropCacheByteBudget;
+        ApolloMemoryRegisterPurgableCache(@"immersive-backdrops", cache);
+    });
+    return cache;
+}
+
+static NSMutableDictionary<NSString *, NSMutableArray<void (^)(UIImage *)> *> *ApolloImmersiveBackdropWaiters(void) {
+    static NSMutableDictionary *waiters = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ waiters = [NSMutableDictionary dictionary]; });
+    return waiters;
+}
+
+static UIImage *ApolloImmersiveCachedBackdrop(UIImage *banner) {
+    return banner ? [ApolloImmersiveBackdropCache() objectForKey:ApolloImmersiveWorkKey(banner)] : nil;
+}
+
+static void ApolloImmersiveRequestBackdrop(UIImage *banner, void (^completion)(UIImage *backdrop)) {
+    if (!banner) {
+        if (completion) completion(nil);
+        return;
+    }
+    NSString *key = ApolloImmersiveWorkKey(banner);
+    UIImage *cached = [ApolloImmersiveBackdropCache() objectForKey:key];
+    if (cached) {
+        if (completion) completion(cached);
+        return;
+    }
+
+    BOOL shouldStartWork = NO;
+    @synchronized (ApolloImmersiveWorkLock()) {
+        cached = [ApolloImmersiveBackdropCache() objectForKey:key];
+        if (!cached) {
+            NSMutableArray<void (^)(UIImage *)> *waiters = ApolloImmersiveBackdropWaiters()[key];
+            if (waiters) {
+                if (completion) [waiters addObject:[completion copy]];
+            } else {
+                waiters = [NSMutableArray array];
+                if (completion) [waiters addObject:[completion copy]];
+                ApolloImmersiveBackdropWaiters()[key] = waiters;
+                shouldStartWork = YES;
+            }
+        }
+    }
+    if (cached) {
+        if (completion) completion(cached);
+        return;
+    }
+    if (!shouldStartWork) return;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        UIImage *backdrop = ApolloImmersiveGaussianBlurredImage(banner);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSArray<void (^)(UIImage *)> *waiters = nil;
+            @synchronized (ApolloImmersiveWorkLock()) {
+                if (backdrop) {
+                    [ApolloImmersiveBackdropCache() setObject:backdrop
+                                                       forKey:key
+                                                         cost:ApolloImageByteCost(backdrop)];
+                }
+                waiters = [ApolloImmersiveBackdropWaiters()[key] copy];
+                [ApolloImmersiveBackdropWaiters() removeObjectForKey:key];
+            }
+            for (void (^waiter)(UIImage *) in waiters) waiter(backdrop);
+        });
+    });
+}
+
+@interface ApolloImmersiveHeaderBackgroundView ()
+@property(nonatomic, strong) UIView *contentContainer;
+@property(nonatomic, strong) UIImageView *backdropView;
+@property(nonatomic, strong) CAGradientLayer *veilLayer;
+@property(nonatomic, strong) UIView *paneChromeCover;
+@property(nonatomic, strong) UIView *sharpClip;
+@property(nonatomic, strong) ApolloTopAnchoredImageView *sharpView;
+@property(nonatomic, strong) CAGradientLayer *sharpFeatherMask;
+@property(nonatomic, strong) CAGradientLayer *chromeScrimLayer;
+@property(nonatomic, strong) CAGradientLayer *trailingTipMask;
+@property(nonatomic, strong) UIColor *pageColor;
+@property(nonatomic, strong) UIImage *sourceBanner;
+@property(nonatomic, copy) NSString *sourceBannerKey;
+@property(nonatomic, assign) CGFloat regionHeight;
+@property(nonatomic, assign) CGFloat extendedHeight;
+@property(nonatomic, assign) CGFloat topInset;
+// The veil/scrim gradient COLORS depend only on the resolved page color, but
+// their locations/frames change every layout pass (per scroll-driven chrome
+// animation frame). Cache the ~14 CGColor arrays keyed on the resolved color
+// so a scroll only recomputes locations, not the color stops.
+@property(nonatomic, strong) UIColor *cachedGradientColorKey;
+@property(nonatomic, copy) NSArray *cachedVeilColors;
+@property(nonatomic, copy) NSArray *cachedScrimColors;
+@end
+
+@implementation ApolloImmersiveHeaderBackgroundView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.userInteractionEnabled = NO;
+    self.clipsToBounds = YES;
+    self.backgroundColor = UIColor.clearColor;
+
+    _contentContainer = [[UIView alloc] init];
+    _contentContainer.userInteractionEnabled = NO;
+    [self addSubview:_contentContainer];
+
+    // Bottom layer: a blurred, blown-up continuation of the banner that runs
+    // behind the identity text (avatar/name/bio).
+    _backdropView = [[UIImageView alloc] init];
+    _backdropView.contentMode = UIViewContentModeScaleAspectFill;
+    _backdropView.clipsToBounds = YES;
+    [_contentContainer addSubview:_backdropView];
+
+    // Page-color veil over the blur: transparent under the sharp banner, then
+    // progressively opaque so the blur resolves to the theme background right
+    // where the header ends and opaque cells begin.
+    _veilLayer = [CAGradientLayer layer];
+    [_contentContainer.layer addSublayer:_veilLayer];
+
+    // Top layer: the sharp banner, alpha-feathered at its bottom edge so it
+    // melts into the blur instead of a hard seam. Sharp artwork reaches behind
+    // the status/navigation bars too, fading directly into the page behind
+    // the avatar. Its shallow canvas is based on width, not chrome height.
+    _sharpClip = [[UIView alloc] init];
+    _sharpClip.clipsToBounds = YES;
+    _sharpClip.userInteractionEnabled = NO;
+    [_contentContainer addSubview:_sharpClip];
+
+    _sharpView = [[ApolloTopAnchoredImageView alloc] init];
+    _sharpView.contentMode = UIViewContentModeScaleAspectFill;
+    _sharpView.clipsToBounds = YES;
+    [_sharpClip addSubview:_sharpView];
+
+    _sharpFeatherMask = [CAGradientLayer layer];
+    // Keep the upper artwork fully visible, then darken progressively through
+    // the lower subject into the page instead of dimming the entire banner.
+    _sharpFeatherMask.locations = @[@0.0, @0.40, @0.55, @0.64, @0.72, @0.84, @0.98, @1.0];
+    _sharpClip.layer.mask = _sharpFeatherMask;
+
+    // Theme-colored scrim under the status bar / nav chrome so titles and the
+    // search field stay readable over arbitrary banner art (white banners were
+    // unreadable without it). Page-colored rather than black so it matches the
+    // theme's chrome text color in both light and dark.
+    _chromeScrimLayer = [CAGradientLayer layer];
+    [_contentContainer.layer addSublayer:_chromeScrimLayer];
+    _paneChromeCover = [UIView new];
+    _paneChromeCover.userInteractionEnabled = NO;
+    _paneChromeCover.hidden = YES;
+    [self addSubview:_paneChromeCover];
+    return self;
+}
+
+- (void)applyBanner:(UIImage *)banner
+          pageColor:(UIColor *)pageColor
+       regionHeight:(CGFloat)regionHeight
+     extendedHeight:(CGFloat)extendedHeight
+           topInset:(CGFloat)topInset {
+    UIColor *resolvedPageColor = pageColor ?: UIColor.systemBackgroundColor;
+    CGFloat newRegionHeight = MAX(0.0, regionHeight);
+    CGFloat newExtendedHeight = MAX(newRegionHeight, extendedHeight);
+    CGFloat newTopInset = MAX(0.0, topInset);
+    // Callers drive this from their host's layout pass, so it re-arrives
+    // unchanged constantly (every viewDidLayoutSubviews, and again for each
+    // scroll-driven chrome-height animation frame). Bail before setNeedsLayout
+    // when nothing that feeds the gradients/frames actually moved.
+    if (banner == self.sourceBanner &&
+        newRegionHeight == self.regionHeight &&
+        newExtendedHeight == self.extendedHeight &&
+        newTopInset == self.topInset &&
+        (resolvedPageColor == self.pageColor || [resolvedPageColor isEqual:self.pageColor])) {
+        return;
+    }
+
+    if (banner != self.sourceBanner) {
+        self.sourceBanner = banner;
+        self.sourceBannerKey = ApolloImmersiveWorkKey(banner);
+        self.sharpView.image = banner;
+        UIImage *cachedBackdrop = ApolloImmersiveCachedBackdrop(banner);
+        self.backdropView.image = cachedBackdrop;
+        if (banner && !cachedBackdrop) {
+            __weak ApolloImmersiveHeaderBackgroundView *weakSelf = self;
+            NSString *expectedKey = self.sourceBannerKey;
+            ApolloImmersiveRequestBackdrop(banner, ^(UIImage *backdrop) {
+                ApolloImmersiveHeaderBackgroundView *strongSelf = weakSelf;
+                if (!strongSelf || ![strongSelf.sourceBannerKey isEqualToString:expectedKey]) return;
+                strongSelf.backdropView.image = backdrop;
+                [strongSelf setNeedsLayout];
+            });
+        }
+    }
+    self.pageColor = resolvedPageColor;
+    self.regionHeight = newRegionHeight;
+    self.extendedHeight = newExtendedHeight;
+    self.topInset = newTopInset;
+    [self setNeedsLayout];
+}
+
+- (void)setContentTranslation:(CGFloat)contentTranslation {
+    // A single scroll frame reaches us twice — once through the scroll view's
+    // own -setContentOffset:, once through the delegate's scrollViewDidScroll:
+    // — with the same offset. Both call sites are kept (each covers scrolls the
+    // other can miss); the duplicate is absorbed here instead, so the transform
+    // is only touched when the parallax actually moves. Compares the CLAMPED
+    // value so rubber-banding above the top doesn't re-set an identity
+    // transform every frame either.
+    _contentTranslation = contentTranslation;
+    CGAffineTransform desired = CGAffineTransformMakeTranslation(0.0, -MAX(0.0, contentTranslation));
+    if (CGAffineTransformEqualToTransform(self.contentContainer.transform, desired)) return;
+    self.contentContainer.transform = desired;
+}
+
+- (void)setUsesProfileHero:(BOOL)usesProfileHero {
+    if (_usesProfileHero == usesProfileHero) return;
+    _usesProfileHero = usesProfileHero;
+    self.cachedGradientColorKey = nil;
+    [self setNeedsLayout];
+}
+
+- (void)setArtworkInsets:(UIEdgeInsets)artworkInsets {
+    if (UIEdgeInsetsEqualToEdgeInsets(_artworkInsets, artworkInsets)) return;
+    _artworkInsets = artworkInsets;
+    [self setNeedsLayout];
+}
+
+- (CGFloat)sharpArtworkHeight {
+    CGFloat regionHeight = MIN(self.regionHeight, MAX(1.0, self.bounds.size.height));
+    if (self.usesProfileHero && self.topInset > 0 && ApolloPaneContextBottomInView(self) > 0) {
+        CGFloat bannerTop = MIN(regionHeight, self.topInset);
+        CGFloat width = MAX(1.0, self.bounds.size.width - self.artworkInsets.left - self.artworkInsets.right);
+        return bannerTop + MIN(regionHeight - bannerTop, width * 0.64);
+    }
+    return self.usesProfileHero
+        ? MIN(regionHeight, MAX(1.0, self.bounds.size.width * 0.64))
+        : regionHeight;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat fullWidth = self.bounds.size.width;
+    CGRect contentFrame = self.bounds;
+    CGRect column = ApolloDuoSplitContentFrame(self.contentViewController, self);
+    if (!CGRectIsNull(column) && column.size.width > 0) {
+        contentFrame.origin.x = CGRectGetMinX(column);
+        contentFrame.size.width = CGRectGetWidth(column);
+    }
+    contentFrame.origin.x += self.artworkInsets.left;
+    contentFrame.size.width = MAX(1.0, contentFrame.size.width -
+        self.artworkInsets.left - self.artworkInsets.right);
+    // Closed Duo cover: the table runs under the trailing rail and status bar.
+    // The sharp banner stays in the safe area, centered under the icon; the
+    // blurred continuation and its fade run on to the trailing screen edge.
+    CGFloat ambientExtension = 0.0;
+    UIView *hostView = self.contentViewController.viewIfLoaded;
+    if (!self.usesProfileHero && CGRectIsNull(column) && hostView.window && ApolloDuoRailHasVisibleSideBar()) {
+        UIEdgeInsets safe = hostView.safeAreaInsets;
+        CGRect safeColumn = [self convertRect:UIEdgeInsetsInsetRect(hostView.bounds, UIEdgeInsetsMake(0, safe.left, 0, safe.right))
+                                     fromView:hostView];
+        CGFloat left = MAX(CGRectGetMinX(contentFrame), CGRectGetMinX(safeColumn));
+        CGFloat right = MIN(CGRectGetMaxX(contentFrame), CGRectGetMaxX(safeColumn));
+        if (right - left > 0.0) {
+            contentFrame.origin.x = left;
+            contentFrame.size.width = right - left;
+            ambientExtension = MAX(0.0, fullWidth - right);
+        }
+    }
+    CGFloat width = contentFrame.size.width;
+    CGFloat totalHeight = MAX(1.0, self.bounds.size.height);
+    CGFloat regionHeight = MIN(self.regionHeight, totalHeight);
+    CGFloat extendedHeight = MIN(self.extendedHeight, totalHeight);
+    UIColor *pageColor = [self.pageColor resolvedColorWithTraitCollection:self.traitCollection];
+    BOOL lightPage = ApolloColorIsLight(pageColor);
+    self.backgroundColor = pageColor;
+    CGFloat boundary = ApolloPaneContextBottomInView(self);
+    BOOL hideCover = boundary <= 0.0;
+    if (self.paneChromeCover.hidden != hideCover) self.paneChromeCover.hidden = hideCover;
+    if (![self.paneChromeCover.backgroundColor isEqual:pageColor]) self.paneChromeCover.backgroundColor = pageColor;
+    CGRect coverFrame = CGRectMake(0, 0, fullWidth, MIN(totalHeight, boundary));
+    if (!CGRectEqualToRect(self.paneChromeCover.frame, coverFrame)) self.paneChromeCover.frame = coverFrame;
+
+    CGAffineTransform transform = self.contentContainer.transform;
+    self.contentContainer.transform = CGAffineTransformIdentity;
+    self.contentContainer.frame = contentFrame;
+    self.contentContainer.transform = transform;
+
+    // Keep ambient artwork when Banner is off: regionHeight == topInset hides
+    // the sharp band without removing its blurred continuation. Chrome-cropped
+    // settings previews express this with both values set to zero.
+    CGFloat bannerTop = MIN(regionHeight, MAX(0.0, self.topInset));
+    BOOL hasArtwork = self.sharpView.image != nil && extendedHeight > 0.0;
+    BOOL hasSharpBanner = hasArtwork && regionHeight > bannerTop;
+    self.backdropView.hidden = !hasArtwork;
+    self.sharpClip.hidden = !hasSharpBanner;
+    self.veilLayer.hidden = !hasArtwork;
+    // No top inset means no chrome to protect; a scrim would falsely fade the banner.
+    self.chromeScrimLayer.hidden = !hasArtwork || self.topInset <= 0.0;
+    if (!hasArtwork) return;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+
+    self.backdropView.frame = CGRectMake(0.0, 0.0, width + ambientExtension, extendedHeight);
+
+    // Use a shallow, width-derived hero rather than filling chrome + the
+    // entire identity header. This keeps the crop independent of collapsing
+    // navigation chrome and avoids both a tiny top strip and excessive zoom.
+    // Dark pages fade directly into the page. Light pages retain the blurred
+    // artwork underneath, so the image dissolves into its own colors first.
+    // A 0.64-width canvas matches the reference's original-image framing:
+    // the subject stays fully inside the trailing edge with sky above it.
+    CGFloat canvasHeight = MAX(1.0, width * 0.64);
+    CGFloat sharpHeight = self.sharpArtworkHeight;
+    self.backdropView.hidden = (hasSharpBanner && !lightPage) || !hasArtwork;
+    self.sharpClip.frame = CGRectMake(0.0, 0.0, width, sharpHeight);
+    self.sharpView.frame = CGRectMake(0.0, 0.0, width, canvasHeight);
+    if (self.usesProfileHero && self.topInset > 0 && boundary > 0) {
+        // The iPad identity plane is opaque. Frame the profile's hero inside
+        // the visible banner below it; a canvas starting at zero puts the
+        // subject's head behind the toolbar after the sidebar narrows it.
+        self.sharpClip.frame = CGRectMake(0, bannerTop, width, MAX(1, sharpHeight - bannerTop));
+    }
+    // Anchor the fade to the image, so moving the identity content does not
+    // change where features in the artwork darken.
+    if (!self.usesProfileHero) {
+        // Original subreddit rendering: crop only the banner strip; the
+        // blurred continuation owns the navigation chrome and identity.
+        self.backdropView.hidden = !hasArtwork;
+        self.sharpClip.frame = CGRectMake(0.0, 0.0, width, regionHeight);
+        CGFloat bannerHeight = MAX(1.0, regionHeight - bannerTop);
+        self.sharpView.frame = CGRectMake(0.0, bannerTop, width, bannerHeight);
+        CGFloat featherStart = MAX(0.0, 1.0 - ApolloImmersiveSharpFeatherHeight / MAX(1.0, regionHeight));
+        self.sharpFeatherMask.locations = @[@(featherStart), @1.0];
+    } else {
+        self.sharpFeatherMask.locations = @[@0.0, @0.40, @0.55, @0.64, @0.72, @0.84, @0.98, @1.0];
+    }
+    self.sharpFeatherMask.frame = self.sharpClip.bounds;
+    if (ambientExtension > 0.0) {
+        if (!self.trailingTipMask) {
+            self.trailingTipMask = [CAGradientLayer layer];
+            self.trailingTipMask.startPoint = CGPointMake(0.0, 0.5);
+            self.trailingTipMask.endPoint = CGPointMake(1.0, 0.5);
+            self.trailingTipMask.colors = @[(id)UIColor.whiteColor.CGColor,
+                                            (id)UIColor.whiteColor.CGColor,
+                                            (id)UIColor.clearColor.CGColor];
+        }
+        self.trailingTipMask.frame = self.sharpView.bounds;
+        self.trailingTipMask.locations = @[@0.0, @(MAX(0.0, 1.0 - ApolloImmersiveTrailingTipWidth / width)), @1.0];
+        if (self.sharpView.layer.mask != self.trailingTipMask) self.sharpView.layer.mask = self.trailingTipMask;
+    } else if (self.sharpView.layer.mask) {
+        self.sharpView.layer.mask = nil;
+    }
+    self.sharpView.anchorsTop = self.usesProfileHero;
+
+    // The veil starts fully clear beneath the sharp banner, reaches a strong
+    // wash where the name/bio text sits, and hits solid page color at the
+    // header's bottom edge. Proportions are derived from the *design* region/
+    // extended heights (not the viewport-clamped locals above) so a header
+    // taller than the current viewport — iPad split view, expanded Dynamic
+    // Type, a long bio — still shows a graceful gradient instead of wash/
+    // deep/end collapsing onto the same clamped point; each location is then
+    // clamped into ascending [0,1] order for the gradient layer.
+    CGFloat rawRegionHeight = MAX(0.0, self.regionHeight);
+    if (self.usesProfileHero && lightPage && hasSharpBanner) {
+        // Resolve the colored continuation gradually beneath the identity,
+        // starting from the actual image end rather than the lower row layout.
+        rawRegionHeight = MIN(rawRegionHeight, canvasHeight);
+    }
+    CGFloat rawExtendedHeight = MAX(rawRegionHeight, self.extendedHeight);
+    CGFloat meltSpan = MAX(1.0, rawExtendedHeight - rawRegionHeight);
+    CGFloat seam = (rawRegionHeight - ApolloImmersiveSharpFeatherHeight) / totalHeight;
+    CGFloat wash = (rawRegionHeight + 0.35 * meltSpan) / totalHeight;
+    CGFloat deep = (rawRegionHeight + 0.70 * meltSpan) / totalHeight;
+    CGFloat end = rawExtendedHeight / totalHeight;
+    CGFloat locSeam = MIN(1.0, MAX(0.0, seam));
+    CGFloat locWash = MIN(1.0, MAX(locSeam, wash));
+    CGFloat locDeep = MIN(1.0, MAX(locWash, deep));
+    CGFloat locEnd = MIN(1.0, MAX(locDeep, end));
+    // Rebuild the color stops only when the resolved page color actually
+    // changed (theme flip / trait change) — not on every scroll-animation frame.
+    if (![self.cachedGradientColorKey isEqual:pageColor]) {
+        self.cachedGradientColorKey = pageColor;
+        // Light surfaces dissolve into the colored backdrop first; the veil
+        // underneath brings that continuation back to the theme page color.
+        self.sharpFeatherMask.colors = @[(id)UIColor.whiteColor.CGColor,
+                                         (id)UIColor.whiteColor.CGColor,
+                                         (id)[UIColor.whiteColor colorWithAlphaComponent:lightPage ? 0.92 : 0.65].CGColor,
+                                         (id)[UIColor.whiteColor colorWithAlphaComponent:lightPage ? 0.80 : 0.45].CGColor,
+                                         (id)[UIColor.whiteColor colorWithAlphaComponent:lightPage ? 0.65 : 0.35].CGColor,
+                                         (id)[UIColor.whiteColor colorWithAlphaComponent:lightPage ? 0.32 : 0.18].CGColor,
+                                         (id)UIColor.clearColor.CGColor,
+                                         (id)UIColor.clearColor.CGColor];
+        if (!self.usesProfileHero) {
+            self.sharpFeatherMask.colors = @[(id)UIColor.whiteColor.CGColor,
+                                             (id)UIColor.clearColor.CGColor];
+        }
+        self.cachedVeilColors = @[(id)[pageColor colorWithAlphaComponent:0.0].CGColor,
+                                  (id)[pageColor colorWithAlphaComponent:0.0].CGColor,
+                                  (id)[pageColor colorWithAlphaComponent:0.60].CGColor,
+                                  (id)[pageColor colorWithAlphaComponent:0.88].CGColor,
+                                  (id)pageColor.CGColor,
+                                  (id)pageColor.CGColor];
+        self.cachedScrimColors = @[(id)[pageColor colorWithAlphaComponent:self.usesProfileHero ? 0.16 : 0.70].CGColor,
+                                   (id)[pageColor colorWithAlphaComponent:self.usesProfileHero ? 0.06 : 0.38].CGColor,
+                                   (id)[pageColor colorWithAlphaComponent:0.0].CGColor];
+    }
+    self.veilLayer.frame = CGRectMake(0.0, 0.0, width + ambientExtension, totalHeight);
+    self.veilLayer.colors = self.cachedVeilColors;
+    self.veilLayer.locations = @[@0.0, @(locSeam), @(locWash), @(locDeep), @(locEnd), @1.0];
+
+    CGFloat scrimHeight = MIN(totalHeight, self.topInset + 32.0);
+    self.chromeScrimLayer.frame = CGRectMake(0.0, 0.0, width + ambientExtension, MAX(1.0, scrimHeight));
+    self.chromeScrimLayer.colors = self.cachedScrimColors;
+    self.chromeScrimLayer.locations = @[@0.0, @0.55, @1.0];
+
+    [CATransaction commit];
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    [super traitCollectionDidChange:previousTraitCollection];
+    [self setNeedsLayout];
+}
+
+@end
+
+@implementation ApolloTopAnchoredImageView
+
+- (void)setAnchorsTop:(BOOL)anchorsTop {
+    if (_anchorsTop == anchorsTop) return;
+    _anchorsTop = anchorsTop;
+    [self apollo_updateContentsRect];
+}
+
+- (void)setImage:(UIImage *)image {
+    [super setImage:image];
+    [self apollo_updateContentsRect];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self apollo_updateContentsRect];
+}
+
+// Aspect fill, horizontally centered. Vertically, of the hidden overflow
+// a quarter is cropped from the top and the rest from the bottom (center
+// crop would split it evenly).
+- (void)apollo_updateContentsRect {
+    CGSize view = self.bounds.size;
+    CGSize image = self.image.size;
+    if (!self.anchorsTop || view.width <= 0 || view.height <= 0 || image.width <= 0 || image.height <= 0) {
+        if (self.contentMode != UIViewContentModeScaleAspectFill) self.contentMode = UIViewContentModeScaleAspectFill;
+        if (!CGRectEqualToRect(self.layer.contentsRect, CGRectMake(0, 0, 1, 1))) self.layer.contentsRect = CGRectMake(0, 0, 1, 1);
+        return;
+    }
+    // Many banners (scans, screenshots) carry a light border on their side
+    // edges; with a wide header the full width is otherwise always visible.
+    static const CGFloat kSideTrim = 0.03;
+    CGFloat usableWidth = image.width * (1.0 - 2.0 * kSideTrim);
+    CGFloat scale = MAX(view.width / usableWidth, view.height / image.height);
+    CGFloat visibleWidth = MIN(1.0, view.width / scale / image.width);
+    CGFloat visibleHeight = MIN(1.0, view.height / scale / image.height);
+    static const CGFloat kTopCropShare = 0.25;
+    CGRect rect = CGRectMake((1.0 - visibleWidth) / 2.0, (1.0 - visibleHeight) * kTopCropShare,
+                             visibleWidth, visibleHeight);
+    if (self.contentMode != UIViewContentModeScaleToFill) self.contentMode = UIViewContentModeScaleToFill;
+    if (!CGRectEqualToRect(self.layer.contentsRect, rect)) self.layer.contentsRect = rect;
+}
+
+@end

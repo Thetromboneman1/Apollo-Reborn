@@ -1,0 +1,266 @@
+#import "ApolloState.h"
+#import "UserDefaultConstants.h"
+
+NSString *sRedditClientId = nil;
+NSString *sRedditClientSecret = nil;
+NSString *sImgurClientId = nil;
+NSString *sImageChestAPIToken = nil;
+NSString *sRedirectURI = nil;
+NSString *sUserAgent = nil;
+NSString *sRandomSubredditsSource = nil;
+NSString *sRandNsfwSubredditsSource = nil;
+NSString *sTrendingSubredditsSource = nil;
+NSString *sTrendingSubredditsLimit = nil;
+NSString *sRecentlyVisitedSubredditsLimit = @"5";
+
+BOOL sBlockAnnouncements = NO;
+BOOL sAutomaticBackupsEnabled = NO;
+NSInteger sAutomaticBackupIntervalDays = 3;
+NSInteger sAutomaticBackupDestination = 0;
+BOOL sICloudReadStateSyncEnabled = NO;
+BOOL sShowDeletedComments = NO;
+BOOL sTapToRevealDeletedComments = NO;
+BOOL sPassiveDeletedComments = NO;
+BOOL sFeedTextPostThumbnails = YES;
+BOOL sRestoreReadingSession = NO;
+BOOL sFeedGalleryCarousel = YES;
+BOOL sFeedGalleryEdgeSwipeNav = YES;
+BOOL sGalleryAutoplayVideos = YES;
+BOOL sGalleryAutoplayGIFs = YES;
+BOOL sForwardSwipeForgetAfterScrolling = NO; // opt in before changing Apollo's common forward gesture
+BOOL sSwipeUpForComments = NO;
+BOOL sDevvitInteractivePosts = NO;
+BOOL sDevvitFeedWidgets = YES;
+BOOL sFloatingPostTabs = NO;         // chat-heads-style floating post tabs (ApolloFloatingTabs.xm)
+BOOL sFloatingPostTabsMagnet = YES;  // effective default ON via registerDefaults; consulted only while master is on
+BOOL sFloatingPostTabsPreview = YES; // effective default ON via registerDefaults; hold-to-preview peek cards
+NSInteger sPreferredGIFFallbackFormat = 1; // 0=GIF, 1=MP4
+
+NSInteger sReadPostMaxCount = 0;
+
+NSInteger sUnmuteCommentsVideos = 0; // 0=Default, 1=Remember from Full Screen, 2=Always
+NSInteger sUnmuteFeedVideos = 0;     // 0=Never, 1=Remember, 2=Always (UDKeyUnmuteFeedVideos)
+BOOL sFeedVideoScrubber = NO;        // hold a feed video's progress bar and slide to scrub
+BOOL sFeedVideoScrollSmoothing = YES; // effective default ON via registerDefaults (UDKeyFeedVideoScrollSmoothing)
+
+BOOL sVideoHoldSpeedEnabled = YES;   // effective default ON via registerDefaults (UDKeyVideoHoldSpeedEnabled)
+float sVideoHoldSpeed = 2.0f;        // effective default 2.0× via registerDefaults (UDKeyVideoHoldSpeed)
+
+BOOL sProxyImgurDDG = NO;
+BOOL sImgurAlbumFallbackProxies = YES;
+BOOL sShowUserAvatars = NO;
+BOOL sUseProfileAvatarTabIcon = NO;
+BOOL sHideTabBarTitles = NO;
+BOOL sUnreadBadgeCompactTabBar = NO;
+BOOL sUnreadBadgeCompactInbox = NO;
+BOOL sUnreadBadgeThemeColor = NO;
+BOOL sTintInactiveTabIcons = NO;
+BOOL sAccentNavigationButtons = NO;
+BOOL sShowDetailedProfiles = YES;   // effective default ON via registerDefaults (UDKeyShowDetailedProfiles)
+BOOL sBadgeBookEnabled = YES;       // effective default ON via registerDefaults (UDKeyBadgeBookEnabled)
+BOOL sProfileHeaderImmersive = YES; // New (immersive melt) vs Classic (flat); default ON (UDKeyProfileHeaderImmersive)
+// Profile customization — viewer preferences for every profile they view. All show-*
+// default ON; avatar style 0=Full snoovatar, 1=Circle, 2=Square (default Full).
+BOOL sProfileShowBanner = YES;
+BOOL sProfileShowStatCards = YES;
+BOOL sProfileShowSocialLinks = YES;
+BOOL sProfileShowActions = YES;   // Follow / Message row on other-user profiles
+NSInteger sProfileAvatarStyle = 1; // Circle until preferences load.
+BOOL sShowSubredditHeaders = NO;
+BOOL sSubredditHeaderImmersive = YES;   // effective default when Reborn header is enabled
+BOOL sSubredditShowBanner = YES;
+BOOL sSubredditShowIcon = YES;
+BOOL sSubredditShowJoinButton = YES;
+BOOL sSubredditShowUserFlairButton = NO;
+BOOL sSubredditShowSidebarButton = NO;
+BOOL sSubredditShowDisplayName = YES;
+BOOL sSubredditShowSubtitle = YES;
+BOOL sSubredditShowDescription = YES;
+BOOL sCommunityHighlights = NO;
+BOOL sCommunityHighlightsWeb = NO;
+NSString *const ApolloTabBarScrollBehaviorChangedNotification = @"ApolloTabBarScrollBehaviorChangedNotification";
+BOOL sClassicTabBarScrollBehavior = NO;
+BOOL sHideTopBarOnScroll = NO;
+ApolloTabBarHideStyle sTabBarHideStyle = ApolloTabBarHideStyleLeft;
+BOOL sLiquidGlassEnabled = YES; // set once by ApolloCommon +load, before Logos constructors
+BOOL sIPadTabBarBottom = NO;   // opt-in (default OFF via registerDefaults, UDKeyIPadTabBarBottom); iPad-gated in the module
+BOOL sIPadPaneLayout = NO;     // opt-in (default OFF via registerDefaults, UDKeyIPadPaneLayout); iPad-gated, relaunch to apply
+BOOL sTabBarSwipeNavigation = NO;   // opt-in (default OFF via registerDefaults, UDKeyTabBarSwipeNavigation); Liquid Glass only, see ApolloLiquidGlass.xm
+NSInteger sDuoUnfoldedFeedLayout = 0;
+BOOL sDuoSubredditPanelGlassEnabled = NO;
+BOOL sDuoTabletopVideoEnabled = NO;
+BOOL sSubredditSwitcherSheetEnabled = NO;
+BOOL sKeepSearchBarInPlace = NO;
+BOOL sShowFeedSearchBar = YES;
+BOOL sShowFindInCommentsBar = YES;
+BOOL sDuoRailReplyButton = YES;
+NSInteger sSearchBarMode = ApolloSearchBarModeOn;
+BOOL sSearchBarModeExplicit = NO;
+
+// MARK: - Search bar preference compatibility
+static ApolloSearchBarMode ApolloValidatedSearchBarMode(NSInteger mode) {
+    return mode >= ApolloSearchBarModeOn && mode <= ApolloSearchBarModeOff
+        ? (ApolloSearchBarMode)mode : ApolloSearchBarModeOn;
+}
+
+void ApolloLoadSearchBarPreferences(NSDictionary *persistentDomain) {
+    id feed = persistentDomain[UDKeyShowFeedSearchBar];
+    id comments = persistentDomain[UDKeyShowFindInCommentsBar];
+    sShowFeedSearchBar = [feed respondsToSelector:@selector(boolValue)] ? [feed boolValue] : YES;
+    sShowFindInCommentsBar = [comments respondsToSelector:@selector(boolValue)] ? [comments boolValue] : YES;
+    id mode = persistentDomain[UDKeySearchBarMode];
+    sSearchBarModeExplicit = mode != nil;
+    sSearchBarMode = ApolloValidatedSearchBarMode([mode respondsToSelector:@selector(integerValue)]
+        ? [mode integerValue] : ApolloSearchBarModeOn);
+}
+
+ApolloSearchBarMode ApolloSearchBarModeForComments(BOOL comments) {
+    if (!sSearchBarModeExplicit) {
+        BOOL show = comments ? sShowFindInCommentsBar : sShowFeedSearchBar;
+        return show ? ApolloSearchBarModeOn : ApolloSearchBarModeOff;
+    }
+    return ApolloValidatedSearchBarMode(sSearchBarMode);
+}
+
+void ApolloSaveSearchBarMode(NSUserDefaults *defaults, ApolloSearchBarMode mode) {
+    sSearchBarMode = ApolloValidatedSearchBarMode(mode);
+    [defaults setInteger:sSearchBarMode forKey:UDKeySearchBarMode];
+    sSearchBarModeExplicit = YES;
+}
+// MARK: - End search bar preference compatibility
+ApolloSettingsIconAppearance sSettingsIconAppearance = ApolloSettingsIconAppearanceLight;
+BOOL sIconRowMagnifier = YES;   // effective default ON via registerDefaults (UDKeyIconRowMagnifier)
+BOOL sInfoRowTapUpvote = YES;      // effective default ON via registerDefaults (UDKeyInfoRowTapUpvote)
+BOOL sInfoRowTapComments = YES;    // effective default ON via registerDefaults (UDKeyInfoRowTapComments)
+BOOL sInfoRowPopupMode = YES;      // info details + comment insights → popup; default ON (UDKeyInfoRowPopupMode)
+BOOL sInfoRowOverlayMode = NO;     // info details + comment insights → overlay; default OFF (UDKeyInfoRowOverlayMode)
+BOOL sInfoRowTapTranslation = YES; // effective default ON via registerDefaults (UDKeyInfoRowTapTranslation)
+BOOL sThreeStateVoting = NO;
+BOOL sCollapseNavigationActions = NO;
+BOOL sScrollReturnButton = YES;
+BOOL sCenterTitleBetweenButtons = NO;
+NSInteger sScrollEdgeEffectStyle = ApolloScrollEdgeEffectStyleAutomatic;
+BOOL sModernSubredditDividers = YES;
+BOOL sSubredditListEnhancements = YES;
+NSInteger sSubredditFeedIconStyle = ApolloSubredditFeedIconStyleClassic;
+NSInteger sSubredditFeedLayout = ApolloSubredditFeedLayoutRows;
+BOOL sPerAccountFavoritesEnabled = NO;
+BOOL sSortFavoritesAlphabetically = NO;
+BOOL sConfirmFavoriteToggle = NO;
+BOOL sHideSubredditListDescriptions = NO;
+BOOL sHideMultiredditDescriptions = NO;
+BOOL sEnableFlairColors = NO;
+BOOL sBoldPostTitles = NO;
+BOOL sEnableInlineImages = NO;
+BOOL sEnableChatMedia = NO;   // effective default YES via registerDefaults (UDKeyEnableChatMedia)
+BOOL sAllPlusNSFWEnabled = NO;   // opt-in; default OFF via registerDefaults (UDKeyAllPlusNSFWEnabled)
+double sAllPlusNSFWBoost = 0.0;  // effective default 0.0 via registerDefaults (UDKeyAllPlusNSFWBoost)
+BOOL sEnableAISummaries = NO;
+BOOL sLiveCommentsFollow = YES;   // effective default ON via registerDefaults (UDKeyLiveCommentsFollow)
+NSInteger sCommentNavigationMode = 0;
+BOOL sPerPostCommentSort = NO;    // opt-in; default OFF via registerDefaults (UDKeyPerPostCommentSort)
+BOOL sEnableAIPostSummaries = YES;
+BOOL sEnableAICommentSummaries = YES;
+BOOL sEnableTapToSummarize = NO;
+BOOL sEnableAIAutoExpandSummaries = NO;
+NSString *sAISummaryProvider = @"apple"; // sanitized to apple|openrouter|gemini|custom on load
+NSString *sOpenRouterAPIKey = nil;
+NSString *sOpenRouterAIModel = nil;
+NSString *sGeminiAPIKey = nil;
+NSString *sGeminiAIModel = nil;
+NSString *sCustomAIAPIKey = nil;
+NSString *sCustomAIModel = nil;
+NSString *sCustomAIBaseURL = nil;
+NSArray<NSDictionary<NSString *, NSString *> *> *sCustomAIHeaders = nil;
+NSInteger sAIPostWordThreshold = 150;
+ApolloAISummaryDetail sAIPostSummaryDetail = ApolloAISummaryDetailBalanced;
+ApolloAISummaryDetail sAICommentSummaryDetail = ApolloAISummaryDetailBalanced;
+NSString *sAISummaryLanguage = nil;
+NSInteger sInlineImageAlignment = ApolloInlineImageAlignmentCenter;
+NSInteger sAutoplayInlineGIFMode = ApolloAutoplayInlineGIFModeDefault;
+NSInteger sInlineMediaSizePercent = 100;
+NSInteger sLinkPreviewBodyMode = ApolloLinkPreviewModeOff;
+NSInteger sLinkPreviewCommentsMode = ApolloLinkPreviewModeOff;
+NSInteger sLinkPreviewCardColor = ApolloLinkPreviewCardColorNeutral;
+NSString *sLinkPreviewCardColorHex = nil;
+uint32_t sLinkPreviewCardColorPacked = 0;
+NSInteger sImageUploadProvider = ImageUploadProviderImgur;
+NSInteger sCommentLinkHost = CommentLinkHostOff;
+BOOL sCommentLinkPreferNative = NO;
+NSInteger sShareLinkHost = ShareLinkHostDefault;
+
+NSString *ApolloShareLinkHostDomain(ShareLinkHost host) {
+    switch (host) {
+        case ShareLinkHostRetiredOldReddit: return nil;
+        case ShareLinkHostVXReddit:  return @"vxreddit.com";
+        case ShareLinkHostFXReddit:  return @"fxddit.com";
+        case ShareLinkHostDefault:
+        default:                     return nil;
+    }
+}
+
+NSString *ApolloShareLinkHostDisplayName(ShareLinkHost host) {
+    switch (host) {
+        case ShareLinkHostRetiredOldReddit: return @"Reddit";
+        case ShareLinkHostVXReddit:  return @"vxReddit";
+        case ShareLinkHostFXReddit:  return @"fxReddit (fxddit.com)";
+        case ShareLinkHostDefault:
+        default:                     return @"Reddit";
+    }
+}
+
+NSString *sLatestRedditBearerToken = nil;
+
+BOOL sEnableBulkTranslation = NO;
+BOOL sAutoTranslateOnAppear = YES;
+BOOL sTapToTranslate = NO;   // per-item "tap to translate" mode; overrides auto-translate display
+BOOL sShowTranslationDetails = YES;   // comments + post-header marker; default ON via registerDefaults
+BOOL sShowTranslationTitleDetails = YES;   // feed-title compact marker; default ON via registerDefaults
+BOOL sTranslationMarkerUseThemeColor = NO;   // NO = green marker; YES = follow app/theme tint
+BOOL sTranslatePostTitles = NO;
+NSString *sTranslationTargetLanguage = nil;
+NSString *sTranslationProvider = nil;
+NSString *sLibreTranslateURL = nil;
+NSString *sLibreTranslateAPIKey = nil;
+NSString *sMicrosoftTranslateAPIKey = nil;
+NSString *sMicrosoftTranslateRegion = nil;
+NSArray<NSString *> *sTranslationSkipLanguages = nil;
+BOOL sAppleTranslateSheet = NO;
+
+BOOL sWebJSONEnabled = NO;
+BOOL sReduceRateLimiting = NO;
+BOOL sKeylessRouteUpdates = YES;
+BOOL sPollsFeatureEnabled = NO;
+NSInteger sPollOptionAlignment = ApolloPollOptionAlignmentCenter;
+NSString *sWebSessionCookieHeader = nil;
+NSString *sWebSessionModhash = nil;
+NSString *sWebSessionUsername = nil;
+BOOL sPiPEnabled = NO;
+NSInteger sPiPActivationMode = ApolloPiPActivationModeUnmutedOnly;
+NSInteger sPiPStartPosition = ApolloPiPStartPositionTopRight;
+BOOL sPiPNativeEnabled = NO;
+BOOL sPiPLoop = YES;
+BOOL sPiPStartHidden = NO;
+BOOL sPiPSkipButtons = NO;
+NSInteger sPiPSkipSeconds = 10;
+BOOL sPiPProgressBar = NO;
+
+NSInteger sNSFWBlurOverride = 0;
+BOOL sTagFilterEnabled = NO;
+NSString *sTagFilterMode = @"blur";
+BOOL sTagFilterNSFW = YES;
+BOOL sTagFilterSpoiler = YES;
+NSDictionary<NSString *, NSDictionary *> *sTagFilterSubredditOverrides = nil;
+
+NSDictionary<NSString *, NSDictionary *> *sPostFilterSubreddits = nil;
+NSArray<NSString *> *sPostFilterNameSubstrings = nil;
+
+float ApolloSanitizedHoldSpeed(float value) {
+    // The exact speeds offered by the picker (mirrors the video player's menu,
+    // minus 1.0× — holding at normal speed would be a no-op).
+    static const float kSupported[] = { 0.25f, 0.5f, 0.75f, 1.25f, 1.5f, 2.0f };
+    for (size_t i = 0; i < sizeof(kSupported) / sizeof(kSupported[0]); i++) {
+        if (fabsf(value - kSupported[i]) < 0.001f) return kSupported[i];
+    }
+    return 2.0f;   // unset (0) / corrupt / unsupported → default boost
+}

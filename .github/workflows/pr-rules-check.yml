@@ -1,0 +1,67 @@
+name: Pull request rules
+
+# Pull requests from outside the core team have to link an issue (for a
+# feature, its request on request.apolloreborn.app works too; a refactor needs
+# none), say whether they're a bug fix, feature or refactor, show the bug
+# reproduced on main and include before/after media where that applies, and
+# list the devices they were tested on (CONTRIBUTING.md#pull-request-rules,
+# with a section for each in .github/pull_request_template.md). An author can
+# also have only a few PRs open at once. This checks a PR when it's opened or
+# marked ready for review (drafts only against the open PR limit). If anything
+# is missing it labels the PR `needs-verification`, comments with exactly what
+# to add, and closes it. When the author edits the description to fill it in,
+# or a maintainer adds `verification-not-needed`, the label comes off and the
+# PR reopens. A PR whose author asked for a device tester passes and gets
+# `needs-device-test`.
+#
+# Size is separate: a PR (draft or not) over the line limit is labelled
+# `needs-size-ok` and stays open until a maintainer adds `large-change-ok`. It's
+# rechecked on every push. Maintainers, bots and docs-only PRs are skipped.
+# The logic lives in .github/scripts/pr-rules-check.js; tests in
+# tests/pr_rules_check_tests.js.
+#
+# pull_request_target, so fork PRs get a token that can label, comment and
+# close. That runs this workflow and the script from the base branch: nothing
+# from the PR is checked out or run, and the PR description is only ever
+# handled as data inside github-script.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, ready_for_review, labeled, synchronize]
+
+concurrency:
+  # One run at a time per PR, so an edit made right after opening is seen
+  # after the opening check has finished.
+  group: pr-rules-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read        # sparse checkout of .github/scripts (base branch)
+  issues: write         # label and comment
+  pull-requests: write  # close and reopen
+
+jobs:
+  check:
+    name: Check the PR against the rules
+    # Cheap pre-filter; the script makes the real call (write access, labels,
+    # drafts, docs-only). A label only matters when it's the waiver or the
+    # large change OK.
+    if: >-
+      github.event.pull_request.user.type != 'Bot' &&
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      (github.event.action != 'labeled' || contains(fromJSON('["verification-not-needed","large-change-ok"]'), github.event.label.name))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the check script (base branch, never the PR)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Check, close or reopen
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const check = require('./.github/scripts/pr-rules-check.js');
+            await check.run({ github, context, core });

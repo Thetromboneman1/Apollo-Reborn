@@ -1,0 +1,43 @@
+#import <UIKit/UIKit.h>
+
+// Apollo's in-app slider overrides the system category only inside settings.
+#ifdef __cplusplus
+extern "C" {
+#endif
+UIColor *ApolloSettingsPrimaryTextColor(void);
+UIFont *ApolloSettingsFont(UIFontTextStyle style, UITraitCollection *traits);
+// Classic single-title rows: native 44pt minimum, growing for wrapped/larger text.
+CGFloat ApolloSettingsClassicRowHeight(UITableView *table, NSString *title, NSString *detail,
+                                      BOOL hasIcon, CGFloat accessoryWidth);
+void ApolloSettingsApplyCellTypography(UITableViewCell *cell);
+void ApolloSettingsApplySectionHeaderTypography(UIView *view);
+// What -tableView:willDisplayFooterView:forSection: applies to every footer. A
+// screen that sizes its own footer view applies it to the view it measures, so
+// the height it answers is the height of the text as it is displayed.
+void ApolloSettingsApplyFooterTypography(UIView *view);
+#ifdef __cplusplus
+}
+#endif
+
+@interface ApolloSettingsTableViewController : UITableViewController
+- (UITableView *)apollo_sourceThemeTableView;
+- (UIColor *)apollo_themeCellBackgroundColor;
+- (UIColor *)apollo_themeAccentColor;
+- (void)apollo_applyPrimaryTextColorToCell:(UITableViewCell *)cell;
+- (void)apollo_applyAccentActionTextColorToCell:(UITableViewCell *)cell;
+- (void)apollo_removeAccentActionTextColorFromCell:(UITableViewCell *)cell;
+- (void)apollo_applyThemeToCell:(UITableViewCell *)cell;
+- (void)apollo_applyTheme;
+// The updates pass that lets the table take section title heights again after
+// a theme font change restyled them (see -viewWillAppear:). The base runs it
+// with the first row on screen kept in place; the form also measures its
+// footers again in it.
+- (void)apollo_takeSectionTitleHeights;
+@end
+
+@interface ApolloFooterLinkTextView : UITextView
+@end
+
+@interface ApolloSettingsLinkFooterView : UITableViewHeaderFooterView
+@property (nonatomic, strong, readonly) ApolloFooterLinkTextView *linkTextView;
+@end

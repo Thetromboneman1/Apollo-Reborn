@@ -1,0 +1,1562 @@
+#import "ApolloOfflineLibrary.h"
+#import "ApolloProfileBannerURL.h"
+#import "ApolloUserProfileCache.h"
+#import "ApolloAccountCredentials.h"   // ApolloActiveAccountUsername() — follow-state account scoping
+#import "ApolloBannedProfile.h"
+#import "ApolloCommon.h"
+#import "ApolloLinkPreviewCache.h"
+#import "ApolloMemoryDiagnostics.h"
+#import "ApolloState.h"
+#import "ApolloWebJSON.h"             // ApolloWebJSONOptionalReadBackoff, ApolloWebJSONHasUsableSession
+#import "ApolloWebSessionStore.h"      // ApolloActiveWebSessionUsername
+
+#import <CommonCrypto/CommonDigest.h>
+
+NSString * const ApolloUserProfileInfoUpdatedNotification = @"ApolloUserProfileInfoUpdatedNotification";
+NSString * const ApolloUserProfileUsernameKey = @"username";
+
+static NSTimeInterval const ApolloUserProfileCacheTTL = 7.0 * 24.0 * 60.0 * 60.0;
+static NSUInteger const ApolloUserProfileDiskCacheMaxEntries = 2000;
+static NSInteger const ApolloUserProfileCacheSchemaVersion = 2;
+
+// Longest pixel dimension worth keeping for banner art: the device's longest
+// screen side in pixels (covers rotation and the immersive backdrop's needs).
+// Warmed from -init on the main thread so off-queue callers never touch
+// UIScreen themselves.
+// TODO: Modernization - process-wide, dispatch_once-cached main-screen size
+// and scale. It bounds banners decoded into the shared, URL-keyed bannerCache
+// (and their disk re-encodes), which serve every window/screen, so no single
+// caller's traits/bounds are the right input. A real fix sizes the decode per
+// requesting display (scale + longest side in the cache key) or lets callers
+// pass the maximum they need; until then this assumes one display = main screen.
+static CGFloat ApolloBannerMaxPixelDimension(void) {
+    static CGFloat dimension = 0.0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // TODO: Modernization - see above; no trait/bounds source here.
+        CGSize bounds = UIScreen.mainScreen.bounds.size;
+        CGFloat scale = UIScreen.mainScreen.scale;
+        dimension = MAX(bounds.width, bounds.height) * scale;
+    });
+    return dimension;
+}
+
+// TODO: Modernization - force-decode for the shared URL-keyed image caches;
+// decoded images are served to every window, so the display scale belongs to
+// the consumer's render step (which draws into explicit point rects), not to
+// this cache. The main-screen fallback below (and the decode scale at the
+// requestImageForURL: call sites) stays until the cache decodes
+// scale-independently, which changes image.size for every consumer.
+static UIImage *ApolloDecodedAvatarImage(UIImage *image) {
+    if (!image || image.images.count > 0 || image.size.width <= 0.0 || image.size.height <= 0.0) return image;
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    // TODO: Modernization - no trait source; see above.
+    format.scale = image.scale > 0.0 ? image.scale : [UIScreen mainScreen].scale;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:image.size format:format];
+    return [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        [image drawInRect:CGRectMake(0.0, 0.0, image.size.width, image.size.height)];
+    }] ?: image;
+}
+
+@implementation ApolloUserProfileInfo
+
+- (instancetype)initWithUsername:(NSString *)username
+                          iconURL:(NSURL *)iconURL
+                        bannerURL:(NSURL *)bannerURL
+                       defaultSnoo:(BOOL)defaultSnoo
+                        fetchedAt:(NSDate *)fetchedAt {
+    self = [super init];
+    if (self) {
+        _username = [username copy];
+        _iconURL = iconURL;
+        _bannerURL = bannerURL;
+        _defaultSnoo = defaultSnoo;
+        _fetchedAt = fetchedAt ?: [NSDate date];
+        _linkKarma = -1;
+        _commentKarma = -1;
+        _createdUTC = 0.0;
+        _userIsSubscriber = NO;
+        _followStateKnown = NO;
+    }
+    return self;
+}
+
+@end
+
+// How long a permanently-failed image URL (404/403/undecodable body) is
+// negative-cached before another fetch may be attempted. Memory-only.
+static NSTimeInterval const ApolloUserProfileImageNotFoundTTL = 15.0 * 60.0;
+
+@interface ApolloUserProfileCache ()
+@property(nonatomic, strong) NSCache<NSString *, ApolloUserProfileInfo *> *infoCache;
+@property(nonatomic, strong) NSCache<NSString *, UIImage *> *imageCache;
+// Banner art lives in its own small cache (see the header note) so its bulk
+// can never evict avatars. Keys are "banner:"-prefixed URL strings, which also
+// keeps its in-flight coalescing distinct inside the shared imageCompletions.
+@property(nonatomic, strong) NSCache<NSString *, UIImage *> *bannerCache;
+// Image-URL negative cache (touched only on `queue`): info fetches have had a
+// not-found sentinel for a while, but failed image URLs used to refetch once
+// per cell per reapply, forever.
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *imageNotFoundDates;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, ApolloUserProfileInfo *> *diskInfo;
+// Immutable point-in-time view of diskInfo. Render/preload callers read this
+// without synchronously entering the serial persistence/network queue.
+@property(atomic, strong) NSDictionary<NSString *, ApolloUserProfileInfo *> *infoSnapshot;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<void (^)(ApolloUserProfileInfo *)> *> *infoCompletions;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<void (^)(UIImage *)> *> *imageCompletions;
+@property(nonatomic, strong) NSURLSession *session;
+// Avatar image bytes come from Reddit's public CDN hosts (different hosts than the
+// authenticated about.json API, and not per-token rate-limited), so they get their
+// own session with a wider per-host pool and their own concurrent I/O queue for the
+// disk cache — keeping image work off the serial profile-state queue.
+@property(nonatomic, strong) NSURLSession *imageSession;
+@property(nonatomic) dispatch_queue_t imageIOQueue;
+@property(nonatomic) NSUInteger imageDiskWriteCount;
+// t2_ fullnames already issued to a batch this session (touched only on `queue`),
+// so re-opening threads with overlapping authors doesn't re-request them.
+@property(nonatomic, strong) NSMutableSet<NSString *> *batchRequestedFullNames;
+// The credential Reddit last answered a profile lookup with 401/403 for, and
+// until when lookups sent on that same credential are skipped (touched only on
+// `queue`). See -holdLookupForRejectedCredential:.
+@property(nonatomic, copy) NSString *rejectedCredential;
+@property(nonatomic) NSTimeInterval rejectedCredentialUntil;
+@property(nonatomic) dispatch_queue_t queue;
+@property(nonatomic) BOOL diskSaveScheduled;
+@property(nonatomic) NSUInteger diskSaveGeneration;
+// Touched only on `queue`: when the "holding profile lookups" line may be logged again.
+@property(nonatomic) NSTimeInterval budgetHoldLogAllowedAt;
+- (void)startInfoFetchForKey:(NSString *)key bypassingCache:(BOOL)bypassingCache attempt:(NSInteger)attempt;
+- (void)startBatchProfileFetchForFullNames:(NSArray<NSString *> *)chunk token:(NSString *)token;
+- (NSUInteger)applyUserDataRecordsLocked:(NSDictionary *)root warmImages:(BOOL)warmImages;
+- (NSString *)imageCacheDirectory;
+- (NSString *)imageDiskPathForKey:(NSString *)key;
+- (void)persistImageData:(NSData *)data forKey:(NSString *)key;
+- (void)pruneImageDiskCache;
+- (void)publishInfoSnapshotLocked;
+- (void)scheduleDiskCacheSaveLocked;
+@end
+
+@implementation ApolloUserProfileCache
+
++ (instancetype)sharedCache {
+    static ApolloUserProfileCache *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[ApolloUserProfileCache alloc] init];
+    });
+    return cache;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _queue = dispatch_queue_create("com.apollofix.userProfileCache", DISPATCH_QUEUE_SERIAL);
+
+        _infoCache = [[NSCache alloc] init];
+        _infoCache.countLimit = 2000;
+
+        // Avatars are decoded at their source size, not the ~40pt they render
+        // at: a 256px icon is 256KB, so this holds about forty authors. A miss
+        // re-reads the disk copy.
+        _imageCache = [[NSCache alloc] init];
+        _imageCache.countLimit = 400;
+        _imageCache.totalCostLimit = 10 * 1024 * 1024;
+        ApolloMemoryRegisterPurgableCache(@"profile-avatars", _imageCache);
+
+        // One profile or subreddit header is on screen at a time; the rest is
+        // look-back. A banner is decoded at up to the screen's longest side, so
+        // one entry alone can be 14MB (2560x1440), and an entry over the limit
+        // is evicted as it is inserted, emptying the cache with it.
+        _bannerCache = [[NSCache alloc] init];
+        _bannerCache.countLimit = 4;
+        _bannerCache.totalCostLimit = 32 * 1024 * 1024;
+        ApolloMemoryRegisterPurgableCache(@"profile-banners", _bannerCache);
+        // TODO: Modernization - warms the cached main-screen size; see ApolloBannerMaxPixelDimension.
+        (void)ApolloBannerMaxPixelDimension(); // warm the UIScreen read on main
+
+        _diskInfo = [NSMutableDictionary dictionary];
+        _infoSnapshot = @{};
+        _infoCompletions = [NSMutableDictionary dictionary];
+        _imageCompletions = [NSMutableDictionary dictionary];
+        _imageNotFoundDates = [NSMutableDictionary dictionary];
+        _batchRequestedFullNames = [NSMutableSet set];
+
+        NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        configuration.requestCachePolicy = NSURLRequestReturnCacheDataElseLoad;
+        configuration.timeoutIntervalForRequest = 15.0;
+        // about.json all targets the one host oauth.reddit.com; widen its pool a little.
+        configuration.HTTPMaximumConnectionsPerHost = 8;
+        _session = [NSURLSession sessionWithConfiguration:configuration];
+
+        // Separate session for avatar image downloads. These hit public CDN hosts
+        // (redditmedia / redditstatic / i.redd.it), which don't rate-limit per token,
+        // so a wider pool loads a burst of icons faster without competing with — or
+        // risking 429s on — the authenticated API session.
+        NSURLSessionConfiguration *imageConfiguration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        imageConfiguration.requestCachePolicy = NSURLRequestReturnCacheDataElseLoad;
+        imageConfiguration.timeoutIntervalForRequest = 20.0;
+        imageConfiguration.HTTPMaximumConnectionsPerHost = 12;
+        _imageSession = [NSURLSession sessionWithConfiguration:imageConfiguration];
+
+        // Concurrent queue for avatar-image disk reads/decodes (dispatch_async) and
+        // exclusive writes/prunes (dispatch_barrier_async). Profile snapshot reads
+        // are non-blocking, and image I/O likewise never occupies that state queue.
+        _imageIOQueue = dispatch_queue_create("com.apollofix.avatarImageIO", DISPATCH_QUEUE_CONCURRENT);
+
+        [self loadDiskCache];
+        dispatch_barrier_async(_imageIOQueue, ^{ [self pruneImageDiskCache]; });
+    }
+    return self;
+}
+
+- (NSString *)normalizedUsername:(NSString *)username {
+    if (![username isKindOfClass:[NSString class]]) return nil;
+    NSString *clean = [username stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([clean hasPrefix:@"u/"] || [clean hasPrefix:@"U/"]) clean = [clean substringFromIndex:2];
+    if (clean.length == 0) return nil;
+    if ([clean isEqualToString:@"[deleted]"] || [clean isEqualToString:@"deleted"]) return nil;
+    // Hidden & Deleted's placeholder list owners (~hd…); never a real account.
+    if ([clean hasPrefix:@"~"]) return nil;
+    return clean.lowercaseString;
+}
+
+- (NSString *)cachePath {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    NSString *cacheRoot = paths.firstObject ?: NSTemporaryDirectory();
+    NSString *directory = [cacheRoot stringByAppendingPathComponent:@"ApolloFix"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+    return [directory stringByAppendingPathComponent:@"ApolloUserProfiles.json"];
+}
+
+- (NSURL *)URLFromString:(id)value {
+    if (![value isKindOfClass:[NSString class]]) return nil;
+    NSString *string = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (string.length == 0) return nil;
+    string = [string stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    if ([string hasPrefix:@"//"]) string = [@"https:" stringByAppendingString:string];
+    NSURL *url = [NSURL URLWithString:string];
+    if (!url.scheme.length || !url.host.length) return nil;
+    return url;
+}
+
+- (NSString *)cleanStringFromValue:(id)value {
+    if (![value isKindOfClass:[NSString class]]) return nil;
+    NSString *string = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (string.length == 0) return nil;
+    return string;
+}
+
+- (NSURL *)decoratorURLFromProfileDictionary:(NSDictionary *)dataDict {
+    NSArray<NSString *> *keys = @[@"avatar_decoration_data", @"avatar_decoration"];
+    for (NSString *key in keys) {
+        NSDictionary *decoration = [dataDict[key] isKindOfClass:[NSDictionary class]] ? dataDict[key] : nil;
+        if (!decoration) continue;
+        NSURL *url = [self URLFromString:decoration[@"asset_url"]] ?:
+            [self URLFromString:decoration[@"static_asset_url"]] ?:
+            [self URLFromString:decoration[@"url"]] ?:
+            [self URLFromString:decoration[@"image_url"]];
+        if (url) return url;
+    }
+    return nil;
+}
+
+- (NSString *)avatarFrameKindForIconURL:(NSURL *)iconURL snoovatarURL:(NSURL *)snoovatarURL {
+    NSString *combined = [NSString stringWithFormat:@"%@ %@", iconURL.absoluteString ?: @"", snoovatarURL.absoluteString ?: @""].lowercaseString;
+    if (![combined containsString:@"nftv2"] && ![combined containsString:@"snoo-nft"]) return nil;
+    if ([combined containsString:@"_legendary_"]) return @"collectible-legendary";
+    if ([combined containsString:@"_epic_"]) return @"collectible-epic";
+    if ([combined containsString:@"_rare_"]) return @"collectible-rare";
+    if ([combined containsString:@"_common_"]) return @"collectible-common";
+    return @"collectible";
+}
+
+- (BOOL)isFreshInfo:(ApolloUserProfileInfo *)info {
+    if (!info.fetchedAt) return NO;
+    return fabs([info.fetchedAt timeIntervalSinceNow]) < ApolloUserProfileCacheTTL;
+}
+
+- (NSDictionary *)dictionaryForInfo:(ApolloUserProfileInfo *)info {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    if (info.username) dict[@"username"] = info.username;
+    if (info.iconURL.absoluteString) dict[@"iconURL"] = info.iconURL.absoluteString;
+    if (info.bannerURL.absoluteString) dict[@"bannerURL"] = info.bannerURL.absoluteString;
+    if (info.snoovatarURL.absoluteString) dict[@"snoovatarURL"] = info.snoovatarURL.absoluteString;
+    dict[@"decoratorURL"] = info.decoratorURL.absoluteString ?: @"";
+    dict[@"avatarFrameKind"] = info.avatarFrameKind ?: @"";
+    dict[@"displayName"] = info.displayName ?: @"";
+    dict[@"aboutText"] = info.aboutText ?: @"";
+    dict[@"defaultSnoo"] = @(info.defaultSnoo);
+    dict[@"hasSnoovatar"] = @(info.hasSnoovatar);
+    dict[@"isSuspended"] = @(info.isSuspended);
+    dict[@"suspensionChecked"] = @(info.suspensionChecked);
+    dict[@"linkKarma"] = @(info.linkKarma);
+    dict[@"commentKarma"] = @(info.commentKarma);
+    dict[@"createdUTC"] = @(info.createdUTC);
+    if (info.followStateKnown) {
+        dict[@"userIsSubscriber"] = @(info.userIsSubscriber);
+        if (info.followStateAccount.length) dict[@"followStateAccount"] = info.followStateAccount;
+    }
+    dict[@"fetchedAt"] = @([info.fetchedAt timeIntervalSince1970]);
+    return dict;
+}
+
+- (ApolloUserProfileInfo *)infoFromDictionary:(NSDictionary *)dict fallbackUsername:(NSString *)fallbackUsername {
+    if (![dict isKindOfClass:[NSDictionary class]]) return nil;
+    NSString *username = [dict[@"username"] isKindOfClass:[NSString class]] ? dict[@"username"] : fallbackUsername;
+    NSURL *iconURL = [self URLFromString:dict[@"iconURL"]];
+    NSURL *bannerURL = [self URLFromString:dict[@"bannerURL"]];
+    NSURL *snoovatarURL = [self URLFromString:dict[@"snoovatarURL"]];
+    NSURL *decoratorURL = [self URLFromString:dict[@"decoratorURL"]];
+    NSString *avatarFrameKind = [dict[@"avatarFrameKind"] isKindOfClass:[NSString class]] ? dict[@"avatarFrameKind"] : nil;
+    if (avatarFrameKind.length == 0) avatarFrameKind = nil;
+    NSString *displayName = [self cleanStringFromValue:dict[@"displayName"]];
+    NSString *aboutText = [self cleanStringFromValue:dict[@"aboutText"]];
+    BOOL defaultSnoo = [dict[@"defaultSnoo"] boolValue];
+    BOOL hasSnoovatar = snoovatarURL || [dict[@"hasSnoovatar"] boolValue];
+    BOOL isSuspended = [dict[@"isSuspended"] boolValue];
+    BOOL suspensionChecked = [dict[@"suspensionChecked"] boolValue];
+    NSTimeInterval timestamp = [dict[@"fetchedAt"] doubleValue];
+    NSDate *fetchedAt = timestamp > 0 ? [NSDate dateWithTimeIntervalSince1970:timestamp] : [NSDate distantPast];
+    if (!dict[@"hasSnoovatar"] && !dict[@"snoovatarURL"]) fetchedAt = [NSDate distantPast];
+    if (!dict[@"decoratorURL"] && !dict[@"avatarFrameKind"]) fetchedAt = [NSDate distantPast];
+    if (!dict[@"displayName"] && !dict[@"aboutText"]) fetchedAt = [NSDate distantPast];
+    // Entries cached before banned-profile support never recorded suspension; force refetch.
+    if (!dict[@"isSuspended"]) {
+        fetchedAt = [NSDate distantPast];
+        suspensionChecked = NO;
+    }
+    // Entries cached before stat capture lack karma/created; force one refetch to gain them.
+    if (!dict[@"createdUTC"]) fetchedAt = [NSDate distantPast];
+    ApolloUserProfileInfo *info = [[ApolloUserProfileInfo alloc] initWithUsername:username iconURL:iconURL bannerURL:bannerURL defaultSnoo:defaultSnoo fetchedAt:fetchedAt];
+    info.snoovatarURL = snoovatarURL;
+    info.decoratorURL = decoratorURL;
+    info.avatarFrameKind = avatarFrameKind;
+    info.displayName = displayName;
+    info.aboutText = aboutText;
+    info.hasSnoovatar = hasSnoovatar;
+    info.isSuspended = isSuspended;
+    info.suspensionChecked = suspensionChecked;
+    // respondsToSelector: guards, not bare key-presence: a JSON null in an
+    // externally hand-edited cache file deserializes to NSNull, and
+    // -[NSNull integerValue] is an unrecognized selector → crash. Matches the
+    // network path's guarding below.
+    if ([dict[@"linkKarma"] respondsToSelector:@selector(integerValue)]) info.linkKarma = [dict[@"linkKarma"] integerValue];
+    if ([dict[@"commentKarma"] respondsToSelector:@selector(integerValue)]) info.commentKarma = [dict[@"commentKarma"] integerValue];
+    if ([dict[@"createdUTC"] respondsToSelector:@selector(doubleValue)]) info.createdUTC = [dict[@"createdUTC"] doubleValue];
+    if ([dict[@"userIsSubscriber"] respondsToSelector:@selector(boolValue)]) {
+        info.userIsSubscriber = [dict[@"userIsSubscriber"] boolValue];
+        info.followStateKnown = YES;
+        // May be nil on entries written before this field existed → reads as
+        // "unknown account" at the use site, which correctly falls back.
+        id acct = dict[@"followStateAccount"];
+        info.followStateAccount = [acct isKindOfClass:[NSString class]] ? acct : nil;
+    }
+    return info;
+}
+
+- (void)pruneDiskInfoLocked {
+    NSMutableArray<NSString *> *staleKeys = [NSMutableArray array];
+    for (NSString *key in self.diskInfo) {
+        if (![self isFreshInfo:self.diskInfo[key]]) [staleKeys addObject:key];
+    }
+    for (NSString *key in staleKeys) [self.diskInfo removeObjectForKey:key];
+
+    if (self.diskInfo.count <= ApolloUserProfileDiskCacheMaxEntries) return;
+
+    NSArray<NSString *> *sorted = [self.diskInfo.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSDate *da = self.diskInfo[a].fetchedAt ?: [NSDate distantPast];
+        NSDate *db = self.diskInfo[b].fetchedAt ?: [NSDate distantPast];
+        return [db compare:da];
+    }];
+    for (NSUInteger i = ApolloUserProfileDiskCacheMaxEntries; i < sorted.count; i++) {
+        [self.diskInfo removeObjectForKey:sorted[i]];
+    }
+}
+
+- (void)loadDiskCache {
+    NSData *data = [NSData dataWithContentsOfFile:[self cachePath]];
+    if (!data.length) return;
+
+    NSError *error = nil;
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (error || ![json isKindOfClass:[NSDictionary class]]) return;
+
+    NSDictionary *root = (NSDictionary *)json;
+    NSInteger schemaVersion = [root[@"schemaVersion"] respondsToSelector:@selector(integerValue)] ? [root[@"schemaVersion"] integerValue] : 1;
+    NSDictionary *entries = [root[@"entries"] isKindOfClass:[NSDictionary class]] ? root[@"entries"] : root;
+    BOOL needsSchemaMigration = schemaVersion < ApolloUserProfileCacheSchemaVersion;
+
+    for (NSString *key in entries) {
+        if (![key isKindOfClass:[NSString class]]) continue;
+        if ([key isEqualToString:@"schemaVersion"]) continue;
+        id value = entries[key];
+        if (![value isKindOfClass:[NSDictionary class]]) continue;
+        ApolloUserProfileInfo *info = [self infoFromDictionary:(NSDictionary *)value fallbackUsername:key];
+        if (!info) continue;
+        if (needsSchemaMigration && !((NSDictionary *)value)[@"isSuspended"]) {
+            info.fetchedAt = [NSDate distantPast];
+            info.suspensionChecked = NO;
+        }
+        self.diskInfo[key] = info;
+    }
+
+    if (needsSchemaMigration) {
+        ApolloLog(@"[BannedProfile] migrated profile cache schema v%ld -> v%ld", (long)schemaVersion, (long)ApolloUserProfileCacheSchemaVersion);
+    }
+
+    [self pruneDiskInfoLocked];
+
+    for (NSString *key in self.diskInfo) {
+        [self.infoCache setObject:self.diskInfo[key] forKey:key];
+    }
+    [self publishInfoSnapshotLocked];
+}
+
+- (void)publishInfoSnapshotLocked {
+    self.infoSnapshot = [self.diskInfo copy] ?: @{};
+}
+
+- (void)saveDiskCacheLocked {
+    [self pruneDiskInfoLocked];
+    [self publishInfoSnapshotLocked];
+
+    NSMutableDictionary *entries = [NSMutableDictionary dictionary];
+    for (NSString *key in self.diskInfo) {
+        entries[key] = [self dictionaryForInfo:self.diskInfo[key]];
+    }
+
+    NSDictionary *root = @{
+        @"schemaVersion": @(ApolloUserProfileCacheSchemaVersion),
+        @"entries": entries,
+    };
+    NSString *path = [self cachePath];
+
+    // Encode + write on a dedicated serial IO queue, NOT on self.queue. This
+    // runs after every info fetch / batch / follow toggle, and the JSON encode
+    // (up to ~2000 entries) plus the synchronous atomic write would otherwise
+    // occupy self.queue and delay network-state mutations. `root` is an
+    // immutable snapshot of freshly-built dictionaries, safe off-queue; the
+    // serial IO queue keeps writes ordered so the newest snapshot wins.
+    static dispatch_queue_t ioQueue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ioQueue = dispatch_queue_create("com.apollo.reborn.profilecache.io", DISPATCH_QUEUE_SERIAL); });
+    dispatch_async(ioQueue, ^{
+        NSData *data = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
+        if (data.length) {
+            [data writeToFile:path atomically:YES];
+        }
+    });
+}
+
+// Profile responses often arrive in bursts while scrolling. Serializing and
+// atomically rewriting the complete JSON dictionary once per response keeps
+// the cache queue busy long enough that old synchronous readers stalled the
+// main thread. Coalesce a burst into one write; the immutable snapshot is
+// published immediately, so this delay affects persistence only.
+- (void)scheduleDiskCacheSaveLocked {
+    if (self.diskSaveScheduled) return;
+    self.diskSaveScheduled = YES;
+    NSUInteger generation = self.diskSaveGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)), self.queue, ^{
+        if (!self.diskSaveScheduled || generation != self.diskSaveGeneration) return;
+        self.diskSaveScheduled = NO;
+        [self saveDiskCacheLocked];
+    });
+}
+
+- (ApolloUserProfileInfo *)cachedInfoForUsername:(NSString *)username {
+    NSString *key = [self normalizedUsername:username];
+    if (!key) return nil;
+    ApolloUserProfileInfo *info = [self.infoCache objectForKey:key];
+    if (info) return info;
+
+    ApolloUserProfileInfo *diskInfo = self.infoSnapshot[key];
+    if (diskInfo) [self.infoCache setObject:diskInfo forKey:key];
+    return diskInfo;
+}
+
+// Optimistically record a follow toggle so the profile header keeps the new state
+// across re-navigation without a full about.json refetch (Reddit is slow to reflect
+// the change in `user_is_subscriber`, so an immediate refetch would revert the pill).
+- (void)updateFollowState:(BOOL)following forUsername:(NSString *)username {
+    NSString *key = [self normalizedUsername:username];
+    if (!key) return;
+    dispatch_async(self.queue, ^{
+        ApolloUserProfileInfo *info = self.diskInfo[key] ?: [self.infoCache objectForKey:key];
+        if (!info) return;
+        info.userIsSubscriber = following;
+        info.followStateKnown = YES;
+        info.followStateAccount = ApolloActiveAccountUsername().lowercaseString;   // whose follow this is
+        self.diskInfo[key] = info;
+        [self.infoCache setObject:info forKey:key];
+        // Same shape as every other writer: publish immediately (the key may be
+        // re-entering diskInfo after a prune, when the old snapshot lacks it),
+        // coalesce the full-cache JSON rewrite.
+        [self publishInfoSnapshotLocked];
+        [self scheduleDiskCacheSaveLocked];
+    });
+}
+
+- (NSString *)escapedUsernameForPath:(NSString *)username {
+    NSMutableCharacterSet *allowed = [[NSCharacterSet alphanumericCharacterSet] mutableCopy];
+    [allowed addCharactersInString:@"_-" ];
+    return [username stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: username;
+}
+
+- (NSURLRequest *)profileRequestForUsername:(NSString *)username {
+    NSString *escaped = [self escapedUsernameForPath:username];
+    NSString *token = ApolloActiveAccountRedditBearerToken();
+    NSString *urlString = token.length > 0
+        ? [NSString stringWithFormat:@"https://oauth.reddit.com/user/%@/about.json?raw_json=1", escaped]
+        : [NSString stringWithFormat:@"https://www.reddit.com/user/%@/about.json?raw_json=1", escaped];
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    request.HTTPMethod = @"GET";
+    request.timeoutInterval = 15.0;
+    if (token.length > 0) {
+        [request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    }
+    NSString *userAgent = sUserAgent.length > 0 ? sUserAgent : @"ApolloProfileAvatars/1.0";
+    [request setValue:userAgent forHTTPHeaderField:@"User-Agent"];
+    // Lets Offline Mode answer this lookup from its saved authors (stays on the device).
+    [NSURLProtocol setProperty:@YES forKey:ApolloOfflineProfileLookupProperty inRequest:request];
+    return request;
+}
+
+- (ApolloUserProfileInfo *)profileInfoFromResponseData:(NSData *)data fallbackUsername:(NSString *)fallbackUsername {
+    if (!data.length) return nil;
+    NSError *error = nil;
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (error || ![json isKindOfClass:[NSDictionary class]]) return nil;
+
+    NSDictionary *root = (NSDictionary *)json;
+    NSDictionary *dataDict = [root[@"data"] isKindOfClass:[NSDictionary class]] ? root[@"data"] : nil;
+    if (!dataDict) return nil;
+
+    NSDictionary *subreddit = [dataDict[@"subreddit"] isKindOfClass:[NSDictionary class]] ? dataDict[@"subreddit"] : nil;
+    NSURL *snoovatarURL = [self URLFromString:dataDict[@"snoovatar_img"]];
+    NSURL *subredditIconURL = [self URLFromString:subreddit[@"icon_img"]] ?: [self URLFromString:subreddit[@"community_icon"]];
+    NSURL *accountIconURL = [self URLFromString:dataDict[@"icon_img"]];
+    NSURL *iconURL = subredditIconURL ?: snoovatarURL ?: accountIconURL;
+    NSURL *decoratorURL = [self decoratorURLFromProfileDictionary:dataDict];
+    NSString *avatarFrameKind = [self avatarFrameKindForIconURL:iconURL snoovatarURL:snoovatarURL];
+
+    NSURL *bannerURL = [self URLFromString:subreddit[@"banner_img"]] ?:
+        [self URLFromString:subreddit[@"mobile_banner_image"]] ?:
+        [self URLFromString:subreddit[@"banner_background_image"]];
+
+    NSString *username = [dataDict[@"name"] isKindOfClass:[NSString class]] ? dataDict[@"name"] : fallbackUsername;
+    NSString *displayName = [self cleanStringFromValue:subreddit[@"title"]] ?: [self cleanStringFromValue:subreddit[@"display_name"]] ?: username;
+    NSString *aboutText = [self cleanStringFromValue:subreddit[@"public_description"]] ?:
+        [self cleanStringFromValue:subreddit[@"description"]] ?:
+        [self cleanStringFromValue:dataDict[@"public_description"]];
+    BOOL defaultSnoo = NO;
+    if (!snoovatarURL && iconURL.host.length > 0) {
+        NSString *host = iconURL.host.lowercaseString;
+        NSString *path = iconURL.path.lowercaseString;
+        defaultSnoo = ([host containsString:@"redditstatic.com"] && [path containsString:@"avatar_default"]);
+    }
+
+    BOOL isSuspended = NO;
+    id suspendedValue = dataDict[@"is_suspended"];
+    if ([suspendedValue respondsToSelector:@selector(boolValue)]) {
+        isSuspended = [suspendedValue boolValue];
+    }
+
+    ApolloUserProfileInfo *info = [[ApolloUserProfileInfo alloc] initWithUsername:username iconURL:iconURL bannerURL:bannerURL defaultSnoo:defaultSnoo fetchedAt:[NSDate date]];
+    info.snoovatarURL = snoovatarURL;
+    info.decoratorURL = decoratorURL;
+    info.avatarFrameKind = avatarFrameKind;
+    info.displayName = displayName;
+    info.aboutText = aboutText;
+    info.hasSnoovatar = snoovatarURL != nil;
+    info.isSuspended = isSuspended;
+    // Offline Mode's small stand-in (see ApolloOfflineProfileLookupProperty):
+    // name and picture only, like a batch entry, so the next online profile
+    // open still fetches the full one.
+    info.suspensionChecked = ![dataDict[@"apollo_offline_lightweight"] boolValue];
+    id linkKarma = dataDict[@"link_karma"];
+    id commentKarma = dataDict[@"comment_karma"];
+    id createdUTC = dataDict[@"created_utc"];
+    if ([linkKarma respondsToSelector:@selector(integerValue)]) info.linkKarma = [linkKarma integerValue];
+    if ([commentKarma respondsToSelector:@selector(integerValue)]) info.commentKarma = [commentKarma integerValue];
+    if ([createdUTC respondsToSelector:@selector(doubleValue)]) info.createdUTC = [createdUTC doubleValue];
+    // Follow state: `data.subreddit.user_is_subscriber` is YES when the logged-in
+    // account follows this user (following == subscribing to their u_ profile).
+    id userIsSubscriber = subreddit[@"user_is_subscriber"];
+    if ([userIsSubscriber respondsToSelector:@selector(boolValue)]) {
+        info.userIsSubscriber = [userIsSubscriber boolValue];
+        info.followStateKnown = YES;
+        // Stamp the account this authenticated fetch ran as — the flag is
+        // account-specific, the rest of the entry is shared and disk-persisted.
+        info.followStateAccount = ApolloActiveAccountUsername().lowercaseString;
+    }
+    return info;
+}
+
+- (void)finishInfoRequestForKey:(NSString *)key info:(ApolloUserProfileInfo *)info {
+    dispatch_async(self.queue, ^{
+        if (info) {
+            self.diskInfo[key] = info;
+            [self.infoCache setObject:info forKey:key];
+            [self publishInfoSnapshotLocked];
+            [self scheduleDiskCacheSaveLocked];
+            if (info.iconURL) [self requestImageForURL:info.iconURL completion:nil];
+            if (info.decoratorURL) [self requestImageForURL:info.decoratorURL completion:nil];
+        }
+
+        NSArray<void (^)(ApolloUserProfileInfo *)> *callbacks = self.infoCompletions[key];
+        [self.infoCompletions removeObjectForKey:key];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (info) {
+                if (info.isSuspended) {
+                    [[ApolloLinkPreviewCache sharedCache] removePreviewsForRedditUsername:key];
+                } else {
+                    // Ban lifted: drop the transient 403 marker so the overlay
+                    // and inline banned hints clear on the next evaluation.
+                    ApolloBannedProfileClearListEndpoint403ForUsername(key);
+                }
+                [[NSNotificationCenter defaultCenter] postNotificationName:ApolloUserProfileInfoUpdatedNotification
+                                                                    object:self
+                                                                  userInfo:@{ApolloUserProfileUsernameKey: key}];
+                if (info.isSuspended) {
+                    ApolloBannedProfileRefreshProfilesForUsername(key);
+                }
+            }
+            for (void (^callback)(ApolloUserProfileInfo *) in callbacks) {
+                callback(info);
+            }
+        });
+    });
+}
+
+// A profile fetch that fails on a TRANSIENT condition (a 429 rate-limit, a 5xx, or
+// a recoverable network error) must not permanently drop the user's avatar for the
+// rest of the session. That single-shot, give-up-on-first-failure behaviour is the
+// root cause of the "some comment avatars load, some don't" reports: under busier
+// real-world conditions (more concurrent Reborn network traffic and higher/variable
+// latency than the simulator's fast local network) some about.json fetches fail
+// transiently, and with no retry those users are left with a blank placeholder for
+// the whole session. Retry a bounded number of times with backoff before giving up.
+// Permanent failures (404 / 403 / parse failure) are NOT retried. The in-flight
+// `infoCompletions` dedup means every cell waiting on this username shares the one
+// retrying request, so retries don't multiply network load.
+static NSInteger const ApolloUserProfileMaxFetchAttempts = 3;
+
+static BOOL ApolloUserProfileErrorIsTransient(NSError *error) {
+    if (![error.domain isEqualToString:NSURLErrorDomain]) return NO;
+    switch (error.code) {
+        case NSURLErrorTimedOut:
+        case NSURLErrorCannotConnectToHost:
+        case NSURLErrorCannotFindHost:
+        case NSURLErrorNetworkConnectionLost:
+        case NSURLErrorNotConnectedToInternet:
+        case NSURLErrorDNSLookupFailed:
+        case NSURLErrorResourceUnavailable:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+static NSTimeInterval ApolloUserProfileRetryBackoffForAttempt(NSInteger attempt) {
+    switch (attempt) {
+        case 0: return 0.6;
+        case 1: return 2.0;
+        default: return 5.0;
+    }
+}
+
+- (void)startInfoFetchForKey:(NSString *)key bypassingCache:(BOOL)bypassingCache {
+    [self startInfoFetchForKey:key bypassingCache:bypassingCache attempt:0];
+}
+
+// A 401/403 on about.json means Reddit rejected the credential the lookup was
+// sent with (an expired or revoked bearer, a signed-out web session, an
+// anonymous request), not that the user is missing. Nothing gets
+// negative-cached for it; instead lookups sent on that same credential are
+// skipped for a while, so every cell that asks doesn't fire another doomed
+// request. A new credential (Apollo refreshing its token, an account switch)
+// isn't held, so avatars come back as soon as one is in place.
+static NSTimeInterval const ApolloUserProfileRejectedCredentialHold = 60.0;
+
+// What a profile request authenticates with: its Authorization header, or for a
+// bearer-less request the account whose web session the request chokepoint
+// signs it with (the active one, or none when signed out).
+static NSString *ApolloUserProfileRequestCredential(NSURLRequest *request) {
+    NSString *authorization = [request valueForHTTPHeaderField:@"Authorization"];
+    if (authorization.length > 0) return authorization;
+    return [@"bearerless:" stringByAppendingString:ApolloActiveAccountUsername().lowercaseString ?: @""];
+}
+
+static NSString *ApolloUserProfileCredentialDescription(NSString *credential) {
+    if (![credential hasPrefix:@"bearerless:"]) return @"the captured bearer";
+    NSString *username = [credential substringFromIndex:@"bearerless:".length];
+    return username.length > 0 ? [NSString stringWithFormat:@"bearer-less requests for u/%@", username]
+                               : @"anonymous requests";
+}
+
+// Runs on `queue`.
+- (BOOL)holdLookupForRejectedCredential:(NSString *)credential {
+    if (self.rejectedCredential.length == 0 || ![credential isEqualToString:self.rejectedCredential]) return NO;
+    if ([[NSDate date] timeIntervalSince1970] < self.rejectedCredentialUntil) return YES;
+    self.rejectedCredential = nil;
+    return NO;
+}
+
+// Any thread.
+- (void)noteRejectedCredential:(NSString *)credential {
+    dispatch_async(self.queue, ^{
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        BOOL alreadyHeld = [credential isEqualToString:self.rejectedCredential] && now < self.rejectedCredentialUntil;
+        self.rejectedCredential = credential;
+        self.rejectedCredentialUntil = now + ApolloUserProfileRejectedCredentialHold;
+        if (!alreadyHeld) {
+            ApolloLog(@"[UserAvatars] Holding profile lookups sent on %@ for %.0fs (Reddit rejected it)",
+                      ApolloUserProfileCredentialDescription(credential), ApolloUserProfileRejectedCredentialHold);
+        }
+    });
+}
+
+// Negative-cache a permanent miss (404 nonexistent/deleted user, unparseable
+// body) so repeated lookups short-circuit for the cache TTL. Without this,
+// every layout pass of any cell referencing the user (inline avatar path,
+// u/ link-preview prefetch) refires the fetch — one network round trip per
+// ~200ms for as long as the cell is near the viewport, which lags comment
+// scrolling. The sentinel has fetchedAt=now + suspensionChecked=YES so
+// requestInfoForUsername's freshness short-circuit skips the network, and a
+// nil username so display fallbacks keep the author's original casing.
+// Memory-only (never diskInfo): a transient upstream 404 must not persist
+// across launches.
+- (void)cacheNotFoundInfoForKey:(NSString *)key {
+    if (!key) return;
+    ApolloUserProfileInfo *sentinel = [ApolloUserProfileInfo new];
+    sentinel.fetchedAt = [NSDate date];
+    sentinel.suspensionChecked = YES;
+    // [ApolloUserProfileInfo new] bypasses the designated init's -1 "unknown"
+    // karma defaults — without these, deleted users' stat cards render
+    // "0 Post Karma" instead of staying hidden.
+    sentinel.linkKarma = -1;
+    sentinel.commentKarma = -1;
+    [self.infoCache setObject:sentinel forKey:key];
+}
+
+// API-Key-Free accounts have no OAuth bearer to capture, so their lookups go to
+// www.reddit.com, where the request chokepoint (Tweak.xm) signs them in with
+// the active web session's cookie. That charges each one to the session's
+// Reddit request budget, the same one its feed and comment loads spend.
+// Returns the web-session username a bearer-less lookup is charged to, or nil
+// when the active account isn't a web-session account.
+static NSString *ApolloUserProfileChargedWebSessionUsername(void) {
+    return ApolloWebJSONHasUsableSession() ? ApolloActiveWebSessionUsername() : nil;
+}
+
+// Runs on `queue`. YES (after logging, at most once per hold) while Reddit has
+// the web session rate-limited, so the lookup waits for the window to reset.
+- (BOOL)holdLookupForWebSessionUsername:(NSString *)webSessionUsername {
+    NSTimeInterval wait = ApolloWebJSONOptionalReadBackoff(webSessionUsername);
+    if (wait <= 0) return NO;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now >= self.budgetHoldLogAllowedAt) {
+        self.budgetHoldLogAllowedAt = now + wait;
+        ApolloLog(@"[UserAvatars] Holding profile lookups for %.0fs while Reddit rate-limits u/%@", wait, webSessionUsername);
+    }
+    return YES;
+}
+
+- (void)startInfoFetchForKey:(NSString *)key bypassingCache:(BOOL)bypassingCache attempt:(NSInteger)attempt {
+    NSMutableURLRequest *request = [[self profileRequestForUsername:key] mutableCopy];
+    if (bypassingCache) {
+        request.cachePolicy = NSURLRequestReloadIgnoringLocalAndRemoteCacheData;
+    }
+
+    // Skip the lookup (and any retry) while Reddit has the web session
+    // rate-limited. Nothing is negative-cached, so the avatar is looked up
+    // again the next time a cell asks for it after the window resets.
+    NSString *webSessionUsername = [request valueForHTTPHeaderField:@"Authorization"].length > 0
+        ? nil : ApolloUserProfileChargedWebSessionUsername();
+    if ([self holdLookupForWebSessionUsername:webSessionUsername]) {
+        [self finishInfoRequestForKey:key info:nil];
+        return;
+    }
+
+    // Back off and retry on transient failure; only finish-with-nil (which releases
+    // every waiting cell) once the retry budget is spent.
+    __weak typeof(self) weakSelf = self;
+    void (^retryOrGiveUp)(NSString *) = ^(NSString *reason) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (attempt + 1 < ApolloUserProfileMaxFetchAttempts) {
+            NSTimeInterval backoff = ApolloUserProfileRetryBackoffForAttempt(attempt);
+            ApolloLog(@"[UserAvatars] Profile fetch u/%@ %@ — retry %ld/%ld in %.1fs",
+                      key, reason, (long)(attempt + 2), (long)ApolloUserProfileMaxFetchAttempts, backoff);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(backoff * NSEC_PER_SEC)), strongSelf.queue, ^{
+                [strongSelf startInfoFetchForKey:key bypassingCache:bypassingCache attempt:attempt + 1];
+            });
+        } else {
+            ApolloLog(@"[UserAvatars] Profile fetch u/%@ %@ — gave up after %ld attempts",
+                      key, reason, (long)ApolloUserProfileMaxFetchAttempts);
+            [strongSelf finishInfoRequestForKey:key info:nil];
+        }
+    };
+
+    NSString *credential = ApolloUserProfileRequestCredential(request);
+    if ([self holdLookupForRejectedCredential:credential]) {
+        [self finishInfoRequestForKey:key info:nil];
+        return;
+    }
+
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) {
+            if (ApolloUserProfileErrorIsTransient(error)) {
+                retryOrGiveUp([NSString stringWithFormat:@"network error (%@)", error.localizedDescription]);
+                return;
+            }
+            ApolloLogError(@"[UserAvatars] Failed to fetch u/%@: %@", key, error.localizedDescription);
+            [self finishInfoRequestForKey:key info:nil];
+            return;
+        }
+
+        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        NSInteger statusCode = http ? http.statusCode : 200;
+        // A web session's 429 lasts until Reddit's window resets, so a retry
+        // in a second or two just hits it again. Give up without
+        // negative-caching; the hold above covers the lookups that follow.
+        if (statusCode == 429 && webSessionUsername.length > 0) {
+            ApolloLog(@"[UserAvatars] Profile fetch u/%@ HTTP 429 on u/%@'s web session — not retrying", key, webSessionUsername);
+            [self finishInfoRequestForKey:key info:nil];
+            return;
+        }
+        // 429 (rate limited) and 5xx are transient server-side conditions — back off
+        // and retry rather than abandoning this user's avatar.
+        if (statusCode == 429 || statusCode >= 500) {
+            retryOrGiveUp([NSString stringWithFormat:@"HTTP %ld", (long)statusCode]);
+            return;
+        }
+        // Rejected credential, see ApolloUserProfileRejectedCredentialHold. No
+        // retry either: it would go out on the same credential.
+        if (statusCode == 401 || statusCode == 403) {
+            ApolloLog(@"[UserAvatars] Profile fetch for u/%@ returned HTTP %ld on %@; not caching u/%@ as missing",
+                      key, (long)statusCode, ApolloUserProfileCredentialDescription(credential), key);
+            [self noteRejectedCredential:credential];
+            [self finishInfoRequestForKey:key info:nil];
+            return;
+        }
+        if (statusCode < 200 || statusCode >= 300) {
+            // Permanent (404 not found, etc.) — no retry.
+            ApolloLog(@"[UserAvatars] Profile fetch for u/%@ returned HTTP %ld", key, (long)statusCode);
+            [self cacheNotFoundInfoForKey:key];
+            [self finishInfoRequestForKey:key info:nil];
+            return;
+        }
+
+        ApolloUserProfileInfo *info = [self profileInfoFromResponseData:data fallbackUsername:key];
+        if (!info) {
+            [self cacheNotFoundInfoForKey:key];
+            [self finishInfoRequestForKey:key info:nil];
+            return;
+        }
+
+        if (info.iconURL || info.bannerURL) {
+            ApolloLog(@"[UserAvatars] Fetched profile info for u/%@ icon=%@ banner=%@ decorator=%@ frame=%@", key, info.iconURL.absoluteString ?: @"nil", info.bannerURL.absoluteString ?: @"nil", info.decoratorURL.absoluteString ?: @"nil", info.avatarFrameKind ?: @"nil");
+        } else {
+            ApolloLog(@"[UserAvatars] Fetched profile info for u/%@ but no avatar/banner URLs were present", key);
+        }
+        if (info.isSuspended) {
+            ApolloLog(@"[BannedProfile] about.json flagged u/%@ as suspended", key);
+        }
+        [self finishInfoRequestForKey:key info:info];
+    }];
+    [task resume];
+}
+
+- (void)startInfoFetchForKey:(NSString *)key {
+    [self startInfoFetchForKey:key bypassingCache:NO];
+}
+
+- (void)requestInfoForUsername:(NSString *)username completion:(void (^)(ApolloUserProfileInfo *info))completion {
+    NSString *key = [self normalizedUsername:username];
+    if (!key) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        return;
+    }
+
+    dispatch_async(self.queue, ^{
+        ApolloUserProfileInfo *info = [self.infoCache objectForKey:key] ?: self.diskInfo[key];
+        if (info) [self.infoCache setObject:info forKey:key];
+
+        if (info && completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(info); });
+        }
+        // Always revalidate a cached suspension: a lifted temp ban must clear
+        // promptly instead of persisting for the full cache TTL. Non-suspended
+        // fresh entries still short-circuit and skip the network.
+        if (info && [self isFreshInfo:info] && info.suspensionChecked && !info.isSuspended) return;
+
+        // A cached suspension must be revalidated against the network, not the
+        // HTTP cache. about.json for a suspended user is cacheable, so a normal
+        // fetch can be served the stale suspended response from NSURLCache and
+        // the overlay would never clear after the ban is lifted. Use the local
+        // `info` (not ApolloBannedProfileCachedIsSuspended) to avoid a
+        // dispatch_sync re-entry onto self.queue.
+        BOOL bypassHTTPCache = (info != nil && info.isSuspended);
+
+        NSMutableArray<void (^)(ApolloUserProfileInfo *)> *callbacks = self.infoCompletions[key];
+        if (callbacks) {
+            if (completion) [callbacks addObject:[completion copy]];
+            return;
+        }
+
+        callbacks = [NSMutableArray array];
+        if (completion) [callbacks addObject:[completion copy]];
+        self.infoCompletions[key] = callbacks;
+        [self startInfoFetchForKey:key bypassingCache:bypassHTTPCache];
+    });
+}
+
+- (void)refetchInfoForUsername:(NSString *)username completion:(void (^)(ApolloUserProfileInfo *info))completion {
+    NSString *key = [self normalizedUsername:username];
+    if (!key) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        return;
+    }
+
+    dispatch_async(self.queue, ^{
+        ApolloUserProfileInfo *previous = self.diskInfo[key] ?: [self.infoCache objectForKey:key];
+        NSMutableArray<NSURL *> *priorURLs = [NSMutableArray array];
+        if (previous.iconURL) [priorURLs addObject:previous.iconURL];
+        if (previous.bannerURL) [priorURLs addObject:previous.bannerURL];
+        if (previous.snoovatarURL) [priorURLs addObject:previous.snoovatarURL];
+        if (previous.decoratorURL) [priorURLs addObject:previous.decoratorURL];
+
+        // Drop any cached images and HTTP responses so a fresh icon/banner with a
+        // recycled URL would still be re-downloaded. In practice Reddit's CDN URLs
+        // include a content hash that changes on update, so this mostly covers edge
+        // cases like default snoos and unchanged subreddit banners.
+        NSURLCache *httpCache = self.session.configuration.URLCache ?: [NSURLCache sharedURLCache];
+        for (NSURL *url in priorURLs) {
+            [self.imageCache removeObjectForKey:url.absoluteString];
+            [httpCache removeCachedResponseForRequest:[NSURLRequest requestWithURL:url]];
+            NSString *diskPath = [self imageDiskPathForKey:url.absoluteString];
+            dispatch_barrier_async(self.imageIOQueue, ^{
+                [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+            });
+        }
+
+        ApolloLog(@"[UserAvatars] Forcing profile refetch for u/%@ priorURLs=%lu", key, (unsigned long)priorURLs.count);
+
+        NSMutableArray<void (^)(ApolloUserProfileInfo *)> *callbacks = self.infoCompletions[key];
+        if (callbacks) {
+            if (completion) [callbacks addObject:[completion copy]];
+            return;
+        }
+        callbacks = [NSMutableArray array];
+        if (completion) [callbacks addObject:[completion copy]];
+        self.infoCompletions[key] = callbacks;
+        [self startInfoFetchForKey:key bypassingCache:YES];
+    });
+}
+
+#pragma mark - Batch prefetch
+
+- (void)batchPrefetchProfilesForFullNames:(NSArray<NSString *> *)fullNames {
+    if (fullNames.count == 0) return;
+
+    dispatch_async(self.queue, ^{
+        // Drop everyone an earlier batch already asked for first: the feed hands
+        // over a whole page each time one of its posts nears the screen (#1438),
+        // so while that page's batch is in flight most calls here add nobody new,
+        // and the credential lookups below both read the keychain.
+        NSMutableOrderedSet<NSString *> *pending = [NSMutableOrderedSet orderedSet];
+        for (NSString *fn in fullNames) {
+            if (![fn isKindOfClass:[NSString class]] || ![fn hasPrefix:@"t2_"]) continue;
+            if ([self.batchRequestedFullNames containsObject:fn]) continue;
+            [pending addObject:fn];
+        }
+        if (pending.count == 0) return;
+
+        // API-Key-Free accounts have no bearer (ApolloActiveAccountRedditBearerToken
+        // returns nil for them): send the batch to www.reddit.com, where the
+        // chokepoint signs it in with the web session cookie. That's one request per
+        // 100 authors against the session's Reddit budget, where the per-cell path
+        // spends one per author. With neither a bearer nor a web session, the
+        // per-cell about.json path covers us. (Resolved here, not on the caller's
+        // main thread: both lookups read the keychain.)
+        NSString *token = ApolloActiveAccountRedditBearerToken();
+        NSString *webSessionUsername = token.length > 0 ? nil : ApolloUserProfileChargedWebSessionUsername();
+        if (token.length == 0 && webSessionUsername.length == 0) return;
+        // Nothing is marked as requested while held, so a later thread open
+        // batches these authors once the budget recovers.
+        if ([self holdLookupForWebSessionUsername:webSessionUsername]) return;
+        [self.batchRequestedFullNames addObjectsFromArray:pending.array];
+
+        // Reddit caps user_data_by_account_ids at 100 ids per request.
+        NSArray<NSString *> *names = pending.array;
+        for (NSUInteger start = 0; start < names.count; start += 100) {
+            NSRange range = NSMakeRange(start, MIN((NSUInteger)100, names.count - start));
+            [self startBatchProfileFetchForFullNames:[names subarrayWithRange:range] token:token];
+        }
+    });
+}
+
+- (void)startBatchProfileFetchForFullNames:(NSArray<NSString *> *)chunk token:(NSString *)token {
+    if (chunk.count == 0) return;
+    NSString *ids = [chunk componentsJoinedByString:@","];
+    // No token = a web-session batch; the chokepoint adds the cookie on www.
+    NSString *host = token.length > 0 ? @"oauth.reddit.com" : @"www.reddit.com";
+    NSString *urlString = [NSString stringWithFormat:@"https://%@/api/user_data_by_account_ids.json?ids=%@&raw_json=1", host, ids];
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) {
+        dispatch_async(self.queue, ^{ for (NSString *fn in chunk) [self.batchRequestedFullNames removeObject:fn]; });
+        return;
+    }
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"GET";
+    request.timeoutInterval = 15.0;
+    if (token.length > 0) {
+        [request setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    }
+    NSString *userAgent = sUserAgent.length > 0 ? sUserAgent : @"ApolloProfileAvatars/1.0";
+    [request setValue:userAgent forHTTPHeaderField:@"User-Agent"];
+
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        BOOL ok = (!error && data.length > 0 && (!http || (http.statusCode >= 200 && http.statusCode < 300)));
+        if (!ok) {
+            ApolloLogError(@"[UserAvatars] Batch profile fetch failed (HTTP %ld, err %@) for %lu ids",
+                      (long)(http ? http.statusCode : -1), error.localizedDescription ?: @"none", (unsigned long)chunk.count);
+            // Un-mark so a later thread open can retry; per-cell about.json still covers these users now.
+            dispatch_async(self.queue, ^{ for (NSString *fn in chunk) [self.batchRequestedFullNames removeObject:fn]; });
+            return;
+        }
+
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![json isKindOfClass:[NSDictionary class]]) return;
+        NSDictionary *root = (NSDictionary *)json;
+
+        dispatch_async(self.queue, ^{
+            NSUInteger applied = [self applyUserDataRecordsLocked:root warmImages:YES];
+            ApolloLog(@"[UserAvatars] Batch profile fetch: %lu ids -> %lu new avatars cached", (unsigned long)chunk.count, (unsigned long)applied);
+        });
+    }];
+    [task resume];
+}
+
+// Runs on `queue`. Caches a lightweight entry for every user in a
+// user_data_by_account_ids response (t2_ fullname -> record) that doesn't have
+// an avatar yet; returns how many it added. `warmImages` also starts each
+// avatar's download, for batches built from cells that are about to show.
+- (NSUInteger)applyUserDataRecordsLocked:(NSDictionary *)root warmImages:(BOOL)warmImages {
+    NSUInteger applied = 0;
+    for (NSString *fullName in root) {
+        NSDictionary *record = [root[fullName] isKindOfClass:[NSDictionary class]] ? root[fullName] : nil;
+        if (!record) continue;
+        NSString *name = [record[@"name"] isKindOfClass:[NSString class]] ? record[@"name"] : nil;
+        NSURL *iconURL = [self URLFromString:record[@"profile_img"]];
+        NSString *key = [self normalizedUsername:name];
+        if (!key || !iconURL) continue;
+
+        // Never clobber a richer entry: about.json (or a prior batch) already gave
+        // this user an icon — keep it (it may carry snoovatar/banner/suspension).
+        ApolloUserProfileInfo *existing = [self.infoCache objectForKey:key] ?: self.diskInfo[key];
+        if (existing.iconURL) continue;
+
+        // Lightweight entry: account icon only. suspensionChecked stays NO so a
+        // later profile-page open still upgrades to full fidelity via about.json.
+        ApolloUserProfileInfo *info = [[ApolloUserProfileInfo alloc] initWithUsername:name
+                                                                             iconURL:iconURL
+                                                                           bannerURL:nil
+                                                                         defaultSnoo:NO
+                                                                           fetchedAt:[NSDate date]];
+        [self.infoCache setObject:info forKey:key];
+        self.diskInfo[key] = info;
+        applied++;
+        // Warm the image cache so the avatar paints the instant the cell appears.
+        if (warmImages) [self requestImageForURL:iconURL completion:nil];
+    }
+    if (applied > 0) {
+        [self publishInfoSnapshotLocked];
+        [self scheduleDiskCacheSaveLocked];
+    }
+    return applied;
+}
+
+- (void)ingestUserDataByAccountIDsResponse:(NSDictionary *)response {
+    if (![response isKindOfClass:[NSDictionary class]] || response.count == 0) return;
+    // Copy out just the two fields we read, on the caller's thread: the parsed
+    // response belongs to Apollo, which goes on to map it into its own models.
+    NSMutableDictionary<NSString *, NSDictionary *> *records = [NSMutableDictionary dictionaryWithCapacity:response.count];
+    for (id fullName in response) {
+        if (![fullName isKindOfClass:[NSString class]] || ![fullName hasPrefix:@"t2_"]) continue;
+        NSDictionary *record = [response[fullName] isKindOfClass:[NSDictionary class]] ? response[fullName] : nil;
+        NSString *name = [record[@"name"] isKindOfClass:[NSString class]] ? [record[@"name"] copy] : nil;
+        NSString *image = [record[@"profile_img"] isKindOfClass:[NSString class]] ? [record[@"profile_img"] copy] : nil;
+        records[fullName] = (name && image) ? @{@"name": name, @"profile_img": image} : @{};
+    }
+    if (records.count == 0) return;
+    dispatch_async(self.queue, ^{
+        // Apollo just asked Reddit for these authors, so our own batch skips them.
+        // A thread adds up to ~100 at a time, so start the session-long set over
+        // once it's large; the cost of that is one repeat batch at most.
+        if (self.batchRequestedFullNames.count + records.count > 4096) [self.batchRequestedFullNames removeAllObjects];
+        [self.batchRequestedFullNames addObjectsFromArray:records.allKeys];
+        // No image warming: Apollo's list covers every loaded comment, most of
+        // which never scroll into view; cells fetch their image as they appear.
+        NSUInteger applied = [self applyUserDataRecordsLocked:records warmImages:NO];
+        ApolloLog(@"[UserAvatars] Apollo's user_data_by_account_ids: %lu ids -> %lu new avatars cached",
+                  (unsigned long)records.count, (unsigned long)applied);
+    });
+}
+
+// Lowercased username -> t2_ fullname, from feed listings (see the header).
+// Guarded by its own lock rather than self.queue: it's read on the main thread
+// as feed cells enter the preload range, where waiting on the queue's network
+// work would stall scrolling.
+static NSMutableDictionary<NSString *, NSString *> *sApolloAuthorFullNames;
+// t3_ post fullname -> the lowercased username -> t2_ fullname map of the whole
+// listing page it came in on (one dictionary shared by the page's posts), under
+// the same lock, so a feed cell can queue its page's authors together.
+static NSMutableDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *sApolloListingPageAuthorsByPost;
+
+- (void)noteAuthorFullNamesFromListing:(NSDictionary *)listing {
+    if (![listing isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *data = [listing[@"data"] isKindOfClass:[NSDictionary class]] ? listing[@"data"] : nil;
+    NSArray *children = [data[@"children"] isKindOfClass:[NSArray class]] ? data[@"children"] : nil;
+    if (children.count == 0) return;
+    NSMutableDictionary<NSString *, NSString *> *found = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *postFullNames = [NSMutableArray array];
+    for (id child in children) {
+        if (![child isKindOfClass:[NSDictionary class]] || ![child[@"kind"] isEqual:@"t3"]) continue;
+        NSDictionary *post = [child[@"data"] isKindOfClass:[NSDictionary class]] ? child[@"data"] : nil;
+        NSString *author = [post[@"author"] isKindOfClass:[NSString class]] ? post[@"author"] : nil;
+        NSString *fullName = [post[@"author_fullname"] isKindOfClass:[NSString class]] ? post[@"author_fullname"] : nil;
+        NSString *key = [self normalizedUsername:author];
+        if (key && [fullName hasPrefix:@"t2_"]) found[key] = [fullName copy];
+        NSString *postFullName = [post[@"name"] isKindOfClass:[NSString class]] ? post[@"name"] : nil;
+        if ([postFullName hasPrefix:@"t3_"]) [postFullNames addObject:[postFullName copy]];
+    }
+    if (found.count == 0) return;
+    NSDictionary<NSString *, NSString *> *pageAuthors = [found copy];
+    @synchronized ([ApolloUserProfileCache class]) {
+        if (!sApolloAuthorFullNames || sApolloAuthorFullNames.count + found.count > 4096) {
+            sApolloAuthorFullNames = [NSMutableDictionary dictionary];
+        }
+        [sApolloAuthorFullNames addEntriesFromDictionary:found];
+        if (!sApolloListingPageAuthorsByPost || sApolloListingPageAuthorsByPost.count + postFullNames.count > 4096) {
+            sApolloListingPageAuthorsByPost = [NSMutableDictionary dictionary];
+        }
+        for (NSString *postFullName in postFullNames) sApolloListingPageAuthorsByPost[postFullName] = pageAuthors;
+    }
+}
+
+- (NSString *)authorFullNameForUsername:(NSString *)username {
+    NSString *key = [self normalizedUsername:username];
+    if (!key) return nil;
+    @synchronized ([ApolloUserProfileCache class]) {
+        return sApolloAuthorFullNames[key];
+    }
+}
+
+- (NSArray<NSString *> *)uncachedAuthorFullNamesOnPageOfPost:(NSString *)postFullName {
+    if (![postFullName isKindOfClass:[NSString class]] || postFullName.length == 0) return nil;
+    NSDictionary<NSString *, NSString *> *pageAuthors = nil;
+    @synchronized ([ApolloUserProfileCache class]) {
+        pageAuthors = sApolloListingPageAuthorsByPost[postFullName];
+    }
+    if (pageAuthors.count == 0) return nil;
+    // Same check the feed cell makes for its own author: memory is hydrated from
+    // disk at launch, so anyone shown before needs no lookup.
+    NSMutableArray<NSString *> *uncached = [NSMutableArray arrayWithCapacity:pageAuthors.count];
+    [pageAuthors enumerateKeysAndObjectsUsingBlock:^(NSString *username, NSString *fullName, __unused BOOL *stop) {
+        if (![self cachedInfoForUsername:username].iconURL) [uncached addObject:fullName];
+    }];
+    return uncached;
+}
+
+- (UIImage *)cachedImageForURL:(NSURL *)url {
+    if (![url isKindOfClass:[NSURL class]]) return nil;
+    return [self.imageCache objectForKey:url.absoluteString];
+}
+
+- (void)finishImageRequestForKey:(NSString *)key image:(UIImage *)image {
+    dispatch_async(self.queue, ^{
+        if (image) {
+            NSUInteger cost = MAX((NSUInteger)1, ApolloImageByteCost(image));
+            [self.imageCache setObject:image forKey:key cost:cost];
+        }
+
+        NSArray<void (^)(UIImage *)> *callbacks = self.imageCompletions[key];
+        [self.imageCompletions removeObjectForKey:key];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (void (^callback)(UIImage *) in callbacks) {
+                callback(image);
+            }
+        });
+    });
+}
+
+// On-disk avatar image cache. The in-memory imageCache is wiped on every relaunch,
+// so without this every cold start re-downloads (and re-decodes) every avatar even
+// though the info JSON cache already knows the URLs. Reddit avatar CDN URLs are
+// content-hashed, so a cached entry is never stale — keyed by SHA256 of the URL.
+- (NSString *)imageCacheDirectory {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    NSString *cacheRoot = paths.firstObject ?: NSTemporaryDirectory();
+    NSString *dir = [[cacheRoot stringByAppendingPathComponent:@"ApolloFix"] stringByAppendingPathComponent:@"Avatars"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+- (NSString *)imageDiskPathForKey:(NSString *)key {
+    const char *str = key.UTF8String ?: "";
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(str, (CC_LONG)strlen(str), digest);
+    NSMutableString *name = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [name appendFormat:@"%02x", digest[i]];
+    return [[self imageCacheDirectory] stringByAppendingPathComponent:name];
+}
+
+// Persist raw image bytes. Runs as a barrier block on imageIOQueue so the write,
+// the write-counter, and the occasional prune are serialized.
+- (void)persistImageData:(NSData *)data forKey:(NSString *)key {
+    if (data.length == 0 || data.length > 2 * 1024 * 1024) return; // skip empty / absurd
+    [data writeToFile:[self imageDiskPathForKey:key] atomically:YES];
+    if ((++self.imageDiskWriteCount % 200) == 0) [self pruneImageDiskCache];
+}
+
+// LRU prune by modification date; only runs on imageIOQueue barrier blocks.
+- (void)pruneImageDiskCache {
+    static NSUInteger const kMaxImageFiles = 2000;
+    NSString *dir = [self imageCacheDirectory];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:dir error:nil];
+    if (names.count <= kMaxImageFiles) return;
+
+    NSMutableArray<NSDictionary *> *entries = [NSMutableArray arrayWithCapacity:names.count];
+    for (NSString *name in names) {
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        NSDate *mdate = [fm attributesOfItemAtPath:path error:nil][NSFileModificationDate] ?: [NSDate distantPast];
+        [entries addObject:@{@"path": path, @"date": mdate}];
+    }
+    [entries sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"date"] compare:b[@"date"]]; // oldest first
+    }];
+    for (NSUInteger i = 0; i < entries.count - kMaxImageFiles; i++) {
+        [fm removeItemAtPath:entries[i][@"path"] error:nil];
+    }
+}
+
+- (void)requestImageForURL:(NSURL *)url completion:(void (^)(UIImage *image))completion {
+    if (![url isKindOfClass:[NSURL class]]) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        return;
+    }
+    NSString *key = url.absoluteString;
+    UIImage *cached = [self.imageCache objectForKey:key];
+    if (cached) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(cached); });
+        return;
+    }
+
+    dispatch_async(self.queue, ^{
+        // Negative cache: a URL that recently failed permanently (deleted CDN
+        // asset, undecodable bytes) short-circuits instead of refiring a
+        // network fetch from every cell on every reapply.
+        NSDate *notFoundAt = self.imageNotFoundDates[key];
+        if (notFoundAt) {
+            if (-[notFoundAt timeIntervalSinceNow] < ApolloUserProfileImageNotFoundTTL) {
+                if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+                return;
+            }
+            [self.imageNotFoundDates removeObjectForKey:key];
+        }
+
+        NSMutableArray<void (^)(UIImage *)> *callbacks = self.imageCompletions[key];
+        if (callbacks) {
+            if (completion) [callbacks addObject:[completion copy]];
+            return;
+        }
+
+        callbacks = [NSMutableArray array];
+        if (completion) [callbacks addObject:[completion copy]];
+        self.imageCompletions[key] = callbacks;
+
+        // Disk read + decode + network all happen off `queue` (on imageIOQueue) so a
+        // batch of decodes can't stall the main thread's sync cachedInfoForUsername.
+        NSString *diskPath = [self imageDiskPathForKey:key];
+        dispatch_async(self.imageIOQueue, ^{
+            NSData *diskData = [NSData dataWithContentsOfFile:diskPath];
+            if (diskData.length > 0) {
+                UIImage *diskImage = nil;
+                @autoreleasepool {
+                    // TODO: Modernization - shared URL-keyed cache decode with no caller
+                    // trait source; see ApolloDecodedAvatarImage. Must match the network decode below.
+                    diskImage = ApolloDecodedAvatarImage([UIImage imageWithData:diskData scale:[UIScreen mainScreen].scale]);
+                }
+                if (diskImage) {
+                    // Touch mtime so the LRU prune keeps recently-shown avatars.
+                    [[NSFileManager defaultManager] setAttributes:@{NSFileModificationDate: [NSDate date]} ofItemAtPath:diskPath error:nil];
+                    [self finishImageRequestForKey:key image:diskImage];
+                    return;
+                }
+            }
+
+            NSURLSessionDataTask *task = [self.imageSession dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                UIImage *image = nil;
+                NSData *persistData = nil;
+                if (!error && data.length > 0) {
+                    @autoreleasepool {
+                        // TODO: Modernization - shared URL-keyed cache decode with no caller
+                        // trait source; see ApolloDecodedAvatarImage. Must match the disk decode above.
+                        image = ApolloDecodedAvatarImage([UIImage imageWithData:data scale:[UIScreen mainScreen].scale]);
+                    }
+                    if (image) persistData = data;
+                }
+                if (!image && error) {
+                    ApolloLogError(@"[UserAvatars] Failed to load image %@: %@", key, error.localizedDescription);
+                }
+                if (!image) {
+                    // Negative-cache only permanent failures — transient
+                    // network errors and 429/5xx must stay retryable.
+                    NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+                    NSInteger statusCode = http ? http.statusCode : 0;
+                    BOOL transient = (error && ApolloUserProfileErrorIsTransient(error)) ||
+                        statusCode == 429 || statusCode >= 500;
+                    if (!transient) {
+                        dispatch_async(self.queue, ^{ self.imageNotFoundDates[key] = [NSDate date]; });
+                    }
+                }
+                if (persistData) {
+                    dispatch_barrier_async(self.imageIOQueue, ^{ [self persistImageData:persistData forKey:key]; });
+                }
+                [self finishImageRequestForKey:key image:image];
+            }];
+            [task resume];
+        });
+    });
+}
+
+#pragma mark - Banner images
+
+// Downscale banner art to at most the device's longest screen side (in
+// pixels) while force-decoding it. Sources at or below that size just get the
+// normal decode.
+static UIImage *ApolloDownscaledBannerImage(UIImage *image) {
+    if (!image || image.size.width <= 0.0 || image.size.height <= 0.0) return image;
+    // TODO: Modernization - cached main-screen bound; see ApolloBannerMaxPixelDimension.
+    CGFloat maxDimension = ApolloBannerMaxPixelDimension();
+    CGFloat pixelWidth = image.size.width * image.scale;
+    CGFloat pixelHeight = image.size.height * image.scale;
+    CGFloat longest = MAX(pixelWidth, pixelHeight);
+    if (maxDimension <= 0.0 || longest <= maxDimension) return ApolloDecodedAvatarImage(image);
+
+    CGFloat ratio = maxDimension / longest;
+    CGSize target = CGSizeMake(MAX(1.0, floor(pixelWidth * ratio)), MAX(1.0, floor(pixelHeight * ratio)));
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.scale = 1.0;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:target format:format];
+    UIImage *result = [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        [image drawInRect:CGRectMake(0.0, 0.0, target.width, target.height)];
+    }];
+    return result ?: image;
+}
+
+static BOOL ApolloImageHasAlphaChannel(UIImage *image) {
+    CGImageRef imageRef = image.CGImage;
+    if (!imageRef) return NO;
+
+    switch (CGImageGetAlphaInfo(imageRef)) {
+        case kCGImageAlphaPremultipliedLast:
+        case kCGImageAlphaPremultipliedFirst:
+        case kCGImageAlphaLast:
+        case kCGImageAlphaFirst:
+        case kCGImageAlphaOnly:
+            return YES;
+        case kCGImageAlphaNone:
+        case kCGImageAlphaNoneSkipLast:
+        case kCGImageAlphaNoneSkipFirst:
+            return NO;
+    }
+    return NO;
+}
+
+- (NSString *)bannerKeyForURL:(NSURL *)url {
+    // Preserve the supplied query in the key: signed/versioned URLs must not collide.
+    return [@"banner-v2:" stringByAppendingString:url.absoluteString ?: @""];
+}
+
+- (UIImage *)cachedBannerImageForURL:(NSURL *)url {
+    if (![url isKindOfClass:[NSURL class]]) return nil;
+    return [self.bannerCache objectForKey:[self bannerKeyForURL:url]];
+}
+
+- (void)finishBannerImageRequestForKey:(NSString *)key image:(UIImage *)image {
+    dispatch_async(self.queue, ^{
+        if (image) {
+            NSUInteger cost = MAX((NSUInteger)1, ApolloImageByteCost(image));
+            [self.bannerCache setObject:image forKey:key cost:cost];
+        }
+
+        NSArray<void (^)(UIImage *)> *callbacks = self.imageCompletions[key];
+        [self.imageCompletions removeObjectForKey:key];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (void (^callback)(UIImage *) in callbacks) {
+                callback(image);
+            }
+        });
+    });
+}
+
+// Same shape as requestImageForURL, but decodes at display scale into
+// bannerCache and disk-persists the downscaled re-encode (so >2MB originals
+// still survive cold starts instead of re-downloading every launch).
+- (void)requestBannerImageForURL:(NSURL *)url completion:(void (^)(UIImage *image))completion {
+    if (![url isKindOfClass:[NSURL class]]) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        return;
+    }
+    NSString *key = [self bannerKeyForURL:url];
+    UIImage *cached = [self.bannerCache objectForKey:key];
+    if (cached) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(cached); });
+        return;
+    }
+
+    dispatch_async(self.queue, ^{
+        NSDate *notFoundAt = self.imageNotFoundDates[key];
+        if (notFoundAt) {
+            if (-[notFoundAt timeIntervalSinceNow] < ApolloUserProfileImageNotFoundTTL) {
+                if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+                return;
+            }
+            [self.imageNotFoundDates removeObjectForKey:key];
+        }
+
+        NSMutableArray<void (^)(UIImage *)> *callbacks = self.imageCompletions[key];
+        if (callbacks) {
+            if (completion) [callbacks addObject:[completion copy]];
+            return;
+        }
+
+        callbacks = [NSMutableArray array];
+        if (completion) [callbacks addObject:[completion copy]];
+        self.imageCompletions[key] = callbacks;
+
+        NSString *diskPath = [self imageDiskPathForKey:key];
+        dispatch_async(self.imageIOQueue, ^{
+            NSData *diskData = [NSData dataWithContentsOfFile:diskPath];
+            if (diskData.length > 0) {
+                UIImage *diskImage = nil;
+                @autoreleasepool {
+                    // Disk entries were already downscaled before persisting;
+                    // the call is a plain decode for them.
+                    diskImage = ApolloDownscaledBannerImage([UIImage imageWithData:diskData]);
+                }
+                if (diskImage) {
+                    [[NSFileManager defaultManager] setAttributes:@{NSFileModificationDate: [NSDate date]} ofItemAtPath:diskPath error:nil];
+                    [self finishBannerImageRequestForKey:key image:diskImage];
+                    return;
+                }
+            }
+
+            NSURL *candidate = ApolloProfileBannerOriginalCandidate(url);
+            [self downloadBannerImageForURL:candidate
+                               fallbackURL:[candidate isEqual:url] ? nil : url key:key];
+        });
+    });
+}
+// At most two attempts; finish/cache only after the selected URL succeeds or both fail.
+- (void)downloadBannerImageForURL:(NSURL *)url fallbackURL:(NSURL *)fallbackURL key:(NSString *)key {
+    NSURLSessionDataTask *task = [self.imageSession dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        UIImage *image = nil;
+        BOOL sourceHasAlpha = NO;
+        NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (id)response : nil;
+        BOOL successfulResponse = !http || (http.statusCode >= 200 && http.statusCode < 300);
+        if (!error && successfulResponse && data.length > 0) {
+            @autoreleasepool {
+                UIImage *sourceImage = [UIImage imageWithData:data];
+                sourceHasAlpha = ApolloImageHasAlphaChannel(sourceImage);
+                image = ApolloDownscaledBannerImage(sourceImage);
+            }
+        }
+        BOOL cancelled = [error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled;
+        if (!image && fallbackURL && !cancelled) {
+            ApolloLog(@"[UserAvatars] Original banner unavailable; retrying supplied URL");
+            [self downloadBannerImageForURL:fallbackURL fallbackURL:nil key:key];
+            return;
+        }
+        if (!image && error) {
+            ApolloLogError(@"[UserAvatars] Failed to load banner (error %ld)", (long)error.code);
+        }
+        if (!image) {
+            NSInteger statusCode = http ? http.statusCode : 0;
+            BOOL transient = (error && ApolloUserProfileErrorIsTransient(error)) ||
+                statusCode == 429 || statusCode >= 500;
+            if (!transient) {
+                dispatch_async(self.queue, ^{ self.imageNotFoundDates[key] = [NSDate date]; });
+            }
+        } else {
+            // JPEG flattens transparency. Preserve alpha-bearing banner
+            // sources as PNG so their cold-cache rendering matches the
+            // in-memory result from the download that created the file.
+            NSData *persistData = sourceHasAlpha
+                ? UIImagePNGRepresentation(image)
+                : UIImageJPEGRepresentation(image, 0.85);
+            if (persistData) {
+                dispatch_barrier_async(self.imageIOQueue, ^{ [self persistImageData:persistData forKey:key]; });
+            }
+        }
+        [self finishBannerImageRequestForKey:key image:image];
+    }];
+    [task resume];
+}
+
+- (void)clearAllCaches {
+    dispatch_async(self.queue, ^{
+        NSUInteger infoCount = self.diskInfo.count;
+        [self.diskInfo removeAllObjects];
+        [self publishInfoSnapshotLocked];
+        self.diskSaveGeneration++;
+        self.diskSaveScheduled = NO;
+        [self.infoCache removeAllObjects];
+        [self.imageCache removeAllObjects];
+        [self.bannerCache removeAllObjects];
+        [self.imageNotFoundDates removeAllObjects];
+        // Reset the batch-prefetch dedupe set so already-seen users get re-warmed
+        // through the fast user_data_by_account_ids path after a clear.
+        [self.batchRequestedFullNames removeAllObjects];
+
+        // Wipe HTTP cache entries so subsequent fetches go to the network.
+        NSURLCache *httpCache = self.session.configuration.URLCache ?: [NSURLCache sharedURLCache];
+        [httpCache removeAllCachedResponses];
+        [self.imageSession.configuration.URLCache removeAllCachedResponses];
+
+        // Drop the on-disk avatar image cache too.
+        dispatch_barrier_async(self.imageIOQueue, ^{
+            [[NSFileManager defaultManager] removeItemAtPath:[self imageCacheDirectory] error:nil];
+        });
+
+        NSString *path = [self cachePath];
+        NSError *error = nil;
+        if (![[NSFileManager defaultManager] removeItemAtPath:path error:&error] &&
+            [error.domain isEqualToString:NSCocoaErrorDomain] &&
+            error.code == NSFileNoSuchFileError) {
+            error = nil;
+        }
+
+        ApolloLog(@"[UserAvatars] Cleared profile cache (info entries=%lu, removeError=%@)", (unsigned long)infoCount, error.localizedDescription ?: @"none");
+    });
+}
+
+- (BOOL)cachedIsSuspendedForUsername:(NSString *)username {
+    ApolloUserProfileInfo *info = [self cachedInfoForUsername:username];
+    if (!info || !info.suspensionChecked) return NO;
+    return info.isSuspended;
+}
+
+@end

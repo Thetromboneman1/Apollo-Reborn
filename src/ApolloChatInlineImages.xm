@@ -1,0 +1,1509 @@
+// ApolloChatInlineImages.xm
+//
+// Feature 1 of the chat upgrade: render image messages inline in DM/chat bubbles.
+//
+// Apollo's chat is Reddit private messages (kind=t4, subject "[direct chat room]")
+// rendered by a MessageKit fork. An image message arrives as markdown text
+//   sent an image
+// where "image" is a link, stored on the rendered messageLabel under Apollo's
+// custom `ApolloLink` attribute, pointing at the Matrix-hosted media:
+//   https://matrix.redditspace.com/_matrix/media/v3/download/reddit.com/<id>
+// Apollo never builds a MessageKind.photo for these, so they show as text + link.
+//
+// Strategy (pure ObjC): post-process the cell the data source returns. Read the
+// rendered messageLabel.attributedText, pull the image URL out of its ApolloLink
+// attribute, load the image, paint it into the bubble, and grow the bubble to the
+// image's aspect ratio by overriding the MessageKit layout attributes'
+// `messageContainerSize` (so MessageKit positions/aligns the bubble itself).
+
+#import "ApolloCommon.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloMemoryDiagnostics.h"
+#import "ApolloUserProfileCache.h"
+#import "ApolloState.h"
+#import "ApolloImageChestResolver.h"
+#import <ImageIO/ImageIO.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import "ApolloClasses.h"
+
+// ---- diagnostics toggle ----------------------------------------------------
+// Off by default; flip to 1 for verbose per-render snoomoji/image/tap tracing.
+#define APOLLO_CHAT_IMG_DEBUG 0
+#if APOLLO_CHAT_IMG_DEBUG
+  #define ChatImgLog(fmt, ...) os_log_debug(ApolloFixLog(), "[ApolloFix] [ChatImg] " fmt, ##__VA_ARGS__)
+#else
+  #define ChatImgLog(fmt, ...) do {} while (0)
+#endif
+
+// Associated-object keys.
+static char kApolloChatImgViewKey;       // on cell: our injected UIImageView
+static char kApolloChatIvMediaKey;       // on the image view: the media (UIImage/FLAnimatedImage) it shows
+static char kApolloChatContainerTapKey;  // on the bubble container: tap-to-fullscreen recognizer added
+static char kApolloChatStickerInsetKey;  // on the image view: NSNumber inset (snoomoji art breathing room)
+static char kApolloChatImgURLKey;        // on cell: NSString URL currently shown (reuse guard)
+static char kApolloChatImgMediaSizeKey;  // on cell: NSValue CGSize of the rendered bubble
+static char kApolloChatMediaWaiterKey;   // on cell: cancellable registration in the shared loader
+static char kApolloChatImgSizeMapKey;    // on VC:  NSMutableDictionary "section.item" -> NSValue CGSize
+static char kApolloChatAvatarUserKey;    // on cell: NSString author we've stamped an avatar for
+static char kApolloChatAvatarScaleObservedKey; // on cell: display-scale handler registered (avatar re-render)
+
+// Bubble sizing bounds.
+static const CGFloat kApolloChatImgMaxWidth  = 232.0;
+static const CGFloat kApolloChatImgMaxHeight = 320.0;
+static const CGFloat kApolloChatImgMinWidth  = 120.0;
+static const NSUInteger kApolloChatMaximumResponseBytes = 25 * 1024 * 1024;
+static const NSUInteger kApolloChatMaximumAnimatedFrames = 500;
+static const unsigned long long kApolloChatMaximumSourcePixels = 80ULL * 1000ULL * 1000ULL;
+static const unsigned long long kApolloChatMaximumSourceDimension = 32768;
+static const NSUInteger kApolloChatStaticDecodeMaximumPixelSize = 4096;
+
+#pragma mark - URL helpers
+
+static BOOL ApolloChatIsRedditUploadedMediaHost(NSString *host) {
+    if (![host isKindOfClass:[NSString class]]) return NO;
+    // Keep the bucket name and amazonaws.com boundary exact while accepting
+    // accelerate, regional, and dual-stack S3 endpoint shapes.
+    if (![host hasPrefix:@"reddit-uploaded-media.s3"] ||
+        ![host hasSuffix:@".amazonaws.com"]) return NO;
+    NSUInteger separatorIndex = @"reddit-uploaded-media.s3".length;
+    if (host.length <= separatorIndex) return NO;
+    unichar separator = [host characterAtIndex:separatorIndex];
+    return separator == '.' || separator == '-';
+}
+
+static BOOL ApolloChatIsImageURL(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) return NO;
+    NSString *scheme = url.scheme.lowercaseString ?: @"";
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+    NSString *host = url.host.lowercaseString ?: @"";
+    NSString *path = url.path.lowercaseString ?: @"";
+    NSString *ext = path.pathExtension;
+    NSString *query = url.query.lowercaseString ?: @"";
+    if ([query containsString:@"format=mp4"]) return NO;
+    // Reddit chat media is served from the Matrix homeserver with no file extension:
+    //   https://matrix.redditspace.com/_matrix/media/v3/download/reddit.com/<mediaId>
+    if ([host isEqualToString:@"matrix.redditspace.com"] && [path containsString:@"/_matrix/media/"]) {
+        return YES;
+    }
+    if ([ext isEqualToString:@"png"] || [ext isEqualToString:@"jpg"] ||
+        [ext isEqualToString:@"jpeg"] || [ext isEqualToString:@"webp"] ||
+        [ext isEqualToString:@"gif"]) {
+        return YES;
+    }
+    static NSArray<NSString *> *imageHosts;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        imageHosts = @[@"i.redd.it", @"preview.redd.it", @"external-preview.redd.it",
+                       @"i.imgur.com", @"redditmedia.com"];
+    });
+    if (ApolloChatIsRedditUploadedMediaHost(host)) return YES;
+    for (NSString *imageHost in imageHosts) {
+        if ([host isEqualToString:imageHost] || [host hasSuffix:[@"." stringByAppendingString:imageHost]]) return YES;
+    }
+    return NO;
+}
+
+// Pull the first inline-image URL out of a rendered messageLabel's attributed text.
+static NSURL *ApolloChatImageURLFromAttributed(NSAttributedString *attr) {
+    if (![attr isKindOfClass:[NSAttributedString class]] || attr.length == 0) return nil;
+    __block NSURL *found = nil;
+    [attr enumerateAttributesInRange:NSMakeRange(0, attr.length) options:0
+                          usingBlock:^(NSDictionary<NSAttributedStringKey, id> *attrs, NSRange range, BOOL *stop) {
+        for (NSAttributedStringKey key in attrs) {
+            id val = attrs[key];
+            NSURL *u = nil;
+            if ([val isKindOfClass:[NSURL class]]) u = val;
+            else if ([val isKindOfClass:[NSString class]] && [(NSString *)val hasPrefix:@"http"]) u = [NSURL URLWithString:val];
+            if (u && (ApolloChatIsImageURL(u) || ApolloImageChestIsPostURL(u))) { found = u; *stop = YES; return; }
+        }
+    }];
+    return found;
+}
+
+// Pull the direct CDN image URL out of an ImageChest resolver result (single image, or first of album).
+static NSURL *ApolloChatDirectURLFromImageChest(NSDictionary *res) {
+    if (![res isKindOfClass:[NSDictionary class]]) return nil;
+    NSArray *imgs = [res[@"images"] isKindOfClass:[NSArray class]] ? res[@"images"] : nil;
+    id first = imgs.firstObject;
+    if ([first isKindOfClass:[NSDictionary class]] && [first[@"url"] isKindOfClass:[NSURL class]]) return first[@"url"];
+    if ([res[@"url"] isKindOfClass:[NSURL class]]) return res[@"url"];
+    return nil;
+}
+
+#pragma mark - ivar access
+
+static UILabel *ApolloChatMessageLabel(id cell) {
+    id label = ApolloObjectIvar(cell, "messageLabel");
+    return [label isKindOfClass:[UILabel class]] ? label : nil;
+}
+
+static UIView *ApolloChatContainerView(id cell) {
+    id v = ApolloObjectIvar(cell, "messageContainerView");
+    return [v isKindOfClass:[UIView class]] ? v : nil;
+}
+
+// Write a CGSize-typed struct ivar by name (object_getIvar can't touch struct ivars).
+static APOLLO_IVAR_NAME void ApolloChatSetCGSizeIvar(id obj, const char *name, CGSize sz) {
+    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
+    if (!iv) return;
+    ptrdiff_t off = ivar_getOffset(iv);
+    char *base = (char *)(__bridge void *)obj;
+    *(CGSize *)(base + off) = sz;
+}
+
+// Read a CGSize-typed struct ivar by name.
+static APOLLO_IVAR_NAME CGSize ApolloChatGetCGSizeIvar(id obj, const char *name) {
+    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
+    if (!iv) return CGSizeZero;
+    return *(CGSize *)((char *)(__bridge void *)obj + ivar_getOffset(iv));
+}
+
+static NSString *ApolloChatIndexKey(NSIndexPath *ip) {
+    return [NSString stringWithFormat:@"%ld.%ld", (long)ip.section, (long)ip.item];
+}
+
+static NSMutableDictionary *ApolloChatSizeMap(id vc) {
+    NSMutableDictionary *m = objc_getAssociatedObject(vc, &kApolloChatImgSizeMapKey);
+    if (!m) { m = [NSMutableDictionary dictionary]; objc_setAssociatedObject(vc, &kApolloChatImgSizeMapKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+    return m;
+}
+
+// Aspect-correct bubble size for a decoded image, clamped to our bounds.
+static CGSize ApolloChatMediaSize(UIImage *img) {
+    CGFloat iw = img.size.width, ih = img.size.height;
+    if (iw <= 0 || ih <= 0) return CGSizeMake(200, 150);
+    CGFloat aspect = ih / iw;
+    CGFloat w = kApolloChatImgMaxWidth;
+    CGFloat h = w * aspect;
+    if (h > kApolloChatImgMaxHeight) { h = kApolloChatImgMaxHeight; w = h / aspect; }
+    if (w < kApolloChatImgMinWidth)  { w = kApolloChatImgMinWidth;  h = w * aspect; if (h > kApolloChatImgMaxHeight) h = kApolloChatImgMaxHeight; }
+    return CGSizeMake(floor(w), floor(h));
+}
+
+// Size a sticker by a fixed HEIGHT (not the longest side) so every one stands the same tall
+// regardless of how many emoji or their aspect — sender and receiver match. Width follows aspect,
+// clamped so a long emoji run can't overflow the bubble. Unicode emoji use a small (text-emoji)
+// height; Reddit snoomoji art uses a larger sticker height. (kApolloChatUnicodeEmojiHeight /
+// kApolloChatSnoomojiHeight)
+static CGSize ApolloChatStickerSize(UIImage *img, CGFloat targetH) {
+    CGFloat iw = img.size.width, ih = img.size.height;
+    if (iw <= 0 || ih <= 0) return CGSizeMake(targetH, targetH);
+    static const CGFloat maxW = 200.0;
+    CGFloat scale = targetH / ih;
+    CGFloat w = iw * scale, h = targetH;
+    if (w > maxW) { scale = maxW / iw; w = maxW; h = ih * scale; }   // very wide run: clamp width
+    return CGSizeMake(floor(w), floor(h));
+}
+static const CGFloat kApolloChatUnicodeEmojiHeight = 46.0;   // 👍 — matches the iOS emoji-keyboard glyph size
+static const CGFloat kApolloChatSnoomojiHeight     = 74.0;   // snoo art — larger sticker (bubble incl. inset)
+static const CGFloat kApolloChatSnoomojiInset      = 9.0;    // breathing room so the snoo art isn't edge-cramped
+
+#pragma mark - gif-aware media loader
+
+// Apollo bundles Flipboard's FLAnimatedImage (FLAnimatedImage + FLAnimatedImageView,
+// a UIImageView subclass). We render gif messages with it so they animate; static
+// images use the same view's -image. Resolved at runtime to avoid a link dependency.
+
+// URL -> loaded media (an FLAnimatedImage for animated GIFs, else UIImage).
+// NSCache makes decoded residency pressure-aware and bounds the normal case.
+// Entries are charged their decoded bytes, and a still is decoded at up to
+// kApolloChatStaticDecodeMaximumPixelSize on the long side, so one photo can be
+// several MB. This holds a handful of them; a pathological 4096px source
+// exceeds the whole budget on its own and is deliberately not kept.
+static NSCache<NSString *, id> *ApolloChatMediaCache(void) {
+    static NSCache<NSString *, id> *cache; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSCache new];
+        cache.totalCostLimit = 20 * 1024 * 1024;
+        cache.countLimit = 40;
+        ApolloMemoryRegisterPurgableCache(@"chat-media", cache);
+    });
+    return cache;
+}
+
+static NSUInteger ApolloChatSaturatingAdd(NSUInteger left, NSUInteger right) {
+    return left > NSUIntegerMax - right ? NSUIntegerMax : left + right;
+}
+
+// FLAnimatedImage predraws/cache-manages a working set of frames. Charging the
+// compressed transfer size badly understates that residency, so account for a
+// conservative ten-frame working set plus the original bytes retained by the
+// animated image object. Static images are charged by decoded bitmap bytes.
+static NSUInteger ApolloChatDecodedMediaCost(id media, NSUInteger sourceBytes) {
+    if ([media isKindOfClass:[UIImage class]]) {
+        return ApolloImageByteCost((UIImage *)media);
+    }
+    Class animatedClass = ApolloClassFLAnimatedImage;
+    if (!animatedClass || ![media isKindOfClass:animatedClass]) return sourceBytes;
+
+    NSUInteger frameCount = [media respondsToSelector:@selector(frameCount)]
+        ? ((NSUInteger (*)(id, SEL))objc_msgSend)(media, @selector(frameCount)) : 1;
+    UIImage *firstFrame = [media respondsToSelector:@selector(imageLazilyCachedAtIndex:)]
+        ? ((id (*)(id, SEL, NSUInteger))objc_msgSend)(media, @selector(imageLazilyCachedAtIndex:), (NSUInteger)0) : nil;
+    NSUInteger frameBytes = firstFrame ? ApolloImageByteCost(firstFrame) : sourceBytes;
+    NSUInteger residentFrames = MAX((NSUInteger)1, MIN(frameCount, (NSUInteger)10));
+    NSUInteger decodedBytes = frameBytes > NSUIntegerMax / residentFrames
+        ? NSUIntegerMax : frameBytes * residentFrames;
+    return ApolloChatSaturatingAdd(sourceBytes, decodedBytes);
+}
+
+// Main-queue-owned single-flight state. Each visible cell owns a waiter; reuse
+// removes that waiter, drops a queued load when it was the last consumer, and
+// cancels an active transfer when nobody else still needs it.
+@class ApolloChatMediaLoad;
+@class ApolloChatMediaWaiter;
+
+typedef void (^ApolloChatMediaCompletion)(id media, ApolloChatMediaWaiter *waiter);
+
+@interface ApolloChatMediaWaiter : NSObject
+@property (nonatomic, weak) ApolloChatMediaLoad *load;
+@property (nonatomic, copy) ApolloChatMediaCompletion completion;
+@end
+
+@interface ApolloChatMediaLoad : NSObject
+@property (nonatomic, strong) NSURL *url;
+@property (nonatomic, copy) NSString *key;
+@property (nonatomic, strong) NSMutableArray<ApolloChatMediaWaiter *> *waiters;
+@property (nonatomic, strong) NSURLSessionDataTask *task;
+@property (nonatomic) BOOL active;
+@end
+
+@implementation ApolloChatMediaWaiter
+@end
+
+@implementation ApolloChatMediaLoad
+- (instancetype)init {
+    self = [super init];
+    if (self) _waiters = [NSMutableArray array];
+    return self;
+}
+@end
+
+static NSMutableDictionary<NSString *, ApolloChatMediaLoad *> *sApolloChatMediaLoadsByURL;
+static NSMutableDictionary<NSString *, ApolloChatMediaLoad *> *ApolloChatMediaLoadsByURL(void) {
+    if (!sApolloChatMediaLoadsByURL) {
+        sApolloChatMediaLoadsByURL = [NSMutableDictionary dictionary];
+    }
+    return sApolloChatMediaLoadsByURL;
+}
+
+static NSMutableArray<ApolloChatMediaLoad *> *sApolloChatQueuedMediaLoads;
+static NSMutableArray<ApolloChatMediaLoad *> *ApolloChatQueuedMediaLoads(void) {
+    if (!sApolloChatQueuedMediaLoads) {
+        sApolloChatQueuedMediaLoads = [NSMutableArray array];
+    }
+    return sApolloChatQueuedMediaLoads;
+}
+
+static NSUInteger sApolloChatActiveMediaLoads;
+static const NSUInteger kApolloChatMaximumConcurrentMediaLoads = 3;
+static const NSUInteger kApolloChatMaximumQueuedMediaLoads = 48;
+static void ApolloChatPumpMediaLoads(void);
+
+// Draw a (possibly multi-codepoint) emoji string into a transparent image. Used to render a
+// pure-emoji message as a sticker overlay — Apollo "jumbo-blanks" a lone-emoji bubble and its
+// TextKit-backed MessageLabel won't reliably draw an enlarged glyph we set, so we rasterize.
+static UIImage *ApolloChatRasterizeEmoji(NSString *emoji, UITraitCollection *traitCollection) {
+    if (emoji.length == 0) return nil;
+    // Render at high res (down-samples crisply), with ~22% transparent padding each side so the
+    // glyph sits at ≈70% of the sticker — matching Reddit snoomoji art padding, so a lone emoji
+    // isn't oversized and never touches the rounded bubble edge.
+    NSDictionary *attrs = @{ NSFontAttributeName: [UIFont systemFontOfSize:80.0] };
+    CGSize glyph = [emoji sizeWithAttributes:attrs];
+    if (glyph.width < 1.0 || glyph.height < 1.0) return nil;
+    CGFloat padX = glyph.width * 0.22, padY = glyph.height * 0.22;
+    CGSize canvas = CGSizeMake(glyph.width + padX * 2, glyph.height + padY * 2);
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+    fmt.opaque = NO; fmt.scale = traitCollection.displayScale;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:canvas format:fmt];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [emoji drawAtPoint:CGPointMake(padX, padY) withAttributes:attrs];
+    }];
+}
+
+// Rasterize a pure-emoji body and stash it in the media cache under a synthetic URL, so the normal
+// image-overlay path (cache hit -> sticker size -> reflow) renders it with zero network work.
+// TODO: Modernization - the sticker is cached in the shared media cache by URL alone, so it
+// keeps the display scale of the first bubble that rasterized it; a display-scale change
+// (external display) serves the old-scale bitmap until the cache evicts it. Fold the scale
+// into the synthetic URL/key if that ever matters.
+static NSURL *ApolloChatEmojiStickerURL(NSString *emoji, UITraitCollection *traitCollection) {
+    if (emoji.length == 0) return nil;
+    NSString *enc = [emoji stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet alphanumericCharacterSet]];
+    NSURL *url = enc.length ? [NSURL URLWithString:[@"x-apollo-emoji:///" stringByAppendingString:enc]] : nil;
+    if (!url) return nil;
+    NSString *key = url.absoluteString;
+    if (![ApolloChatMediaCache() objectForKey:key]) {
+        UIImage *img = ApolloChatRasterizeEmoji(emoji, traitCollection);
+        if (!img) return nil;
+        [ApolloChatMediaCache() setObject:img forKey:key cost:ApolloImageByteCost(img)];
+    }
+    return url;
+}
+
+static BOOL ApolloDataIsGIF(NSData *d) {
+    if (d.length < 6) return NO;
+    const unsigned char *b = (const unsigned char *)d.bytes;
+    return b[0] == 'G' && b[1] == 'I' && b[2] == 'F';   // GIF87a / GIF89a
+}
+
+static dispatch_queue_t ApolloChatMediaDecodeQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.apolloreborn.chat-media-decode", DISPATCH_QUEUE_SERIAL);
+        dispatch_set_target_queue(queue, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    });
+    return queue;
+}
+
+static BOOL ApolloChatReadSourceDimensions(CGImageSourceRef source,
+                                           unsigned long long *widthOut,
+                                           unsigned long long *heightOut) {
+    if (!source) return NO;
+    CFDictionaryRef properties = CGImageSourceCopyPropertiesAtIndex(source, 0, NULL);
+    if (!properties) return NO;
+    CFNumberRef widthNumber = (CFNumberRef)CFDictionaryGetValue(properties, kCGImagePropertyPixelWidth);
+    CFNumberRef heightNumber = (CFNumberRef)CFDictionaryGetValue(properties, kCGImagePropertyPixelHeight);
+    long long widthValue = 0;
+    long long heightValue = 0;
+    BOOL valid = widthNumber && CFGetTypeID(widthNumber) == CFNumberGetTypeID() &&
+        heightNumber && CFGetTypeID(heightNumber) == CFNumberGetTypeID() &&
+        CFNumberGetValue(widthNumber, kCFNumberLongLongType, &widthValue) &&
+        CFNumberGetValue(heightNumber, kCFNumberLongLongType, &heightValue);
+    CFRelease(properties);
+    if (!valid || widthValue <= 0 || heightValue <= 0) return NO;
+    if (widthOut) *widthOut = (unsigned long long)widthValue;
+    if (heightOut) *heightOut = (unsigned long long)heightValue;
+    return YES;
+}
+
+static CFDictionaryRef ApolloChatThumbnailOptions(void) {
+    static CFDictionaryRef options;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSInteger maximumPixelSize = (NSInteger)kApolloChatStaticDecodeMaximumPixelSize;
+        CFNumberRef maximumPixelNumber = CFNumberCreate(kCFAllocatorDefault,
+                                                         kCFNumberNSIntegerType,
+                                                         &maximumPixelSize);
+        const void *keys[] = {
+            kCGImageSourceCreateThumbnailFromImageAlways,
+            kCGImageSourceCreateThumbnailWithTransform,
+            kCGImageSourceShouldCacheImmediately,
+            kCGImageSourceThumbnailMaxPixelSize,
+        };
+        const void *values[] = {
+            kCFBooleanTrue, kCFBooleanTrue, kCFBooleanTrue, maximumPixelNumber,
+        };
+        options = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 4,
+                                     &kCFTypeDictionaryKeyCallBacks,
+                                     &kCFTypeDictionaryValueCallBacks);
+        CFRelease(maximumPixelNumber);
+    });
+    return options;
+}
+
+static id ApolloChatDecodeMediaData(NSData *data) {
+    if (data.length == 0) return nil;
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    if (!source) return nil;
+
+    size_t frameCount = CGImageSourceGetCount(source);
+    if (frameCount == 0 || frameCount > kApolloChatMaximumAnimatedFrames) {
+        CFRelease(source);
+        return nil;
+    }
+    unsigned long long width = 0;
+    unsigned long long height = 0;
+    BOOL dimensionsValid = ApolloChatReadSourceDimensions(source, &width, &height);
+    BOOL sourceAllowed = dimensionsValid &&
+        width <= kApolloChatMaximumSourceDimension &&
+        height <= kApolloChatMaximumSourceDimension &&
+        height <= kApolloChatMaximumSourcePixels / width;
+    if (!sourceAllowed) {
+        CFRelease(source);
+        return nil;
+    }
+
+    id media = nil;
+    Class animatedClass = ApolloClassFLAnimatedImage;
+    if (animatedClass && frameCount > 1 && ApolloDataIsGIF(data)) {
+        id (*initFn)(id, SEL, NSData *, NSUInteger, BOOL) =
+            (id (*)(id, SEL, NSData *, NSUInteger, BOOL))objc_msgSend;
+        media = initFn([animatedClass alloc],
+                       @selector(initWithAnimatedGIFData:optimalFrameCacheSize:predrawingEnabled:),
+                       data, (NSUInteger)0, YES);
+    }
+    if (!media) {
+        CGImageRef thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0,
+                                                                    ApolloChatThumbnailOptions());
+        if (thumbnail) {
+            media = [UIImage imageWithCGImage:thumbnail];
+            CGImageRelease(thumbnail);
+        }
+    }
+    CFRelease(source);
+    return media;
+}
+
+// Put either an animated gif or a static image on the (FLAnimatedImageView) media view.
+static void ApolloChatSetMedia(UIImageView *iv, id media) {
+    if (!iv || !media) return;
+    // Keep a direct handle to the media so the tap-to-fullscreen handler doesn't have to read it
+    // back through FLAnimatedImageView's image/animatedImage getters (unreliable for static images).
+    objc_setAssociatedObject(iv, &kApolloChatIvMediaKey, media, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    Class fl = ApolloClassFLAnimatedImage;
+    if (fl && [media isKindOfClass:fl]) {
+        // FLAnimatedImageView setter; clearing -image first avoids a stale poster frame.
+        iv.image = nil;
+        ((void (*)(id, SEL, id))objc_msgSend)(iv, @selector(setAnimatedImage:), media);
+    } else if ([media isKindOfClass:[UIImage class]]) {
+        // ensure any previously-set animatedImage is cleared
+        if ([iv respondsToSelector:@selector(setAnimatedImage:)])
+            ((void (*)(id, SEL, id))objc_msgSend)(iv, @selector(setAnimatedImage:), nil);
+        iv.image = media;
+    }
+}
+
+// Stop + clear any media on the view (both static image and the animated gif), so a
+// recycled cell doesn't keep an old gif animating or flash a stale frame.
+static void ApolloChatClearMedia(UIImageView *iv) {
+    if (!iv) return;
+    objc_setAssociatedObject(iv, &kApolloChatIvMediaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    iv.image = nil;
+    if ([iv respondsToSelector:@selector(setAnimatedImage:)])
+        ((void (*)(id, SEL, id))objc_msgSend)(iv, @selector(setAnimatedImage:), nil);
+}
+
+static void ApolloChatCancelMediaWaiter(ApolloChatMediaWaiter *waiter) {
+    if (!waiter) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ ApolloChatCancelMediaWaiter(waiter); });
+        return;
+    }
+    ApolloChatMediaLoad *load = waiter.load;
+    waiter.load = nil;
+    waiter.completion = nil;
+    if (!load) return;
+    [load.waiters removeObjectIdenticalTo:waiter];
+    if (load.waiters.count > 0) return;
+
+    if (ApolloChatMediaLoadsByURL()[load.key] == load) {
+        [ApolloChatMediaLoadsByURL() removeObjectForKey:load.key];
+    }
+    [ApolloChatQueuedMediaLoads() removeObjectIdenticalTo:load];
+    if (load.active && load.task.state != NSURLSessionTaskStateCompleted &&
+        load.task.state != NSURLSessionTaskStateCanceling) {
+        [load.task cancel];
+    }
+    ApolloChatPumpMediaLoads();
+}
+
+static void ApolloChatCancelCellMediaWaiter(id cell) {
+    ApolloChatMediaWaiter *waiter =
+        objc_getAssociatedObject(cell, &kApolloChatMediaWaiterKey);
+    if (!waiter) return;
+    objc_setAssociatedObject(cell, &kApolloChatMediaWaiterKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloChatCancelMediaWaiter(waiter);
+}
+
+static void ApolloChatDropQueuedMediaLoad(ApolloChatMediaLoad *load) {
+    if (!load || load.active) return;
+    [ApolloChatQueuedMediaLoads() removeObjectIdenticalTo:load];
+    if (ApolloChatMediaLoadsByURL()[load.key] == load) {
+        [ApolloChatMediaLoadsByURL() removeObjectForKey:load.key];
+    }
+    NSArray<ApolloChatMediaWaiter *> *waiting = [load.waiters copy];
+    [load.waiters removeAllObjects];
+    for (ApolloChatMediaWaiter *waiter in waiting) {
+        ApolloChatMediaCompletion callback = waiter.completion;
+        waiter.load = nil;
+        waiter.completion = nil;
+        if (callback) callback(nil, waiter);
+    }
+}
+
+// Fetch raw bytes once (cached), sniff the gif magic, and hand back an FLAnimatedImage
+// (animated) or a decoded UIImage (static). The returned waiter is owned by the
+// requesting cell and can be removed on reuse without disrupting other cells.
+static ApolloChatMediaWaiter *ApolloChatLoadMedia(NSURL *url,
+                                                   ApolloChatMediaCompletion completion) {
+    NSCAssert([NSThread isMainThread], @"Chat media state is main-queue owned");
+    NSString *key = url.absoluteString;
+    if (key.length == 0) {
+        if (completion) completion(nil, nil);
+        return nil;
+    }
+    id cached = [ApolloChatMediaCache() objectForKey:key];
+    if (cached) {
+        if (completion) completion(cached, nil);
+        return nil;
+    }
+
+    ApolloChatMediaLoad *load = ApolloChatMediaLoadsByURL()[key];
+    if (!load) {
+        load = [ApolloChatMediaLoad new];
+        load.url = url;
+        load.key = key;
+        ApolloChatMediaLoadsByURL()[key] = load;
+        [ApolloChatQueuedMediaLoads() addObject:load];
+    }
+
+    ApolloChatMediaWaiter *waiter = [ApolloChatMediaWaiter new];
+    waiter.load = load;
+    waiter.completion = completion;
+    [load.waiters addObject:waiter];
+    while (ApolloChatQueuedMediaLoads().count > kApolloChatMaximumQueuedMediaLoads) {
+        ApolloChatDropQueuedMediaLoad(ApolloChatQueuedMediaLoads().firstObject);
+    }
+    ApolloChatPumpMediaLoads();
+    return waiter;
+}
+
+static void ApolloChatPumpMediaLoads(void) {
+    NSCAssert([NSThread isMainThread], @"Chat media state is main-queue owned");
+    while (sApolloChatActiveMediaLoads < kApolloChatMaximumConcurrentMediaLoads &&
+           ApolloChatQueuedMediaLoads().count > 0) {
+        ApolloChatMediaLoad *load = ApolloChatQueuedMediaLoads().firstObject;
+        [ApolloChatQueuedMediaLoads() removeObjectAtIndex:0];
+        if (load.waiters.count == 0 || ApolloChatMediaLoadsByURL()[load.key] != load) continue;
+
+        NSURL *url = load.url;
+        NSString *key = load.key;
+        load.active = YES;
+        sApolloChatActiveMediaLoads++;
+
+        NSURLRequest *request = [NSURLRequest requestWithURL:url
+                                                cachePolicy:NSURLRequestReturnCacheDataElseLoad
+                                            timeoutInterval:20.0];
+        load.task = ApolloStartBoundedDataRequest(request, kApolloChatMaximumResponseBytes,
+            ^NSError *(NSHTTPURLResponse *response) {
+                NSString *mimeType = response.MIMEType.lowercaseString ?: @"";
+                if (mimeType.length == 0 || [mimeType hasPrefix:@"image/"] ||
+                    [mimeType isEqualToString:@"application/octet-stream"] ||
+                    [mimeType isEqualToString:@"binary/octet-stream"]) {
+                    return nil;
+                }
+                return [NSError errorWithDomain:@"ApolloChatMediaError" code:1
+                                        userInfo:@{NSLocalizedDescriptionKey: @"The chat media response was not an image."}];
+            }, ApolloChatMediaDecodeQueue(),
+            ^(NSData *data, __unused NSHTTPURLResponse *response, NSError *error) {
+                id media = error ? nil : ApolloChatDecodeMediaData(data);
+                NSUInteger cost = media ? ApolloChatDecodedMediaCost(media, data.length) : 0;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSArray<ApolloChatMediaWaiter *> *waiting = [load.waiters copy] ?: @[];
+                    [load.waiters removeAllObjects];
+                    if (load.active && sApolloChatActiveMediaLoads > 0) {
+                        sApolloChatActiveMediaLoads--;
+                    }
+                    load.active = NO;
+                    load.task = nil;
+                    if (ApolloChatMediaLoadsByURL()[key] == load) {
+                        [ApolloChatMediaLoadsByURL() removeObjectForKey:key];
+                    }
+                    if (media) [ApolloChatMediaCache() setObject:media forKey:key cost:cost];
+                    ApolloChatPumpMediaLoads();
+                    for (ApolloChatMediaWaiter *waiter in waiting) {
+                        ApolloChatMediaCompletion callback = waiter.completion;
+                        waiter.load = nil;
+                        waiter.completion = nil;
+                        if (callback) callback(media, waiter);
+                    }
+                });
+            });
+    }
+}
+
+#pragma mark - rendering
+
+// Persistent URL -> bubble CGSize cache. Lets re-renders during scroll size the
+// bubble deterministically (independent of async image-load timing), so a recycled
+// cell never flashes a mis-sized (white-cropped) image.
+static NSMutableDictionary<NSString *, NSValue *> *ApolloChatSizeByURL(void) {
+    static NSMutableDictionary<NSString *, NSValue *> *sizes;
+    if (!sizes) sizes = [NSMutableDictionary dictionary];
+    return sizes;
+}
+
+static NSMutableOrderedSet<NSString *> *ApolloChatSizeURLOrder(void) {
+    static NSMutableOrderedSet<NSString *> *order;
+    if (!order) order = [NSMutableOrderedSet orderedSet];
+    return order;
+}
+
+static NSValue *ApolloChatKnownSizeForURL(NSString *urlString) {
+    NSCAssert([NSThread isMainThread], @"Chat size state is main-queue owned");
+    return urlString.length ? ApolloChatSizeByURL()[urlString] : nil;
+}
+
+static void ApolloChatStoreKnownSize(NSString *urlString, NSValue *sizeValue) {
+    NSCAssert([NSThread isMainThread], @"Chat size state is main-queue owned");
+    if (urlString.length == 0 || !sizeValue) return;
+    ApolloChatSizeByURL()[urlString] = sizeValue;
+    [ApolloChatSizeURLOrder() removeObject:urlString];
+    [ApolloChatSizeURLOrder() addObject:urlString];
+    while (ApolloChatSizeURLOrder().count > 500) {
+        NSString *oldest = ApolloChatSizeURLOrder().firstObject;
+        [ApolloChatSizeURLOrder() removeObjectAtIndex:0];
+        [ApolloChatSizeByURL() removeObjectForKey:oldest];
+    }
+}
+
+// Deferred, coalesced layout invalidation. invalidateLayout called synchronously from
+// cellForItem (which runs mid-layout) is ignored by UICollectionView, so a cache-hit
+// image stays text-sized (cropped) until the next scroll. Dispatching to the next
+// runloop makes the size override take on first open too.
+static void ApolloChatScheduleReflow(id collectionView) {
+    static char kPendingReflowKey;
+    if (!collectionView || objc_getAssociatedObject(collectionView, &kPendingReflowKey)) return;
+    objc_setAssociatedObject(collectionView, &kPendingReflowKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak id wcv = collectionView;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id cv = wcv; if (!cv) return;
+        objc_setAssociatedObject(cv, &kPendingReflowKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        id layout = [cv respondsToSelector:@selector(collectionViewLayout)] ? [cv collectionViewLayout] : nil;
+        [layout invalidateLayout];
+    });
+}
+
+#pragma mark - tap-to-fullscreen viewer
+
+// Nearest hosting view controller (for presenting) via the responder chain, falling back to the
+// view's own window (else the key window) root VC.
+static UIViewController *ApolloChatHostVC(UIView *view) {
+    UIResponder *r = view;
+    while ((r = r.nextResponder)) if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+    return (view.window ?: ApolloKeyWindow()).rootViewController;
+}
+
+// Lightweight full-screen viewer for a tapped chat image/gif: black backdrop, pinch + double-tap
+// zoom, single-tap / swipe-down / close-button to dismiss. Animated gifs keep animating.
+@interface ApolloChatImageViewerVC : UIViewController <UIScrollViewDelegate>
+@property (nonatomic, strong) id media;   // UIImage or FLAnimatedImage
+@end
+@implementation ApolloChatImageViewerVC {
+    UIScrollView *_scroll;
+    UIImageView *_imageView;
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor blackColor];
+
+    _scroll = [[UIScrollView alloc] initWithFrame:self.view.bounds];
+    _scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _scroll.delegate = self;
+    _scroll.minimumZoomScale = 1.0;
+    _scroll.maximumZoomScale = 4.0;
+    _scroll.showsHorizontalScrollIndicator = NO;
+    _scroll.showsVerticalScrollIndicator = NO;
+    _scroll.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    [self.view addSubview:_scroll];
+
+    Class fl = ApolloClassFLAnimatedImage;
+    BOOL animated = fl && [self.media isKindOfClass:fl];
+    Class ivClass = animated ? (ApolloClassFLAnimatedImageView ?: [UIImageView class]) : [UIImageView class];
+    _imageView = [[ivClass alloc] initWithFrame:_scroll.bounds];
+    _imageView.contentMode = UIViewContentModeScaleAspectFit;
+    _imageView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    if (animated) ((void (*)(id, SEL, id))objc_msgSend)(_imageView, @selector(setAnimatedImage:), self.media);
+    else if ([self.media isKindOfClass:[UIImage class]]) _imageView.image = self.media;
+    [_scroll addSubview:_imageView];
+
+    UITapGestureRecognizer *single = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onSingleTap:)];
+    UITapGestureRecognizer *dbl = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onDoubleTap:)];
+    dbl.numberOfTapsRequired = 2;
+    [single requireGestureRecognizerToFail:dbl];
+    [self.view addGestureRecognizer:single];
+    [self.view addGestureRecognizer:dbl];
+    UISwipeGestureRecognizer *down = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(dismissSelf)];
+    down.direction = UISwipeGestureRecognizerDirectionDown;
+    [self.view addGestureRecognizer:down];
+
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    [close setImage:[UIImage systemImageNamed:@"xmark.circle.fill"] forState:UIControlStateNormal];
+    close.tintColor = [UIColor whiteColor];
+    [close setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:30 weight:UIImageSymbolWeightRegular] forImageInState:UIControlStateNormal];
+    [close addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
+    // Give the tap target room (the glyph alone is a tiny hit area) and keep it above the scroll view.
+    close.frame = CGRectMake(0, 0, 44, 44);
+    close.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:close];
+    [NSLayoutConstraint activateConstraints:@[
+        [close.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:12],
+        [close.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8],
+    ]];
+}
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)sv { return _imageView; }
+- (void)scrollViewDidZoom:(UIScrollView *)sv {
+    CGSize b = sv.bounds.size; CGRect f = _imageView.frame;
+    _imageView.frame = CGRectMake(f.size.width < b.width ? (b.width - f.size.width)/2 : 0,
+                                  f.size.height < b.height ? (b.height - f.size.height)/2 : 0,
+                                  f.size.width, f.size.height);
+}
+- (void)onSingleTap:(UITapGestureRecognizer *)g {
+    if (_scroll.zoomScale > _scroll.minimumZoomScale) [_scroll setZoomScale:_scroll.minimumZoomScale animated:YES];
+    else [self dismissSelf];
+}
+- (void)onDoubleTap:(UITapGestureRecognizer *)g {
+    if (_scroll.zoomScale > _scroll.minimumZoomScale) { [_scroll setZoomScale:_scroll.minimumZoomScale animated:YES]; return; }
+    CGFloat scale = 2.5; CGPoint pt = [g locationInView:_imageView]; CGSize s = _scroll.bounds.size;
+    [_scroll zoomToRect:CGRectMake(pt.x - (s.width/scale)/2, pt.y - (s.height/scale)/2, s.width/scale, s.height/scale) animated:YES];
+}
+- (void)dismissSelf { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (BOOL)prefersStatusBarHidden { return YES; }
+@end
+
+// Shared tap target (one instance, retained for the app life). The recognizer is attached to the
+// bubble CONTAINER, not our overlay image view — Apollo re-orders subviews on top of our overlay
+// after we render, so a gesture on the iv never receives the touch. The container reliably does.
+@interface ApolloChatImageTapTarget : NSObject <UIGestureRecognizerDelegate>
++ (instancetype)shared;
+- (void)chatBubbleTapped:(UITapGestureRecognizer *)g;
+@end
+@implementation ApolloChatImageTapTarget
++ (instancetype)shared {
+    static ApolloChatImageTapTarget *s; static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [ApolloChatImageTapTarget new]; });
+    return s;
+}
+// Coexist with Apollo's own bubble gestures (long-press menu, link tap) rather than fighting them.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return YES;
+}
+- (void)chatBubbleTapped:(UITapGestureRecognizer *)g {
+    // Find our overlay image view within the tapped bubble — the one carrying a media handle AND
+    // marked interactive (sticker overlays are non-interactive, so taps on emoji are ignored).
+    id media = nil;
+    NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:g.view];
+    while (q.count) {
+        UIView *v = q.firstObject; [q removeObjectAtIndex:0];
+        id m = objc_getAssociatedObject(v, &kApolloChatIvMediaKey);
+        if (m && v.userInteractionEnabled) { media = m; break; }
+        [q addObjectsFromArray:v.subviews];
+    }
+    ChatImgLog("BUBBLE TAP fired media=%{public}@", media ? @"y" : @"NIL");
+    if (!media) return;
+    ApolloChatImageViewerVC *viewer = [ApolloChatImageViewerVC new];
+    viewer.media = media;
+    viewer.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    viewer.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    UIViewController *host = ApolloChatHostVC(g.view);
+    while (host.presentedViewController) host = host.presentedViewController;
+    if ([host isMemberOfClass:[ApolloChatImageViewerVC class]]) return;   // already open
+    [host presentViewController:viewer animated:YES completion:nil];
+}
+@end
+
+#pragma mark - rendering image overlay
+
+static void ApolloChatRenderImageInCell(id vc, id cell, NSURL *url, NSIndexPath *ip, id collectionView, BOOL sticker) {
+    UIView *container = ApolloChatContainerView(cell);
+    if (!container) return;
+    NSString *urlStr = url.absoluteString;
+    NSString *ipKey = ApolloChatIndexKey(ip);
+    ApolloChatMediaWaiter *existingWaiter =
+        objc_getAssociatedObject(cell, &kApolloChatMediaWaiterKey);
+    BOOL alreadyWaitingForURL = [existingWaiter.load.key isEqualToString:urlStr];
+    if (existingWaiter && !alreadyWaitingForURL) {
+        ApolloChatCancelCellMediaWaiter(cell);
+        existingWaiter = nil;
+    }
+
+    // Tap-to-fullscreen: the recognizer lives on the bubble CONTAINER (added once), because Apollo
+    // re-stacks subviews over our overlay so a gesture on the iv never gets the touch. The handler
+    // walks the bubble for an interactive overlay carrying media, so emoji stickers are ignored.
+    if (!objc_getAssociatedObject(container, &kApolloChatContainerTapKey)) {
+        objc_setAssociatedObject(container, &kApolloChatContainerTapKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        container.userInteractionEnabled = YES;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+            initWithTarget:[ApolloChatImageTapTarget shared] action:@selector(chatBubbleTapped:)];
+        tap.delegate = [ApolloChatImageTapTarget shared];
+        [container addGestureRecognizer:tap];
+    }
+
+    UIImageView *iv = objc_getAssociatedObject(cell, &kApolloChatImgViewKey);
+    if (!iv) {
+        Class ivClass = ApolloClassFLAnimatedImageView ?: [UIImageView class];   // animates gifs
+        iv = [[ivClass alloc] initWithFrame:container.bounds];
+        iv.clipsToBounds = YES;
+        iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        objc_setAssociatedObject(cell, &kApolloChatImgViewKey, iv, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // Rendered media floats on the chat background with NO bubble — matching how Reddit shows
+    // images/GIFs/emoji. A real image/gif gets rounded corners + aspect-fill; an emoji/snoomoji
+    // sticker is transparent + unrounded (the glyph carries its own padding). We clear BOTH our image
+    // view's background AND Apollo's blue/grey message container, so a transparent PNG (folder icon)
+    // or a snoomoji shows the chat background through its margins instead of sitting in a box.
+    // MessageKit re-applies the bubble colour when this cell is reused for a text message.
+    if (sticker) {
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.layer.cornerRadius = 0.0;
+    } else {
+        iv.contentMode = UIViewContentModeScaleAspectFill;
+        iv.layer.cornerRadius = 15.0;   // rounds opaque photos; transparent PNGs ignore it
+    }
+    iv.backgroundColor = [UIColor clearColor];
+    container.backgroundColor = [UIColor clearColor];
+    iv.userInteractionEnabled = !sticker;   // tappable for images/gifs, not for emoji stickers
+    if (iv.superview != container) [container addSubview:iv];
+    [container bringSubviewToFront:iv];
+    iv.frame = container.bounds;
+    objc_setAssociatedObject(cell, &kApolloChatImgURLKey, urlStr, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+    id cachedMedia = [ApolloChatMediaCache() objectForKey:urlStr];
+    NSValue *knownSize = ApolloChatKnownSizeForURL(urlStr);
+    // Unicode emoji (our synthetic x-apollo-emoji:// scheme) render at normal text-emoji size with
+    // built-in (rasterized) padding; Reddit snoomoji art renders larger and is inset within the
+    // bubble so the tightly-cropped art sits centered with breathing room instead of edge-cramped.
+    BOOL isUnicodeEmoji = [url.scheme isEqualToString:@"x-apollo-emoji"];
+    CGFloat stickerH = isUnicodeEmoji ? kApolloChatUnicodeEmojiHeight : kApolloChatSnoomojiHeight;
+    CGFloat stickerInset = (sticker && !isUnicodeEmoji) ? kApolloChatSnoomojiInset : 0.0;
+    objc_setAssociatedObject(iv, &kApolloChatStickerInsetKey, @(stickerInset), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    iv.frame = CGRectInset(container.bounds, stickerInset, stickerInset);   // snoomoji: centered with margin
+
+    // Commit a size to BOTH the cell (drives applyLayoutAttributes' container width)
+    // and the VC map (drives sizeForItemAtIndexPath's height) so they never disagree.
+    void (^applySize)(id, NSValue *) = ^(id theCell, NSValue *mv) {
+        objc_setAssociatedObject(theCell, &kApolloChatImgMediaSizeKey, mv, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Keyed on the collection view so the flow-layout hook (queried on every
+        // scroll) and sizeForItem both see the same per-index size.
+        if (collectionView) ApolloChatSizeMap(collectionView)[ipKey] = mv;   // nil removes
+    };
+
+    if (knownSize) {
+        // We've measured this media before: size the bubble deterministically right now.
+        // Even if the gif isn't decoded yet, the placeholder fill (not white) shows.
+        applySize(cell, knownSize);
+        ApolloChatMessageLabel(cell).hidden = YES;
+        ApolloChatScheduleReflow(collectionView);   // apply the size on first open (not just after a scroll)
+    } else {
+        // First time we see this media: stay a normal text bubble until it's measured,
+        // so we never show a big empty bubble.
+        applySize(cell, nil);
+        ApolloChatMessageLabel(cell).hidden = NO;
+    }
+
+    if (cachedMedia) {
+        if (existingWaiter) ApolloChatCancelCellMediaWaiter(cell);
+        ApolloChatSetMedia(iv, cachedMedia);
+        ApolloChatMessageLabel(cell).hidden = YES;
+        if (!knownSize) {
+            NSValue *mv = [NSValue valueWithCGSize:(sticker ? ApolloChatStickerSize((UIImage *)cachedMedia, stickerH) : ApolloChatMediaSize((UIImage *)cachedMedia))];
+            ApolloChatStoreKnownSize(urlStr, mv);
+            applySize(cell, mv);
+            ApolloChatScheduleReflow(collectionView);
+        }
+        return;
+    }
+    if (alreadyWaitingForURL) return;
+
+    // Load asynchronously (gif-aware); commit size + media together when it arrives.
+    __weak UIImageView *weakIV = iv;
+    __weak id weakCell = cell, weakCV = collectionView;
+    ApolloChatMediaWaiter *waiter = ApolloChatLoadMedia(
+        url, ^(id media, ApolloChatMediaWaiter *completedWaiter) {
+        UIImageView *sIV = weakIV; id sCell = weakCell;
+        if (sCell && objc_getAssociatedObject(sCell, &kApolloChatMediaWaiterKey) == completedWaiter) {
+            objc_setAssociatedObject(sCell, &kApolloChatMediaWaiterKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else {
+            return;
+        }
+        if (!media || !sIV || !sCell) return;
+        if (![objc_getAssociatedObject(sCell, &kApolloChatImgURLKey) isEqualToString:urlStr]) return; // recycled
+        NSValue *mv = [NSValue valueWithCGSize:(sticker ? ApolloChatStickerSize((UIImage *)media, stickerH) : ApolloChatMediaSize((UIImage *)media))];
+        ApolloChatStoreKnownSize(urlStr, mv);
+        objc_setAssociatedObject(sCell, &kApolloChatImgMediaSizeKey, mv, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (weakCV) ApolloChatSizeMap(weakCV)[ipKey] = mv;
+        ApolloChatSetMedia(sIV, media);
+        UIView *c = ApolloChatContainerView(sCell);
+        if (c) sIV.frame = c.bounds;
+        ApolloChatMessageLabel(sCell).hidden = YES;
+        ApolloChatScheduleReflow(weakCV);
+    });
+    if (waiter) {
+        objc_setAssociatedObject(cell, &kApolloChatMediaWaiterKey, waiter,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void ApolloChatClearImageInCell(id cell) {
+    ApolloChatCancelCellMediaWaiter(cell);
+    UIImageView *iv = objc_getAssociatedObject(cell, &kApolloChatImgViewKey);
+    if (iv) { ApolloChatClearMedia(iv); [iv removeFromSuperview]; }
+    objc_setAssociatedObject(cell, &kApolloChatImgViewKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, &kApolloChatImgURLKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(cell, &kApolloChatImgMediaSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloChatMessageLabel(cell).hidden = NO;
+}
+
+static void ApolloChatApplyAvatarToCell(id cell);                    // defined below
+static void ApolloChatLoadSnoomoji(id collectionView);               // defined below (fetches the snoomoji table)
+static NSURL *ApolloChatSnoomojiStickerURL(UILabel *label);          // defined below (single-snoomoji -> URL)
+static NSString *ApolloChatPureEmojiBody(UILabel *label);            // defined below (pure-emoji body -> string)
+static BOOL ApolloChatRunIsEmoji(NSString *s);                       // defined below
+
+static void ApolloChatProcessCell(id vc, id collectionView, id cell, NSIndexPath *indexPath) {
+    @try {
+        UILabel *label = ApolloChatMessageLabel(cell);
+        NSURL *imgURL = nil;
+        BOOL sticker = NO;
+        // Master toggle: when OFF we render nothing (fall through to clear any overlay + show the
+        // stock text/link), so chat reverts to stock Apollo. Avatars below stay ungated (own toggle).
+        if (sEnableChatMedia) {
+            // Kick the snoomoji table load (dispatch_once) so a single-snoomoji bubble can resolve to
+            // a sticker. On the very first open the table isn't ready yet; ApolloChatLoadSnoomoji's
+            // completion re-runs this pipeline for the visible cells once it lands.
+            ApolloChatLoadSnoomoji(collectionView);
+
+            imgURL = label ? ApolloChatImageURLFromAttributed(label.attributedText) : nil;
+            if (!imgURL && label) {
+                // Apollo "jumbo-blanks" a message that is just emoji (a Reddit snoomoji renders as the
+                // bare NAME, a unicode emoji renders invisibly), and its TextKit-backed MessageLabel
+                // won't reliably draw a glyph/attachment we inject. So render any pure-emoji bubble as a
+                // sticker overlay — the same proven path as inline gifs/images.
+                NSURL *s = ApolloChatSnoomojiStickerURL(label);          // :snoo_hearteyes: -> emoji CDN URL
+                if (!s) {
+                    NSString *e = ApolloChatPureEmojiBody(label);        // 👍 / 🤜🤛 -> rasterized sticker
+                    if (e) s = ApolloChatEmojiStickerURL(e, label.traitCollection);
+                }
+                if (s) { imgURL = s; sticker = YES; }
+            }
+            // An ImgChest post URL (imgchest.com/p/<id>) isn't a direct image — resolve it to the CDN
+            // image via the shared resolver, then render that. Our own sent images use this short link;
+            // inbound ImgChest links resolve the same way. Until resolved, leave it as text/link.
+            if (imgURL && !sticker && ApolloImageChestIsPostURL(imgURL)) {
+                NSURL *direct = ApolloChatDirectURLFromImageChest(ApolloImageChestCachedResolution(imgURL));
+                if (direct) {
+                    imgURL = direct;
+                } else {
+                    __weak id wcv = collectionView;
+                    ApolloImageChestResolveURL(imgURL, ^(__unused NSDictionary *r) {
+                        if (wcv) ApolloChatScheduleReflow(wcv);
+                    });
+                    imgURL = nil;
+                }
+            }
+        }
+        if (imgURL) {
+            ChatImgLog("detected %{public}@ %{public}@ -> %{public}@", sticker ? @"snoomoji" : @"image", ApolloChatIndexKey(indexPath), imgURL.absoluteString);
+            ApolloChatRenderImageInCell(vc, cell, imgURL, indexPath, collectionView, sticker);
+        } else {
+            if (cell && objc_getAssociatedObject(cell, &kApolloChatImgViewKey)) ApolloChatClearImageInCell(cell);
+            // Keep the index-path size map in sync with reality: this row is NOT an image,
+            // so drop any image size still cached for its index path (an earlier image that
+            // occupied this index path, or one shifted here when a newer message inserted).
+            // Otherwise sizeForItem + the flow-layout override keep sizing this text bubble
+            // to the stale image height (the giant ":orly:" bubble). Reflow to re-lay-out.
+            NSMutableDictionary *map = objc_getAssociatedObject(collectionView, &kApolloChatImgSizeMapKey);
+            NSString *ipKey = ApolloChatIndexKey(indexPath);
+            if (map[ipKey]) { [map removeObjectForKey:ipKey]; ApolloChatScheduleReflow(collectionView); }
+            // Avatars only on text bubbles (image/sticker bubbles hide the header label).
+            ApolloChatApplyAvatarToCell(cell);
+        }
+    } @catch (__unused id e) {}
+}
+
+static CGSize ApolloChatSizeOverride(id vc, id collectionView, CGSize orig, NSIndexPath *indexPath) {
+    @try {
+        NSValue *mv = ApolloChatSizeMap(collectionView)[ApolloChatIndexKey(indexPath)];
+        if ([mv isKindOfClass:[NSValue class]]) {
+            CGSize media = mv.CGSizeValue;
+            return CGSizeMake(orig.width, media.height + 22.0);
+        }
+    } @catch (__unused id e) {}
+    return orig;
+}
+
+#pragma mark - avatars (feature 3)
+
+// Oval-clipped, aspect-fill avatar render (transparent corners). Nil -> neutral fill.
+static UIImage *ApolloChatCircularAvatar(UIImage *src, CGFloat d, UITraitCollection *traitCollection) {
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+    fmt.scale = traitCollection.displayScale; fmt.opaque = NO;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(d, d) format:fmt];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        CGRect rect = CGRectMake(0, 0, d, d);
+        [[UIBezierPath bezierPathWithOvalInRect:rect] addClip];
+        if (src) {
+            CGFloat a = src.size.width > 0 ? src.size.height / src.size.width : 1.0;
+            CGFloat w = d, h = d;
+            if (a > 1.0) { w = d; h = d * a; } else if (a > 0.0) { w = d / a; h = d; }
+            [src drawInRect:CGRectMake((d - w) / 2.0, (d - h) / 2.0, w, h)];
+        } else {
+            [[UIColor secondarySystemFillColor] setFill]; UIRectFill(rect);
+        }
+    }];
+}
+
+// Author username = first whitespace token of the bubble header ("iChopPryde  1h\n…").
+static NSString *ApolloChatAuthorFromLabel(UILabel *label) {
+    NSString *t = label.text;
+    if (t.length == 0) return nil;
+    if ([t characterAtIndex:0] == 0xFFFC) return nil;   // already stamped this configure
+    NSRange nl = [t rangeOfString:@"\n"];
+    NSString *firstLine = nl.location != NSNotFound ? [t substringToIndex:nl.location] : t;
+    for (NSString *tok in [firstLine componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]) {
+        if (tok.length == 0) continue;
+        return [tok hasPrefix:@"u/"] ? [tok substringFromIndex:2] : tok;
+    }
+    return nil;
+}
+
+static const CGFloat kApolloChatAvatarDiameter = 18.0;
+// How much wider the flow-layout hooks below make a text bubble for the avatar prefix.
+static const CGFloat kApolloChatAvatarBubbleWidening = kApolloChatAvatarDiameter + 6.0;
+
+// "[avatar] " for a message's attributed text. The prefix carries the message's own paragraph
+// style and font from its first character: MessageLabel applies the paragraph style it finds at
+// index 0 to the whole string, so a prefix without one dropped Apollo's line spacing from the
+// entire message. Pass the same style object; MessageLabel only keeps an NSMutableParagraphStyle.
+static NSAttributedString *ApolloChatAvatarPrefixWithAttachment(NSTextAttachment *att, NSAttributedString *text) {
+    NSMutableAttributedString *m = [[NSMutableAttributedString alloc] init];
+    [m appendAttributedString:[NSAttributedString attributedStringWithAttachment:att]];
+    [m appendAttributedString:[[NSAttributedString alloc] initWithString:@" "]];
+    if (text.length > 0) {
+        NSMutableDictionary *attributes = [NSMutableDictionary dictionary];
+        id style = [text attribute:NSParagraphStyleAttributeName atIndex:0 effectiveRange:NULL];
+        id font = [text attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
+        if (style) attributes[NSParagraphStyleAttributeName] = style;
+        if (font) attributes[NSFontAttributeName] = font;
+        if (attributes.count) [m addAttributes:attributes range:NSMakeRange(0, m.length)];
+    }
+    return m;
+}
+
+// Build the "[avatar] " prefix attributed string for a given avatar image.
+static NSAttributedString *ApolloChatAvatarPrefix(UIImage *avatar, NSAttributedString *text, UITraitCollection *traitCollection) {
+    NSTextAttachment *att = [NSTextAttachment new];
+    att.image = ApolloChatCircularAvatar(avatar, kApolloChatAvatarDiameter, traitCollection);
+    att.bounds = CGRectMake(0, -4, kApolloChatAvatarDiameter, kApolloChatAvatarDiameter);
+    return ApolloChatAvatarPrefixWithAttachment(att, text);
+}
+
+// Swap the stamped avatar attachment's image in place (async avatar arrival, or a
+// display-scale change re-rendering the cached avatar at the new scale).
+static void ApolloChatSwapAvatarImageInCell(id scell, NSString *author, UIImage *img) {
+    if (![objc_getAssociatedObject(scell, &kApolloChatAvatarUserKey) isEqualToString:author]) return;
+    UILabel *lab = ApolloChatMessageLabel(scell);
+    if (!lab || lab.hidden || lab.attributedText.length == 0) return;
+    if ([lab.text characterAtIndex:0] != 0xFFFC) return;   // header no longer ours
+    NSTextAttachment *att = [lab.attributedText attribute:NSAttachmentAttributeName atIndex:0 effectiveRange:NULL];
+    if (![att isKindOfClass:[NSTextAttachment class]]) return;
+    att.image = ApolloChatCircularAvatar(img, kApolloChatAvatarDiameter, lab.traitCollection);
+    att.bounds = CGRectMake(0, -4, kApolloChatAvatarDiameter, kApolloChatAvatarDiameter);
+    lab.attributedText = [lab.attributedText copy];   // re-set to force a redraw
+}
+
+// Stamp the sender's avatar into the bubble header (next to the username).
+static void ApolloChatApplyAvatarToCell(id cell) {
+    if (!sShowUserAvatars) return;
+    UILabel *label = ApolloChatMessageLabel(cell);
+    if (!label || label.hidden || label.attributedText.length == 0) return;   // image cells hide the label
+    NSString *author = ApolloChatAuthorFromLabel(label);
+    if (author.length == 0) return;
+    objc_setAssociatedObject(cell, &kApolloChatAvatarUserKey, author, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+    // The avatar is a bitmap baked at the label's display scale: re-render the cached avatar
+    // when that scale changes. Registered once per (reused) cell; the handler reads the
+    // cell's CURRENT author, so it stays correct across reuse.
+    if (@available(iOS 17.0, *)) {
+        if ([cell isKindOfClass:[UIView class]] && !objc_getAssociatedObject(cell, &kApolloChatAvatarScaleObservedKey)) {
+            objc_setAssociatedObject(cell, &kApolloChatAvatarScaleObservedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [(UIView *)cell registerForTraitChanges:@[UITraitDisplayScale.class]
+                                        withHandler:^(__kindof UIView *v, __unused UITraitCollection *previous) {
+                NSString *currentAuthor = objc_getAssociatedObject(v, &kApolloChatAvatarUserKey);
+                if (currentAuthor.length == 0) return;
+                ApolloUserProfileCache *profiles = [ApolloUserProfileCache sharedCache];
+                ApolloUserProfileInfo *currentInfo = [profiles cachedInfoForUsername:currentAuthor];
+                NSURL *currentURL = currentInfo ? (currentInfo.iconURL ?: currentInfo.snoovatarURL) : nil;
+                UIImage *currentImg = currentURL ? [profiles cachedImageForURL:currentURL] : nil;
+                if (currentImg) ApolloChatSwapAvatarImageInCell(v, currentAuthor, currentImg);
+            }];
+        }
+    }
+
+    ApolloUserProfileCache *cache = [ApolloUserProfileCache sharedCache];
+    ApolloUserProfileInfo *info = [cache cachedInfoForUsername:author];
+    NSURL *url = info ? (info.iconURL ?: info.snoovatarURL) : nil;
+    UIImage *cachedImg = url ? [cache cachedImageForURL:url] : nil;
+
+    // Prepend the avatar (real if cached, neutral placeholder otherwise).
+    NSMutableAttributedString *m = [[NSMutableAttributedString alloc] init];
+    [m appendAttributedString:ApolloChatAvatarPrefix(cachedImg, label.attributedText, label.traitCollection)];
+    [m appendAttributedString:label.attributedText];
+    label.attributedText = m;
+    if (cachedImg) return;
+
+    // Resolve asynchronously, then swap the placeholder attachment's image in place.
+    __weak id wcell = cell;
+    void (^update)(UIImage *) = ^(UIImage *img) {
+        id scell = wcell; if (!img || !scell) return;
+        ApolloChatSwapAvatarImageInCell(scell, author, img);
+    };
+    if (info && url) {
+        [cache requestImageForURL:url completion:update];
+    } else {
+        [cache requestInfoForUsername:author completion:^(ApolloUserProfileInfo *info2) {
+            NSURL *u = info2.iconURL ?: info2.snoovatarURL;
+            if (u) [cache requestImageForURL:u completion:update];
+        }];
+    }
+}
+
+#pragma mark - inline snoomoji (render :name: emoji like the website chat does)
+
+// Apollo resolves :name: emoji in comments/posts from each item's media_metadata, but a bridged
+// chat RDKMessage carries no media_metadata — just the markdown body with :name: tokens. So we
+// resolve names ourselves: load Reddit's platform "snoomoji" set (name -> image URL) once,
+// preload the small images, then swap :name: tokens in message bubbles for the emoji image (the
+// same idea as the inline gif/image rendering, keyed by name instead of URL).
+static NSMutableDictionary<NSString *, NSURL *> *ApolloChatSnoomojiMap(void) {
+    static NSMutableDictionary *m; static dispatch_once_t once;
+    dispatch_once(&once, ^{ m = [NSMutableDictionary dictionary]; });
+    return m;
+}
+
+// The message body, with Apollo's leading "sender  timeago" header line (always the FIRST line of
+// these cells) stripped. A pure-emoji or single-snoomoji bubble's body is exactly the emoji.
+static NSString *ApolloChatMessageBody(UILabel *label) {
+    if (!label || label.attributedText.length == 0) return nil;
+    NSString *full = label.attributedText.string;
+    if (full.length == 0) return nil;
+    NSRange nl = [full rangeOfString:@"\n"];   // FIRST newline = end of the header line
+    NSString *body = (nl.location == NSNotFound) ? full : [full substringFromIndex:nl.location + 1];
+    return [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+// If this bubble is essentially a single Reddit snoomoji, return its image URL (else nil). Apollo
+// draws such a message as the bare emoji NAME (e.g. "snoo_hearteyes"; some, like ":orly:", keep
+// their colons). The whole body must be one token, AND — to avoid hijacking a plain one-word
+// message that merely equals a snoomoji name (e.g. someone literally typing "doge" or "cake") and
+// hiding their text — a BARE (no-colon) name is only accepted when it's unambiguously an emoji
+// token: it carries the explicit :name: syntax, contains an underscore/digit (snoo_hearteyes…), or
+// is a universal Reddit vote reaction. Plain dictionary words require the :name: form.
+static NSURL *ApolloChatSnoomojiStickerURL(UILabel *label) {
+    NSMutableDictionary *map = ApolloChatSnoomojiMap();
+    if (map.count == 0) return nil;
+    NSString *body = ApolloChatMessageBody(label);
+    if (body.length == 0) return nil;
+    if ([body rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].location != NSNotFound)
+        return nil;   // the whole body must be a single token
+    BOOL colonWrapped = body.length >= 3 && [body hasPrefix:@":"] && [body hasSuffix:@":"];
+    NSString *token = colonWrapped ? [body substringWithRange:NSMakeRange(1, body.length - 2)] : body;
+    if (token.length == 0) return nil;
+    NSString *key = token.lowercaseString;
+    if (!map[key]) return nil;
+    if (!colonWrapped) {
+        // bare name: require it to look like an emoji token, not a plain word
+        BOOL emojiShaped = [token rangeOfCharacterFromSet:
+            [NSCharacterSet characterSetWithCharactersInString:@"_0123456789"]].location != NSNotFound;
+        static NSSet *voteReactions; static dispatch_once_t once;
+        dispatch_once(&once, ^{ voteReactions = [NSSet setWithArray:@[@"upvote", @"downvote"]]; });
+        if (!emojiShaped && ![voteReactions containsObject:key]) return nil;
+    }
+    return map[key];
+}
+
+// If the whole message body is pure emoji (👍, 🤜🤛, etc.), return that emoji string (else nil).
+// Mixed text+emoji ("ok 👍") returns nil — Apollo renders those inline fine; only a lone-emoji
+// bubble gets jumbo-blanked, and that's the case we turn into a rasterized sticker.
+static NSString *ApolloChatPureEmojiBody(UILabel *label) {
+    NSString *body = ApolloChatMessageBody(label);
+    if (body.length == 0) return nil;
+    return ApolloChatRunIsEmoji(body) ? body : nil;
+}
+// Fetch the platform snoomoji name->URL table once. We render single-snoomoji bubbles as image
+// stickers (the overlay path), so we only need the URLs here — the bytes are fetched + decoded
+// (and gif-animated) on demand by ApolloChatLoadMedia, exactly like inbound chat images.
+static void ApolloChatLoadSnoomoji(id collectionView) {
+    // Called only from ApolloChatProcessCell (cellForItem / the main-queue re-run) — i.e. always on the
+    // main thread — so these guards need no lock. We deliberately do NOT use dispatch_once: a single
+    // failed or empty first fetch (launched offline, or before the Reddit bearer token is captured)
+    // must not permanently disable snoomoji for the session. `sLoaded` latches only once the map is
+    // actually populated; `sInFlight` coalesces duplicate fetches but is cleared on a transient
+    // failure so the next chat open retries. (Reported by @nickclyde in review.)
+    static BOOL sLoaded = NO;     // YES only after the map has been populated with entries
+    static BOOL sInFlight = NO;   // a fetch is currently running (avoid duplicate concurrent fetches)
+    if (sLoaded || sInFlight) return;
+    sInFlight = YES;
+    __weak id wcv = collectionView;
+    NSString *bearer = sLatestRedditBearerToken;
+    NSString *sub = @"nintendo";   // any emoji-enabled sub returns the platform "snoomojis" section
+    NSString *urlStr = bearer.length
+        ? [NSString stringWithFormat:@"https://oauth.reddit.com/api/v1/%@/emojis/all?raw_json=1", sub]
+        : [NSString stringWithFormat:@"https://www.reddit.com/api/v1/%@/emojis/all.json?raw_json=1", sub];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+    if (bearer.length) [req setValue:[@"Bearer " stringByAppendingString:bearer] forHTTPHeaderField:@"Authorization"];
+    [req setValue:@"Apollo iOS" forHTTPHeaderField:@"User-Agent"];
+    [[NSURLSession.sharedSession dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        // Parse off-main into a LOCAL dictionary (no shared state touched on the background queue)...
+        NSDictionary *json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSDictionary *snoo = [json isKindOfClass:[NSDictionary class]] ? json[@"snoomojis"] : nil;
+        NSMutableDictionary<NSString *, NSURL *> *parsed = [NSMutableDictionary dictionary];
+        if ([snoo isKindOfClass:[NSDictionary class]]) {
+            for (NSString *name in snoo) {
+                NSDictionary *e = snoo[name];
+                NSString *u = [e isKindOfClass:[NSDictionary class]] ? e[@"url"] : nil;
+                NSURL *url = [u isKindOfClass:[NSString class]] ? [NSURL URLWithString:u] : nil;
+                if (name.length && url) parsed[name.lowercaseString] = url;
+            }
+        }
+        // ...then merge into the shared map + flip the guards on the MAIN thread, so the snoomoji map
+        // is only ever mutated on the same thread ApolloChatSnoomojiStickerURL reads it on.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            sInFlight = NO;
+            ChatImgLog("snoomoji fetch: %lu entries (sample orly=%{public}@)",
+                       (unsigned long)parsed.count, parsed[@"orly"] ? @"y" : @"-");
+            if (parsed.count == 0) return;   // transient failure: leave sLoaded NO so the next open retries
+            [ApolloChatSnoomojiMap() addEntriesFromDictionary:parsed];
+            sLoaded = YES;
+            // Re-run the cell pipeline for what's already on screen: any single-snoomoji bubble
+            // that rendered as bare text before the table arrived now resolves to a sticker.
+            id cv = wcv;
+            if (!cv || ![cv respondsToSelector:@selector(visibleCells)]) return;
+            id dvc = [cv respondsToSelector:@selector(delegate)] ? [(UICollectionView *)cv delegate] : nil;
+            for (id cell in [(UICollectionView *)cv visibleCells]) {
+                NSIndexPath *ip = [(UICollectionView *)cv indexPathForCell:cell];
+                if (dvc && ip) ApolloChatProcessCell(dvc, cv, cell, ip);
+            }
+        });
+    }] resume];
+}
+
+// Is the whole string a pure emoji (no regular letters/digits)? Used to spot a single-emoji
+// message body that Apollo blanked.
+static BOOL ApolloChatRunIsEmoji(NSString *s) {
+    if (s.length == 0) return NO;
+    __block BOOL emoji = NO, text = NO;
+    [s enumerateSubstringsInRange:NSMakeRange(0, s.length) options:NSStringEnumerationByComposedCharacterSequences
+                       usingBlock:^(NSString *sub, NSRange r1, NSRange r2, BOOL *stop) {
+        if (sub.length == 0) return;
+        unichar c = [sub characterAtIndex:0];
+        if (c >= 0xD800 && c <= 0xDBFF) emoji = YES;                         // astral plane (most emoji)
+        else if (c >= 0x2190 && c <= 0x2BFF) emoji = YES;                    // BMP arrows/symbols/dingbats
+        else if (c == 0xFE0F || c == 0x200D || c == 0x20E3 || c == 0x2122 || c == 0xA9 || c == 0xAE) { /* modifiers */ }
+        else if (![[NSCharacterSet whitespaceAndNewlineCharacterSet] characterIsMember:c]) text = YES;
+    }];
+    return emoji && !text;
+}
+
+#pragma mark - hooks
+
+// Resize the bubble for image rows: override the layout attributes' messageContainerSize
+// so MessageKit sizes + positions (and side-aligns) the bubble for us.
+%hook _TtC6Apollo15TextMessageCell
+// Reset our per-cell state on reuse so a recycled image cell doesn't carry stale
+// media sizing onto a text bubble (which made text wrap at the narrow image width).
+- (void)prepareForReuse {
+    %orig;
+    ApolloChatClearImageInCell(self);
+    objc_setAssociatedObject(self, &kApolloChatAvatarUserKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+- (void)applyLayoutAttributes:(id)attributes {
+    NSValue *mv = objc_getAssociatedObject(self, &kApolloChatImgMediaSizeKey);
+    if (mv && attributes) {
+        ApolloChatSetCGSizeIvar(attributes, "messageContainerSize", mv.CGSizeValue);
+    }
+    %orig;
+    if (mv) {
+        UIImageView *iv = objc_getAssociatedObject(self, &kApolloChatImgViewKey);
+        UIView *c = ApolloChatContainerView(self);
+        if (iv && c && iv.superview == c) {
+            CGFloat inset = [objc_getAssociatedObject(iv, &kApolloChatStickerInsetKey) doubleValue];
+            iv.frame = CGRectInset(c.bounds, inset, inset);   // snoomoji art sits centered with margin
+        }
+    }
+}
+%end
+
+#pragma mark - bubble height = the text MessageLabel draws
+
+// Apollo sizes a text bubble (TextMessageSizeCalculator.messageContainerSize) with
+// -[NSAttributedString boundingRectWithSize:options:context:], but MessageLabel draws the text
+// with its own TextKit 1 NSLayoutManager. On iOS 16+ boundingRect lays out with TextKit 2, which
+// adds the font's leading on top of Apollo's 3 pt markdown line spacing where TextKit 1 folds it
+// in, so each line is measured ~1.5 pt taller than it is drawn and a long message ends in a band
+// of empty bubble (95 pt on a 64-line modmail). With avatars on it grows: the flow-layout hooks
+// below widen the bubble after it was measured, so the text rewraps into fewer lines than were
+// counted. While a message list sizes its cells, answer the calculator's measurement with the
+// height MessageLabel will actually draw.
+static __thread NSUInteger sApolloChatBubbleSizingDepth = 0;   // > 0 inside a message list's sizing pass (main thread)
+
+// Apollo hands the calculator a new attributed string on every pass, so key by content
+// (NSAttributedString equality covers the attributes too) -> "width|avatars" -> drawn height.
+static NSCache<NSAttributedString *, NSMutableDictionary<NSString *, NSNumber *> *> *ApolloChatDrawnHeightCache(void) {
+    static NSCache *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSCache new];
+        cache.countLimit = 128;
+    });
+    return cache;
+}
+
+// MessageLabel's layout: the paragraph style at index 0 (only if mutable, else a fresh one) with
+// word wrapping, applied to the whole string (-[MessageLabel setAttributedText:]); a TextKit 1
+// container with no line limit and zero line-fragment padding.
+static CGFloat ApolloChatBubbleDrawnTextHeight(NSAttributedString *text, CGFloat width, BOOL avatarPrefix,
+                                               CGFloat measuredHeight) {
+    if (text.length == 0 || width <= 0) return 0;
+    NSCache *cache = ApolloChatDrawnHeightCache();
+    NSMutableDictionary<NSString *, NSNumber *> *heights = [cache objectForKey:text];
+    NSString *key = [NSString stringWithFormat:@"%.2f|%d", width, avatarPrefix];
+    NSNumber *cached = heights[key];
+    if (cached) return cached.doubleValue;
+
+    NSMutableAttributedString *drawn = [NSMutableAttributedString new];
+    if (avatarPrefix) {
+        // Same geometry as ApolloChatAvatarPrefix; the image itself doesn't affect layout.
+        NSTextAttachment *att = [NSTextAttachment new];
+        att.bounds = CGRectMake(0, -4, kApolloChatAvatarDiameter, kApolloChatAvatarDiameter);
+        [drawn appendAttributedString:ApolloChatAvatarPrefixWithAttachment(att, text)];
+    }
+    [drawn appendAttributedString:text];
+    id first = [drawn attribute:NSParagraphStyleAttributeName atIndex:0 effectiveRange:NULL];
+    NSMutableParagraphStyle *style = [first isKindOfClass:[NSMutableParagraphStyle class]]
+        ? [(NSMutableParagraphStyle *)first mutableCopy] : [NSMutableParagraphStyle new];
+    style.lineBreakMode = NSLineBreakByWordWrapping;
+    [drawn addAttribute:NSParagraphStyleAttributeName value:style range:NSMakeRange(0, drawn.length)];
+
+    NSTextStorage *storage = [[NSTextStorage alloc] initWithAttributedString:drawn];
+    NSLayoutManager *layoutManager = [NSLayoutManager new];
+    NSTextContainer *container = [[NSTextContainer alloc] initWithSize:CGSizeMake(width, CGFLOAT_MAX)];
+    container.lineFragmentPadding = 0;
+    container.maximumNumberOfLines = 0;
+    [layoutManager addTextContainer:container];
+    [storage addLayoutManager:layoutManager];
+    [layoutManager ensureLayoutForTextContainer:container];
+    CGFloat height = ceil([layoutManager usedRectForTextContainer:container].size.height);
+
+    if (!heights) {
+        heights = [NSMutableDictionary dictionary];
+        [cache setObject:heights forKey:[text copy]];
+    }
+    heights[key] = @(height);
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [ChatBubble] %lu-char message at %.0f pt: measured %.1f pt, drawn %.0f pt (avatars %d)",
+                   (unsigned long)text.length, width, measuredHeight, height, avatarPrefix);
+    return height;
+}
+
+%hook NSAttributedString
+- (CGRect)boundingRectWithSize:(CGSize)size options:(NSStringDrawingOptions)options context:(NSStringDrawingContext *)context {
+    // Process-wide and hot: everything outside a message list's own sizing pass stops here.
+    if (sApolloChatBubbleSizingDepth == 0) return %orig;
+    CGRect measured = %orig;
+    // Only the size calculator's call: a width, unbounded height, line fragments + font leading.
+    if (context || size.height < CGFLOAT_MAX / 2.0 ||
+        options != (NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading)) return measured;
+    // The calculator integral-rounds this rect, adds the label insets, and the flow-layout hooks
+    // add the avatar widening; the label's text column is what remains of that width.
+    BOOL avatarPrefix = sShowUserAvatars;
+    CGFloat width = CGRectGetWidth(CGRectIntegral(measured)) + (avatarPrefix ? kApolloChatAvatarBubbleWidening : 0.0);
+    CGFloat drawnHeight = ApolloChatBubbleDrawnTextHeight(self, width, avatarPrefix, CGRectGetHeight(measured));
+    if (drawnHeight <= 0) return measured;
+    measured.size.height = drawnHeight;
+    return measured;
+}
+%end
+
+// Apply the cached image-bubble size (or the avatar widening for a text bubble) to one
+// flow-layout attributes object. Shared by both flow-layout attribute queries below.
+static void ApolloChatAdjustLayoutAttributes(NSDictionary *map, UICollectionViewLayoutAttributes *la,
+                                             NSIndexPath *indexPath) {
+    NSValue *mv = map.count ? map[ApolloChatIndexKey(indexPath)] : nil;
+    if (mv) {
+        ApolloChatSetCGSizeIvar(la, "messageContainerSize", mv.CGSizeValue);
+    } else if (sShowUserAvatars) {
+        // Widen text bubbles so the avatar prefix doesn't push the timestamp onto
+        // a second header line where it hides the message body.
+        CGSize cur = ApolloChatGetCGSizeIvar(la, "messageContainerSize");
+        if (cur.width > 0)
+            ApolloChatSetCGSizeIvar(la, "messageContainerSize",
+                CGSizeMake(cur.width + kApolloChatAvatarBubbleWidening, cur.height));
+    }
+}
+
+// The cell's applyLayoutAttributes only re-fires on (re)configuration, so on a plain
+// scroll the cached attributes' (text-sized) messageContainerSize would be reused,
+// clipping the big image. The flow layout's attribute query runs on every scroll —
+// override messageContainerSize here (keyed by index path via the collection-view map)
+// so an image bubble is sized correctly whether freshly built or scrolled back in.
+%hook _TtC6Apollo32MessagesCollectionViewFlowLayout
+- (NSArray *)layoutAttributesForElementsInRect:(CGRect)rect {
+    NSArray *attrs = nil;
+    sApolloChatBubbleSizingDepth++;
+    @try {
+        attrs = %orig;
+    } @finally {
+        sApolloChatBubbleSizingDepth--;
+    }
+    @try {
+        NSMutableDictionary *map = objc_getAssociatedObject([(UICollectionViewLayout *)self collectionView], &kApolloChatImgSizeMapKey);
+        for (UICollectionViewLayoutAttributes *la in attrs) {
+            if (![la isKindOfClass:[UICollectionViewLayoutAttributes class]]) continue;
+            ApolloChatAdjustLayoutAttributes(map, la, la.indexPath);
+        }
+    } @catch (__unused id e) {}
+    return attrs;
+}
+- (id)layoutAttributesForItemAtIndexPath:(id)indexPath {
+    id la = nil;
+    sApolloChatBubbleSizingDepth++;
+    @try {
+        la = %orig;
+    } @finally {
+        sApolloChatBubbleSizingDepth--;
+    }
+    @try {
+        NSMutableDictionary *map = objc_getAssociatedObject([(UICollectionViewLayout *)self collectionView], &kApolloChatImgSizeMapKey);
+        if ([la isKindOfClass:[UICollectionViewLayoutAttributes class]]) {
+            ApolloChatAdjustLayoutAttributes(map, la, indexPath);
+        }
+    } @catch (__unused id e) {}
+    return la;
+}
+%end
+
+%hook _TtC6Apollo28PrivateMessageViewController
+- (id)collectionView:(id)collectionView cellForItemAtIndexPath:(id)indexPath {
+    id cell = %orig;
+    ApolloChatProcessCell(self, collectionView, cell, indexPath);
+    return cell;
+}
+- (CGSize)collectionView:(id)collectionView layout:(id)layout sizeForItemAtIndexPath:(id)indexPath {
+    CGSize originalSize = CGSizeZero;
+    sApolloChatBubbleSizingDepth++;
+    @try {
+        originalSize = %orig;
+    } @finally {
+        sApolloChatBubbleSizingDepth--;
+    }
+    return ApolloChatSizeOverride(self, collectionView, originalSize, indexPath);
+}
+%end
+
+%hook _TtC6Apollo22MessagesViewController
+- (id)collectionView:(id)collectionView cellForItemAtIndexPath:(id)indexPath {
+    id cell = %orig;
+    ApolloChatProcessCell(self, collectionView, cell, indexPath);
+    return cell;
+}
+- (CGSize)collectionView:(id)collectionView layout:(id)layout sizeForItemAtIndexPath:(id)indexPath {
+    CGSize originalSize = CGSizeZero;
+    sApolloChatBubbleSizingDepth++;
+    @try {
+        originalSize = %orig;
+    } @finally {
+        sApolloChatBubbleSizingDepth--;
+    }
+    return ApolloChatSizeOverride(self, collectionView, originalSize, indexPath);
+}
+%end
+
+%ctor {
+    ApolloLog(@"[ChatImg] module loaded");
+}

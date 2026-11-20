@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "upstream_repository": "Apollo-Reborn/Apollo-Reborn",
+  "pull_requests": [
+    {
+      "number": 1592,
+      "reason": "Phone release exclusion: draft 4.1 sunset removes Classic appearance and older backup restore support"
+    }
+  ],
+  "allowed_pull_requests": []
+}

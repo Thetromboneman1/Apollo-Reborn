@@ -1,0 +1,97 @@
+# src/settings/ — tweak settings screens and native-settings integration
+
+Everything settings-related lives here. Two distinct layers — pick the right one for the table you're touching:
+
+| You're changing… | Use | Never |
+|---|---|---|
+| A **tweak-owned** screen (Apollo Reborn root, Deleted Comments, Translation, …) | `ApolloSettingsForm` — declare rows in `-buildForm` | Hand-roll `numberOfRows`/`cellForRow` switches or index arithmetic |
+| Apollo's **native** Settings > General screen (a Eureka form we don't own) | `ApolloSettingsGeneralTable` — register a hide matcher or row injection in your `%ctor` | `%hook` that screen's table delegate/dataSource methods (two remappers desync index spaces — the PR #570 bug class) |
+
+The ••• menus' item order/visibility (Interface → Action Menus) is modelled in `src/ApolloActionMenuLayout.{h,m}` and applied by that same action-menu owner — a new tweak row only needs a catalogue entry there (keyed by its spec identifier) to become reorderable/hideable; a native row is catalogued by its Action kind.
+
+Other native screens have their own single owners: the Settings root and About injections live in `src/settings/ApolloSettings.xm`, the Filters screen in `src/ApolloFiltersBlocksInject.xm`, the Appearance screen (the Theme Manager row plus the switches appended to native sections — Color Flairs, Bold Post Titles) in `src/ApolloThemeManagerIntegration.xm`, and Apollo's "..." action-menu sheet (`_TtC6Apollo16ActionController`, both the Liquid Glass `UIMenu` and the legacy table sheet) in `src/ApolloActionMenu.{h,xm}` — register a row spec in your `%ctor` via `ApolloActionMenuRegister()`, don't `%hook` that class's table methods yourself. One remapper per screen, always.
+
+## Adding a new tweak setting (the 5-step recipe)
+
+1. **Key** — `UDKey*` constant in `src/UserDefaultConstants.h`, with a comment saying what it does and its default.
+2. **Global** — `s*` BOOL/NSInteger in `src/ApolloState.{h,m}` (the header's `extern "C"` block; .xm consumers are ObjC++).
+3. **Default + load** — register the default in `Tweak.xm`'s `registerDefaults` dictionary and read it into the global in the same `%ctor` block as its neighbors. Prefer `@YES` there over inverted-key tricks for default-on.
+4. **Row** — add an `ApolloSettingsRow` to the right screen's `-buildForm`. For a plain toggle that's 5 lines (see any converted screen). Conditional row? Set `.visible` and call `[self visibilityDidChange]` from whatever toggle drives it — never compute indices.
+5. **Consume** — read the `s*` global from your feature module.
+
+**Launch-time exception:** `UDKeyLiquidGlassEnabled` is registered and latched in
+`ApolloCommon.m`’s `+load`, before UIKit selects its design and before Logos
+constructors install appearance-specific hooks. Its switch saves only the next
+launch’s preference; never reload `sLiquidGlassEnabled` during a running session.
+
+Do **not** add the setting to `ApolloBackupRestore.m`'s statics re-sync block: settings ride `standardUserDefaults`, so they're in Backup/Restore for free, and restore always force-exits (`exit(0)`) so `%ctor` re-reads everything on relaunch. The re-sync list is intentionally partial.
+
+## ApolloSettingsForm quick reference
+
+### Setup Assistant
+
+`ApolloSetupAssistant` is a four-page modal UIKit pager (connect/restore, starting
+point, appearance, summary), with decorative artwork, swipe navigation and a
+fixed footer. All Settings/search/deep-link entry points present the same sheet.
+Its optional feature and privacy details use the shared form layer.
+`ApolloSetupPreset` owns the Foundation-only preset maps and the first-launch
+classification. The bootstrap snapshots persistent domains
+in `+load`, before constructor migrations/unlock flags can make a new install
+look configured. Existing preference domains are conservatively excluded from
+automatic onboarding; the Settings route `setup-assistant` stays available and
+starts with **Keep My Settings** for existing users.
+
+Preset, appearance and privacy choices live in a draft until Finish. Credentials
+and explicitly requested backup operations use their existing save/restore flows.
+Finish writes ordinary defaults once and requests one clean restart when effective
+values changed; no preset is reapplied on an upgrade. Liquid Glass's latched global
+is never changed live. A successful restore marks setup complete even for old or
+mid-setup backups. Skip suppresses automatic setup without applying the draft.
+
+Keep authentication, privacy, filters, sound, experimental services, AI and
+translation out of feature presets. If adding a preset-owned feature, put its key
+in **every** map so selecting Classic can reverse Full Featured. Changes to the
+map and launch policy are checked by `tests/run_setup_preset_tests.sh`.
+
+Manual verification: use a separate simulator/bundle ID with an empty data domain;
+check welcome appears without What's New/update prompts, each preset changes the
+sample and checkmark without writing its defaults, Back preserves the draft,
+Skip survives relaunch, Finish persists the chosen map and reopens without setup,
+and existing/restored preferences never trigger automatic onboarding. Run the
+Settings route again: Keep My Settings + Keep Current Appearance must preserve
+customisations. Exercise privacy disclosure on screen, supported/unsupported Glass
+builds, light/dark, Dynamic Type and iPad rotation. Account sign-in and backup import
+should be validated with private test credentials/backups outside the repository.
+
+### Form API
+
+Full API docs in `ApolloSettingsForm.h`. The load-bearing rules:
+
+- **Indices are derived, never computed.** The dataSource serves a visibility snapshot; `visible` blocks are only evaluated at load and inside `visibilityDidChange` (which diffs and animates the insert/delete for you). Refer to rows by identity: `reloadRowWithID:`, `cellForRowID:` (also your popover `sourceView` anchor), `indexPathForRowID:`.
+- **Row kinds**: `switchRow` (isOn/onToggle blocks, optional `.enabled`), `valueRow` (detail block; Value1), `disclosureRow` (push block), `buttonRow` (accent action text), `customRow` (escape hatch — the block owns the cell). Blocks are retained by the VC via the row model — capture `weakSelf`, not `self`, or you leak the screen.
+- **`ApolloSettingsPresentPicker`** replaces the hand-rolled "(Current)" action sheets. It fires `apply` on ANY pick **including re-picking the current option** (legacy sheet semantics some handlers rely on) — apply blocks must be idempotent. Sheets needing a message body or extra actions stay bespoke; anchor them to `cellForRowID:`.
+- **`ApolloSettingsPresentLivePicker`** uses the same sheet, applying once before dismissal through a signature-checked UIKit hook, with the public handler as fallback. Use only for synchronous in-place updates; **never push or present a controller** from its callback. Update visible cells instead of reloading rows during dismissal. Cancel and other pickers keep their normal behavior.
+- **Dynamic row lists** (rows generated per data item inside `buildForm`, like Translation's skip-languages): refresh with `rebuildSectionContainingRowID:withRowAnimation:`, not `rebuildForm` — a full `reloadData` reconfigures every section's cells and clobbers in-progress text-field edits elsewhere on the screen.
+- **When to reach for `customRow`**: bespoke cells (preview cards, status subtitles, centered labels), text-field rows (keep the tag-based `UITextFieldDelegate` machinery — it's index-immune by design), and anything whose color must NOT be the accent (e.g. destructive red — `buttonRow` tags the cell for accent action text).
+- **The form holds plain-title header heights.** Once it answers a footer's height (next rule), UIKit stops stripping the next header's top padding, so a header it sizes again after that comes back 7.3pt shorter than it opened. The form holds each titled header at the height it had the first time it was shown and serves that from `heightForHeaderInSection:`, so updates passes (row reloads in `viewWillAppear:`, rows appearing or disappearing) leave headers where they were. If your screen overrides `heightForHeaderInSection:`, return `[super tableView:heightForHeaderInSection:]` for the sections you don't special-case; if you override `willDisplayHeaderView:`, call super.
+- **The form owns plain-string footer heights.** It measures each footer's real view once it is displayed and serves that from `heightForFooterInSection:` (UIKit's own number is a title-only estimate that every updates pass puts back on the off-screen footers; a footer sized short rides UP over the rows above it). If your screen overrides `heightForFooterInSection:`, return `[super tableView:heightForFooterInSection:]` for sections whose footer is a plain string, and if you override `willDisplayFooterView:`, call super.
+- **Don't reload from `viewWillAppear:`.** A cancelled interactive swipe-back calls it again as the gesture ends, and a `reloadData`, `rebuildForm` or `reloadRowWithID:` there goes through UIKit's post-update scroll restore, which moves the list when the top edge of the screen sits inside a section footer. To pick up state that changed while the screen was off-stack, update the affected cells in place (`cellForRowID:` returns the visible cell, or one UIKit prefetched).
+- **Section titles catch up with the theme on return.** The base styles section headers and footers in `willDisplayHeaderView:`/`willDisplayFooterView:`, and calls those again from `viewWillAppear:` for the ones the screen is showing, so a screen that was covered while the theme changed doesn't keep the old colour or font. When their fonts changed too, it runs one updates pass once the transition is over so the table takes their new heights, with the rows on screen kept where they are (the form measures its footers again in that pass). If your screen overrides those two methods, keep what they do safe to run twice.
+- **A glyph or other styling in a section title**: set the section's `headerDisplay`/`footerDisplay` block instead of overriding `willDisplayHeaderView:`/`willDisplayFooterView:` with section numbers. The block runs on every display, after the theme styling and again on a restyle pass, so build the label from the model's text, not the label's (which may already hold the glyph). Accessibility the block sets is cleared when the view is reused for another section. Footer heights are still measured from the plain footer string.
+- **Adding or removing rows while the list is scrolled** (an edit on this screen): wrap the rebuild in `performUpdateKeepingVisibleRowsInPlace:`. The same restore moves the list after a reload or batch update whenever the top edge of the screen is inside a section footer; this puts the rows that were on screen back where they were.
+- **Theming is automatic** via the `ApolloSettingsTableViewController` base (accent walk in `willDisplayCell`); don't hand-tint.
+- **Typography follows Apollo's Appearance setting** through `ApolloSettingsFont` and the shared base controller. Use semantic text styles for custom labels. A screen that returns its own footer view and answers `heightForFooterInSection:` for it measures the view it shows: build both with one method, and apply `ApolloSettingsApplyFooterTypography` there. The base applies that styling again in `willDisplayFooterView:`, after the table has taken the height, so a view that only gets it there can be shown in a bigger font than it was measured in, and the lines that don't fit are cut off (that clipped every `CustomAPIViewController` link footer under Rounded, Serif and Mono theme fonts). To restyle such footers later (a theme change), find them yourself — `-footerViewForSection:` only returns `UITableViewHeaderFooterView`s — restyle them with that same method, and run an updates pass if their fitted height changed. `ApolloCustomTextSize` is **one-based** (1 = Extra Small, 4 = Large, 7 = XXX Large); verify against native rows rather than assuming Swift case indices are persisted raw values. Primary text uses Apollo's palette, including the softer gray in Pure Black mode.
+- **Classic row spacing**: standard rows and title-only hub navigation rows use `ApolloSettingsClassicRowHeight`, matching Apollo's native 44pt minimum while measuring wrapped/larger text. UIKit's automatic sizing otherwise gives some plain navigation rows a 52pt minimum. Real subtitles and custom layouts retain automatic sizing; explicit `row.height` blocks remain authoritative. Liquid Glass retains its existing sizing.
+- **Testing**: no automated tests. When touching conditional rows, manually exercise the full flag matrix in the sim (`scripts/run-in-sim.sh`) with the section ON SCREEN while toggling — the insert/delete path, not just relaunch.
+
+## Native Settings > General (Eureka) facts
+
+Apollo's native settings screens are Eureka `FormViewController`s (Eureka ~5.5, an embedded framework in the IPA).
+
+RE facts that make `ApolloSettingsGeneralTable`'s NSProxy approach safe (full verification notes in `ApolloSettingsGeneralTable.xm`'s header — re-check them on any base-IPA bump):
+
+- Eureka indexes `form[indexPath.section][indexPath.row]` with **no bounds guard** — any unmapped index path reaching it is an `NSRangeException`. That's why exactly one owner may remap that screen's index space.
+- Eureka touches the table's `delegate`/`dataSource` only in `viewDidLoad`'s nil-guards, never reads them back for dispatch, and never casts them; cells find their VC by walking the **responder chain**, and `form.delegate` is Eureka's own Form→VC link. That's what makes delegate interposition safe.
+- The General form is built exactly once per VC instance (its hidden-conditions use empty tag arrays — evaluated once, no observers), so a single viewDidLoad scan is sound.
+- Eureka caches each row's value on its Row object. Writing a defaults key under a live SwitchRow does **not** update it — flip the visible `UISwitch` and `sendActionsForControlEvents:UIControlEventValueChanged` so Eureka processes a real value change (the "cross-flip stops working" lesson from PR #570; see `PPCSTurnNativeRememberSubredditSortOff`).
+- Rows have no stable tags; match by trimmed title via `ApolloGeneralTableCellHasTitle` (handles custom-label cells). Anchors are fail-soft: no match → the native screen is left untouched.

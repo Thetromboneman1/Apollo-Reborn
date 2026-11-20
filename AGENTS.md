@@ -1,0 +1,429 @@
+# AGENTS.md
+
+## Project Overview
+
+Apollo-Reborn is an iOS tweak for the Apollo for Reddit app that adds in-app configurable API keys and several bug fixes/improvements. Built using the Theos framework, it hooks into Apollo's runtime to provide custom API credential management, sideload fixes, and media handling improvements.
+
+## Opening Pull Requests
+
+Only relevant when you're asked to draft or open a PR; nothing here applies while coding.
+
+First, check whether the person you're working for maintains this repo:
+`gh api repos/Apollo-Reborn/Apollo-Reborn --jq .permissions.push` (`true` = maintainer). If `gh` isn't signed in, ask them.
+
+**Maintainers:** write the PR as usual; the rules bot skips them.
+
+**Everyone else:** a bot checks the PR against [CONTRIBUTING.md#pull-request-rules](CONTRIBUTING.md#pull-request-rules) and closes it if anything is missing. Fill in `.github/pull_request_template.md` and:
+- Tick a checklist box only if it's true. Don't tick "a person tried it" or "ran it in the app" for the person. If they can't try it on the device it affects, tick "Needs a device tester" and write `N/A: <why>` under Before and After.
+- Before writing a bug fix, reproduce the bug on current `main`. If you can't, say so and stop; don't open a PR built on a guess.
+- Over 500 changed lines (not counting `tests/` and docs) needs a maintainer's agreement; the PR stays open with `needs-size-ok` until then. If the change is heading that way, tell the person before building more, and suggest splitting it or opening it early as a draft that says why it needs to be this size.
+- At most 3 open PRs per person, drafts included. Check with `gh pr list -R Apollo-Reborn/Apollo-Reborn --author @me` before opening another.
+
+## Build & Development Commands
+
+```bash
+# Sync submodules (required before first build)
+git submodule update --init --recursive
+
+# Standard build
+make package
+
+# Build a local test IPA from the persistent Apollo base IPA
+# (--fix-safari-extension packages the manual + legacy Safari extensions;
+# release builds always apply it, so local device-test IPAs should too)
+./patch.sh ./Apollo-base.ipa --liquid-glass --fix-safari-extension -o /tmp/Apollo-base-liquid-glass.ipa
+./build-ipa.sh --ipa /tmp/Apollo-base-liquid-glass.ipa --deb ./packages/<tweak>.deb -o ./packages/Apollo-Test.ipa
+```
+
+The Makefile automatically generates `src/Version.h` from the `control` file and links FFmpegKit libraries.
+`THEOS` is available at `~/theos`. Do not rely on Azule/Cyan living in `/tmp`; `build-ipa.sh` uses the repo-local `scripts/inject-deb-local.sh` first for this repo's already-injected `Apollo-base.ipa` flow, then falls back to `azule`/`cyan` only for truly stock IPAs.
+
+**macOS 27 / Apple Silicon without Rosetta:** azule's bundled helpers (`~/Azule/bin/darwin/{ldid,insert_dylib,jq}`) are x86_64-only and upstream has not shipped arm64 builds, so azule fails with `Bad CPU type in executable` once Rosetta is gone. Replace them in place with arm64 builds (`brew install ldid jq` and symlink those two; compile `insert_dylib` from Tyilo/insert_dylib `main.c` with `clang -arch arm64`). They must live in that directory because azule prepends it to `PATH`. Separately, Xcode 27's `lipo` only recognizes the bundled CydiaSubstrate's legacy arm64e slice as `arm64e.old`; `scripts/modules/strip-substrate-arm64e.sh` handles both spellings and fails the build (rather than warning) if the slice cannot be removed, since shipping it aborts at launch on arm64e iOS 26 devices.
+
+### Required SDK: iOS 26.0 pinned via `$THEOS/sdks` (device builds only)
+
+Device `make package` defaults to `TARGET := iphone:clang:26.0:14.0`. Keep this SDK pin for release builds so the tweak continues to support iOS 14. Installing a newer Xcode or device SDK does not change that default.
+
+The iOS 27.1 SDK declares `SupportedTargets.iphoneos.MinimumDeploymentTarget = 15.0` in `SDKSettings.json`. Pinning that SDK by name does **not** bypass its minimum. A developer-only newer-SDK build must explicitly select both SDK and a compatible deployment target, for example `make package APOLLO_DEVICE_SDK=27.1 APOLLO_DEVICE_DEPLOY=15.0`; that artifact does not support iOS 14. The Makefile rejects alternate SDK pins without an explicit iOS 15-or-newer deployment target. Check the selected SDK's metadata for any higher minimum. Explicit command-line `TARGET` remains authoritative; the simulator script supplies `TARGET=simulator:clang:latest:15.0` and bypasses device defaults.
+
+For the private iOS 27 device-update workflow, use the matching SDK installed in the selected Xcode and set both its SDK root and the iOS 15 floor explicitly. Build 365 was verified with Xcode 27.2 using:
+
+```sh
+THEOS="$HOME/theos" \
+THEOS_PLATFORM_SDK_ROOT=/Applications/Xcode.app/Contents/Developer \
+make -j2 package FINALPACKAGE=1 APOLLO_DEVICE_SDK=27.2 APOLLO_DEVICE_DEPLOY=15.0
+```
+
+Do not fall back to the default iOS 26 device SDK for a private build containing iOS 27 framework references: that configuration reaches the linker and then fails with undefined iOS 27 symbols. If Xcode 27.1 is restored, use the equivalent explicit `27.1` SDK pin with the same iOS 15 deployment floor.
+
+Theos merges SDK candidates from `$THEOS_SDKS_PATH` (`$THEOS/sdks`) and the selected Xcode's SDK directory (see `$THEOS/makefiles/targets/_common/darwin_head.mk`). It matches the folder name `iPhoneOS<version>.sdk`. A real `iPhoneOS26.0.sdk` under `$THEOS/sdks` therefore supplies the release SDK without changing the Xcode.app bundle or switching the host's active toolchain. `DEVELOPER_DIR` is respected.
+
+**The simulator needs its current SDK.** A simulator binary links to the host's system libraries. Pairing an old Simulator SDK with a newer compiler is incompatible; see the simulator section below. The simulator uses a local-only iOS 15 deployment floor. This does not change the device release floor.
+
+Because the default device build (14.0) and simulator build (15.0) have different floors, an iOS-15-deprecated API can warn only in the simulator build. Theos enables `-Werror` globally. `ApolloReborn_CFLAGS` includes `-Wno-error=deprecated-declarations`, leaving these warnings visible without failing local simulator builds. Prefer safe non-deprecated replacements where available; retain iOS 14 availability guards for APIs such as `UIButtonConfiguration`.
+
+**If `$THEOS/sdks/iPhoneOS26.0.sdk` is missing**, get a genuine SDK in this order:
+
+1. Extract it from a locally installed Xcode 26.x:
+   ```bash
+   cp -R "/Applications/Xcode_26.x.x.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk" \
+         "$THEOS/sdks/iPhoneOS26.0.sdk"
+   ```
+2. [theos/sdks](https://github.com/theos/sdks), if the required version is available.
+3. [xybp888/iOS-SDKs](https://github.com/xybp888/iOS-SDKs), if the required version is available. This is a third-party SDK dump; prefer an Apple-issued local copy.
+
+Check `SDKSettings.json` → `Version` before copying. Do not rename an older SDK to impersonate a newer one. An iOS 27.1 Simulator runtime is also not a device SDK. For an explicit 27.1 developer build, use the real 27.1 device SDK and its compatible deployment floor described above.
+
+Verify the installed SDKs with:
+```bash
+xcodebuild -showsdks 2>&1  # Xcode's SDKs; does not show $THEOS/sdks entries
+ls "$THEOS/sdks/"
+```
+The SDK lives outside the repo and must be installed separately on a new development machine.
+
+**CI** selects `/Applications/Xcode_26.0.1.app` before `make package`, which supplies the same pinned iOS 26.0 SDK and iOS 14 release floor directly. Local developers with newer Xcode should keep the 26.0 SDK in Theos instead of changing the global Xcode selection.
+
+### Fast iteration in the iOS Simulator
+
+For UI/settings/nav-bar/Liquid Glass work, `scripts/run-in-sim.sh` runs the tweak inside the iOS Simulator so you can test a change in seconds without building an IPA, signing, or sideloading. **Use this as the default inner loop**; fall back to a device IPA only for the things the simulator can't do (see limits below).
+
+```bash
+scripts/run-in-sim.sh              # build the sim tweak, (re)prepare Apollo, launch it injected
+scripts/run-in-sim.sh --no-build   # relaunch without rebuilding the tweak
+scripts/run-in-sim.sh --logs       # also stream ApolloLog (os_log subsystem "apollofix") after launch
+scripts/run-in-sim.sh --drive      # after launch, capture the idb accessibility tree + a screenshot to ./.sim/
+scripts/run-in-sim.sh --fresh-app  # re-patch the base IPA from scratch (after a new apollo-base.ipa)
+scripts/run-in-sim.sh --dark       # boot the simulator in dark mode (--light forces light)
+scripts/run-in-sim.sh --glass      # apply the iOS 26 Liquid Glass patch (--no-glass disables)
+scripts/run-in-sim.sh --widgets    # swap in the Reborn widgets (sim build) for the stock Athena widget, as release builds do
+scripts/run-in-sim.sh --backup B.zip  # preload an Apollo settings backup (API keys + account)
+BUNDLE_ID=com.you.Build scripts/run-in-sim.sh   # run under a custom (rebranded) bundle id
+```
+
+How it works (and why each piece is needed):
+
+- **Apollo runs in the sim** because the script patches every Mach-O in `Payload/Apollo.app` (main binary + appex + frameworks) from `LC_BUILD_VERSION` platform iOS (2) to iOS-Simulator (7) and re-signs ad-hoc. The arm64 code is identical on an Apple Silicon Mac; only the platform tag blocks loading. This shell is cached under `./.sim/` and only re-prepared on `--fresh-app`.
+- **The tweak is built for the sim** with `make TARGET=simulator:clang:latest:15.0 LOGOS_DEFAULT_GENERATOR=internal APOLLO_SIM_BUILD=1`. Unlike the device build, this deliberately uses `latest` rather than pinning to an older SDK: a simulator binary runs in-process on the build host, dynamically linking against *this Mac's actual* libSystem/Foundation/libc++, not a separate per-version runtime the way a real device has its own matching system libraries. Pairing the iOS 26.0 Simulator SDK with a newer (iOS 27-era) clang hits a hard, intentional block — `module '_c_standard_library_obsolete' requires feature 'found_incompatible_headers__check_search_paths'` — which is Apple's clang correctly refusing a genuinely unsafe combination, not a quirk to route around. So the simulator build's floor was bumped to iOS 15.0 (`DEPLOY_MIN` in `scripts/run-in-sim.sh`) instead of SDK-pinning like the device build does; this only affects local dev/testing convenience, not real iOS 14 device support (which is fully covered by the shipped device build's `iphone:clang:26.0:14.0` target). The *internal* Logos generator swizzles via the ObjC runtime, so the dylib has **no CydiaSubstrate dependency** (the shipped device build links CydiaSubstrate, which can't load in the sim). `APOLLO_SIM_BUILD=1` makes the Makefile skip device-only **FFmpegKit** and the FLEX/openin subprojects, and `ApolloMedia.xm` stubs its FFmpeg v.redd.it audio fix under the same macro. `MSHookIvar` still works (it's a header-only ObjC-runtime template, force-included via `-include substrate.h`).
+- **The tweak is injected** via `SIMCTL_CHILD_DYLD_INSERT_LIBRARIES` pointing at `./.sim/ApolloReborn.dylib`. Code-only changes are just `scripts/run-in-sim.sh` again (rebuild + relaunch); no reinstall.
+- **The bundle id is configurable** via `BUNDLE_ID=...` (defaults to `com.christianselig.Apollo`). When it differs from the cached shell's id, the script re-prepares and rebrands the app + every appex `CFBundleIdentifier` (mirroring `scripts/rebrand-ipa.sh`; the `apollo://` scheme and the `group.com.christianselig.apollo` app group are left intact). Switching ids forces one re-prep (~15s), then caches. Device/runtime are overridable via `SIM_NAME`, `SIM_DEVICE_TYPE`, `SIM_RUNTIME`.
+- **Settings backups preload via `--backup file.zip`** (or `BACKUP_ZIP=...`, or by dropping the zip at `./.sim/backup.zip`, which is auto-loaded when no `--backup` is given): the script uninstalls first (wiping the data container + cfprefsd cache), reinstalls, then copies the backup's `preferences.plist` to `<container>/Library/Preferences/<BUNDLE_ID>.plist`, `group.plist` to `…/group.com.christianselig.apollo.plist`, and (if present) `keychain.plist` to `…/Library/Caches/ApolloKeychainSeed.plist`. In the simulator both the app and app-group domains live in the app data container (the group suite falls back there without full app-group provisioning), matching the tweak's own `NSHomeDirectory()`-based restore path. **A backup contains live account credentials; keep test zips out of the repo** (`./.sim/` is gitignored).
+  - **What loads:** the API keys (Reddit/Imgur/Giphy/ImageChest), the app-only OAuth session, **and your signed-in Reddit user account** — so profile, inbox, and voting work, not just browsing.
+  - **How the account restore works (and why it used to fail):** Apollo's `AccountManager` loads logged-in accounts on launch from the **keychain via Valet** (key `2RedditAccounts2`), and the *whole* load is gated behind `Valet.canAccessKeychain()`. An ad-hoc-signed simulator app has no `application-identifier`/`keychain-access-groups` entitlement, so securityd rejects every `Sec*` call with `errSecMissingEntitlement` (-34018) even after we strip `kSecAttrAccessGroup` — `canAccessKeychain()` returns NO, the load is skipped, and the restored account is pruned (`RedditAccounts2` ~50KB → ~219-byte empty array). Adding the entitlement is a dead end (the iOS-26 simulator refuses to launch an ad-hoc app carrying it). **Fix:** the tweak virtualizes Valet's keychain in the sim (`#if APOLLO_SIM_BUILD` in `Tweak.xm` — a plist-backed store under `Library/Caches/ApolloSimKeychain.plist` that backs `SecItemAdd/CopyMatching/Update/Delete` for Valet queries, so `canAccessKeychain()` passes and reads/writes work). The account blob can't be synthesized from the NSUserDefaults mirror — Apollo's keychain format is an array of `[String:String]` dicts, not the `[RDKClient]` archive the defaults hold — so `Backup Settings` now **captures Apollo's real Valet keychain items** (`src/settings/ApolloBackupRestore.m` → `keychain.plist`), and the sim seeds the virtual store from them. **Requires a backup exported by a build with this feature**; older backups have no `keychain.plist` and the account won't restore (the script prints a note). Device restore replays the same items into the real keychain.
+- **Appearance** is set with `xcrun simctl ui <DEV> appearance dark|light` via `--dark`/`--light` (or `APPEARANCE=`); it persists on the device until changed.
+- **Liquid Glass** is off by default (the raw `apollo-base.ipa` links against the iOS 16 SDK, so `IsLiquidGlass()` is NO and both UIKit's iOS-26 chrome and the tweak's LG hooks stay dormant). **This assumes `apollo-base.ipa` is a fresh, unpatched decryption of the Apollo binary** — since it's gitignored and supplied per-developer, if yours has already been run through `patch.sh --liquid-glass` (or came from a pre-patched/glass distribution build) it'll read as glass-linked (`sdk 19.0`+) no matter what flags you pass, and `--no-glass` won't undo it, since the re-prep just re-extracts your already-glass base — re-source a clean, unpatched IPA instead of trying to downgrade it in place. `--glass` (or `GLASS=1`) prepares the shell from a `patch.sh --liquid-glass` base — the canonical glass patcher, reused so it stays in sync: it bumps the main binary's linked SDK to **27.1** (which flips `IsLiquidGlass()` because the major is still >= 19, and is what iPhone Duo needs to stop letterboxing a phone-sized column), drops the duplicate `@executable_path/Frameworks` LC_RPATH (iOS-26 dyld rejects it — otherwise the launch dies with an `SBMainWorkspace` denial), swaps in the prebuilt `Assets.car`, and writes the `CFBundleAlternateIcons` metadata that turns on the in-app icon picker. The glass base is cached at `./.sim/glass-base.ipa` (regenerated when `apollo-base.ipa` changes or the cached stamp is not `27.1`); toggling `--glass`/`--no-glass` re-prepares the app shell (detected from the cached main binary's SDK). A leftover `sdk 19.0` glass shell still counts as glass for `IsLiquidGlass()` but Duo will letterbox it — `--fresh-app` after this bump.
+
+**Verify the tweak actually loaded** (don't assume from a clean launch): check os_log for the `apollofix` subsystem — module load lines and `... hook installed ...` confirm the internal-generator hooks took:
+
+```bash
+xcrun simctl spawn "$(cat .sim/device.txt)" log show --last 2m --predicate 'subsystem == "apollofix"' | grep ApolloFix
+```
+
+**Driving the UI yourself (idb):** use matching **idb client and companion 1.7.7 or newer** (`brew install facebook/fb/idb` installs both). The current Python client supports Python 3.10+; 1.7.7 was verified with Python 3.14. The Python 3.11 restriction applies to the old 1.1.x client. For a separate client environment, point the script at it with `IDB=/path/to/venv/bin/idb scripts/run-in-sim.sh --drive` and keep the matching companion on `PATH`; direct CLI calls also accept `--companion-path`. Useful commands: `idb ui describe-all --udid <DEV>` (accessibility tree with labels + frames), `idb ui tap <x> <y>`, and `idb ui text "..."`. Prefer native HID input for gesture verification and read screenshots back to confirm results.
+
+**Xcode 27 / Device Hub:** Simulator.app is now Device Hub (`com.apple.dt.Devices`); `run-in-sim.sh` opens Device Hub only and never falls back to Simulator.app. Use Simulator.app only for a specific capability Device Hub cannot provide, explain that special case first, and close it afterward while keeping Device Hub open. Old idb_companion 1.1.8 looks for `SimulatorKit.framework` at `Contents/Developer/Library/PrivateFrameworks/`; Xcode 27 moved it to `Contents/SharedFrameworks/`. idb 1.7.7 supports the new location, so upgrade both components rather than modifying Xcode.app. `--drive` still captures via `simctl io screenshot`. For Duo's multiple displays, explicitly capture the active display with `xcrun simctl io <DEV> screenshot --display=<ID> out.png`: an inactive display can be black while Apollo is running correctly. Use Device Hub's actual posture and rotation controls when verifying folding or orientation changes.
+
+**Simulator limits — use a device IPA for these:** APNs push (so Live Activities push-to-start can't be exercised in the sim), the FFmpeg v.redd.it CMAF/MPEG-TS audio remux (stubbed out), and anything genuinely device-only. (A signed-in user account *does* work in the sim now, via the keychain-capture backup above — provided the backup was exported by a build with that feature.) The sim *is* the same iOS 26.x family as the test device, so Liquid Glass nav-bar/tab-bar behavior reproduces faithfully.
+
+## Project Structure
+
+### Core Tweak Modules
+
+| Path | Purpose |
+|------|---------|
+| `src/Tweak.xm` / `src/Tweak.h` | Main tweak entry point and core runtime hooks |
+| `src/Apollo*.xm` | Feature-focused Logos modules; see `Makefile` for the current build list |
+| `src/ApolloCommon.{h,m}` | Shared utilities, including `ApolloLog` and helper functions |
+| `src/ApolloWebTextDecoding.{h,m}` | Charset-aware decode of bytes fetched from arbitrary third-party pages (BOM → `Content-Type` → `<meta charset>`, plus the WHATWG label upgrades). Use this instead of `initWithData:encoding:NSUTF8StringEncoding` for any *foreign* page — a UTF-8 guess mojibakes EUC-KR/Shift_JIS/GB18030/Big5 sites. Foundation-only, so the `.m` compiles straight into a host-side harness |
+| `src/ApolloWebJSONWriteRepair.{h,m}` | The comment/self-text write-response repair (legacy old-reddit shape → modern JSON), split out of `ApolloWebJSON.m` so it stays Foundation-only. Network-free by design: it runs inside `RDKResponseSerializer`; edits are filled from the pre-edit model captured at submit time. Host-side harness: `tests/run_web_json_write_repair_tests.sh` |
+| `src/ApolloUpdateManifest.{h,m}` + `src/ApolloUpdateChecker.{h,m}` + `src/ApolloUpdatePromptViewController.{h,m}` | In-app update prompt (a half-height form sheet like the account switcher: medium + large detents, grabber; Release Notes expands it to full height and shows the changelog from the variant's source JSON, prefetched when the sheet appears, with Update / Later / Skip pinned underneath, and Update opens a sideloader-chooser page that slides in; the real app icon comes from the shared `ApolloAppIcon.{h,m}`, which What's New also uses, including picked Icon Composer alternates). A sideloaded app can't replace itself, so this reads `release-manifest.json` from `main`, picks the installed variant's entry from the stamped `ARBuildVariant` (`ApolloBuildVariant()`), and hands off to the user's sideloader: that variant's AltStore/SideStore source, `feather://install/` or `flarestore://downloadApp=` with its IPA, or `apple-magnifier://install?url=` for TrollStore when the app itself was installed by it (the `_TrollStore`/`_TrollStoreLite` marker next to the `.app`, else `LSApplicationWorkspace` reporting TrollStore); that row leads the chooser there and replaces Apollo in place while keeping the data container, and is hidden elsewhere because the same scheme opens Magnifier. A build that can't name its variant (an injected `.deb` with no release stamp, e.g. a `Build IPA` run) only has its sideloader apps opened bare and swaps the IPA download for the release page, because any guess at the variant could silently swap the user's build; dev builds get the release page alone. `ApolloUpdateManifest` is Foundation-only (version normalize/compare, variant mapping, https-only URL parsing, sideloader URLs) with a host harness: `tests/run_update_manifest_tests.sh`. The checker revalidates the manifest every 15 minutes while active (opt-out `UDKeyAutomaticUpdateChecks`), checks on foreground when due, and retries failures after 5 minutes. `ApolloUpdateManifestCache.{h,m}` persists the public manifest and ETag together under Library/Caches; unchanged responses reuse the validated body. Automatic prompts appear only over the base UI; Later (including swipe dismissal and chooser Cancel) snoozes that exact version for 24 hours across launches via `UDKeyUpdateDeferredReminder`, while `UDKeyUpdateSkippedVersion` hides a version indefinitely. A newer version can prompt during a snooze. Jailbroken `.deb` installs do not check. Host harnesses: `tests/run_update_manifest_cache_tests.sh` and `tests/run_update_checker_tests.sh`. The prompt appears as soon as the check finds an update, waiting only while What's New is due. Sim builds accept `APOLLO_UPDATE_MANIFEST_URL` / `APOLLO_UPDATE_NOTES_URL` (incl. `file://`) and `APOLLO_UPDATE_BUILD_VARIANT` env overrides (pass via `SIMCTL_CHILD_`; `unstamped` models an injected IPA with no stamp, any other `deb-*` value a package-manager install) since sim builds have no variant stamp and the live manifest matches the running version |
+| `src/ApolloState.{h,m}` | Global state, captured singletons, and feature flags |
+| `src/palhome/` | Pal Home, which replaces Pixel Pals (rooms, care on Apollo's own data, Reborn species, shelter, widget). Read `src/palhome/README.md` first; host tests are `tests/run_pal_home_*.sh` |
+| `src/ApolloClasses.{h,m}` | Shared table of the classes looked up by name (`ApolloClass…` globals), resolved once at launch by a constructor that runs before every `%ctor`; plus lazy accessors for the few classes whose image loads later. See "Looking up classes by name" below |
+
+### Settings & UI (`src/settings/`)
+
+Tweak-owned settings screens live under `src/settings/` and are built on a
+declarative form layer — rows are data, indices are derived, no index math in
+screens. See `docs/settings-form-refactor-plan.md`.
+
+| Path | Purpose |
+|------|---------|
+| `src/settings/ApolloSettingsForm.{h,m}` | Declarative row/section model + `ApolloSettingsFormViewController` base (visibility snapshot + diff, identity-based reloads, shared "(Current)" picker). Subclass, override `-buildForm`. |
+| `src/settings/ApolloSettingsTableViewController.{h,m}` | Theming base (accent walk) all settings screens share |
+| `src/settings/CustomAPIViewController.{h,m}` | Root "Apollo Reborn" settings screen (API keys, General, Media, Subreddits, About, ...) — a form subclass |
+| `src/settings/ApolloBackupRestore.{h,m}` | Backup/restore engine (zip build, plist replay, Valet keychain capture/replay); the VC keeps only the UI |
+| `src/settings/ApolloContributors.{h,m}` + `ApolloThanksTo`/`ApolloBuyUsACoffee` VCs | contributors.json fetch/parse + the two About screens (dynamic lists, hand-rolled) |
+| `src/settings/ApolloSettingsGeneralTable.{h,xm}` | Single owner of Apollo's NATIVE Settings > General table geometry (row hide/inject registry + NSProxy remapper) — for the table we don't own |
+| `src/settings/SavedCategoriesViewController.{h,m}` | Saved post categories CRUD (add/rename/delete, stored in group NSUserDefaults; not a form — dynamic list) |
+| `src/settings/ApolloActionMenuSettingsViewController.{h,m}` + `src/ApolloActionMenuLayout.{h,m}` | Interface → Action Menus: per-menu (feed / post / post-in-comments / comment) ••• item order + hidden set, with a pinned live mock of the menu. The model (contexts, item catalogue keyed by Apollo's Action kinds, saved layouts) uses Foundation and UIKit; `ApolloActionMenu.xm` applies it by permuting the sheet's Swift `actions` buffer in place and filtering/ranking the registered specs |
+
+**Working on settings? Read `src/settings/README.md` first** — it has the 5-step add-a-setting recipe, the form-layer rules, and the Eureka facts. The hard rules: tweak-owned screens declare rows in `-buildForm` (never hand-rolled index math); Apollo's native General screen is modified ONLY through `ApolloSettingsGeneralTable`'s registry (never `%hook` its table methods — one remapper per screen); new settings do NOT get added to `ApolloBackupRestore`'s statics re-sync (restore force-exits; `%ctor` re-reads on relaunch).
+
+**Settings cell primary text is opt-in.** Standard form rows are marked
+automatically; normal enabled `customRow` and hand-rolled cells must call
+`apollo_applyPrimaryTextColorToCell:` before returning. Do not mark accent,
+destructive, disabled/placeholder, or intentionally secondary/tertiary rows.
+
+### Siri & Spotlight (`siri/`, optional iOS 27)
+
+A separate `ApolloSiri.framework` (App Intents entities, Spotlight indexing, onscreen context) injected by `scripts/inject-siri-proof.sh`; not part of `make package` or release builds. Tweak-side hooks live in `src/ApolloIntelligenceBridge.xm` and no-op without the framework. **Read `siri/README.md` before changing it** (packaging, privacy scope, known Siri limitations). Host tests: `bash scripts/test-siri-catalog.sh`.
+
+### Crash Reporting (`src/crash/`)
+
+Local-only crash recording built on KSCrash 2.5.1's **recording layer only** (`modules/KSCrash` submodule, pinned; only Core/RecordingCore/Recording compile — no sinks/filters/installations, so no transmission path exists in the binary). Every public KSCrash symbol AND ObjC class is namespaced via `-DKSCRASH_NAMESPACE=_ApolloReborn` (global CFLAG — required in every TU that imports KSCrash headers). Reports live under `Library/Caches/ApolloReborn/LocalCrashReports` (max 3, cleanup policy Never) and leave the device only through the user-reviewed report-form flow.
+
+| Path | Purpose |
+|------|---------|
+| `src/crash/ApolloCrashManager.{h,m}` | Installs KSCrash first thing in `%ctor` (privacy-locked: no memory introspection, no queue names, no console log, no `__cxa_throw` swap), fronts the report store (enumerate / load+sanitize / delete) |
+| `src/crash/ApolloCrashSanitizer.{h,m}` | **Allowlist** converter: raw KSCrash dict → `apollo_reborn_crash` schema; omits all free-form exception text and permits only known system exception/action identifiers, hex-ifies addresses, hard caps (1MB / 128 threads / 256+64 frames / 512 images, referenced-first). Raw dicts never leave the manager |
+| `src/crash/ApolloCrashContext.{h,m}` | Enumerated recent-actions ring buffer (the API takes an enum — free-form strings are impossible by design) published into KSCrash userInfo, debounced |
+| `src/crash/ApolloCrashPromptCoordinator.{h,m}` | Once-per-report relaunch prompt (Review & Report / Not Now / Delete). "Not Now" never re-nags — prompted IDs persist in `UDKeyCrashPromptedReportIDs`; the report stays under Settings → Privacy → Crash Reports |
+| `src/crash/ApolloCrashReviewViewController.{h,m}` | Consent screen (form subclass): included/never-included lists, exact sanitized-JSON viewer, share-sheet export, optional off-by-default debug-log inclusion, Continue → report form |
+| `src/crash/ApolloCrashReportsViewController.{h,m}` | Settings screen: capture toggle (`UDKeyCrashCaptureEnabled`, default ON; KSCrash installs once per process so it takes effect next launch) + pending report list. Registered as route `crash-reports` |
+| `src/crash/ApolloCrashBugsnagNeutralize.xm` | No-ops every Bugsnag start entry point so Apollo's embedded (KSCrash-fork) recorder never installs handlers, breadcrumbs activity, or maintains device/user UUIDs — the upload-domain blocklist alone never stopped local capture |
+
+Key invariants: the local KSCrash report is deleted only on explicit user action or after report.apolloreborn.app confirms (via the `reportSubmitted` bridge message in `ApolloReportViewController`) a submission that still included the crash attachment — closing the form, losing connectivity, or removing the attachment keeps it. The report store's fixer returns `report.timestamp` as microseconds OR a 6-digit-fraction UTC string depending on path — the sanitizer normalizes both. The web half of the bridge (`attachTextFile`, filename-level `bridgeFilesChanged`, `reportSubmitted`, the `source=crash-recovery` issue label) lives in the apolloreborn-site repo (`report/form.html` + worker); the native side degrades to the legacy `attachLog` bridge against older site deployments and then never auto-deletes the local report.
+
+Testing: with FLEX debugging enabled, Settings → Privacy → Crash Reports gains a Testing section — "Write Test Report (No Crash)" records a real report via KSCrash's user-reported path (`-[ApolloCrashManager writeTestCrashReport]`, `terminateProgram:NO`) and exercises review/share/submit without killing the app; "Crash Now (NSException)" genuinely crashes for full capture + relaunch-prompt testing. Works on device and sim. The sim debug bridge additionally has `echo "crash <nsexception|abort|badaccess|overflow>" > /tmp/apollofix-tap.txt && xcrun simctl spawn <DEV> notifyutil -p apollofix.debugtap` for scripted crashes. Never test Mach-exception handling under a debugger (it changes exception ownership). Exported sanitized JSON symbolicates with the release-dSYM workflow below (instruction/image addresses + UUIDs are preserved).
+
+### Runtime & Libraries
+
+| Path | Purpose |
+|------|---------|
+| `src/fishhook.{c,h}` | Facebook's fishhook for C function rebinding (Security framework, `swift_allocObject`) |
+| `modules/ffmpeg-kit/` | FFmpegKit static libs for v.redd.it CMAF video processing |
+| `modules/ZipArchive/` | SSZipArchive for settings backup/restore zip export |
+| `modules/KSCrash/` | KSCrash 2.5.1 (git submodule, pinned) — recording modules only; see Crash Reporting section |
+| `modules/FLEXing/` | FLEX debugging tools (git submodule) |
+
+### Reference & Build
+
+| Path | Purpose |
+|------|---------|
+| `Headers/` | Class-dump headers for Apollo |
+| `packages/` | Build output (.deb files) |
+| `control` | Debian package metadata (name, version, depends) |
+| `Makefile` | Theos build config; auto-generates `src/Version.h`, links FFmpegKit |
+
+## Theos & Logos Conventions
+
+- Use Logos directives (`%hook`, `%orig`, `%group`, `%ctor`) for runtime patches
+- Use `%hookf` for C function hooks
+- Register new source files in `Makefile` under `ApolloReborn_FILES`
+- Keep related hooks grouped together
+- **`%orig` passes original arguments**: `%orig;` always calls the original method with the original captured arguments, even if you've reassigned the local parameter variables. To pass modified values, use explicit arguments: `%orig(arg1, modifiedArg2, arg3)`. This matters when normalizing URLs in blocks/callbacks — the ignoreHandler must use `%orig(textNode, attr, val, point, range)` not bare `%orig;` if `val` was modified.
+- **`MSHookIvar` is an inline C++ template, not a Logos directive**: it works anywhere in an `.xm` file (Logos output is Objective-C++), including static helpers — but not in plain `.m` files (no templates in Objective-C). It returns a typed lvalue reference into the ivar slot and dereferences NULL (crashes) if the ivar is missing. For by-name reads that must tolerate a renamed/missing ivar, or that live in `.m` files, use the `src/ApolloSwiftRuntime.h` helpers instead: `ApolloObjectIvar` (ObjC object ivars via `object_getIvar`, honors `__weak`), `ApolloReadObjectIvar` (raw pointer load), `ApolloReadBoolIvar` / `ApolloReadSwiftStringIvar` / `ApolloReadSwiftWeakObjectIvar` (Swift value and weak storage), and `ApolloIvarOffset` for anything else. Ivar names must be non-NULL C strings (enforced with `nonnull`). Swift stored properties carry an EMPTY ObjC type encoding, so don't gate Swift ivar reads on `ivar_getTypeEncoding`.
+- **In sim builds, a subclass hook freezes an inherited method**: Logos' internal generator adds a hook for a method the class only inherits to the subclass, with the superclass's implementation as it stood then, so superclass hooks installed later (Makefile order) never run for that subclass. `ApolloDuoRail.xm` hooks `ApolloTabBarController`'s `viewDidLayoutSubviews` and `viewWillTransitionToSize:withTransitionCoordinator:`; put shared work for those in that subclass hook.
+- **Avoid layout-driving writes inside `layoutSubviews` hooks**: Writing `frame`, `bounds`, `layoutMargins`, `separatorInset`, stack spacing, or other Auto Layout inputs from `layoutSubviews` can loop during rotation. Do one-shot row/cell prep from non-layout entry points such as `tableView:willDisplayCell:forRowAtIndexPath:` and clear flags in `prepareForReuse`.
+- **Hooked `self` is `__unsafe_unretained`**: under ARC, Logos declares a `%hook` method's `self` as `T *const __unsafe_unretained`, so a block queued from a hook (`dispatch_async`/`dispatch_after`, completion handlers) must capture a strong local or a `__weak` ref, never bare `self`. `__typeof__(self)` carries the same qualifier, so the strong half of a weak/strong pair needs an explicit `__strong` (`__strong __typeof__(self) strongSelf = weakSelf;`) or a concrete type (`UIViewController *strongSelf = weakSelf;`); without it the local is a nil check that owns nothing. Tweak-owned `@implementation` methods are unaffected (their `self` is strong).
+
+## Code Style
+
+- **Indentation**: 4 spaces
+- **Braces**: Same line as statement
+- **Logging**: Use `ApolloLog` for privacy-friendly diagnostics
+- When iterating on a feature, if something isn't working, prefer outright replacing the implementation over adding fallback codepaths. Use generous amount of comments and diagnostic/debug logging.
+
+## Theme Accent in Tweak-Drawn UI
+
+- Any accent color in tweak-drawn UI comes from `ApolloThemeAccentColor()` (`ApolloThemeRuntime.h`): the custom theme's accent when one is active, else the stock Apollo theme's (all 18 themes; `kStockThemes` table in `ApolloThemeRuntime.xm`, values recovered from the binary — see docs/theme-builder-RE.md). Chain as `ApolloThemeAccentColor() ?: someView.tintColor ?: systemBlue`; never hand-roll nav/tab-bar tintColor walks (they only ever approximated the accent).
+- `UIView.tintColor` never returns nil for a real view (it inherits, bottoming out at system blue) — a fallback arm after a guaranteed-non-nil tint read is dead code. Nil only arrives via messaging a nil view, which is what the `?: systemBlue` tail covers.
+- The returned accent is a dynamic provider color. Before any `.CGColor` use (layer borders, ASDK background-thread layout), resolve it with `resolvedColorWithTraitCollection:` against an in-hierarchy view's traits — ambient resolution can pick the wrong light/dark variant when Apollo overrides the window style.
+- Text drawn on an accent fill needs `ApolloColorIsLight()` (ApolloCommon) to choose black vs white — stock monochromatic (dark) and chumbus (light) accents are near-white.
+
+## Testing
+
+Host-side tests live in `tests/` and run in CI through `scripts/validate-downstream.sh` (Repository Validation workflow): the upstream-sync, release-input, update-manifest, Pal Home and other harnesses. Run `scripts/validate-downstream.sh` before pushing; add `--build` on a Mac with Theos to include the package build. Tweak behaviour inside Apollo still needs manual validation in the simulator or on a device.
+
+Before pushing a branch, run `python3 scripts/documentation_health.py --write` and commit any `README.md` / `docs/` changes. Documentation health self-heals stale docs only on pushes to `main`; on a PR branch the check just fails until you commit the regenerated docs.
+
+## RE Notes
+
+### Handy Hopper MCP Tools
+
+- `Hopper/list_documents`, `Hopper/set_current_document`: select `Apollo.hop`
+- `Hopper/goto_address`: jump to an address (static address Hopper uses)
+- `Hopper/current_procedure`: find which function the current address is in
+- `Hopper/procedure_pseudo_code`, `Hopper/procedure_assembly`: decompile/disassemble the function
+- `Hopper/search_procedures`: find functions by name/regex (works well for ObjC methods)
+- `Hopper/search_strings`: search embedded strings (bundle IDs, selectors, product identifiers, URLs)
+- `Hopper/xrefs`: find references to a string or address
+- `Hopper/list_segments`, `Hopper/list_names`: quick orientation for the binary layout
+- `Hopper/procedure_callers`, `Hopper/procedure_callees`: trace call graphs (who calls this? what does this call?)
+
+### Effective Hopper Investigation Patterns
+
+**Discovering class layout via `.cxx_destruct`**: Search for `-[ClassName .cxx_destruct]` and decompile it. This reveals every ivar in the class, their types (ObjC objects use `objc_release`, Swift structs use type metadata accessors, bridged objects use `swift_bridgeObjectRelease`), and their ivar offset symbols. This is the fastest way to understand a Swift class's storage layout from ObjC.
+
+**Tracing from a known entry point**: When you know the ObjC method (e.g. `linkButtonTappedWithSender:`), decompile it to find the `sub_XXXX` helper it delegates to. Then decompile that helper. This "peel the onion" approach is how you find the actual navigation/logic functions buried under Swift thunks.
+
+**Fix transition bugs at the source**: For media/navigation regressions, start from the method that initiates the behavior (`commentsButtonTapped:`, `didExitVisibleState`, reclaim helpers, MediaViewer dismiss callbacks) and trace forward in Hopper before adding new hooks. In this repo, the durable fixes usually came from understanding the native transition or async completion block first, not from stacking more downstream notification hooks.
+
+**Identifying Swift property access patterns**: Swift stored properties on classes don't always have ObjC getters. Check `search_procedures` for the class — if no `-[Class property]` method exists, the property is NOT `@objc`-visible. You'll need alternative access strategies (reading from display nodes, using runtime ivar access, etc.) rather than `objc_msgSend`.
+
+**Reading Swift function calls in pseudocode**: Hopper labels Swift stdlib/Foundation calls like `Foundation.URL.absoluteString.getter()`, `Swift.String._bridgeToObjectiveC()`, etc. These tell you what types are in play even when the pseudocode is hard to follow. Look for these labels to understand data flow.
+
+**Pseudocode constant folding of base registers**: Hopper's decompiler sometimes loses track of a base register and folds it into offset constants, producing misleading absolute-looking addresses. For example, if the assembly is `madd x8, x21, x8, x22` then `str w0, [x8, #0x20]` (meaning `buffer + index*stride + 0x20`), the pseudocode may render this as `*(stride * index + 0x50)` — collapsing `buffer + 0x20` into a single constant `0x50`. This is a critical trap: the pseudocode appears to say elements start at offset 0x50, when they actually start at buffer+0x20. **Always verify struct/array element offsets from the raw assembly** (look for `madd`/`add` base register calculations and `ldr`/`str` displacement operands) rather than trusting the pseudocode constants.
+
+**Decoding Swift small strings from assembly**: Strings <=15 bytes are stored inline in two registers (x0/x1) rather than as heap pointers. Hopper's decompiler hides the actual values behind `_bridgeToObjectiveC()` calls — you must read the raw assembly. Layout: x0 holds bytes 0-7 (little-endian), x1 holds bytes 8-14 in bits 0-55 plus a discriminator byte in bits 56-63 (discriminator = `0xE0 + length`). Each `mov`/`movk` with `#0xXXYY` stores two ASCII bytes in little-endian order (YY first, XX second). Strings >15 bytes use buffer pointers (`x1 = addr | 0x8000000000000000`, UTF-8 at `addr+0x20`) and appear in Hopper's string table. See `docs/sekrit-icon-keys-RE.md` for a worked example.
+
+**Extracting Swift enum metadata from jump tables**: Swift switch helpers for enum titles/icons often compile to a small dispatcher that masks the enum case, loads a jump-table offset, adds it to a code base, then `br`s there. In assembly this looks like `and x8, x0, #0xffff` + `ldrh/ldrsw` from a table + `add x10, base, offset` + `br x10`. To replace a private helper safely, extract the table data and emulate each target block offline instead of calling a hardcoded app address at runtime. For the Apollo action menu metadata this recovered the exact `actionKind -> title/icon asset` mapping used in `ApolloNativeActionMetadata.h`.
+
+**Emulating simple Swift string-returning blocks**: For switch arms that return strings, a tiny ARM64 emulator is often faster and safer than manual transcription. Use the Mach-O `__TEXT` base (`0x100000000` for Apollo) to map `vmaddr -> file offset`, read the jump table bytes, then emulate the small instruction subset used by these blocks: `mov`, `movk`, `adrp`, `adr`, `add`, `sub`, `orr`, `b`, `ret`, and sometimes `bl` to a known Swift/Foundation bridge or image-loading helper. Decode x0/x1 as a Swift small or long string. Validate a few known UI strings via `Hopper/search_strings`/xrefs before trusting the generated table.
+
+**Avoid runtime calls to private binary helper addresses**: Hardcoded Apollo helper addresses like `0x1007xxxxx` can appear to work, but they are version-fragile and can crash or silently mislabel UI when the app binary shifts. Prefer one of: ObjC-visible selectors, stable ivar data, generated metadata tables checked into the tweak, or hook/capture points around the original call path. If a generated table is used, include a source note and spot-check entries whose labels/icons are user-visible.
+
+### iOS 26 Runtime Headers And Decompiled Internals
+
+Two external repos are useful to reference for Liquid Glass / iOS 26 work. Both are gitignored — clone them into the repo root before starting:
+
+```bash
+git clone https://github.com/qingralf/iOS26-Runtime-Headers.git
+
+# Full repo is huge; sparse-checkout just UIKitCore.framework.
+git clone --depth 1 --filter=blob:none --sparse https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore.git
+cd iPhone18-3_26.1_23B85_Restore
+git sparse-checkout set System/Library/PrivateFrameworks/UIKitCore.framework
+cd ..
+```
+
+- `iOS26-Runtime-Headers/` — RuntimeBrowser-style ObjC headers for every framework. Use to discover ivars, properties, and selectors on private classes (e.g. `_UINavigationBarTitleControl`, `_UINavigationBarContentViewLayout`).
+- `iPhone18-3_26.1_23B85_Restore/System/Library/PrivateFrameworks/UIKitCore.framework/UIKitCore/` — IDA-style decompilation of UIKitCore as one `.mm` file per class. Use to read actual setter/method bodies (e.g. checking whether a setter is a synthesized ivar setter or actually does work). UIKitCore is the most useful framework here for nav bar / tab bar / Liquid Glass investigations.
+
+### Mapping Runtime PCs To Hopper Addresses
+
+Crash logs typically show:
+
+- A loaded image base, e.g. `Apollo 0x10444c000 + 7746680`
+- A program counter (PC), e.g. `0x104baf478`
+
+The offset is `PC - imageBase`. Hopper usually uses a Mach-O "file base" of `0x100000000`, so:
+
+- `hopperAddr = 0x100000000 + (PC - imageBase)`
+
+Once you have `hopperAddr`:
+
+- `Hopper/goto_address` -> `Hopper/current_procedure` -> decompile around the trap/crash site.
+
+### Symbolicating User Crash Reports With Release dSYMs
+
+Release IPAs are built with `FINALPACKAGE=1`, so the shipped tweak dylib is optimized and stripped. Public upstream release IPAs come from the `Apollo-Reborn/Apollo-Reborn` release workflow below; builds of this fork come from `Thetromboneman1/Apollo-Reborn`'s own **Build and release IPA variants** workflow, so use `--repo Thetromboneman1/Apollo-Reborn` in the commands below for a fork build:
+
+```text
+https://github.com/Apollo-Reborn/Apollo-Reborn/actions/workflows/release-ipa-variants.yml
+```
+
+That workflow publishes a matching `*-dSYMs.zip` release asset alongside the IPA/deb assets; use that dSYM for `.ips` reports instead of asking users to reproduce on debug builds.
+
+First identify the release that produced the user's IPA from the IPA filename, release tag, or app/tweak version shown in the `.ips`. Then download and unpack symbols with `gh`:
+
+```bash
+mkdir -p /tmp/apollo-reborn-symbols
+gh release download <release-tag> \
+  --repo Apollo-Reborn/Apollo-Reborn \
+  --pattern '*-dSYMs.zip' \
+  --dir /tmp/apollo-reborn-symbols
+unzip -q /tmp/apollo-reborn-symbols/*-dSYMs.zip -d /tmp/apollo-reborn-symbols/unpacked
+find /tmp/apollo-reborn-symbols/unpacked -name 'ApolloReborn.dylib.dSYM' -type d
+```
+
+If the tag is unknown, inspect recent releases and asset names:
+
+```bash
+gh release list --repo Apollo-Reborn/Apollo-Reborn --limit 20
+gh release view <release-tag> --repo Apollo-Reborn/Apollo-Reborn --json assets --jq '.assets[].name'
+```
+
+For tweak frames like:
+
+```text
+ApolloReborn.dylib  0x103bbca90 0x103ad4000 + 952976
+```
+
+1. Match the `ApolloReborn.dylib` UUID in the `.ips` `usedImages` / `binaryImages` section against:
+
+```bash
+dwarfdump --uuid /tmp/apollo-reborn-symbols/unpacked/symbols/rootful/ApolloReborn.dylib.dSYM
+```
+
+2. Symbolicate every `ApolloReborn.dylib` frame from the crashed thread:
+
+```bash
+atos -arch arm64 \
+  -o /tmp/apollo-reborn-symbols/unpacked/symbols/rootful/ApolloReborn.dylib.dSYM/Contents/Resources/DWARF/ApolloReborn.dylib \
+  -l 0x103ad4000 \
+  0x103bbca90
+```
+
+Use the image load address as `-l` and the frame PC/address as the final argument. If the crash only provides an offset, compute `address = imageLoadAddress + offset`. Once frames resolve to source files/lines, investigate the Logos hook/block at that location and use the rest of the crashed thread plus exception type to infer runtime state.
+
+### Swift Struct Ivars and iOS Version Pitfalls
+
+Swift value types (structs like `Foundation.URL`) stored as ivars in a class are laid out inline — they are NOT object pointers. `MSHookIvar<NSURL *>` on a `URL` ivar works by accident on older iOS (where `URL`'s first field happened to be an `NSURL *`) but breaks when Apple changes the struct layout (e.g. iOS 26 swift-foundation changes). When you need data from a Swift struct ivar:
+
+1. Check if there's an `@objc` getter (search Hopper for `-[Class property]`)
+2. If not, look for ObjC display nodes or other ObjC objects that hold the same data (e.g. `urlTextNode.attributedText.string` for a URL shown in a button)
+3. As a last resort, study the struct layout via `.cxx_destruct` and the type metadata accessor
+
+### Capturing Swift Singletons via fishhook
+
+Pure Swift classes (no ObjC-visible methods) that use `dispatch_once` singletons can't be accessed through normal hooking. Use `fishhook` to briefly hook `swift_allocObject`, match on the class's type metadata pointer (which equals the `objc_getClass` result for Swift classes), capture the instance, and immediately unhook:
+
+```objc
+static __unsafe_unretained id sSingleton = nil;
+static void *sTargetMetadata = NULL;
+static void *(*orig_swift_allocObject)(void *type, size_t size, size_t alignMask);
+
+static void *hooked_swift_allocObject(void *type, size_t size, size_t alignMask) {
+    void *obj = orig_swift_allocObject(type, size, alignMask);
+    if (type == sTargetMetadata && !sSingleton) {
+        sSingleton = (__bridge id)obj;
+        rebind_symbols((struct rebinding[1]){{"swift_allocObject", (void *)orig_swift_allocObject, NULL}}, 1);
+    }
+    return obj;
+}
+
+// In %ctor:
+sTargetMetadata = (__bridge void *)objc_getClass("_TtC6Module12ClassName");
+if (sTargetMetadata) {
+    rebind_symbols((struct rebinding[1]){{"swift_allocObject", (void *)hooked_swift_allocObject, (void **)&orig_swift_allocObject}}, 1);
+}
+```
+
+Once captured, access ivars via `class_copyIvarList` + `object_getIvar` (by name for robustness, with fallback by type). This avoids hardcoded binary addresses and works across binary versions as long as the class/property names are stable.
+
+### ASVideoNode Player Access — Shareable vs Non-Shareable
+
+Apollo uses two distinct video player paths depending on content type:
+
+**Two player paths:**
+- **Shareable** (v.redd.it): player shared via AVPlayerLayer between feed and comments. ASVideoNode's `_player` ivar is nil — player lives on `[[videoNode playerLayer] player]`.
+- **Non-shareable** (GIFs, Giphy, Streamable): player on `[videoNode player]` directly.
+- **Always use `[[videoNode playerLayer] player]`** (the native mute handler's path), fall back to `[videoNode player]` if playerLayer returns nil.
+
+**Transition-specific behavior:**
+- **Compact posts**: feed -> fullscreen -> comments often creates a fresh comments `AVPlayer` asynchronously. Do not assume the fullscreen player and comments player are the same object; expect to retry after async asset/player preparation completes.
+- **Non-compact posts**: feed/comments/fullscreen may all be manipulating the same shared player layer. Fixes must update the real player state first, then separately resync the mute button/icon if Apollo's UI falls out of sync.
+- **Crossposts**: when scanning visible media or resyncing state, inspect both the cell's `richMediaNode` and `crosspostNode.richMediaNode`.
+
+**Unmuting requires (in order):**
+1. `setCategory:AVAudioSessionCategoryPlayback` — Apollo defaults to `Ambient`, which silences audio even when `player.muted=NO`.
+2. `[player setMuted:NO]` directly (for shareable, `[videoNode setMuted:NO]` alone won't reach the real player since `_player` is nil) + `[videoNode setMuted:NO]` to sync the internal `_muted` flag.
+3. Blocking session reversion to `Ambient` — Apollo resets the session after player setup. Handled by AVAudioSession hooks keyed on `sAutoUnmutedPlayer`.
+
+**Mute dance** (`sub_1003414cc`): Apollo's async mute sequence, fired when a video exits the visible area (`TouchHintVideoNode.didExitVisibleState` → `sub_10058cb30`) or when fullscreen MediaViewer dismisses. T+0: pause all, T+50ms: `setCategory:Ambient` + `setActive:NO`, T+100ms: `setMuted:YES` + unpause all. The native unmute (`sub_100341894`) survives this because it registers the player with `VideoSharingManager.activeAudioPlayer`; our auto-unmute survives via `sAutoUnmutedPlayer` + hook blocking. The native unpause handler only resumes non-shareable videos — shareable comments header videos stay paused, fixed in our `RichMediaNode.unpauseAllAVPlayersNotificationReceivedWithNotification:` hook.
+
+**Mute button:** Icon names `"small-mute"` / `"small-unmute"` on MuteUnmuteVideoButtonNode's `icon` ASImageNode, with `isMuted` Swift Bool ivar. Don't use `muteUnmuteButtonTappedWithSender:` for programmatic unmuting — it's a toggle (mutes if already unmuted) and depends on a weak `actionDelegate` that may be nil.
+
+**Best hook for comments header video:** `RichMediaHeaderCellNode.cellNodeVisibilityEvent:` — event-driven, comments-only (no context check needed). Player may not exist on event=0; use ~500ms retry.
+
+## Headers And Runtime Introspection Tips
+
+- For methods you only need to call defensively, prefer `objc_getClass` + `@selector(...)` + `objc_msgSend` over adding brittle headers. Write constant selectors as `@selector(name:)`; reserve `NSSelectorFromString` for names built at runtime. For a zero-argument object getter, `ApolloSendObject(object, @selector(name))` (ApolloCommon.h) does the respondsToSelector/objc_msgSend pair.
+- Swift class names: look them up in either form, but compare names only in the dotted form. `objc_getClass` and `NSClassFromString` resolve both `_TtC6Apollo22ThickSeparatorCellNode` and `Apollo.ThickSeparatorCellNode` (`%hook` takes the mangled identifier), while `NSStringFromClass`, `class_getName` and `object_getClassName` always return `Apollo.ThickSeparatorCellNode` (verified on the macOS and iOS 26 simulator runtimes), so an `isEqualToString:`/`hasPrefix:`/`strncmp` against `_TtC…` never matches. Prefer `isKindOfClass:`/`isMemberOfClass:` against `objc_getClass("_TtC…")` over comparing names; when a string test is unavoidable, match `Apollo.`.
+- **Looking up classes by name** (every `objc_getClass`): `objc_getClass` takes the global runtime lock, hashes the name and probes the class tables on every call, and a miss is worse still (it retries with a Swift-mangled name and calls the Swift hook). A `dispatch_once` fast path is a single load and compare. Use `objc_getClass` rather than `NSClassFromString`, which does the same lookup plus a string conversion, and pick a pattern per class:
+  - **A, the default:** add the class to the shared table in `src/ApolloClasses.{h,m}`. Declare `extern Class ApolloClassFoo;` in the header and add one `objc_getClass` line (mangled `_TtC…` name for Swift classes; objc4 tries a dotted name first, misses, then mangles it with a malloc) to the constructor in `ApolloClasses.m`. Then use `ApolloClassFoo` everywhere and nil-check it, falling back to the original behaviour. That constructor runs before every module's `%ctor` (`ApolloClasses.m` is listed first in the Makefile), and every image these classes live in is already mapped by then, so no lazy lookup is needed. A class absent for the whole process simply stays Nil. Use it for anything present at launch: Apollo's binary and bundled frameworks, Texture, RedditKit, UIKit (private ones too), linked system frameworks, and the tweak's own classes. Never write a per-file `dispatch_once` accessor for these, because every file then pays for its own copy.
+  - **B:** for a class whose image loads after launch (a framework or bundle that is dlopened or soft-linked later, e.g. TextInputUI's `TUIVariantSelectorView`), use a lazy accessor defined once in `ApolloClasses.m` and declared in the header. Make it an atomic `if (!cached)` retry (`_Atomic(void *)` with acquire/release; ARC won't take `_Atomic(Class)`), only for classes that can appear later: a dlopen'd bundle, or `objc_allocateClassPair`. Never use it for a class that may never exist.
+  - **C:** a direct `objc_getClass` call, only in cold or one-shot code (`%ctor`, setup, a user tap, error paths, or inside another one-time initializer) or for names built at runtime. Never call it per frame, per cell, per layout pass or in a loop.
+- Apollo and Texture classes live in Apollo's binary, which the dylib is injected into rather than linked against, so `[ApolloClass class]` fails at link time; use `objc_getClass`. Public SDK classes from linked frameworks (UIKit, Photos, PhotosUI, SafariServices, ...) can be referenced directly as `[UIKitClass class]`.
+- If a class is only forward-declared, cast `self` to `UIViewController *` (or `id`) before sending UIKit messages to keep clang happy.

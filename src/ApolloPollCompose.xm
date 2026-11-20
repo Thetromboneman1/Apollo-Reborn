@@ -1,0 +1,828 @@
+// Native poll creation: adds a "Poll" post type to Apollo's compose sheet.
+//
+// Apollo's ComposePostViewController drives its Link/Text/Image types from a
+// UISegmentedControl (postTypeSegmentedControl ivar). Polls never existed in
+// the official API, so instead of teaching Apollo's Swift table layout a new
+// postType, we append a "Poll" segment and, when it's selected, show our own
+// composer beneath the shared control. The poll is submitted the way
+// new.reddit.com does it — POST /api/submit_poll_post.json with the
+// account's harvested web-session cookie + modhash (the same per-username
+// session ApolloPollVoting.xm votes with; OAuth accounts harvest one on first
+// use via the existing login flow).
+#import "ApolloCommon.h"
+#import "ApolloAccountCredentials.h"
+#import "ApolloWebSessionLoginViewController.h"
+#import "ApolloWebSessionStore.h"
+#import "ApolloThemeRuntime.h"
+#import "Defaults.h"
+#import "UIWindow+Apollo.h"
+#import <objc/message.h>
+#import <objc/runtime.h>
+#import "ApolloSwiftRuntime.h"
+
+static NSString *const kApolloPollSubmitEndpoint = @"https://www.reddit.com/api/submit_poll_post.json";
+static const NSUInteger kApolloPollMinOptions = 2;
+static const NSUInteger kApolloPollMaxOptions = 6;
+static const NSInteger kApolloPollDefaultDurationDays = 3;
+
+static const void *kApolloPollSegmentIndexKey = &kApolloPollSegmentIndexKey;
+static const void *kApolloPollComposerKey = &kApolloPollComposerKey;
+static const void *kApolloPollPendingPostTypeKey = &kApolloPollPendingPostTypeKey;
+static const void *kApolloPollSetupScheduledKey = &kApolloPollSetupScheduledKey;
+
+static NSString *ApolloPollComposeFlairString(NSDictionary *option, NSArray<NSString *> *keys) {
+    if (![option isKindOfClass:NSDictionary.class]) return nil;
+    for (NSString *key in keys) {
+        id value = option[key];
+        if ([value isKindOfClass:NSString.class] && [value length] > 0) return value;
+    }
+    return nil;
+}
+
+static NSString *ApolloPollComposeFlairTitle(NSDictionary *option) {
+    NSString *text = ApolloPollComposeFlairString(option, @[@"text", @"flair_text", @"name"]);
+    if (text.length > 0) return text;
+    id richText = option[@"richtext"] ?: option[@"flair_richtext"];
+    if ([richText isKindOfClass:NSArray.class]) {
+        NSMutableString *joined = [NSMutableString string];
+        for (id piece in (NSArray *)richText) {
+            if (![piece isKindOfClass:NSDictionary.class]) continue;
+            NSString *pieceText = ApolloPollComposeFlairString(piece, @[@"t", @"a"]);
+            if (pieceText.length > 0) [joined appendString:pieceText];
+        }
+        if (joined.length > 0) return joined;
+    }
+    return @"Untitled Flair";
+}
+
+// The subreddit the compose sheet is posting to. Prefer the RDKSubreddit
+// object; fall back to the Swift subredditName string (set even when Apollo
+// was handed just a name).
+static NSString *ApolloPollComposeSubredditName(id composeVC) {
+    id subreddit = ApolloObjectIvar(composeVC, "subreddit");
+    if ([subreddit respondsToSelector:@selector(name)]) {
+        NSString *name = ((NSString *(*)(id, SEL))objc_msgSend)(subreddit, @selector(name));
+        if ([name isKindOfClass:NSString.class] && name.length > 0) return name;
+    }
+    return ApolloReadSwiftStringIvar(composeVC, "subredditName");
+}
+
+// The account the sheet will post as: the compose account switcher's temporary
+// pick when set, otherwise the app's active account.
+static NSString *ApolloPollComposeUsername(id composeVC) {
+    id account = ApolloObjectIvar(composeVC, "temporaryPostingAccount");
+    for (NSString *key in @[ @"username", @"name" ]) {
+        if (![account respondsToSelector:NSSelectorFromString(key)]) continue;
+        NSString *name = [account valueForKey:key];
+        if ([name isKindOfClass:NSString.class] && name.length > 0) return name;
+    }
+    return ApolloActiveAccountUsername();
+}
+
+#pragma mark - Quick post-type menu ("Submit Post" replacement)
+
+// Post type picked from the subreddit "..." menu, applied to the compose
+// sheet's segmented control when it appears. Time-limited so a compose sheet
+// opened later through another path doesn't inherit a stale pick.
+static NSString *sApolloPollPendingPostType = nil;
+static CFAbsoluteTime sApolloPollPendingPostTypeSetAt = 0;
+
+static void ApolloPollComposeSetPendingPostType(NSString *type) {
+    sApolloPollPendingPostType = [type copy];
+    sApolloPollPendingPostTypeSetAt = CFAbsoluteTimeGetCurrent();
+}
+
+static void ApolloPollComposeClaimPendingPostType(id composeVC) {
+    NSString *pending = sApolloPollPendingPostType;
+    sApolloPollPendingPostType = nil;
+    if (pending.length == 0 || CFAbsoluteTimeGetCurrent() - sApolloPollPendingPostTypeSetAt > 30.0) return;
+    // Once the sheet owns the pick, retain it through Apollo's asynchronous
+    // setup. Another sheet must not steal it, and a slow subreddit fetch must
+    // not turn a Poll quick-pick into the default Photo Post.
+    objc_setAssociatedObject(composeVC, kApolloPollPendingPostTypeKey, pending, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
+static void ApolloPollComposeApplyPendingPostType(id composeVC) {
+    NSString *pending = objc_getAssociatedObject(composeVC, kApolloPollPendingPostTypeKey);
+    if (pending.length == 0) return;
+    UISegmentedControl *control = ApolloObjectIvar(composeVC, "postTypeSegmentedControl");
+    if (![control isKindOfClass:UISegmentedControl.class] || control.numberOfSegments == 0) return;
+
+    // Match the picked type against the compose sheet's segment titles
+    // case-insensitively. Apollo calls its image segment "Photo", while
+    // ApolloPhotoPostComposerScrollFix relabels it "Media" for Reddit uploads.
+    // That relabel can run before this deferred selection, so all three names
+    // must select the same native post type.
+    NSString *wanted = pending.lowercaseString;
+    NSArray<NSString *> *mediaTitles = @[@"photo", @"image", @"media"];
+    NSArray<NSString *> *accepted = [mediaTitles containsObject:wanted] ? mediaTitles : @[wanted];
+    for (NSInteger index = 0; index < control.numberOfSegments; index++) {
+        NSString *segTitle = [control titleForSegmentAtIndex:index].lowercaseString;
+        if (segTitle.length == 0 || ![accepted containsObject:segTitle]) continue;
+        objc_setAssociatedObject(composeVC, kApolloPollPendingPostTypeKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        if (control.selectedSegmentIndex != index) {
+            control.selectedSegmentIndex = index;
+            // Fires Apollo's own postTypeSegmentedControlValueChanged: (and,
+            // for Poll, this file's hook) exactly as a user tap would.
+            [control sendActionsForControlEvents:UIControlEventValueChanged];
+        }
+        ApolloLog(@"[PollCompose] applied quick-pick '%@'", pending);
+        return;
+    }
+    // The selector can arrive before the subreddit/account prerequisites for
+    // installing Poll. Keep that choice with this sheet until setup completes.
+    if ([wanted isEqualToString:@"poll"] && ApolloPollsFeatureEnabled()) return;
+    // No native segment matched — leave the sheet on its default type rather than
+    // guessing an index, but surface the miss so a title/label drift can't fail
+    // silently the way it would with a bare exact-string match.
+    objc_setAssociatedObject(composeVC, kApolloPollPendingPostTypeKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    ApolloLog(@"[PollCompose] quick-pick '%@' matched no compose segment title — left default type", pending);
+}
+
+static UIViewController *ApolloPollComposeVisibleViewController(void) {
+    return (ApolloKeyWindow() ?: ApolloAllWindows().firstObject).visibleViewController;
+}
+
+// Loads one of the tweak's bundled custom post-type symbols. These are SF
+// Symbols custom-symbol exports compiled into ApolloPollSymbols.bundle
+// (Assets.car), staged inside ApolloReborn.bundle. Resolved once and cached;
+// returns nil when the bundle is unavailable so callers fall back to a stock
+// SF Symbol. Exported (ApolloCommon.h) for the Action Menus settings preview,
+// whose mock of the quick new-post buttons draws the same glyphs.
+UIImage *ApolloPollComposeSymbol(NSString *symbolName) {
+    static NSBundle *symbols = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *path = ApolloBundledResourcePath(@"ApolloPollSymbols", @"bundle");
+        symbols = path ? [NSBundle bundleWithPath:path] : nil;
+        if (!symbols) ApolloLog(@"[PollCompose] ApolloPollSymbols.bundle not found — using SF Symbol fallbacks");
+    });
+    return symbols ? [UIImage imageNamed:symbolName inBundle:symbols compatibleWithTraitCollection:nil] : nil;
+}
+
+// SF Symbols has no checklist.badge.plus. Combine the configured checklist
+// with a small creation badge so it fits the other three post shortcuts.
+// Both the live menu and its settings preview use this same template image.
+static UIImage *ApolloPollComposeChecklistSymbol(UIImageSymbolConfiguration *configuration) {
+    UIImage *image = [UIImage systemImageNamed:@"checklist" withConfiguration:configuration];
+    if (!image) return nil;
+    UIImage *badge = [UIImage systemImageNamed:@"plus.circle.fill"
+        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:10.0
+                                                                          weight:UIImageSymbolWeightRegular]];
+    CGSize size = CGSizeMake(image.size.width + badge.size.width * 0.35,
+                             image.size.height + badge.size.height * 0.25);
+    CGRect badgeRect = CGRectMake(size.width - badge.size.width, size.height - badge.size.height,
+                                  badge.size.width, badge.size.height);
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        [[image imageWithTintColor:UIColor.blackColor renderingMode:UIImageRenderingModeAlwaysOriginal]
+            drawAtPoint:CGPointZero];
+        // A transparent halo, not a painted background, keeps the badge clear
+        // on dark/custom themes and the translucent native menu surface.
+        CGContextSetBlendMode(context.CGContext, kCGBlendModeClear);
+        CGContextFillEllipseInRect(context.CGContext, CGRectInset(badgeRect, -1.0, -1.0));
+        CGContextSetBlendMode(context.CGContext, kCGBlendModeNormal);
+        [[badge imageWithTintColor:UIColor.blackColor renderingMode:UIImageRenderingModeAlwaysOriginal]
+            drawInRect:badgeRect];
+    }];
+}
+
+// The ControlGroup-style inline icon row that replaces the "Submit Post" menu
+// item: one entry per post type the current subreddit accepts
+// (RDKSubmissionType: Any=1, Link=2, Self=3 — RedditKit's transformer defaults
+// missing to Any), each landing directly on that type in the compose sheet.
+// RDK predates polls, so there is no allow_polls flag to check — Poll shows
+// for any signed-in account and the server's error surfaces if a sub
+// disallows them (same as the compose sheet's Poll segment).
+//
+// The whole picker is gated on the experimental Polls feature: with Polls off,
+// this returns nil so Apollo's plain "Submit Post" row is left exactly as-is.
+// The Photo/Link/Text speed-up isn't poll-specific, but shipping it to every
+// install would be a stock-behavior change outside the feature flag, so it
+// rides the Polls gate rather than silently replacing the default row.
+UIMenu *ApolloSubmitPostTypesMenu(__unused id actionController, void (^selectRow)(void)) {
+    if (!ApolloPollsFeatureEnabled()) return nil;
+    id subreddit = ApolloObjectIvar(ApolloPollComposeVisibleViewController(), "currentSubreddit");
+    NSInteger submissionType = 1;
+    BOOL allowImages = YES;
+    if ([subreddit respondsToSelector:@selector(acceptedSubmissionsType)]) {
+        submissionType = ((NSInteger (*)(id, SEL))objc_msgSend)(subreddit, @selector(acceptedSubmissionsType));
+        if (submissionType < 1 || submissionType > 3) submissionType = 1;
+    }
+    if ([subreddit respondsToSelector:@selector(allowImagePosts)]) {
+        allowImages = ((BOOL (*)(id, SEL))objc_msgSend)(subreddit, @selector(allowImagePosts));
+    }
+    BOOL linkAllowed = submissionType != 3;
+    BOOL textAllowed = submissionType != 2;
+    // Photo/Link/Text use bundled custom symbols with stock fallbacks. Poll
+    // uses the system checklist with a creation badge composed below.
+    // These fields only borrow string literals, whose lifetime covers every menu
+    // use. The action handler captures its title with normal ARC ownership.
+    const struct {
+        __unsafe_unretained NSString *title;
+        __unsafe_unretained NSString *customSymbol;
+        __unsafe_unretained NSString *fallback;
+        BOOL available;
+    } entries[] = {
+        { @"Photo", @"custom.photo.badge.plus",     @"photo",          linkAllowed && allowImages },
+        { @"Link",  @"custom.link.badge.plus",      @"link",           linkAllowed },
+        { @"Text",  @"custom.text.page.badge.plus", @"text.alignleft", textAllowed },
+    };
+    UIImageSymbolConfiguration *iconConfig =
+        [UIImageSymbolConfiguration configurationWithPointSize:22.0 weight:UIImageSymbolWeightRegular];
+    UIAction *(^makeAction)(NSString *, UIImage *) = ^(NSString *title, UIImage *image) {
+        image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        return [UIAction actionWithTitle:title image:image
+                              identifier:nil handler:^(__unused UIAction *action) {
+            ApolloPollComposeSetPendingPostType(title);
+            selectRow();
+        }];
+    };
+    NSMutableArray<UIAction *> *nativeActions = [NSMutableArray array];
+    for (const auto &entry : entries) {
+        if (!entry.available) continue;
+        UIImage *image = ApolloPollComposeSymbol(entry.customSymbol) ?: [UIImage systemImageNamed:entry.fallback];
+        image = [image imageByApplyingSymbolConfiguration:iconConfig];
+        [nativeActions addObject:makeAction(entry.title, image)];
+    }
+    // Feature gate already passed above; Poll just needs a signed-in account.
+    UIAction *pollAction = ApolloActiveAccountUsername().length > 0
+        ? makeAction(@"Poll", ApolloPollComposeChecklistSymbol(iconConfig)) : nil;
+    if (nativeActions.count + (pollAction ? 1 : 0) < 2) return nil;
+
+    // Small elements keep all four post types on one clean, compact icon row
+    // (no labels, no vertical bulk). Medium was worse: it shows labels and only
+    // fits three per row, dropping Poll onto a lopsided second row. The custom
+    // badge-plus glyphs read clearly at this size, so the row stays legible
+    // while staying a single native UIMenu (keyboard/VoiceOver come free).
+    NSMutableArray<UIAction *> *actions = [nativeActions mutableCopy];
+    if (pollAction) [actions addObject:pollAction];
+    UIMenu *iconRow = [UIMenu menuWithTitle:@"" image:nil identifier:nil
+                                    options:UIMenuOptionsDisplayInline children:actions];
+    if (@available(iOS 16.0, *)) {
+        iconRow.preferredElementSize = UIMenuElementSizeSmall;
+    }
+    return [UIMenu menuWithTitle:@"" image:nil identifier:nil
+                         options:UIMenuOptionsDisplayInline children:@[iconRow]];
+}
+
+#pragma mark - Poll composer
+
+@interface ApolloPollComposeViewController : UITableViewController <UITextFieldDelegate>
+@property (nonatomic, weak) UIViewController *composeHost;
+@property (nonatomic, copy) NSString *originalComposeTitle;
+@property (nonatomic, strong) UIColor *composeBackgroundColor;
+@property (nonatomic, strong) UIColor *composeCellColor;
+@property (nonatomic, strong) UIColor *composePrimaryTextColor;
+@property (nonatomic, strong) UIColor *composeSecondaryTextColor;
+@property (nonatomic, strong) UIBarButtonItem *originalPostButton;
+@property (nonatomic, strong) UIBarButtonItem *pollPostButton;
+@property (nonatomic, copy) NSString *subredditName;
+@property (nonatomic, copy) NSString *username;
+@property (nonatomic, strong) NSMutableArray<NSString *> *optionTexts;
+@property (nonatomic, copy) NSString *titleText;
+@property (nonatomic, copy) NSArray<NSDictionary *> *flairOptions;
+@property (nonatomic, copy) NSDictionary *selectedFlairOption;
+@property (nonatomic) NSInteger durationDays;
+@property (nonatomic) BOOL submitting;
+@end
+
+@implementation ApolloPollComposeViewController
+
+- (UINavigationItem *)activeNavigationItem {
+    return self.composeHost.navigationItem ?: self.navigationItem;
+}
+
+- (instancetype)init {
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (self) {
+        _optionTexts = [NSMutableArray arrayWithObjects:@"", @"", nil];
+        _titleText = @"";
+        _durationDays = kApolloPollDefaultDurationDays;
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    UINavigationItem *item = self.activeNavigationItem;
+    self.originalPostButton = item.rightBarButtonItem;
+    self.pollPostButton = [[UIBarButtonItem alloc]
+        initWithTitle:@"Post" style:UIBarButtonItemStyleDone target:self action:@selector(postTapped)];
+    item.rightBarButtonItem = self.pollPostButton;
+    UIColor *accent = ApolloThemeAccentColor();
+    if (accent) self.navigationController.navigationBar.tintColor = accent;
+    self.tableView.backgroundColor = self.composeBackgroundColor ?: self.composeHost.view.backgroundColor;
+    [self refreshFlairOptions];
+    [self revalidate];
+}
+
+- (void)refreshFlairOptions {
+    // Swift Optional<Array<Dictionary<String, Any>>> stores its bridged heap
+    // object in the first word and has no ObjC getter, so read that word
+    // directly (never object_getIvar: it's a Swift value type, not an ObjC ivar).
+    id rawOptions = ApolloReadObjectIvar(self.composeHost, "flairOptions");
+    if ([rawOptions isKindOfClass:NSArray.class]) {
+        NSMutableArray<NSDictionary *> *valid = [NSMutableArray array];
+        for (id option in (NSArray *)rawOptions) {
+            if ([option isKindOfClass:NSDictionary.class]) [valid addObject:option];
+        }
+        self.flairOptions = valid;
+    } else {
+        self.flairOptions = @[];
+    }
+    if (!self.selectedFlairOption) {
+        id selected = ApolloReadObjectIvar(self.composeHost, "selectedFlairOption");
+        if ([selected isKindOfClass:NSDictionary.class]) self.selectedFlairOption = selected;
+    }
+}
+
+- (NSArray<NSString *> *)filledOptions {
+    NSMutableArray *filled = [NSMutableArray array];
+    for (NSString *text in self.optionTexts) {
+        NSString *trimmed = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (trimmed.length > 0) [filled addObject:trimmed];
+    }
+    return filled;
+}
+
+- (void)revalidate {
+    NSString *title = [self.titleText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    self.pollPostButton.enabled =
+        !self.submitting && title.length > 0 && self.filledOptions.count >= kApolloPollMinOptions;
+}
+
+#pragma mark Table
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 4; }
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (section == 0) return 1;
+    if (section == 1) return self.optionTexts.count + (self.optionTexts.count < kApolloPollMaxOptions ? 1 : 0);
+    return 1;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (section == 0) return @"Title";
+    if (section == 1) return @"Options";
+    if (section == 2) return @"Flair";
+    return @"Duration";
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 1) return @"2 to 6 options. Empty ones are skipped.";
+    if (section == 2) return @"Required in communities that require post flair.";
+    if (section == 3) return @"Voting closes this many days after posting.";
+    return nil;
+}
+
+- (UITextField *)textFieldForCell:(UITableViewCell *)cell {
+    UITextField *field = [[UITextField alloc] initWithFrame:CGRectZero];
+    field.translatesAutoresizingMaskIntoConstraints = NO;
+    field.delegate = self;
+    field.returnKeyType = UIReturnKeyNext;
+    field.textColor = self.composePrimaryTextColor;
+    [field addTarget:self action:@selector(textFieldChanged:) forControlEvents:UIControlEventEditingChanged];
+    [cell.contentView addSubview:field];
+    [NSLayoutConstraint activateConstraints:@[
+        [field.leadingAnchor constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.leadingAnchor],
+        [field.trailingAnchor constraintEqualToAnchor:cell.contentView.layoutMarginsGuide.trailingAnchor],
+        [field.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor],
+        [field.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor],
+        [field.heightAnchor constraintGreaterThanOrEqualToConstant:44.0],
+    ]];
+    return field;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    UIColor *card = self.composeCellColor;
+    if (card) {
+        cell.backgroundColor = card;
+        cell.contentView.backgroundColor = card;
+    }
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    if (indexPath.section == 0) {
+        UITextField *field = [self textFieldForCell:cell];
+        field.placeholder = @"Poll title";
+        field.text = self.titleText;
+        field.tag = -1;
+    } else if (indexPath.section == 1) {
+        if ((NSUInteger)indexPath.row < self.optionTexts.count) {
+            UITextField *field = [self textFieldForCell:cell];
+            field.placeholder = [NSString stringWithFormat:@"Option %ld", (long)indexPath.row + 1];
+            field.text = self.optionTexts[indexPath.row];
+            field.tag = indexPath.row;
+        } else {
+            cell.textLabel.text = @"Add Option";
+            cell.textLabel.textColor = ApolloThemeAccentColor() ?: cell.textLabel.tintColor;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        }
+    } else if (indexPath.section == 2) {
+        cell.textLabel.text = @"Post Flair";
+        cell.detailTextLabel.text = self.selectedFlairOption
+            ? ApolloPollComposeFlairTitle(self.selectedFlairOption) : @"None";
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    } else {
+        cell.textLabel.text = @"Poll Duration";
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld %@", (long)self.durationDays,
+                                     self.durationDays == 1 ? @"Day" : @"Days"];
+        UIStepper *stepper = [[UIStepper alloc] init];
+        stepper.minimumValue = 1;
+        stepper.maximumValue = 7;
+        stepper.value = self.durationDays;
+        [stepper addTarget:self action:@selector(durationChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = stepper;
+    }
+    cell.textLabel.textColor = self.composePrimaryTextColor;
+    cell.detailTextLabel.textColor = self.composeSecondaryTextColor;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 2) {
+        [self presentFlairPickerFromCell:[tableView cellForRowAtIndexPath:indexPath]];
+        return;
+    }
+    if (indexPath.section != 1 || (NSUInteger)indexPath.row != self.optionTexts.count) return;
+    [self.optionTexts addObject:@""];
+    // Reload the section rather than inserting: the "Add Option" row also moves
+    // (or disappears at the 6-option cap), and these tiny tables reload cheaply.
+    [tableView reloadSections:[NSIndexSet indexSetWithIndex:1] withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+
+- (void)presentFlairPickerFromCell:(UITableViewCell *)cell {
+    [self refreshFlairOptions];
+    if (self.flairOptions.count == 0) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"No Post Flairs"
+            message:@"This community did not return any post flair choices. If its flairs are still loading, wait a moment and try again."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    UIAlertController *picker = [UIAlertController alertControllerWithTitle:@"Post Flair"
+        message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [picker addAction:[UIAlertAction actionWithTitle:@"None" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+        weakSelf.selectedFlairOption = nil;
+        [weakSelf.tableView reloadSections:[NSIndexSet indexSetWithIndex:2] withRowAnimation:UITableViewRowAnimationNone];
+    }]];
+    for (NSDictionary *option in self.flairOptions) {
+        NSString *title = ApolloPollComposeFlairTitle(option);
+        [picker addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            weakSelf.selectedFlairOption = option;
+            [weakSelf.tableView reloadSections:[NSIndexSet indexSetWithIndex:2] withRowAnimation:UITableViewRowAnimationNone];
+        }]];
+    }
+    [picker addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UIPopoverPresentationController *popover = picker.popoverPresentationController;
+    if (popover) {
+        popover.sourceView = cell ?: self.view;
+        popover.sourceRect = cell ? cell.bounds : self.view.bounds;
+    }
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)textFieldChanged:(UITextField *)field {
+    if (field.tag == -1) {
+        self.titleText = field.text ?: @"";
+    } else if (field.tag >= 0 && (NSUInteger)field.tag < self.optionTexts.count) {
+        self.optionTexts[field.tag] = field.text ?: @"";
+    }
+    [self revalidate];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)field {
+    [field resignFirstResponder];
+    return YES;
+}
+
+- (void)durationChanged:(UIStepper *)stepper {
+    self.durationDays = (NSInteger)stepper.value;
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:3] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+#pragma mark Submission
+
+- (void)showError:(NSString *)message {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Couldn't Create Poll"
+        message:message ?: @"Reddit rejected the poll." preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)setSubmitting:(BOOL)submitting {
+    _submitting = submitting;
+    UISegmentedControl *segments = ApolloObjectIvar(self.composeHost, "postTypeSegmentedControl");
+    segments.enabled = !submitting;
+    if (submitting) {
+        UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc]
+            initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+        [spinner startAnimating];
+        self.activeNavigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:spinner];
+    } else {
+        self.activeNavigationItem.rightBarButtonItem = self.pollPostButton;
+    }
+    [self revalidate];
+}
+
+- (void)postTapped {
+    if (self.submitting) return;
+    [self.view endEditing:YES];
+    NSString *title = [self.titleText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSArray<NSString *> *options = self.filledOptions;
+    NSMutableSet *uniqueOptions = [NSMutableSet set];
+    for (NSString *option in options) [uniqueOptions addObject:option.lowercaseString];
+    if (title.length > 300) { [self showError:@"Poll titles can be at most 300 characters."]; return; }
+    if (options.count < 2 || options.count > 6) { [self showError:@"Polls require 2 to 6 options."]; return; }
+    if (uniqueOptions.count != options.count) { [self showError:@"Each poll option must be different."]; return; }
+    for (NSString *option in options) {
+        if (option.length > 120) { [self showError:@"Poll options can be at most 120 characters."]; return; }
+    }
+    NSString *currentUsername = ApolloPollComposeUsername(self.composeHost);
+    if (currentUsername.length == 0) { [self showError:@"Choose an account before posting."]; return; }
+    self.username = currentUsername;
+    self.submitting = YES;
+    ApolloWebSessionEntry *session = ApolloWebSessionPollFor(self.username);
+    if (session.cookieHeader.length > 0) { [self submitWithSession:session]; return; }
+
+    // OAuth account without a harvested reddit.com session yet: run the same
+    // one-time cookie login the poll-voting flow uses, then submit.
+    ApolloWebSessionLoginViewController *login = [ApolloWebSessionLoginViewController
+        loginControllerForUsername:self.username completion:^(BOOL success) {
+            if (!success) { self.submitting = NO; return; }
+            ApolloWebSessionEntry *harvested = ApolloWebSessionPollFor(self.username);
+            if (harvested.cookieHeader.length > 0) {
+                [self submitWithSession:harvested];
+            } else {
+                self.submitting = NO;
+                [self showError:@"A Reddit web session is required to create polls."];
+            }
+        }];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:login];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)submitWithSession:(ApolloWebSessionEntry *)session {
+    if (session.modhash.length == 0) {
+        self.submitting = NO;
+        [self showError:@"The stored Reddit session has no modhash. Sign in again from the account switcher and retry."];
+        return;
+    }
+    NSMutableDictionary *body = [@{ @"sr": self.subredditName ?: @"",
+                                    @"title": [self.titleText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],
+                                    @"text": @"",
+                                    @"options": self.filledOptions,
+                                    @"duration": @(self.durationDays),
+                                    @"api_type": @"json",
+                                    @"kind": @"poll",
+                                    @"resubmit": @YES,
+                                    @"sendreplies": @YES } mutableCopy];
+    NSString *flairID = ApolloPollComposeFlairString(self.selectedFlairOption,
+        @[@"id", @"flair_id", @"template_id"]);
+    NSString *flairText = ApolloPollComposeFlairString(self.selectedFlairOption,
+        @[@"text", @"flair_text"]);
+    if (flairID.length > 0) body[@"flair_id"] = flairID;
+    if (flairText.length > 0) body[@"flair_text"] = flairText;
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kApolloPollSubmitEndpoint]];
+    request.HTTPMethod = @"POST";
+    NSError *serializationError = nil;
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:&serializationError];
+    if (!request.HTTPBody) {
+        self.submitting = NO;
+        ApolloLog(@"[PollCompose] submit failed stage=serialization");
+        [self showError:serializationError.localizedDescription ?: @"Apollo could not prepare the poll."];
+        return;
+    }
+    request.HTTPShouldHandleCookies = NO;
+    request.timeoutInterval = 30.0;
+    [request setValue:session.cookieHeader forHTTPHeaderField:@"Cookie"];
+    [request setValue:session.modhash forHTTPHeaderField:@"X-Modhash"];
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [request setValue:defaultUserAgent forHTTPHeaderField:@"User-Agent"];
+
+    NSURLSession *urlSession = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.ephemeralSessionConfiguration];
+    [[urlSession dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.submitting = NO;
+            NSInteger status = [response isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+            id jsonObject = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            NSDictionary *json = [jsonObject isKindOfClass:NSDictionary.class] ? jsonObject : nil;
+            id errorsObject = [json valueForKeyPath:@"json.errors"];
+            NSArray *errors = [errorsObject isKindOfClass:NSArray.class] ? errorsObject : @[];
+            id postURLObject = [json valueForKeyPath:@"json.data.url"];
+            NSString *postURL = [postURLObject isKindOfClass:NSString.class] ? postURLObject : nil;
+            if (error || status != 200 || errors.count > 0 || postURL.length == 0) {
+                // api_type=json errors are [code, human message, field] triples.
+                NSString *serverMessage = nil;
+                id first = errors.firstObject;
+                if ([first isKindOfClass:NSArray.class] && [first count] > 1 && [first[1] isKindOfClass:NSString.class]) serverMessage = first[1];
+                NSString *message = serverMessage ?: error.localizedDescription;
+                if (status == 429) message = @"Reddit is rate limiting posts. Wait a moment before trying again.";
+                else if (status == 401) {
+                    // Only a 401 is a definite authentication failure — remove the
+                    // stored session so the user is prompted to sign in again.
+                    ApolloWebSessionRemove(self.username);
+                    message = @"The Reddit web session expired. Sign in again and retry.";
+                }
+                else if (status == 403) {
+                    // A 403 from /api/submit_poll_post.json is very reachable
+                    // without the session being bad: the subreddit disallows
+                    // polls, the user is banned/muted, lacks the karma to post,
+                    // or the subreddit is restricted. Do NOT remove the session —
+                    // for a keyless account this is its primary API-key-free
+                    // transport, and ApolloWebSessionRemove would sign it out of
+                    // the whole cookie transport, not just polls. Mirror
+                    // ApolloPollVoting.xm's 403 handling and surface Reddit's own
+                    // reason instead.
+                    message = serverMessage ?: @"Reddit did not authorize this poll. You may not be allowed to post polls in this subreddit.";
+                }
+                else if (status >= 500) message = @"Reddit is temporarily unavailable. Try again later.";
+                ApolloLogError(@"[PollCompose] submit failed status=%ld code=%ld", (long)status, (long)error.code);
+                [self showError:message ?: (status > 0 ? [NSString stringWithFormat:@"Reddit returned HTTP %ld.", (long)status] : @"Reddit could not be reached.")];
+                return;
+            }
+            UINotificationFeedbackGenerator *feedback = [UINotificationFeedbackGenerator new];
+            [feedback notificationOccurred:UINotificationFeedbackTypeSuccess];
+            [self openCreatedPoll:postURL];
+        });
+        [urlSession finishTasksAndInvalidate];
+    }] resume];
+}
+
+- (void)openCreatedPoll:(NSString *)postURL {
+    // Reddit commonly returns a www.reddit.com URL.  Hand-building an
+    // apollo://www.reddit.com URL bypasses Apollo's native Reddit host route
+    // and falls into its web viewer.  Use the shared router, which canonicalizes
+    // Reddit hosts and invokes Apollo's deep-link handler in-process.
+    NSURL *createdURL = [NSURL URLWithString:postURL];
+    // Apollo predates Reddit's internal community names (r/a:t5_*).  Its URL
+    // handler accepts the route but then opens those subreddit-qualified URLs
+    // in the web viewer.  A post's canonical /comments/<id> route is equivalent
+    // and does not require Apollo to resolve the community namespace.
+    NSArray<NSString *> *components = createdURL.pathComponents;
+    NSUInteger commentsIndex = [components indexOfObject:@"comments"];
+    NSURL *nativeURL = createdURL;
+    if (commentsIndex != NSNotFound && commentsIndex + 1 < components.count) {
+        NSString *postID = components[commentsIndex + 1];
+        if (postID.length > 0) {
+            nativeURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://reddit.com/comments/%@", postID]];
+        }
+    }
+    UIViewController *root = self.composeHost.presentingViewController ?: self.presentingViewController;
+    [root dismissViewControllerAnimated:YES completion:^{
+        BOOL routed = nativeURL && ApolloRouteResolvedURLViaApolloScheme(nativeURL);
+        if (!routed) {
+            ApolloLog(@"[PollCompose] native route failed after successful creation");
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Poll Created"
+                message:@"The poll was created, but Apollo could not open it."
+                preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+            [root presentViewController:alert animated:YES completion:nil];
+        }
+    }];
+}
+
+@end
+
+#pragma mark - Compose sheet hook
+
+static void ApolloPollComposePresentComposer(UIViewController *composeVC) {
+    NSString *subredditName = ApolloPollComposeSubredditName(composeVC);
+    NSString *username = ApolloPollComposeUsername(composeVC);
+    if (subredditName.length == 0 || username.length == 0) return;
+    ApolloPollComposeViewController *existing = objc_getAssociatedObject(composeVC, kApolloPollComposerKey);
+    if (existing) {
+        existing.view.hidden = NO;
+        composeVC.navigationItem.rightBarButtonItem = existing.pollPostButton;
+        composeVC.navigationItem.title = @"Poll";
+        [existing revalidate];
+        return;
+    }
+    ApolloPollComposeViewController *composer = [ApolloPollComposeViewController new];
+    composer.subredditName = subredditName;
+    composer.username = username;
+    composer.composeHost = composeVC;
+    composer.originalComposeTitle = composeVC.navigationItem.title ?: composeVC.title;
+    composeVC.navigationItem.title = @"Poll";
+    UITableView *nativeTable = ApolloReadSwiftWeakObjectIvar(composeVC, "tableView");
+    UITableViewCell *nativeCell = [nativeTable.visibleCells firstObject];
+    // Use the same semantic surface roles that the settings controllers use,
+    // rather than sampling the presenting controller.  The latter is the
+    // dimmed sheet's white host view, hence the white poll editor on a dark or
+    // custom Apollo theme.  Runtime colours are dynamic, so live light/dark
+    // and custom-theme changes continue to resolve correctly.
+    UIColor *page = ApolloThemeRuntimeColor(ApolloThemeTokenBackground);
+    UIColor *card = ApolloThemeRuntimeColor(ApolloThemeTokenSecondaryBackground);
+    composer.composeBackgroundColor = page ?: nativeTable.backgroundColor
+        ?: composeVC.view.backgroundColor ?: UIColor.systemGroupedBackgroundColor;
+    composer.composeCellColor = card ?: nativeCell.backgroundColor
+        ?: UIColor.secondarySystemGroupedBackgroundColor;
+    composer.composePrimaryTextColor = nativeCell.textLabel.textColor ?: UIColor.labelColor;
+    composer.composeSecondaryTextColor = nativeCell.detailTextLabel.textColor
+        ?: [composer.composePrimaryTextColor colorWithAlphaComponent:0.62];
+
+    objc_setAssociatedObject(composeVC, kApolloPollComposerKey, composer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // Keep Apollo's post-type segmented control visible and replace only the
+    // content beneath it. Poll is therefore a genuine peer mode: selecting
+    // Text/Link/Photo again immediately uncovers Apollo's original content.
+    [composeVC addChildViewController:composer];
+    UIView *view = composer.view;
+    view.translatesAutoresizingMaskIntoConstraints = NO;
+    [composeVC.view addSubview:view];
+    [NSLayoutConstraint activateConstraints:@[
+        [view.leadingAnchor constraintEqualToAnchor:composeVC.view.leadingAnchor],
+        [view.trailingAnchor constraintEqualToAnchor:composeVC.view.trailingAnchor],
+        [view.topAnchor constraintEqualToAnchor:((UIView *)ApolloObjectIvar(composeVC, "postTypeSegmentedControl")).bottomAnchor constant:8.0],
+        [view.bottomAnchor constraintEqualToAnchor:composeVC.view.bottomAnchor],
+    ]];
+    [composer didMoveToParentViewController:composeVC];
+}
+
+static void ApolloPollComposeHideComposer(UIViewController *composeVC) {
+    ApolloPollComposeViewController *composer = objc_getAssociatedObject(composeVC, kApolloPollComposerKey);
+    if (!composer || composer.view.hidden) return;
+    [composer.view endEditing:YES];
+    composer.view.hidden = YES;
+    if (composer.originalPostButton) {
+        composeVC.navigationItem.rightBarButtonItem = composer.originalPostButton;
+    }
+    composeVC.navigationItem.title = composer.originalComposeTitle;
+}
+
+// Apollo builds the segmented control asynchronously, sometimes after
+// viewDidAppear:. Install only once that control exists.
+static void ApolloPollComposeInstallSegment(id composeVC) {
+    if (!ApolloPollsFeatureEnabled()) return;
+    UISegmentedControl *control = ApolloObjectIvar(composeVC, "postTypeSegmentedControl");
+    if (![control isKindOfClass:UISegmentedControl.class] || control.numberOfSegments == 0) {
+        return;
+    }
+    if ([[control titleForSegmentAtIndex:control.numberOfSegments - 1] isEqualToString:@"Poll"]) return;
+    // Profile posts and other targets without a resolvable subreddit keep the
+    // stock sheet. Signed-out browsing has no account to post as.
+    NSString *subredditName = ApolloPollComposeSubredditName(composeVC);
+    NSString *username = ApolloPollComposeUsername(composeVC);
+    if (subredditName.length == 0 || username.length == 0) return;
+    [control insertSegmentWithTitle:@"Poll" atIndex:control.numberOfSegments animated:NO];
+    objc_setAssociatedObject(composeVC, kApolloPollSegmentIndexKey,
+                             @(control.numberOfSegments - 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloLog(@"[PollCompose] installed Poll segment after native composer became ready");
+}
+
+static void ApolloPollComposeScheduleSetup(UIViewController *composeVC) {
+    UISegmentedControl *control = ApolloObjectIvar(composeVC, "postTypeSegmentedControl");
+    if (![control isKindOfClass:UISegmentedControl.class] || control.numberOfSegments == 0) return;
+    BOOL pending = objc_getAssociatedObject(composeVC, kApolloPollPendingPostTypeKey) != nil;
+    BOOL needsPoll = ApolloPollsFeatureEnabled()
+        && ![[control titleForSegmentAtIndex:control.numberOfSegments - 1] isEqualToString:@"Poll"]
+        && ApolloPollComposeSubredditName(composeVC).length > 0
+        && ApolloPollComposeUsername(composeVC).length > 0;
+    if ((!pending && !needsPoll) || objc_getAssociatedObject(composeVC, kApolloPollSetupScheduledKey)) return;
+
+    // Layout tells us when Apollo has attached the asynchronously created
+    // selector. Do not mutate that control or add child-view constraints in
+    // the layout pass itself: coalesce one setup on the next main-queue turn.
+    objc_setAssociatedObject(composeVC, kApolloPollSetupScheduledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIViewController *weakHost = composeVC;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *host = weakHost;
+        if (!host) return;
+        objc_setAssociatedObject(host, kApolloPollSetupScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!host.viewIfLoaded.window) return;
+        ApolloPollComposeInstallSegment(host);
+        ApolloPollComposeApplyPendingPostType(host);
+    });
+}
+
+%hook _TtC6Apollo25ComposePostViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    ApolloPollComposeClaimPendingPostType(self);
+    ApolloPollComposeScheduleSetup((UIViewController *)self);
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    ApolloPollComposeScheduleSetup((UIViewController *)self);
+}
+
+- (void)postTypeSegmentedControlValueChanged:(UISegmentedControl *)sender {
+    NSNumber *pollIndex = objc_getAssociatedObject(self, kApolloPollSegmentIndexKey);
+    if (pollIndex && sender.selectedSegmentIndex == pollIndex.integerValue) {
+        // Do not forward the synthetic enum case into Apollo's Swift switch;
+        // leave Poll selected and show our content below the shared control.
+        ApolloPollComposePresentComposer((UIViewController *)self);
+        return;
+    }
+    ApolloPollComposeHideComposer((UIViewController *)self);
+    %orig;
+}
+
+%end

@@ -1,0 +1,15 @@
+# Keeps SHA-pinned actions current (submodules stay manual: KSCrash is
+# deliberately pinned to 2.5.1). Updates arrive as
+# grouped weekly PRs so pr-build-ipa / repository-validation test them first.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

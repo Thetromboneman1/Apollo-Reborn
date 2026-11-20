@@ -1,0 +1,393 @@
+// ApolloGalleryMenu.xm
+//
+// Puts "Gallery View" in a subreddit or multireddit's nav-bar "..." menu, and
+// opens ApolloGalleryViewController when it's picked.
+//
+// Row rendering on both the Liquid Glass UIMenu and the legacy ActionController
+// sheet is owned entirely by ApolloActionMenu.{h,xm} — see that header for the
+// single-owner rationale. This file only supplies the feature-specific part
+// that genuinely can't be generic: WHICH sheet is "the subreddit's ... menu"
+// (identification below) and what happens when the row is picked
+// (ApolloGalleryMenuOpenForController). Everything about how the row looks or
+// where it's positioned is a declarative ApolloActionMenuSpec registered below.
+//
+// Which sheet is ours: the "..." menu has no header title to match on, so we
+// arm on -[PostsViewController moreOptionsBarButtonItemTappedWithSender:] and
+// let the first ActionController built inside a short grace window claim the
+// arm. The claim is recorded on the controller (via ApolloActionMenu's own
+// per-controller memoization of `matches`, which only ever runs this once per
+// sheet instance), so no later, unrelated sheet can pick it up.
+//
+// Which screens get the row: every feed that has a listing behind it. Subreddit
+// slugs, canonical multireddit paths and the Popular/All/Mod pseudo-subreddit
+// slugs all come from ApolloSubredditHeaders, whose helpers gate on Apollo's own
+// PostsType tag; Home is resolved here, as is a user profile (its "..." arms on
+// ProfileViewController below, resolved to "u/<name>"). The signed-in user's own
+// profile tab has no native "..." at all, so ApolloProfileMoreMenu.xm builds one
+// with Gallery View built in. Search results and every unrelated sheet resolve
+// to nil, which is what keeps the row off them.
+
+#import <UIKit/UIKit.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+
+#import "ApolloActionMenu.h"
+#import "ApolloCommon.h"
+#import "ApolloGalleryFeed.h"
+#import "ApolloGallerySource.h"
+#import "ApolloGalleryViewController.h"
+#import "ApolloNativeActionMenus.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloClasses.h"
+
+// Defined in ApolloSubredditHeaders.xm — resolves the slug for a genuine
+// single-subreddit feed, and nil for anything else (multireddit, Popular/All,
+// profile/special feeds).
+extern NSString *ApolloSubredditNameFromViewController(UIViewController *viewController);
+extern NSString *ApolloMultiredditPathFromViewController(UIViewController *viewController);
+extern NSInteger ApolloPostsTypeTagFromViewController(UIViewController *viewController);
+// The complement of the above for Apollo's three pseudo-subreddit feeds:
+// "popular", "all" or "mod" — the slugs their listings live at.
+extern NSString *ApolloSpecialFeedSlugFromViewController(UIViewController *viewController);
+// Defined in ApolloUserAvatars.xm — the username a profile screen is showing,
+// nil while it can't be determined yet.
+extern NSString *ApolloUsernameFromProfileViewController(UIViewController *viewController);
+
+static NSString *const kApolloGalleryMenuTitle = @"Gallery View";
+static NSString *const kApolloGalleryMenuSymbol = @"square.grid.2x2";
+
+// How long after the "..." tap an ActionController may still claim the arm.
+static const CFTimeInterval kApolloGalleryMenuArmGraceSeconds = 1.5;
+
+// The view controller whose "..." was just tapped, and when.
+static __weak UIViewController *sApolloGalleryArmedVC = nil;
+static CFTimeInterval sApolloGalleryArmedAt = 0.0;
+
+// Set on an ActionController once it has claimed the arm: an NSHashTable
+// holding the owning view controller weakly (a plain associated object
+// would keep the view controller alive).
+static char kApolloGalleryMenuOwnerKey;
+
+#pragma mark - Claiming
+
+// The view controller this ActionController belongs to, claiming the
+// pending arm the first time it's asked. Returns nil for every sheet that isn't
+// the subreddit/profile "..." menu. Safe to call more than once per controller —
+// only ApolloActionMenu's `matches` blocks below actually do, and they're
+// memoized to exactly once per sheet instance.
+static UIViewController *ApolloGalleryMenuOwnerForController(id actionController) {
+    if (!actionController) return nil;
+
+    NSHashTable *holder = objc_getAssociatedObject(actionController, &kApolloGalleryMenuOwnerKey);
+    if (holder) return holder.anyObject;
+
+    UIViewController *armed = sApolloGalleryArmedVC;
+    if (!armed) return nil;
+    if (CACurrentMediaTime() - sApolloGalleryArmedAt > kApolloGalleryMenuArmGraceSeconds) {
+        sApolloGalleryArmedVC = nil;
+        return nil;
+    }
+
+    holder = [NSHashTable weakObjectsHashTable];
+    [holder addObject:armed];
+    objc_setAssociatedObject(actionController, &kApolloGalleryMenuOwnerKey, holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // One-shot: consumed here so a second sheet opened later can't also claim it.
+    sApolloGalleryArmedVC = nil;
+    return armed;
+}
+
+// "u/<name>" when the owner is a profile screen showing a resolvable user,
+// else nil. The prefix keeps the identifier unambiguous next to bare subreddit
+// slugs and "/user/x/m/y" multireddit paths in the shared plumbing below, and
+// presentGalleryForSubreddit: routes it to the username presenter.
+static NSString *ApolloGalleryMenuProfileIdentifierForOwner(UIViewController *owner) {
+    if (![owner isKindOfClass:ApolloClassProfileViewController]) return nil;
+    NSString *username = ApolloUsernameFromProfileViewController(owner);
+    return username.length > 0 ? [@"u/" stringByAppendingString:username] : nil;
+}
+
+// "~home" when the owner is the signed-in HOME front page — the one feed whose
+// listings live at the API root rather than under a slug, which is why it needs
+// a sentinel instead of joining the pseudo-subreddits above. It can't collide
+// with a real slug: "~" is invalid in subreddit names.
+static NSString *ApolloGalleryMenuHomeIdentifierForOwner(UIViewController *owner) {
+    Class postsClass = ApolloClassPostsViewController;
+    if (!postsClass || ![owner isKindOfClass:postsClass]) return nil;
+    // Home's tag measured at 6 (2026-08-14 sim probe; subreddit=0,
+    // multireddit=1, random=5 per ApolloSubredditHeaders). The nav title is a
+    // second lock so a future re-numbering fails closed rather than pointing a
+    // root-path feed at the wrong listing.
+    NSInteger tag = ApolloPostsTypeTagFromViewController(owner);
+    if (tag != 6) return nil;
+    NSString *title = owner.navigationItem.title ?: owner.title;
+    if (![title isEqualToString:@"Home"]) return nil;
+    return @"~home";
+}
+
+// Bare subreddit slug (real or one of the Popular/All/Mod pseudo-subreddits),
+// canonical multireddit path, "u/<name>" profile identifier, or the "~home"
+// sentinel — whichever this screen's feed is. Nil for search results and every
+// other screen, which is what keeps the row off them.
+//
+// Every gate goes through this one function: the arm hook, the spec's `matches`
+// and the open path all have to agree on whether a screen has a gallery, and
+// three hand-kept copies of the chain could drift apart.
+static NSString *ApolloGalleryMenuIdentifierForOwner(UIViewController *owner) {
+    if (!owner) return nil;
+    return ApolloSubredditNameFromViewController(owner)
+        ?: ApolloMultiredditPathFromViewController(owner)
+        ?: ApolloSpecialFeedSlugFromViewController(owner)
+        ?: ApolloGalleryMenuProfileIdentifierForOwner(owner)
+        ?: ApolloGalleryMenuHomeIdentifierForOwner(owner);
+}
+
+static NSString *ApolloGalleryMenuListingIdentifierForController(id actionController) {
+    return ApolloGalleryMenuIdentifierForOwner(ApolloGalleryMenuOwnerForController(actionController));
+}
+
+static NSString *ApolloGalleryMenuSourceDescription(NSString *listingIdentifier) {
+    if ([listingIdentifier isEqualToString:@"~home"]) return @"Home";
+    if ([listingIdentifier hasPrefix:@"u/"]) return listingIdentifier;
+    if ([listingIdentifier hasPrefix:@"/user/"]) {
+        NSString *name = [listingIdentifier pathComponents].lastObject ?: @"multireddit";
+        return [@"m/" stringByAppendingString:name];
+    }
+    return listingIdentifier.length > 0 ? [@"r/" stringByAppendingString:listingIdentifier] : @"feed";
+}
+
+#pragma mark - Source sort inheritance
+
+// Apollo's PostsViewController keeps its active listing sort in Swift
+// optional-enum ivars — `currentSort` (RDKLinkSortingMethod?) and
+// `currentTimeSort` (RDKTimeSortingMethod?): Int64 raw at +0, is-nil byte at
+// +8. Same Optional layout ApolloPerPostCommentSort reads on the comments
+// screen; reads are defensive so a layout surprise just means "nothing to
+// inherit".
+static BOOL ApolloGalleryMenuReadOptionalEnumIvar(id object, const char *name, int64_t *outRaw) {
+    ptrdiff_t offset = ApolloIvarOffset(object_getClass(object), name);
+    if (offset < 0) return NO;
+    if ((size_t)(offset + 9) > class_getInstanceSize(object_getClass(object))) return NO;
+    const uint8_t *base = (const uint8_t *)(__bridge const void *)object;
+    if ((*(base + offset + 8)) & 0x1) return NO;   // Optional is .none
+    int64_t raw = 0;
+    memcpy(&raw, base + offset, sizeof(raw));
+    if (outRaw) *outRaw = raw;
+    return YES;
+}
+
+// RDKLinkSortingMethod raw → gallery sort. Raw values measured in the
+// simulator by flipping Apollo's own sort menu and logging the ivar
+// (2026-08-14, r/aww): hot=1, best=2, new=3, rising=4, controversial=5,
+// top=6. Every one of Apollo's sorts now has a gallery listing to match.
+static NSNumber *ApolloGalleryMenuGallerySortForLinkSortRaw(int64_t raw) {
+    switch (raw) {
+        case 1: return @(ApolloGallerySortHot);
+        case 2: return @(ApolloGallerySortBest);
+        case 3: return @(ApolloGallerySortNew);
+        case 4: return @(ApolloGallerySortRising);
+        case 5: return @(ApolloGallerySortControversial);
+        case 6: return @(ApolloGallerySortTop);
+        default: return nil;
+    }
+}
+
+// RDKTimeSortingMethod raw → gallery top window. Measured the same way:
+// day=2, week=3, month=4, year=6, all time=7 (hour=1 inferred as the only
+// slot below day; 5 never appears in Apollo's UI). "This hour" collapses to
+// Today — the gallery's smallest window — and the unobserved 5 leans Year,
+// the nearer neighbour of the 4/6 values around it.
+static NSNumber *ApolloGalleryMenuTopWindowForTimeSortRaw(int64_t raw) {
+    switch (raw) {
+        case 1: return @(ApolloGalleryTopWindowDay);
+        case 2: return @(ApolloGalleryTopWindowDay);
+        case 3: return @(ApolloGalleryTopWindowWeek);
+        case 4: return @(ApolloGalleryTopWindowMonth);
+        case 5: return @(ApolloGalleryTopWindowYear);
+        case 6: return @(ApolloGalleryTopWindowYear);
+        case 7: return @(ApolloGalleryTopWindowAll);
+        default: return nil;
+    }
+}
+
+// The source feed's sort, mapped for the gallery. Only PostsViewController
+// carries these ivars (profiles have no listing sort to read); everywhere
+// else both out-params stay nil and the gallery opens on its defaults.
+static void ApolloGalleryMenuResolveInheritedSort(UIViewController *owner,
+                                                  NSNumber **outSort,
+                                                  NSNumber **outWindow) {
+    if (outSort) *outSort = nil;
+    if (outWindow) *outWindow = nil;
+    Class postsClass = ApolloClassPostsViewController;
+    if (!postsClass || ![owner isKindOfClass:postsClass]) return;
+
+    int64_t sortRaw = 0;
+    if (!ApolloGalleryMenuReadOptionalEnumIvar(owner, "currentSort", &sortRaw)) return;
+    NSNumber *sort = ApolloGalleryMenuGallerySortForLinkSortRaw(sortRaw);
+
+    int64_t timeRaw = 0;
+    BOOL hasTime = ApolloGalleryMenuReadOptionalEnumIvar(owner, "currentTimeSort", &timeRaw);
+    NSNumber *window = hasTime ? ApolloGalleryMenuTopWindowForTimeSortRaw(timeRaw) : nil;
+
+    ApolloLog(@"[GalleryMenu] source sort raw=%lld timeRaw=%lld -> gallery sort=%@ window=%@",
+              (long long)sortRaw, (long long)(hasTime ? timeRaw : -1), sort, window);
+    if (outSort) *outSort = sort;
+    if (outWindow) *outWindow = window;
+}
+
+static void ApolloGalleryMenuOpenForController(id actionController) {
+    UIViewController *owner = ApolloGalleryMenuOwnerForController(actionController);
+    // Show the prepared listing on the tap, alongside the menu dismissal.
+    // Its presenter retains UIKit's dismissal resources through the push.
+    NSString *subreddit = ApolloGalleryMenuIdentifierForOwner(owner);
+    if (subreddit.length == 0 || !owner) {
+        ApolloLog(@"[GalleryMenu] Gallery View tapped but the listing could not be resolved");
+        return;
+    }
+
+    // Resolved now, not inside the block: the sort should reflect what the
+    // feed showed when the row was tapped, and the owner is guaranteed alive
+    // here.
+    NSNumber *inheritedSort = nil;
+    NSNumber *inheritedWindow = nil;
+    ApolloGalleryMenuResolveInheritedSort(owner, &inheritedSort, &inheritedWindow);
+
+    dispatch_block_t openGallery = ^{
+        [ApolloGalleryViewController presentGalleryForSubreddit:subreddit
+                                             fromViewController:owner
+                                             inheritedSortValue:inheritedSort
+                                        inheritedTopWindowValue:inheritedWindow];
+    };
+    if (ApolloNativeActionMenuPerformWithDismissal(actionController, openGallery)) {
+        ApolloLog(@"[GalleryMenu] Opening alongside the glass menu dismissal for %@",
+                  ApolloGalleryMenuSourceDescription(subreddit));
+        return;
+    }
+    openGallery();
+}
+
+#pragma mark - Arming
+
+%hook _TtC6Apollo19PostsViewController
+
+- (void)moreOptionsBarButtonItemTappedWithSender:(id)sender {
+    // Only arm for feeds a gallery makes sense for; that keeps every other
+    // sheet (and every other feed type) completely untouched.
+    NSString *identifier = ApolloGalleryMenuIdentifierForOwner((UIViewController *)self);
+    if (identifier.length > 0) {
+        sApolloGalleryArmedVC = (UIViewController *)self;
+        sApolloGalleryArmedAt = CACurrentMediaTime();
+        NSNumber *sort = nil;
+        NSNumber *window = nil;
+        ApolloGalleryMenuResolveInheritedSort((UIViewController *)self, &sort, &window);
+        [ApolloGalleryViewController prepareGalleryForSubreddit:identifier
+                                            fromViewController:(UIViewController *)self
+                                            inheritedSortValue:sort
+                                       inheritedTopWindowValue:window];
+    } else {
+        sApolloGalleryArmedVC = nil;
+    }
+    %orig;
+}
+
+%end
+
+// Someone else's profile: Apollo's own "..." presents the Private Message /
+// Follow / Block sheet, which flows through the same ActionController (and, on
+// Liquid Glass, the same UIMenu conversion) as the subreddit menu — so the
+// identical arm-and-claim adds Gallery View there. The signed-in user's own
+// profile tab never shows this button; ApolloProfileMoreMenu.xm owns that side.
+%hook _TtC6Apollo21ProfileViewController
+
+- (void)moreOptionsBarButtonItemTappedWithSender:(id)sender {
+    if (ApolloGalleryMenuProfileIdentifierForOwner((UIViewController *)self).length > 0) {
+        sApolloGalleryArmedVC = (UIViewController *)self;
+        sApolloGalleryArmedAt = CACurrentMediaTime();
+    } else {
+        sApolloGalleryArmedVC = nil;
+    }
+    %orig;
+}
+
+%end
+
+#pragma mark - Registration
+
+// Where our glass section goes: after whatever "submit a post" affordance leads
+// the menu, never above it. That affordance has two shapes in the wild — a plain
+// "Submit Post" row (what stock Apollo's action list produces), and a leading
+// inline UIMenu that renders as a small row of post-type icons (image / link /
+// text) at the top of the menu. Skipping both keeps the composer where muscle
+// memory expects it and puts Gallery View directly underneath. (Local copy of
+// the scan for the buildElement below — the registry's own scanner isn't
+// exported, and a combined two-row section can't be expressed declaratively.)
+static NSUInteger ApolloGalleryMenuInsertionIndex(NSArray<UIMenuElement *> *children) {
+    NSUInteger index = 0;
+    while (index < children.count) {
+        UIMenuElement *element = children[index];
+        if ([element isKindOfClass:[UIMenu class]]) { index++; continue; }
+        if ([element isKindOfClass:[UIAction class]] &&
+            [((UIAction *)element).title hasPrefix:@"Submit"]) { index++; continue; }
+        break;
+    }
+    return index;
+}
+
+%ctor {
+    %init;
+
+    ApolloActionMenuSpec *spec = [ApolloActionMenuSpec new];
+    spec.identifier = @"GalleryView";
+    spec.placement = ApolloActionMenuPlacementAfterLeadingSubmitAffordance;
+    spec.inlineSection = YES;
+    spec.legacyDismissesSheet = YES;
+
+    spec.matches = ^BOOL(id actionController, NSString *menuTitle) {
+        (void)menuTitle;
+        // Matches any feed with a gallery behind it — subreddit, multireddit,
+        // Home, Popular/All/Mod, or a user profile — and nothing else.
+        return ApolloGalleryMenuListingIdentifierForController(actionController).length > 0;
+    };
+    spec.title = ^NSString *(id actionController, UITableViewCell *donor) {
+        (void)actionController; (void)donor;
+        return kApolloGalleryMenuTitle;
+    };
+    spec.image = ^UIImage *(id actionController, UITableViewCell *donor) {
+        (void)actionController; (void)donor;
+        return ApolloActionMenuSymbolIcon(kApolloGalleryMenuSymbol)
+            ?: [UIImage systemImageNamed:kApolloGalleryMenuSymbol];
+    };
+    spec.perform = ^(id actionController) {
+        ApolloGalleryMenuOpenForController(actionController);
+    };
+    // Keep Gallery View in its own inline group.
+    spec.buildElement = ^(id actionController, NSMutableArray<UIMenuElement *> *children) {
+        NSString *listingIdentifier = ApolloGalleryMenuListingIdentifierForController(actionController);
+        if (listingIdentifier.length == 0) return;
+        __weak id weakController = actionController;
+        // ApolloActionMenuSymbolIcon, not a raw symbol: UIMenu restyles raw
+        // symbol images through its own smaller configuration, which left this
+        // row's glyph ~15pt next to the ~24pt native rasters (#985 review).
+        UIImage *galleryIcon = ApolloActionMenuSymbolIcon(kApolloGalleryMenuSymbol)
+            ?: [UIImage systemImageNamed:kApolloGalleryMenuSymbol];
+        UIAction *galleryAction = [UIAction actionWithTitle:kApolloGalleryMenuTitle
+                                                      image:galleryIcon
+                                                 identifier:nil
+                                                    handler:^(__unused __kindof UIAction *sender) {
+            ApolloGalleryMenuOpenForController(weakController);
+        }];
+        UIMenu *section = [UIMenu menuWithTitle:@""
+                                          image:nil
+                                     identifier:nil
+                                        options:UIMenuOptionsDisplayInline
+                                       children:@[galleryAction]];
+        NSUInteger index = ApolloGalleryMenuInsertionIndex(children);
+        [children insertObject:section atIndex:index];
+        ApolloLog(@"[GalleryMenu] Injected row for %@ at index %lu (glass menu)",
+                  ApolloGalleryMenuSourceDescription(listingIdentifier),
+                  (unsigned long)index);
+    };
+
+    ApolloActionMenuRegister(spec);
+
+    ApolloLog(@"[GalleryMenu] Gallery View menu specs registered");
+}

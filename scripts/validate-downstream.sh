@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD=false
+
+if [[ "${1:-}" == "--build" ]]; then
+  BUILD=true
+elif [[ $# -gt 0 ]]; then
+  printf 'usage: %s [--build]\n' "$0" >&2
+  exit 2
+fi
+
+python3 "$ROOT/scripts/documentation_health.py" --check
+python3 -m py_compile \
+  "$ROOT/scripts/generate_release_notes.py" \
+  "$ROOT/scripts/upstream_pr_batch.py" \
+  "$ROOT/scripts/update_source_json.py" \
+  "$ROOT/scripts/validate_release_inputs.py"
+
+bash -n \
+  "$ROOT/build-ipa.sh" \
+  "$ROOT/patch.sh" \
+  "$ROOT/scripts/publish-upstream-pr-batch.sh" \
+  "$ROOT/scripts/push-validated-docs.sh" \
+  "$ROOT/scripts/publish-upstream-sync-review.sh" \
+  "$ROOT/scripts/build_release_variants.sh" \
+  "$ROOT/scripts/validate_release_variants.sh" \
+  "$ROOT/scripts/verify-base-ipa.sh"
+
+bash "$ROOT/tests/upstream_sync_publish_test.sh"
+bash "$ROOT/tests/push_validated_docs_test.sh"
+python3 "$ROOT/tests/upstream_pr_batch_test.py"
+python3 "$ROOT/tests/upstream_batch_preservation_test.py"
+python3 "$ROOT/tests/pr_ipa_authorization_test.py"
+bash "$ROOT/tests/verify_base_ipa_test.sh"
+python3 "$ROOT/tests/integration_review_regression_test.py"
+bash "$ROOT/tests/run_allplus_feed_tests.sh"
+bash "$ROOT/tests/run_allplus_merge_tests.sh"
+bash "$ROOT/tests/run_allplus_slider_tests.sh"
+bash "$ROOT/tests/run_spelling_tests.sh"
+bash "$ROOT/tests/run_native_search_visibility_tests.sh"
+bash "$ROOT/tests/run_search_bar_preferences_tests.sh"
+bash "$ROOT/tests/run_unread_badge_migration_tests.sh"
+bash "$ROOT/tests/run_native_direct_action_gate_tests.sh"
+bash "$ROOT/tests/run_offline_library_tests.sh"
+
+if [[ "$BUILD" == true ]]; then
+  : "${THEOS:?THEOS must point to a Theos checkout for --build}"
+  make -C "$ROOT" package FINALPACKAGE=1
+  compgen -G "$ROOT/packages/*.deb" >/dev/null || {
+    printf 'Apollo-Reborn build did not produce a package\n' >&2
+    exit 1
+  }
+fi
+
+printf 'Apollo-Reborn downstream validation passed\n'

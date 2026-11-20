@@ -1,0 +1,3791 @@
+// Simulator-only debug bridge: synthesize a real UITouch tap inside the app.
+//
+// idb_companion 1.1.8's HID events are silently dropped by Xcode 27's iOS-27
+// simulators, so there is currently no external way to tap the sim from
+// scripts. This module lets the host drive taps through the injected tweak
+// instead: write "x y" (screen points) to /tmp/apollofix-tap.txt, then post
+// the Darwin notification:
+//
+//   echo "200 560" > /tmp/apollofix-tap.txt
+//   xcrun simctl spawn <UDID> notifyutil -p apollofix.debugtap
+//
+// The synthesized touch goes through -[UIApplication sendEvent:], so it
+// exercises genuine hit-testing, responder-chain bubbling, gesture
+// recognizers, and ASControlNode tracking — unlike calling handlers directly.
+// Never compiled into device builds.
+#if APOLLO_SIM_BUILD
+
+#import "ApolloAccountCredentials.h"
+#import "ApolloAsyncDisplayGuard.h"
+#import "ApolloAutoHideTabBar.h"
+#import "ApolloTiledText.h"
+#import "ApolloChatRoomDirectory.h"
+#import "ApolloDirectChatWeb.h"
+#import "ApolloWebSessionStore.h"
+#import "ApolloUnreadBadges.h"
+#import "ApolloCommentVoteInsights.h"
+#import <AVFoundation/AVFoundation.h>
+#import <objc/runtime.h>
+#import "ApolloCommon.h"
+#import "ApolloDuoRail.h"
+#import "ApolloDuoSplitView.h"
+#import "ApolloImageUploadHost.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloFloatingTabs.h"
+#import "ApolloGalleryImageLoader.h"
+#import "ApolloGoogleSearch.h"
+#import "ApolloKagiSearch.h"
+#import "ApolloGoogleSearchTab.h"
+#import "ApolloLinkPreviewFetcher.h"
+#import "ApolloProfileEditorWebViewController.h"
+#import "ApolloTranslation.h"
+#import "ApolloWebTextDecoding.h"
+#import "ApolloWebJSON.h"
+#import "ApolloWebJSONRoutes.h"
+#import "ApolloState.h"
+#import "ApolloTextureDecls.h"
+#import "ApolloThemeStore.h"
+#import "ApolloThemeRuntime.h"
+#import "UserDefaultConstants.h"
+#import "UIWindow+Apollo.h"
+#import "ipad/ApolloPaneSplitViewController.h"
+#import "ipad/ApolloPaneLayout.h"
+#import "ipad/ApolloIPadLayoutWelcome.h"
+#import "ipad/ApolloPaneSidebar.h"
+#import "ipad/ApolloPaneMenus.h"
+#import "ipad/ApolloPaneFocus.h"
+#import <mach-o/dyld.h>
+
+void ApolloSubredditIndexDebugDescribeTables(void); // ApolloSubredditIndexPolish.xm (sim-only)
+#import <objc/message.h>
+#import <objc/runtime.h>
+#import <mach/mach.h>
+#import "ApolloClasses.h"
+
+@interface UITouch (ApolloSimDebugTap)
+- (void)setPhase:(UITouchPhase)phase;
+- (void)setTapCount:(NSUInteger)tapCount;
+- (void)setTimestamp:(NSTimeInterval)timestamp;
+- (void)setWindow:(UIWindow *)window;
+- (void)setView:(UIView *)view;
+- (void)_setLocationInWindow:(CGPoint)location resetPrevious:(BOOL)resetPrevious;
+- (void)_setIsFirstTouchForView:(BOOL)first;
+@end
+
+@interface UIEvent (ApolloSimDebugTap)
+- (void)_clearTouches;
+- (void)_addTouch:(UITouch *)touch forDelayedDelivery:(BOOL)delayed;
+- (void)_setTimestamp:(NSTimeInterval)timestamp;
+@end
+
+@interface UIApplication (ApolloSimDebugTap)
+- (UIEvent *)_touchesEvent;
+@end
+
+// The command file and the Darwin notification that announces it are
+// machine-global, and several simulators driven by parallel sessions are the
+// norm on a dev box — a tap meant for one app landed in every listening app.
+// Each launch can therefore name its own pair via the environment
+// (SIMCTL_CHILD_APOLLOFIX_TAP_FILE / SIMCTL_CHILD_APOLLOFIX_TAP_NOTIFY on the
+// simctl launch line); the historical defaults remain for single-session use.
+static NSString *const kApolloSimDefaultTapFile = @"/tmp/apollofix-tap.txt";
+static NSString *const kApolloSimDefaultTapNotify = @"apollofix.debugtap";
+
+static NSString *ApolloSimTapFile(void) {
+    NSString *env = NSProcessInfo.processInfo.environment[@"APOLLOFIX_TAP_FILE"];
+    return env.length ? env : kApolloSimDefaultTapFile;
+}
+
+static NSString *ApolloSimTapNotify(void) {
+    NSString *env = NSProcessInfo.processInfo.environment[@"APOLLOFIX_TAP_NOTIFY"];
+    return env.length ? env : kApolloSimDefaultTapNotify;
+}
+
+// "mediastate": dump the presented fullscreen viewer's player + the audio
+// session, for the rotation-mute diagnosis (issue #1072).
+static void ApolloSimDebugDumpMediaState(void) {
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    UIWindowScene *scene = ApolloAllWindows().firstObject.windowScene;
+    ApolloLog(@"[SimDebugTap] mediastate: session=%@ orientation=%ld",
+              session.category, (long)scene.interfaceOrientation);
+    for (UIWindow *window in ApolloAllWindows()) {
+        UIViewController *vc = window.rootViewController;
+        while (vc) {
+            NSString *name = NSStringFromClass([vc class]);
+            ApolloLog(@"[SimDebugTap] mediastate: presented chain -> %@ bounds=%@", name,
+                      NSStringFromCGRect(vc.view.bounds));
+            if ([name containsString:@"MediaPageViewController"]) {
+                NSArray *pages = [vc respondsToSelector:@selector(viewControllers)]
+                    ? [(UIPageViewController *)vc viewControllers] : @[];
+                for (UIViewController *page in pages) {
+                    AVPlayer *player = ApolloObjectIvar(page, "player");
+                    NSString *source = @"player";
+                    if (!player) {
+                        id container = ApolloObjectIvar(page, "playerLayerContainerView");
+                        id layer = ApolloObjectIvar(container, "playerLayer");
+                        if ([layer isKindOfClass:[AVPlayerLayer class]]) {
+                            player = [(AVPlayerLayer *)layer player];
+                            source = @"playerLayerContainerView";
+                        }
+                    }
+                    ApolloLog(@"[SimDebugTap] mediastate: page=%@ player=%p (%@) muted=%d rate=%.2f bounds=%@",
+                              NSStringFromClass([page class]), player, source,
+                              player ? (int)[player isMuted] : -1, player ? [player rate] : 0.0f,
+                              NSStringFromCGRect(page.view.bounds));
+                }
+            }
+            vc = vc.presentedViewController;
+        }
+        // The feed table under the viewer: offset/insets, visible rows and
+        // each visible cell's video player, so a rotation-driven visibility
+        // change can be correlated with the fullscreen player above it.
+        UIViewController *root = window.rootViewController;
+        UIViewController *content = root;
+        if ([content isKindOfClass:[UITabBarController class]]) content = [(UITabBarController *)content selectedViewController];
+        if ([content isKindOfClass:[UINavigationController class]]) content = [(UINavigationController *)content topViewController];
+        UITableView *table = nil;
+        if ([content.view isKindOfClass:[UITableView class]]) table = (UITableView *)content.view;
+        for (UIView *sub in content.view.subviews) {
+            if ([sub isKindOfClass:[UITableView class]]) { table = (UITableView *)sub; break; }
+        }
+        if (!table) continue;
+        ApolloLog(@"[SimDebugTap] mediastate: feed %@ table bounds=%@ offset=%@ insets=%@ window=%p",
+                  NSStringFromClass([content class]), NSStringFromCGRect(table.bounds),
+                  NSStringFromCGPoint(table.contentOffset),
+                  NSStringFromUIEdgeInsets(table.adjustedContentInset), table.window);
+        for (UITableViewCell *cell in table.visibleCells) {
+            NSIndexPath *ip = [table indexPathForCell:cell];
+            id node = [cell respondsToSelector:@selector(node)] ? [(id)cell node] : nil;
+            id rich = ApolloObjectIvar(node, "richMediaNode");
+            id videoNode = ApolloObjectIvar(rich, "videoNode");
+            SEL layerSel = @selector(playerLayer);
+            id layer = [videoNode respondsToSelector:layerSel]
+                ? ((id (*)(id, SEL))objc_msgSend)(videoNode, layerSel) : nil;
+            AVPlayer *player = [layer isKindOfClass:[AVPlayerLayer class]] ? [(AVPlayerLayer *)layer player] : nil;
+            SEL playerSel = @selector(player);
+            if (!player && [videoNode respondsToSelector:playerSel]) {
+                player = ((id (*)(id, SEL))objc_msgSend)(videoNode, playerSel);
+            }
+            ApolloLog(@"[SimDebugTap] mediastate:   row %ld frame=%@ node=%@ videoNode=%p player=%p muted=%d rate=%.2f",
+                      (long)ip.row, NSStringFromCGRect(cell.frame), NSStringFromClass([node class]),
+                      videoNode, player, player ? (int)[player isMuted] : -1, player ? [player rate] : 0.0f);
+        }
+    }
+}
+
+@interface ApolloPaneTransitionProbeViewController : UIViewController
+- (instancetype)initWithIdentifier:(NSString *)identifier;
+@end
+
+@implementation ApolloPaneTransitionProbeViewController {
+    NSString *_probeIdentifier;
+}
+
+- (instancetype)initWithIdentifier:(NSString *)identifier {
+    self = [super initWithNibName:nil bundle:nil];
+    if (self) {
+        _probeIdentifier = [identifier copy] ?: @"unnamed";
+        self.title = [NSString stringWithFormat:@"Transition Probe %@", _probeIdentifier];
+    }
+    return self;
+}
+
+- (void)loadView {
+    UIView *view = [UIView new];
+    view.backgroundColor = UIColor.systemBackgroundColor;
+    UILabel *label = [UILabel new];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
+    label.text = self.title;
+    [view addSubview:label];
+    [NSLayoutConstraint activateConstraints:@[
+        [label.centerXAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.centerXAnchor],
+        [label.centerYAnchor constraintEqualToAnchor:view.safeAreaLayoutGuide.centerYAnchor],
+    ]];
+    self.view = view;
+}
+
+@end
+
+static void ApolloSimDebugSendTouch(UITouch *touch) {
+    UIApplication *app = UIApplication.sharedApplication;
+    if (![app respondsToSelector:@selector(_touchesEvent)]) return;
+    UIEvent *event = [app _touchesEvent];
+    if ([touch respondsToSelector:@selector(setTimestamp:)]) {
+        [touch setTimestamp:NSProcessInfo.processInfo.systemUptime];
+    }
+    if ([event respondsToSelector:@selector(_setTimestamp:)]) {
+        [event _setTimestamp:NSProcessInfo.processInfo.systemUptime];
+    }
+    [event _clearTouches];
+    [event _addTouch:touch forDelayedDelivery:NO];
+    [app sendEvent:event];
+}
+
+// "pinch cx cy startDistance endDistance [seconds]": two real touches in a
+// single event, exercising UIKit's recognizer and interactive layout rather
+// than invoking the gallery's action directly. Distances are screen points.
+static void ApolloSimDebugPerformPinch(CGPoint center, CGFloat startDistance,
+                                       CGFloat endDistance, NSTimeInterval duration) {
+    UIWindow *window = ApolloKeyWindow() ?: ApolloAllWindows().firstObject;
+    if (!window || startDistance <= 0 || endDistance <= 0) return;
+    NSMutableArray<UITouch *> *touches = [NSMutableArray array];
+    for (NSInteger index = 0; index < 2; index++) {
+        CGPoint point = CGPointMake(center.x + (index ? 0.5 : -0.5) * startDistance, center.y);
+        UIView *hitView = [window hitTest:point withEvent:nil];
+        if (!hitView) return;
+        UITouch *touch = [UITouch new];
+        [touch setWindow:window];
+        [touch setView:hitView];
+        [touch setTapCount:1];
+        [touch _setIsFirstTouchForView:index == 0];
+        [touch _setLocationInWindow:point resetPrevious:YES];
+        [touch setPhase:UITouchPhaseBegan];
+        [touches addObject:touch];
+    }
+    void (^send)(void) = ^{
+        UIApplication *app = UIApplication.sharedApplication;
+        UIEvent *event = [app _touchesEvent];
+        NSTimeInterval timestamp = NSProcessInfo.processInfo.systemUptime;
+        [event _clearTouches];
+        [event _setTimestamp:timestamp];
+        for (UITouch *touch in touches) {
+            [touch setTimestamp:timestamp];
+            [event _addTouch:touch forDelayedDelivery:NO];
+        }
+        [app sendEvent:event];
+    };
+    send();
+    NSInteger steps = MAX(2, (NSInteger)(duration * 60.0));
+    for (NSInteger step = 1; step <= steps + 1; step++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(step * duration / steps * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            CGFloat fraction = MIN(1.0, (CGFloat)step / steps);
+            CGFloat distance = startDistance + (endDistance - startDistance) * fraction;
+            for (NSInteger index = 0; index < 2; index++) {
+                UITouch *touch = touches[index];
+                [touch _setLocationInWindow:CGPointMake(center.x + (index ? 0.5 : -0.5) * distance, center.y)
+                              resetPrevious:NO];
+                [touch setPhase:step > steps ? UITouchPhaseEnded : UITouchPhaseMoved];
+            }
+            send();
+            if (step > steps) ApolloLog(@"[SimDebugTap] pinch delivered %.0f -> %.0f", startDistance, endDistance);
+        });
+    }
+}
+
+static void ApolloSimDebugPerformTap(CGPoint point) {
+    // Hit-test every visible window from topmost down, not just the key
+    // window: alert/overlay windows sit above it, and key-window-only taps
+    // sailed straight through their chrome into the app underneath.
+    UIView *hitView = nil;
+    UIWindow *window = nil;
+    NSArray<UIWindow *> *ordered = [ApolloAllWindows() sortedArrayUsingComparator:^NSComparisonResult(UIWindow *a, UIWindow *b) {
+        if (a.windowLevel == b.windowLevel) return NSOrderedSame;
+        return a.windowLevel > b.windowLevel ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    for (UIWindow *candidate in ordered) {
+        if (candidate.hidden) continue;
+        UIView *hit = [candidate hitTest:point withEvent:nil];
+        if (hit) { window = candidate; hitView = hit; break; }
+    }
+    if (!window || !hitView) {
+        ApolloLog(@"[SimDebugTap] no window/hit view for (%.0f, %.0f)", point.x, point.y);
+        return;
+    }
+    ApolloLog(@"[SimDebugTap] tapping (%.0f, %.0f) hit=%@", point.x, point.y,
+              NSStringFromClass(hitView.class));
+
+    UITouch *touch = [UITouch new];
+    if (![touch respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)] ||
+        ![touch respondsToSelector:@selector(setPhase:)]) {
+        ApolloLog(@"[SimDebugTap] UITouch private setters unavailable on this runtime");
+        return;
+    }
+    [touch setWindow:window];
+    [touch setView:hitView];
+    [touch setTapCount:1];
+    if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) {
+        [touch _setIsFirstTouchForView:YES];
+    }
+    [touch _setLocationInWindow:point resetPrevious:YES];
+    [touch setPhase:UITouchPhaseBegan];
+    ApolloSimDebugSendTouch(touch);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [touch _setLocationInWindow:point resetPrevious:NO];
+        [touch setPhase:UITouchPhaseEnded];
+        ApolloSimDebugSendTouch(touch);
+        ApolloLog(@"[SimDebugTap] tap delivered");
+    });
+}
+
+// "hold x y" command: a stationary touch held long enough to trigger ordinary
+// UILongPressGestureRecognizer interactions. This is separate from swipe so a
+// long-press test doesn't inject tiny moved phases that can trip movement limits.
+static void ApolloSimDebugPerformHold(CGPoint point) {
+    UIWindow *window = ApolloKeyWindow() ?: ApolloAllWindows().firstObject;
+    UIView *hitView = [window hitTest:point withEvent:nil];
+    if (!window || !hitView) {
+        ApolloLog(@"[SimDebugTap] no window/hit view for hold (%.0f, %.0f)", point.x, point.y);
+        return;
+    }
+    ApolloLog(@"[SimDebugTap] holding (%.0f, %.0f) hit=%@", point.x, point.y,
+              NSStringFromClass(hitView.class));
+
+    UITouch *touch = [UITouch new];
+    if (![touch respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)] ||
+        ![touch respondsToSelector:@selector(setPhase:)]) return;
+    [touch setWindow:window];
+    [touch setView:hitView];
+    [touch setTapCount:1];
+    if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) {
+        [touch _setIsFirstTouchForView:YES];
+    }
+    [touch _setLocationInWindow:point resetPrevious:YES];
+    [touch setPhase:UITouchPhaseBegan];
+    ApolloSimDebugSendTouch(touch);
+
+    // A real finger produces stationary samples while it is held. Supplying one
+    // gives UIKit's long-press timers a fresh event to advance against in the
+    // simulator's synthesized UIEvent stream.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [touch _setLocationInWindow:point resetPrevious:NO];
+        [touch setPhase:UITouchPhaseStationary];
+        ApolloSimDebugSendTouch(touch);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [touch _setLocationInWindow:point resetPrevious:NO];
+        [touch setPhase:UITouchPhaseEnded];
+        ApolloSimDebugSendTouch(touch);
+        ApolloLog(@"[SimDebugTap] hold delivered");
+    });
+}
+
+// "swipe x1 y1 x2 y2" command: a real drag (began → moved steps → ended) so a
+// scroll view actually scrolls, unlike the single tap above. Reuses the same
+// synthesized-touch delivery path.
+// steps/interval control the drag speed: the default 12 x 12 ms is a flick that
+// commits an interactive pop; a slow, short drag (e.g. 30 x 20 ms to x=45) ends
+// below UIKit's commit threshold and cancels it instead.
+// `settle` (seconds, default 0) keeps the finger DOWN and stationary at the end
+// point before lifting, so the pan recognizer's velocity has decayed to ~0 when
+// the touch ends: a drag that stops dead where it is, with no deceleration.
+// Without it the synthetic lift carries the last move's velocity and the list
+// keeps travelling (measured: a 60pt swipe scrolling 314pt), which cannot land
+// the search bar exactly at its collapsed rest the way a paused finger does.
+static void ApolloSimDebugPerformSwipeTimed(CGPoint start, CGPoint end, int steps, NSTimeInterval interval,
+                                            NSTimeInterval settle) {
+    UIWindow *window = ApolloKeyWindow() ?: ApolloAllWindows().firstObject;
+    UIView *hitView = [window hitTest:start withEvent:nil];
+    if (!window || !hitView) {
+        ApolloLog(@"[SimDebugTap] no window/hit view for swipe start (%.0f, %.0f)", start.x, start.y);
+        return;
+    }
+    UITouch *touch = [UITouch new];
+    if (![touch respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)] ||
+        ![touch respondsToSelector:@selector(setPhase:)]) return;
+    [touch setWindow:window];
+    [touch setView:hitView];
+    [touch setTapCount:1];
+    if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) [touch _setIsFirstTouchForView:YES];
+    [touch _setLocationInWindow:start resetPrevious:YES];
+    [touch setPhase:UITouchPhaseBegan];
+    ApolloSimDebugSendTouch(touch);
+
+    for (int i = 1; i <= steps; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * interval * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            CGFloat t = (CGFloat)i / steps;
+            CGPoint p = CGPointMake(start.x + (end.x - start.x) * t, start.y + (end.y - start.y) * t);
+            [touch _setLocationInWindow:p resetPrevious:NO];
+            [touch setPhase:UITouchPhaseMoved];
+            ApolloSimDebugSendTouch(touch);
+        });
+    }
+    // A held finger still reports itself: stationary Moved events through the
+    // settle window are what let the recognizer's velocity integrator see
+    // time passing with no displacement.
+    if (settle > 0.0) {
+        int holds = MAX(1, (int)(settle / 0.03));
+        for (int h = 1; h <= holds; h++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)((steps * interval + h * 0.03) * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [touch _setLocationInWindow:end resetPrevious:NO];
+                [touch setPhase:UITouchPhaseMoved];
+                ApolloSimDebugSendTouch(touch);
+            });
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((steps * interval + settle + 0.02) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [touch _setLocationInWindow:end resetPrevious:NO];
+        [touch setPhase:UITouchPhaseEnded];
+        ApolloSimDebugSendTouch(touch);
+        ApolloLog(@"[SimDebugTap] swipe delivered (%.0f,%.0f)->(%.0f,%.0f) over %d x %.0f ms, settle %.0f ms",
+                  start.x, start.y, end.x, end.y, steps, interval * 1000.0, settle * 1000.0);
+    });
+}
+
+// "press x y seconds" command: touch down, hold stationary, touch up. Drives
+// UILongPressGestureRecognizer and UIContextMenuInteraction, which idb's
+// synthesized HID events fail to trigger reliably.
+static void ApolloSimDebugPerformPress(CGPoint point, NSTimeInterval duration) {
+    UIWindow *window = ApolloKeyWindow() ?: ApolloAllWindows().firstObject;
+    UIView *hitView = [window hitTest:point withEvent:nil];
+    if (!window || !hitView) {
+        ApolloLog(@"[SimDebugTap] no window/hit view for press (%.0f, %.0f)", point.x, point.y);
+        return;
+    }
+    UITouch *touch = [UITouch new];
+    if (![touch respondsToSelector:@selector(_setLocationInWindow:resetPrevious:)] ||
+        ![touch respondsToSelector:@selector(setPhase:)]) return;
+    [touch setWindow:window];
+    [touch setView:hitView];
+    [touch setTapCount:1];
+    if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) [touch _setIsFirstTouchForView:YES];
+    [touch _setLocationInWindow:point resetPrevious:YES];
+    [touch setPhase:UITouchPhaseBegan];
+    ApolloSimDebugSendTouch(touch);
+
+    // Stationary "moved" ticks keep the touch alive for recognizers that
+    // sample continuously; a long press tolerates zero movement.
+    const NSTimeInterval tick = 0.1;
+    for (NSTimeInterval elapsed = tick; elapsed < duration; elapsed += tick) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(elapsed * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [touch _setLocationInWindow:point resetPrevious:NO];
+            [touch setPhase:UITouchPhaseStationary];
+            ApolloSimDebugSendTouch(touch);
+        });
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(duration * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [touch _setLocationInWindow:point resetPrevious:NO];
+        [touch setPhase:UITouchPhaseEnded];
+        ApolloSimDebugSendTouch(touch);
+        ApolloLog(@"[SimDebugTap] press delivered (%.0f,%.0f) duration=%.2f",
+                  point.x, point.y, duration);
+    });
+}
+
+// "dump" command: write the full view hierarchy of every window (class, frame
+// in window coords, hidden/alpha/backgroundColor) to /tmp/apollofix-dump.txt so
+// the host can inspect z-order and geometry without a debugger attached.
+static void ApolloSimDebugDumpView(UIView *view, UIWindow *window, NSInteger depth, NSMutableString *out) {
+    CGRect winFrame = [view.superview convertRect:view.frame toView:window];
+    NSString *pad = [@"" stringByPaddingToLength:MIN(depth, 40) * 2 withString:@" " startingAtIndex:0];
+    UIColor *bg = view.backgroundColor;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    NSString *bgDesc = @"nil";
+    if (bg && [bg getRed:&r green:&g blue:&b alpha:&a]) {
+        bgDesc = [NSString stringWithFormat:@"rgba(%.2f,%.2f,%.2f,%.2f)", r, g, b, a];
+    } else if (bg) {
+        bgDesc = bg.description;
+    }
+    [out appendFormat:@"%@%@ frame=(%.1f,%.1f,%.1f,%.1f)%@ alpha=%.2f bg=%@\n",
+        pad, NSStringFromClass(view.class),
+        winFrame.origin.x, winFrame.origin.y, winFrame.size.width, winFrame.size.height,
+        view.hidden ? @" HIDDEN" : @"", view.alpha, bgDesc];
+    for (UIView *subview in view.subviews) {
+        ApolloSimDebugDumpView(subview, window, depth + 1, out);
+    }
+}
+
+// "sbprobe x y [seconds [refreshAt]]" command: tap (x, y) and, for the next
+// `seconds` (default 1.2), sample every 33ms the first nav-bar UISearchBar's subtree —
+// model frame (bar coordinates), presentation-layer frame and opacity, hidden,
+// clipsToBounds and running animation keys of every button / text field /
+// container — to /tmp/apollofix-sbprobe.txt. Used to see what UIKit's cancel
+// button actually does during the search activation animation. `refreshAt`
+// forces a navigation-title refresh that many seconds in, to land the title
+// recenter inside the trailing-item swap on purpose (see the title-width
+// reservation in ApolloLiquidGlass.xm).
+static UISearchBar *ApolloSimDebugFindSearchBar(UIView *view) {
+    if ([view isKindOfClass:UISearchBar.class]) return (UISearchBar *)view;
+    for (UIView *sub in view.subviews) {
+        UISearchBar *found = ApolloSimDebugFindSearchBar(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static NSString *ApolloSimDebugProbeLine(UIView *view, UIView *bar) {
+    CGRect model = bar ? [view.superview convertRect:view.frame toView:bar] : view.frame;
+    CALayer *pres = view.layer.presentationLayer;
+    CGRect pf = pres ? pres.frame : CGRectNull;
+    return [NSString stringWithFormat:@"%@ model=(%.1f,%.1f,%.1f,%.1f) pres=(%.1f,%.1f,%.1f,%.1f) a=%.2f/%.2f h=%d/%d%@ clip=%d/%d mask=%d anims=%@",
+        NSStringFromClass(view.class),
+        model.origin.x, model.origin.y, model.size.width, model.size.height,
+        pf.origin.x, pf.origin.y, pf.size.width, pf.size.height,
+        view.alpha, pres ? pres.opacity : -1.0, (int)view.hidden, pres ? (int)pres.hidden : -1, view.hidden ? @" HIDDEN" : @"",
+        (int)view.clipsToBounds, (int)view.layer.masksToBounds, view.layer.mask != nil,
+        [view.layer.animationKeys componentsJoinedByString:@","] ?: @""];
+}
+
+// Every view from the bar down to (and including) the cancel button's whole
+// subtree, plus the bar's ancestors up to the navigation bar: what clips,
+// what masks, what is transparent while the cancel button animates in.
+static void ApolloSimDebugProbeCollect(UIView *view, UIView *bar, NSMutableString *out, NSInteger depth) {
+    // The whole navigation bar subtree, every sample: what is on screen, what
+    // is a portal copy, what is hidden or transparent while the cancel button
+    // animates in. Text field internals and the tweak's own action strip are
+    // noise and skipped; SwiftUI platter internals are cut at depth 9.
+    [out appendFormat:@"  %*s%@\n", (int)depth * 2, "", ApolloSimDebugProbeLine(view, bar)];
+    if ([view isKindOfClass:UITextField.class] || depth >= 9) return;
+    if ([NSStringFromClass(view.class) isEqualToString:@"ApolloNavigationActionsStrip"]) return;
+    for (UIView *sub in view.subviews) ApolloSimDebugProbeCollect(sub, bar, out, depth + 1);
+}
+
+static UIView *ApolloSimDebugProbeNavBar(UIView *bar) {
+    UIView *v = bar;
+    while (v && ![v isKindOfClass:UINavigationBar.class]) v = v.superview;
+    return v;
+}
+
+static void ApolloSimDebugSearchBarProbe(CGPoint point, NSTimeInterval seconds, NSTimeInterval refreshAt) {
+    // Optional: force a navigation-title refresh `refreshAt` seconds after the tap, to
+    // land the title recenter inside the item swap on purpose (it only happens by chance
+    // otherwise) and watch what it does to the title control's width.
+    if (refreshAt > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(refreshAt * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            for (UIWindow *window in ApolloAllWindows()) {
+                if (window.hidden) continue;
+                UISearchBar *bar = ApolloSimDebugFindSearchBar(window);
+                UINavigationBar *navBar = (UINavigationBar *)ApolloSimDebugProbeNavBar(bar);
+                if (!navBar) continue;
+                ApolloNavigationTitleGlassRefreshNavigationBar(navBar);
+                ApolloLog(@"[SimDebugTap] forced title refresh at +%.2fs", refreshAt);
+                break;
+            }
+        });
+    }
+    NSMutableString *out = [NSMutableString string];
+    NSDate *start = [NSDate date];
+    __block NSInteger samples = 0;
+    NSInteger total = (NSInteger)(seconds / 0.033);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApolloSimDebugPerformTap(point);
+    });
+    for (NSInteger i = 0; i <= total; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.033 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UISearchBar *bar = nil;
+            for (UIWindow *window in ApolloAllWindows()) {
+                if (window.hidden) continue;
+                bar = ApolloSimDebugFindSearchBar(window);
+                if (bar) break;
+            }
+            [out appendFormat:@"--- t=%.3f bar=%@\n", -[start timeIntervalSinceNow], bar ? @"" : @"(none)"];
+            UIView *navBar = ApolloSimDebugProbeNavBar(bar);
+            if (navBar) ApolloSimDebugProbeCollect(navBar, bar, out, 0);
+            else if (bar) ApolloSimDebugProbeCollect(bar, bar, out, 0);
+            if (++samples > total) {
+                [out writeToFile:@"/tmp/apollofix-sbprobe.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                ApolloLog(@"[SimDebugTap] search bar probe written (%lu bytes)", (unsigned long)out.length);
+            }
+        });
+    }
+}
+
+// "fieldprobe" command: log everything that decides whether the nav-bar
+// search field draws its glass pill — the field's dynamic-material flags,
+// its background views and layer tree, the bar's hosting flags and the
+// owning navigation item — so a before/after of a cancelled swipe-back can
+// be compared line by line.
+static void ApolloSimDebugProbeLayer(CALayer *layer, NSInteger depth, NSInteger maxDepth) {
+    CGFloat bgAlpha = layer.backgroundColor ? CGColorGetAlpha(layer.backgroundColor) : -1.0;
+    CALayer *pres = layer.presentationLayer;
+    id source = [layer respondsToSelector:sel_registerName("sourceLayer")]
+        ? ((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("sourceLayer")) : nil;
+    ApolloLog(@"[FieldProbe] %*slayer %@ frame=%@ hidden=%d opacity=%.2f pres=%.2f/%d corner=%.1f bgA=%.2f filters=%lu comp=%d mask=%d subs=%lu%@",
+              (int)depth * 2, "", NSStringFromClass(layer.class), NSStringFromCGRect(layer.frame),
+              (int)layer.hidden, layer.opacity, pres ? pres.opacity : -1.0, pres ? (int)pres.hidden : -1,
+              layer.cornerRadius, bgAlpha,
+              (unsigned long)layer.filters.count, layer.compositingFilter != nil, layer.mask != nil,
+              (unsigned long)layer.sublayers.count,
+              source ? [NSString stringWithFormat:@" source=%@ %@ hidden=%d", NSStringFromClass([source class]),
+                        [source isKindOfClass:CALayer.class] ? NSStringFromCGRect(((CALayer *)source).frame) : @"",
+                        [source isKindOfClass:CALayer.class] ? (int)((CALayer *)source).hidden : -1] : @"");
+    if (depth >= maxDepth) return;
+    for (CALayer *sub in layer.sublayers) ApolloSimDebugProbeLayer(sub, depth + 1, maxDepth);
+}
+
+static BOOL ApolloSimDebugProbeBool(id object, const char *selectorName) {
+    SEL selector = sel_registerName(selectorName);
+    if (![object respondsToSelector:selector]) return NO;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static long long ApolloSimDebugProbeInteger(id object, const char *selectorName) {
+    SEL selector = sel_registerName(selectorName);
+    if (![object respondsToSelector:selector]) return -99;
+    return ((long long (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static id ApolloSimDebugProbeObject(id object, const char *selectorName) {
+    SEL selector = sel_registerName(selectorName);
+    if (![object respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+// "titleprobe": every visible navigation-bar title control, its labels and the
+// horizontal constraints sizing it, for diagnosing squeezed titles.
+static void ApolloSimDebugCollectTitleControls(UIView *view, NSMutableArray<UIView *> *out) {
+    if ([NSStringFromClass(view.class) isEqualToString:@"_UINavigationBarTitleControl"]) [out addObject:view];
+    for (UIView *subview in view.subviews) ApolloSimDebugCollectTitleControls(subview, out);
+}
+
+static void ApolloSimDebugTitleProbe(void) {
+    NSMutableArray<UIView *> *controls = [NSMutableArray array];
+    for (UIWindow *window in ApolloAllWindows()) ApolloSimDebugCollectTitleControls(window, controls);
+    for (UIView *control in controls) {
+        ApolloLog(@"[TitleProbe] %p frame=%@ alpha=%.2f hidden=%d intrinsic=%@ super=%@ transform=%@",
+                  control, NSStringFromCGRect(control.frame), control.alpha, control.hidden,
+                  NSStringFromCGSize(control.intrinsicContentSize), NSStringFromClass(control.superview.class),
+                  NSStringFromCGAffineTransform(control.transform));
+        NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:control];
+        for (NSUInteger i = 0; i < queue.count; i++) {
+            UIView *view = queue[i];
+            if ([view isKindOfClass:UILabel.class]) {
+                UILabel *label = (UILabel *)view;
+                ApolloLog(@"[TitleProbe]   label '%@' frame=%@ intrinsic=%@", label.text,
+                          NSStringFromCGRect(label.frame), NSStringFromCGSize(label.intrinsicContentSize));
+            } else if (view != control) {
+                ApolloLog(@"[TitleProbe]   %@ frame=%@", NSStringFromClass(view.class), NSStringFromCGRect(view.frame));
+            }
+            [queue addObjectsFromArray:view.subviews];
+        }
+        for (NSLayoutConstraint *constraint in [control constraintsAffectingLayoutForAxis:UILayoutConstraintAxisHorizontal]) {
+            ApolloLog(@"[TitleProbe]   constraint %@", constraint);
+        }
+    }
+}
+
+// "constraintprobe <Class>": the constraints owned by the first visible view of
+// that class and by each of its direct subviews.
+static UIView *ApolloSimDebugFindViewOfClass(UIView *view, Class cls) {
+    if ([view isKindOfClass:cls] && !view.hidden && view.window) return view;
+    for (UIView *subview in view.subviews) {
+        UIView *found = ApolloSimDebugFindViewOfClass(subview, cls);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void ApolloSimDebugConstraintProbe(NSString *className) {
+    Class cls = objc_getClass(className.UTF8String);
+    UIView *view = nil;
+    for (UIWindow *window in ApolloAllWindows()) {
+        view = cls ? ApolloSimDebugFindViewOfClass(window, cls) : nil;
+        if (view) break;
+    }
+    if (!view) { ApolloLog(@"[ConstraintProbe] no visible %@", className); return; }
+    ApolloLog(@"[ConstraintProbe] %@ %p frame=%@ safe=%@", className, view, NSStringFromCGRect(view.frame),
+              NSStringFromUIEdgeInsets(view.safeAreaInsets));
+    NSMutableArray<UIView *> *owners = [NSMutableArray arrayWithObject:view];
+    [owners addObjectsFromArray:view.subviews];
+    for (UIView *owner in owners) {
+        for (NSLayoutConstraint *constraint in owner.constraints) {
+            ApolloLog(@"[ConstraintProbe]   %@ owns %@", NSStringFromClass(owner.class), constraint);
+        }
+    }
+}
+
+// "focusprobe": the item UIKit's focus system currently has focused in each
+// window, with its frame and ancestry.
+static void ApolloSimDebugFocusProbe(void) {
+    for (UIWindow *window in ApolloAllWindows()) {
+        UIFocusSystem *system = [UIFocusSystem focusSystemForEnvironment:window];
+        id<UIFocusItem> item = system.focusedItem;
+        if (!item) { ApolloLog(@"[FocusProbe] %@: nothing focused", NSStringFromClass(window.class)); continue; }
+        NSMutableString *chain = [NSMutableString string];
+        if ([(id)item isKindOfClass:UIView.class]) {
+            for (UIView *view = (UIView *)item; view && view != window; view = view.superview) {
+                [chain appendFormat:@" < %@", NSStringFromClass(view.class)];
+                if (chain.length > 300) break;
+            }
+        }
+        CGRect frame = [item.focusItemContainer.coordinateSpace convertRect:item.frame toCoordinateSpace:window];
+        ApolloLog(@"[FocusProbe] %@ focused=%@ frame=%@ effect=%@%@", NSStringFromClass(window.class),
+                  NSStringFromClass([(id)item class]), NSStringFromCGRect(frame),
+                  [(id)item respondsToSelector:@selector(focusEffect)] ? item.focusEffect : nil, chain);
+    }
+}
+
+// "responderprobe": each window's first responder (found through UIKit's
+// private -firstResponder, which also reports view controllers) and, for a
+// message thread on screen, whether its reply bar is in a window.
+static void ApolloSimDebugResponderProbe(void) {
+    SEL firstResponder = NSSelectorFromString(@"firstResponder");
+    for (UIWindow *window in ApolloAllWindows()) {
+        id responder = [window respondsToSelector:firstResponder]
+            ? ((id (*)(id, SEL))objc_msgSend)(window, firstResponder) : nil;
+        ApolloLog(@"[ResponderProbe] %@ key=%d firstResponder=%@ %p", NSStringFromClass(window.class),
+                  window.isKeyWindow, NSStringFromClass([responder class]), responder);
+    }
+    Class threadClass = objc_getClass("_TtC6Apollo22MessagesViewController");
+    for (UIWindow *window in ApolloAllWindows()) {
+        NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:window];
+        for (NSUInteger i = 0; i < queue.count; i++) {
+            UIResponder *next = queue[i].nextResponder;
+            if (threadClass && [next isKindOfClass:threadClass]) {
+                UIViewController *thread = (UIViewController *)next;
+                UIView *bar = thread.inputAccessoryView;
+                UIScrollView *list = ApolloObjectIvar(thread, "messagesCollectionView");
+                ApolloLog(@"[ResponderProbe] thread %@ %p isFirst=%d canBecome=%d bar.window=%@ bar.frame=%@ list.inset=%@ list.frame=%@",
+                          NSStringFromClass(thread.class), thread, thread.isFirstResponder,
+                          thread.canBecomeFirstResponder, NSStringFromClass(bar.window.class),
+                          NSStringFromCGRect([bar convertRect:bar.bounds toView:nil]),
+                          [list isKindOfClass:UIScrollView.class] ? [NSString stringWithFormat:@"%@ content=%@ safe=%@", NSStringFromUIEdgeInsets(list.adjustedContentInset), NSStringFromUIEdgeInsets(list.contentInset), NSStringFromUIEdgeInsets(list.safeAreaInsets)] : @"-",
+                          [list isKindOfClass:UIScrollView.class] ? NSStringFromCGRect([list convertRect:list.bounds toView:nil]) : @"-");
+            }
+            [queue addObjectsFromArray:queue[i].subviews];
+        }
+    }
+}
+
+static void ApolloSimDebugFieldProbe(NSString *tag) {
+    UISearchBar *bar = nil;
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (window.hidden) continue;
+        bar = ApolloSimDebugFindSearchBar(window);
+        if (bar) break;
+    }
+    if (!bar) { ApolloLog(@"[FieldProbe] %@: no search bar in any window", tag); return; }
+    UITextField *field = bar.searchTextField;
+    NSMutableString *chain = [NSMutableString string];
+    for (UIView *v = field; v; v = v.superview) {
+        [chain appendFormat:@"%@%@", chain.length ? @" < " : @"", NSStringFromClass(v.class)];
+    }
+    ApolloLog(@"[FieldProbe] %@ chain: %@", tag, chain);
+    UINavigationBar *navBar = (UINavigationBar *)ApolloSimDebugProbeNavBar(bar);
+    UINavigationItem *item = navBar.topItem;
+    UISearchController *sc = ApolloSimDebugProbeObject(bar, "_searchController");
+    ApolloLog(@"[FieldProbe] %@ bar frame=%@ hidden=%d alpha=%.2f style=%ld translucent=%d bg=%@ inlineHosted=%d backdrop=%lld sc=%p active=%d item.sc=%d hidesWhenScrolling=%d placement=%ld",
+              tag, NSStringFromCGRect(bar.frame), (int)bar.hidden, bar.alpha, (long)bar.searchBarStyle, (int)bar.translucent,
+              bar.backgroundColor, (int)ApolloSimDebugProbeBool(bar, "_isHostedInlineByNavigationBar"),
+              ApolloSimDebugProbeInteger(bar, "_backdropStyle"), sc, (int)sc.active, (int)(item.searchController == sc),
+              (int)item.hidesSearchBarWhenScrolling,
+              (long)ApolloSimDebugProbeInteger(item, "preferredSearchBarPlacement"));
+    Ivar styleIvar = class_getInstanceVariable(field.class, "_backdropStyle");
+    long long backdropStyle = -99;
+    if (styleIvar) backdropStyle = *(long long *)((uint8_t *)(__bridge void *)field + ivar_getOffset(styleIvar));
+    UIView *effectTop = ApolloObjectIvar(field, "_effectBackgroundTop");
+    UIView *effectBottom = ApolloObjectIvar(field, "_effectBackgroundBottom");
+    ApolloLog(@"[FieldProbe] %@ field %@ frame=%@ hidden=%d alpha=%.2f border=%ld bg=%@ bgImage=%d wantsDynamic=%d shouldBeGlass=%d pocket=%@ backdropStyle=%lld effectTop=%@ effectBottom=%@ window=%d",
+              tag, NSStringFromClass(field.class), NSStringFromCGRect(field.frame), (int)field.hidden, field.alpha,
+              (long)field.borderStyle, field.backgroundColor, field.background != nil,
+              (int)ApolloSimDebugProbeBool(field, "_wantsDynamicBackgroundMaterial"),
+              (int)ApolloSimDebugProbeBool(field, "_backgroundMaterialShouldBeGlass"),
+              ApolloSimDebugProbeObject(field, "scrollPocketInteraction"), backdropStyle,
+              effectTop ? [NSString stringWithFormat:@"%@ sup=%@ h=%d a=%.2f", NSStringFromClass(effectTop.class), NSStringFromClass(effectTop.superview.class), (int)effectTop.hidden, effectTop.alpha] : @"nil",
+              effectBottom ? [NSString stringWithFormat:@"%@ sup=%@ h=%d a=%.2f", NSStringFromClass(effectBottom.class), NSStringFromClass(effectBottom.superview.class), (int)effectBottom.hidden, effectBottom.alpha] : @"nil",
+              field.window != nil);
+    for (UIView *sub in field.subviews) {
+        CGFloat bgAlpha = sub.backgroundColor ? CGColorGetAlpha(sub.backgroundColor.CGColor) : -1.0;
+        ApolloLog(@"[FieldProbe] %@   sub %@ frame=%@ hidden=%d alpha=%.2f bgA=%.2f", tag, NSStringFromClass(sub.class),
+                  NSStringFromCGRect(sub.frame), (int)sub.hidden, sub.alpha, bgAlpha);
+    }
+    // The glass pill is UIKit's "background material": when applied, the
+    // view renders through a _UIMultiLayer that hosts the material layers
+    // beside the content layer. Log both the material bookkeeping and the
+    // layer class so a lost pill can be told apart from a cleared material.
+    id material = ApolloSimDebugProbeObject(field, "_resolvedBackgroundMaterial");
+    ApolloLog(@"[FieldProbe] %@ suppressed: field=%d container=%d bar=%d navBar=%d alphaOverride(field)=%.2f",
+              tag, (int)ApolloSimDebugProbeBool(field, "_isBackgroundSuppressed"),
+              (int)ApolloSimDebugProbeBool(field.superview, "_isBackgroundSuppressed"),
+              (int)ApolloSimDebugProbeBool(bar, "_isBackgroundSuppressed"),
+              (int)ApolloSimDebugProbeBool(navBar, "_isBackgroundSuppressed"),
+              field.layer.presentationLayer ? field.layer.presentationLayer.opacity : -1.0);
+    ApolloLog(@"[FieldProbe] %@ field layer=%@ multiLayer=%d hasMaterial=%d material=%@ barLayer=%@ containerLayer=%@",
+              tag, NSStringFromClass(field.layer.class),
+              (int)ApolloSimDebugProbeBool(field, "__dbg_renderingModeIsMultiLayer"),
+              (int)ApolloSimDebugProbeBool(field, "_hasBackgroundMaterial"),
+              material ? [NSString stringWithFormat:@"%@ %@", NSStringFromClass([material class]), material] : @"nil",
+              NSStringFromClass(bar.layer.class), NSStringFromClass(field.superview.layer.class));
+    // The material lives in an intermediate _UIMultiLayer that UIKit wraps
+    // around the view's own layer inside the superview's layer; log from the
+    // superlayer down so the wrapper (or its absence) shows.
+    CALayer *superlayer = field.layer.superlayer;
+    ApolloLog(@"[FieldProbe] %@ field superlayer=%@ isSuperviewLayer=%d", tag,
+              NSStringFromClass(superlayer.class), (int)(superlayer == field.superview.layer));
+    ApolloSimDebugProbeLayer(superlayer ?: field.layer, 0, 7);
+}
+
+static void ApolloSimDebugDumpHierarchy(void) {
+    NSMutableString *out = [NSMutableString string];
+    for (UIWindow *window in ApolloAllWindows()) {
+        [out appendFormat:@"=== window %@ hidden=%d level=%.0f ===\n",
+            NSStringFromClass(window.class), window.hidden, (double)window.windowLevel];
+        ApolloSimDebugDumpView(window, window, 0, out);
+    }
+    [out writeToFile:@"/tmp/apollofix-dump.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[SimDebugTap] hierarchy dump written (%lu bytes)", (unsigned long)out.length);
+}
+
+// The window's first responder, checking each view before its subviews. A
+// focused search field comes back as its UISearchBar: the bar answers
+// -isFirstResponder with its field's isEditing, and it is reached first.
+static UIResponder *ApolloSimDebugFirstResponder(UIView *view) {
+    if (view.isFirstResponder) return view;
+    for (UIView *subview in view.subviews) {
+        UIResponder *responder = ApolloSimDebugFirstResponder(subview);
+        if (responder) return responder;
+    }
+    return nil;
+}
+
+// "text <string>" command: insert into the focused field through UIKeyInput,
+// which fires the same editing events as typing. A UISearchBar from the walk
+// isn't UIKeyInput, so its searchTextField takes the text; a window whose
+// first responder is something else is skipped instead of ending the search.
+// The payload is newline-trimmed, so Return can't be typed: see "searchsubmit".
+static void ApolloSimDebugTypeText(NSString *text) {
+    UIResponder *responder = nil;
+    for (UIWindow *window in ApolloAllWindows()) {
+        UIResponder *candidate = ApolloSimDebugFirstResponder(window);
+        if ([candidate isKindOfClass:UISearchBar.class]) candidate = ((UISearchBar *)candidate).searchTextField;
+        if ([candidate conformsToProtocol:@protocol(UIKeyInput)]) { responder = candidate; break; }
+        if (candidate) {
+            ApolloLog(@"[SimDebugTap] text: skipping %@ in %@ (not key input)",
+                      NSStringFromClass(candidate.class), NSStringFromClass(window.class));
+        }
+    }
+    if (!responder) {
+        ApolloLog(@"[SimDebugTap] no key-input first responder for text command");
+        return;
+    }
+    [(id<UIKeyInput>)responder insertText:text];
+    ApolloLog(@"[SimDebugTap] typed %lu chars into %@",
+              (unsigned long)text.length, NSStringFromClass(responder.class));
+}
+
+// "searchsubmit" command: press the keyboard's Search key, which "text" can't
+// type. Acts on the focused search bar, else the first visible window's, and
+// calls the bar delegate's searchBarSearchButtonClicked:, where the key lands
+// (UIKit's -[UISearchBar _searchFieldReturnPressed] also tells the bar's
+// UISearchController when it has one; the Search tab's bar has none).
+static void ApolloSimDebugSubmitSearch(void) {
+    UISearchBar *bar = nil;
+    BOOL focused = NO;
+    for (UIWindow *window in ApolloAllWindows()) {
+        UIResponder *responder = ApolloSimDebugFirstResponder(window);
+        if ([responder isKindOfClass:UISearchBar.class]) { bar = (UISearchBar *)responder; focused = YES; break; }
+    }
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (bar) break;
+        if (!window.hidden) bar = ApolloSimDebugFindSearchBar(window);
+    }
+    id<UISearchBarDelegate> delegate = bar.delegate;
+    if (![delegate respondsToSelector:@selector(searchBarSearchButtonClicked:)]) {
+        ApolloLog(@"[SimDebugTap] searchsubmit: no search bar delegate to press Search on (bar %@)", bar);
+        return;
+    }
+    ApolloLog(@"[SimDebugTap] searchsubmit: %@ search bar, %lu chars -> %@", focused ? @"focused" : @"first visible",
+              (unsigned long)bar.text.length, NSStringFromClass([(id)delegate class]));
+    [delegate searchBarSearchButtonClicked:bar];
+}
+
+// "crash <type>" command: deliberately crash the process to exercise the
+// local crash recorder (src/crash/). Types mirror the crash-capture test
+// plan: nsexception, abort, badaccess, overflow.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winfinite-recursion"
+__attribute__((noinline)) static void ApolloSimDebugRecursiveCrash(volatile NSUInteger value) {
+    volatile NSUInteger next = value + 1;
+    ApolloSimDebugRecursiveCrash(next);
+}
+#pragma clang diagnostic pop
+
+static void ApolloSimDebugPerformCrash(NSString *type) {
+    ApolloLog(@"[SimDebugTap] deliberate test crash: %@", type);
+    if ([type isEqualToString:@"nsexception"]) {
+        [@[] objectAtIndex:1];
+    } else if ([type isEqualToString:@"abort"]) {
+        abort();
+    } else if ([type isEqualToString:@"badaccess"]) {
+        *(volatile int *)0 = 1;
+    } else if ([type isEqualToString:@"overflow"]) {
+        ApolloSimDebugRecursiveCrash(0);
+    }
+    ApolloLog(@"[SimDebugTap] unknown crash type: %@", type);
+}
+
+// "insetbottom N" command: ask every visible Apollo ASTableView to accept a
+// specific bottom inset. This reproduces the iOS 27 foreground write (153 -> 0)
+// without depending on the simulator exhibiting the upstream lifecycle bug.
+// ApolloListBottomInsetGuard should guard the zero and log the correction.
+static void ApolloSimDebugForceBottomInsetInView(UIView *view, CGFloat bottom) {
+    if ([view isKindOfClass:ApolloClassASTableView] && view.window) {
+        UIScrollView *scrollView = (UIScrollView *)view;
+        UIEdgeInsets inset = scrollView.contentInset;
+        CGFloat before = inset.bottom;
+        inset.bottom = bottom;
+        scrollView.contentInset = inset;
+        ApolloLog(@"[SimDebugTap] insetbottom requested=%.1f before=%.1f after=%.1f table=%@",
+                  bottom, before, scrollView.contentInset.bottom,
+                  NSStringFromClass(scrollView.class));
+    }
+    for (UIView *subview in view.subviews) {
+        ApolloSimDebugForceBottomInsetInView(subview, bottom);
+    }
+}
+
+static void ApolloSimDebugForceBottomInset(CGFloat bottom) {
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (!window.hidden) ApolloSimDebugForceBottomInsetInView(window, bottom);
+    }
+}
+
+// Stamp-key accessors exported by ApolloScrollEdgeEffect.xm (both files are
+// ObjC++, so plain C++ linkage matches).
+const void *ApolloScrollEdgeEffectTopStampKey(void);
+const void *ApolloScrollEdgeEffectForcedHiddenStampKey(void);
+
+static void ApolloSimDebugDumpHeaderEffectsInView(UIView *view) {
+    if ([view isKindOfClass:[UIScrollView class]]) {
+        SEL topSelector = @selector(topEdgeEffect);
+        if ([view respondsToSelector:topSelector]) {
+            id effect = ((id (*)(id, SEL))objc_msgSend)(view, topSelector);
+            if (effect) {
+                BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(effect, @selector(isHidden));
+                id style = ((id (*)(id, SEL))objc_msgSend)(effect, @selector(style));
+                ApolloLog(@"[SimDebugTap][headerdump] scroll=%@ window=%d effect=%p hidden=%d style=%@ topStamp=%d forcedStamp=%d",
+                          NSStringFromClass(view.class), view.window != nil, effect, hidden, style,
+                          objc_getAssociatedObject(effect, ApolloScrollEdgeEffectTopStampKey()) != nil,
+                          objc_getAssociatedObject(effect, ApolloScrollEdgeEffectForcedHiddenStampKey()) != nil);
+            }
+        }
+    }
+    for (UIView *subview in view.subviews) ApolloSimDebugDumpHeaderEffectsInView(subview);
+}
+
+static void ApolloSimDebugDumpHeaderEffects(void) {
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (!window.hidden) ApolloSimDebugDumpHeaderEffectsInView(window);
+    }
+}
+
+// Overriding the child's traits from its parent is the supported way to force a
+// size class on one subtree; passing nil restores inheritance. Matching on
+// UISplitViewController keeps this generic — no dependency on src/ipad/.
+static void ApolloSimDebugForceCompactSplitColumns(BOOL compact) {
+    UIViewController *tabBarController = ApolloMainTabBarController();
+    if (![tabBarController isKindOfClass:[UITabBarController class]]) {
+        ApolloLog(@"[SimDebugTap] compact: no tab bar controller");
+        return;
+    }
+
+    UITraitCollection *override = compact
+        ? [UITraitCollection traitCollectionWithHorizontalSizeClass:UIUserInterfaceSizeClassCompact]
+        : nil;
+
+    NSUInteger applied = 0;
+    for (UIViewController *child in [(UITabBarController *)tabBarController viewControllers]) {
+        if (![child isKindOfClass:[UISplitViewController class]]) continue;
+        [tabBarController setOverrideTraitCollection:override forChildViewController:child];
+        applied++;
+    }
+    ApolloLog(@"[SimDebugTap] compact=%d applied to %lu split controller(s)",
+              compact, (unsigned long)applied);
+}
+
+// "accessibilityescape": invoke the same action VoiceOver's two-finger scrub
+// sends to the visible pane. This validates the compact cross-column escape
+// path without relying on simulator HID support for accessibility gestures.
+static void ApolloSimDebugPerformAccessibilityEscape(void) {
+    UIViewController *controller = ApolloMainTabBarController();
+    UIViewController *selected = [controller isKindOfClass:[UITabBarController class]]
+        ? ((UITabBarController *)controller).selectedViewController : nil;
+    BOOL handled = [selected accessibilityPerformEscape];
+    ApolloLog(@"[SimDebugTap] accessibility escape handled=%d selected=%@",
+              handled, NSStringFromClass(selected.class));
+}
+
+// "visibleprobe dump|alert|share|dismiss": exercise the same recursive
+// visible-controller helper used by production presentation call sites and log
+// the concrete presenter relationship. The share probe configures a popover
+// anchor so an incorrect iPad presenter fails as a hierarchy bug, not because
+// UIActivityViewController itself was incompletely configured.
+static void ApolloSimDebugVisiblePresenterProbe(NSString *operation) {
+    UIWindow *window = nil;
+    for (UIWindow *candidate in ApolloAllWindows()) {
+        if (!candidate.hidden && candidate.alpha > 0.01 && candidate.isKeyWindow) {
+            window = candidate;
+            break;
+        }
+    }
+    if (!window) {
+        for (UIWindow *candidate in ApolloAllWindows()) {
+            if (!candidate.hidden && candidate.alpha > 0.01 && candidate.windowLevel == UIWindowLevelNormal) {
+                window = candidate;
+                break;
+            }
+        }
+    }
+    UIViewController *visible = window.visibleViewController;
+    NSString *name = NSStringFromClass(visible.class) ?: @"nil";
+    ApolloLog(@"[SimDebugTap][visibleprobe] operation=%@ visible=%@ attached=%d window=%@",
+              operation, name, visible.viewIfLoaded.window != nil,
+              NSStringFromClass(window.class));
+
+    if ([operation isEqualToString:@"dump"] || !visible) return;
+    if ([operation isEqualToString:@"dismiss"]) {
+        [window.rootViewController dismissViewControllerAnimated:NO completion:^{
+            ApolloLog(@"[SimDebugTap][visibleprobe] dismissed");
+        }];
+        return;
+    }
+
+    UIViewController *probe = nil;
+    if ([operation isEqualToString:@"alert"]) {
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"Pane Presenter Probe"
+                             message:name
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+        probe = alert;
+    } else if ([operation isEqualToString:@"share"]) {
+        UIActivityViewController *activity = [[UIActivityViewController alloc]
+            initWithActivityItems:@[ @"Apollo pane presenter probe" ] applicationActivities:nil];
+        UIPopoverPresentationController *popover = activity.popoverPresentationController;
+        popover.sourceView = visible.view;
+        popover.sourceRect = CGRectMake(CGRectGetMidX(visible.view.bounds),
+                                        CGRectGetMidY(visible.view.bounds), 1.0, 1.0);
+        popover.permittedArrowDirections = 0;
+        probe = activity;
+    }
+    if (!probe) {
+        ApolloLog(@"[SimDebugTap][visibleprobe] unknown operation %@", operation);
+        return;
+    }
+
+    [visible presentViewController:probe animated:NO completion:^{
+        UIViewController *actual = probe.presentingViewController;
+        BOOL sameBranch = actual == visible ||
+            ApolloViewControllerContains(actual, visible) ||
+            ApolloViewControllerContains(visible, actual);
+        ApolloLog(@"[SimDebugTap][visibleprobe] presented=%@ requested=%@ actual=%@ sameBranch=%d",
+                  NSStringFromClass(probe.class), NSStringFromClass(visible.class),
+                  NSStringFromClass(actual.class), sameBranch);
+    }];
+}
+
+// "navdump" command: prove which real navigation stacks the shared tab-child
+// helpers expose. This catches a subtle pane regression that a screenshot cannot:
+// UIKit owns an outer wrapper navigation controller around the secondary host,
+// while Apollo's visible detail stack is a different navigation controller
+// nested inside that host. The dump must list the latter exactly once.
+static void ApolloSimDebugDumpNavigationControllers(void) {
+    UIViewController *controller = ApolloMainTabBarController();
+    if (![controller isKindOfClass:[UITabBarController class]]) {
+        ApolloLog(@"[SimDebugTap] navdump: no tab bar controller");
+        return;
+    }
+
+    UITabBarController *tabBarController = (UITabBarController *)controller;
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"selected=%lu tabs=%lu\n",
+        (unsigned long)tabBarController.selectedIndex,
+        (unsigned long)tabBarController.viewControllers.count];
+    [tabBarController.viewControllers enumerateObjectsUsingBlock:
+        ^(UIViewController *child, NSUInteger tabIndex, BOOL *stop) {
+            NSArray<UINavigationController *> *navs = ApolloAllNavigationControllersForTabChild(child);
+            UINavigationController *primary = ApolloNavigationControllerForTabChild(child);
+            [out appendFormat:@"tab=%lu child=%@ navs=%lu primary=%p\n",
+                (unsigned long)tabIndex, NSStringFromClass(child.class),
+                (unsigned long)navs.count, primary];
+            [navs enumerateObjectsUsingBlock:
+                ^(UINavigationController *nav, NSUInteger navIndex, BOOL *innerStop) {
+                    NSMutableArray<NSString *> *classes = [NSMutableArray array];
+                    for (UIViewController *stackController in nav.viewControllers) {
+                        [classes addObject:NSStringFromClass(stackController.class) ?: @"(unknown)"];
+                    }
+                    [out appendFormat:@"  nav=%lu ptr=%p primary=%d parent=%@ stack=[%@]\n",
+                        (unsigned long)navIndex, nav, nav == primary,
+                        NSStringFromClass(nav.parentViewController.class),
+                        [classes componentsJoinedByString:@", "]];
+                }];
+        }];
+    [out writeToFile:@"/tmp/apollofix-navcontrollers.txt"
+          atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[SimDebugTap] navigation-controller dump written (%lu bytes)",
+              (unsigned long)out.length);
+}
+
+// "loadstatus" command: inspect lazy pane materialization without touching any
+// unloaded view. This makes Task 15's cold-launch contract directly observable:
+// construction may wrap all tab stacks, but only a visited tab may load its
+// pane/column hierarchy.
+static void ApolloSimDebugDumpPaneLoadStatus(void) {
+    UIViewController *controller = ApolloMainTabBarController();
+    if (![controller isKindOfClass:[UITabBarController class]]) {
+        ApolloLog(@"[PaneLoadTest] no tab bar controller pass=0");
+        return;
+    }
+
+    UITabBarController *tabBarController = (UITabBarController *)controller;
+    NSMutableString *out = [NSMutableString stringWithFormat:@"selected=%lu tabs=%lu\n",
+        (unsigned long)tabBarController.selectedIndex,
+        (unsigned long)tabBarController.viewControllers.count];
+    __block NSUInteger loadedPaneCount = 0;
+    __block NSUInteger attachedPaneCount = 0;
+    __block BOOL selectedPaneLoaded = NO;
+    [tabBarController.viewControllers enumerateObjectsUsingBlock:
+        ^(UIViewController *child, NSUInteger tabIndex, BOOL *stop) {
+            if (![child isKindOfClass:[ApolloPaneSplitViewController class]]) {
+                [out appendFormat:@"tab=%lu child=%@ pane=0\n", (unsigned long)tabIndex,
+                    NSStringFromClass(child.class)];
+                return;
+            }
+            ApolloPaneSplitViewController *pane = (ApolloPaneSplitViewController *)child;
+            UINavigationController *primary =
+                [pane apollo_navigationControllerForColumn:ApolloPaneColumnPrimary];
+            UINavigationController *detail =
+                [pane apollo_navigationControllerForColumn:ApolloPaneColumnSecondary];
+            UIViewController *host =
+                [pane viewControllerForColumn:UISplitViewControllerColumnSecondary];
+            BOOL paneLoaded = pane.isViewLoaded;
+            if (paneLoaded) loadedPaneCount++;
+            BOOL attached = pane.viewIfLoaded.window != nil;
+            if (attached) attachedPaneCount++;
+            if (tabIndex == tabBarController.selectedIndex) selectedPaneLoaded = paneLoaded;
+            [out appendFormat:
+                @"tab=%lu paneLoaded=%d primaryLoaded=%d detailLoaded=%d hostLoaded=%d "
+                 "primaryRootLoaded=%d detailRootLoaded=%d attached=%d\n",
+                (unsigned long)tabIndex, paneLoaded, primary.isViewLoaded,
+                detail.isViewLoaded, host.isViewLoaded,
+                primary.viewControllers.firstObject.isViewLoaded,
+                detail.viewControllers.firstObject.isViewLoaded,
+                attached];
+        }];
+    [out appendFormat:@"loadedPaneCount=%lu attachedPaneCount=%lu pass=%d\n",
+        (unsigned long)loadedPaneCount, (unsigned long)attachedPaneCount,
+        selectedPaneLoaded && attachedPaneCount == 1];
+    [out writeToFile:@"/tmp/apollofix-pane-load-status.txt"
+          atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[PaneLoadTest] load status written loaded=%lu selected=%lu",
+              (unsigned long)loadedPaneCount, (unsigned long)tabBarController.selectedIndex);
+}
+
+static void ApolloSimDebugRunAutoHideScan(NSString *contents) {
+    NSArray<NSString *> *tokens = [contents componentsSeparatedByCharactersInSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSUInteger iterations = tokens.count > 1 ? MAX(tokens[1].integerValue, 1) : 10000;
+    NSString *status = ApolloAutoHideTabBarSimScanStatus(iterations);
+    [status writeToFile:@"/tmp/apollofix-autohide-scan.txt"
+             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[AutoHideTabBarPerf] %@", status);
+}
+
+static void ApolloSimDebugSetAutoHidePolicy(NSString *contents) {
+    BOOL enabled = [contents rangeOfString:@" on"].location != NSNotFound;
+    NSString *status = ApolloAutoHideTabBarSimSetPolicy(enabled);
+    [status writeToFile:@"/tmp/apollofix-autohide-policy.txt"
+             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[AutoHideTabBarPerf] policy %@", status);
+}
+
+static UINavigationController *ApolloSimDebugSelectedNavigationController(NSString *columnName) {
+    UIViewController *controller = ApolloMainTabBarController();
+    UIViewController *selected = [controller isKindOfClass:[UITabBarController class]]
+        ? ((UITabBarController *)controller).selectedViewController : nil;
+    UINavigationController *primary = ApolloNavigationControllerForTabChild(selected);
+    if (![columnName isEqualToString:@"detail"]) return primary;
+
+    for (UINavigationController *candidate in ApolloAllNavigationControllersForTabChild(selected)) {
+        if (candidate != primary) return candidate;
+    }
+    // Compact has one physical stack. Falling back to it lets the same command
+    // exercise logical-detail Back before and after an expansion.
+    return primary;
+}
+
+static ApolloPaneSplitViewController *ApolloSimDebugSelectedPane(void) {
+    UIViewController *controller = ApolloMainTabBarController();
+    UIViewController *selected = [controller isKindOfClass:[UITabBarController class]]
+        ? ((UITabBarController *)controller).selectedViewController : nil;
+    return [selected isKindOfClass:[ApolloPaneSplitViewController class]]
+        ? (ApolloPaneSplitViewController *)selected : nil;
+}
+
+// Task 18 width-stability harness. Detail presentation used to hide UIKit's
+// global tab sidebar, instantly handing roughly 270pt back to the content and
+// forcing every visible Texture node through a constrained-width remeasure.
+// Production no longer owns sidebar visibility (Task 7), so sample the actual
+// resolved geometry across first and repeated detail loads and prove that the
+// old trigger stays absent. Newly appearing detail tables establish a baseline;
+// only a later width change on the same live ASTableView counts as churn.
+static NSUInteger sApolloSimReflowGeneration;
+static BOOL sApolloSimReflowActive;
+static NSUInteger sApolloSimReflowSamples;
+static BOOL sApolloSimReflowSidebarAvailable;
+static BOOL sApolloSimReflowInitialSidebarHidden;
+static BOOL sApolloSimReflowLastSidebarHidden;
+static NSUInteger sApolloSimReflowSidebarChanges;
+static CGFloat sApolloSimReflowInitialPrimaryColumnWidth;
+static CGFloat sApolloSimReflowLastPrimaryColumnWidth;
+static CGFloat sApolloSimReflowMinPrimaryColumnWidth;
+static CGFloat sApolloSimReflowMaxPrimaryColumnWidth;
+static CGFloat sApolloSimReflowInitialPrimaryNavigationWidth;
+static CGFloat sApolloSimReflowLastPrimaryNavigationWidth;
+static CGFloat sApolloSimReflowMinPrimaryNavigationWidth;
+static CGFloat sApolloSimReflowMaxPrimaryNavigationWidth;
+static NSMapTable<UIView *, NSNumber *> *sApolloSimReflowPrimaryTableWidths;
+static NSMapTable<UIView *, NSNumber *> *sApolloSimReflowDetailTableWidths;
+static NSUInteger sApolloSimReflowPrimaryTableWidthChanges;
+static NSUInteger sApolloSimReflowDetailTableWidthChanges;
+static CGFloat sApolloSimReflowLargestTextureWidthJump;
+
+static void ApolloSimDebugCollectVisibleTextureTables(UIView *view,
+                                                       NSMutableArray<UIView *> *tables) {
+    if (!view || !view.window) return;
+    Class tableClass = objc_getClass("ASTableView");
+    if (tableClass && [view isKindOfClass:tableClass] && !view.hidden && view.alpha > 0.01) {
+        [tables addObject:view];
+    }
+    for (UIView *subview in view.subviews) {
+        ApolloSimDebugCollectVisibleTextureTables(subview, tables);
+    }
+}
+
+static void ApolloSimDebugRecordTextureWidths(
+        UIView *root,
+        NSMapTable<UIView *, NSNumber *> *widths,
+        NSUInteger *changeCount) {
+    if (!root || !widths || !changeCount) return;
+    NSMutableArray<UIView *> *tables = [NSMutableArray array];
+    ApolloSimDebugCollectVisibleTextureTables(root, tables);
+    for (UIView *table in tables) {
+        CGFloat width = CGRectGetWidth(table.bounds);
+        NSNumber *previousNumber = [widths objectForKey:table];
+        if (previousNumber) {
+            CGFloat jump = fabs(width - previousNumber.doubleValue);
+            if (jump > 0.5) {
+                (*changeCount)++;
+                sApolloSimReflowLargestTextureWidthJump =
+                    MAX(sApolloSimReflowLargestTextureWidthJump, jump);
+            }
+        }
+        [widths setObject:@(width) forKey:table];
+    }
+}
+
+static NSString *ApolloSimDebugReflowStatus(void) {
+    CGFloat primaryColumnRange = sApolloSimReflowSamples > 0
+        ? sApolloSimReflowMaxPrimaryColumnWidth - sApolloSimReflowMinPrimaryColumnWidth : 0.0;
+    CGFloat primaryNavigationRange = sApolloSimReflowSamples > 0
+        ? sApolloSimReflowMaxPrimaryNavigationWidth - sApolloSimReflowMinPrimaryNavigationWidth : 0.0;
+    NSUInteger primaryTables = sApolloSimReflowPrimaryTableWidths.count;
+    NSUInteger detailTables = sApolloSimReflowDetailTableWidths.count;
+    BOOL pass = sApolloSimReflowSamples >= 10 && sApolloSimReflowSidebarAvailable &&
+        sApolloSimReflowSidebarChanges == 0 && primaryColumnRange <= 1.0 &&
+        primaryNavigationRange <= 1.0 && sApolloSimReflowPrimaryTableWidthChanges == 0 &&
+        sApolloSimReflowDetailTableWidthChanges == 0 && detailTables > 0;
+    return [NSString stringWithFormat:
+        @"active=%d samples=%lu sidebarInitialHidden=%d sidebarFinalHidden=%d sidebarChanges=%lu "
+         "primaryColumnInitial=%.1f primaryColumnFinal=%.1f primaryColumnRange=%.1f "
+         "primaryNavInitial=%.1f primaryNavFinal=%.1f primaryNavRange=%.1f "
+         "primaryTextureTables=%lu primaryTextureWidthChanges=%lu detailTextureTables=%lu "
+         "detailTextureWidthChanges=%lu largestTextureWidthJump=%.1f pass=%d",
+        sApolloSimReflowActive, (unsigned long)sApolloSimReflowSamples,
+        sApolloSimReflowInitialSidebarHidden, sApolloSimReflowLastSidebarHidden,
+        (unsigned long)sApolloSimReflowSidebarChanges,
+        sApolloSimReflowInitialPrimaryColumnWidth, sApolloSimReflowLastPrimaryColumnWidth,
+        primaryColumnRange, sApolloSimReflowInitialPrimaryNavigationWidth,
+        sApolloSimReflowLastPrimaryNavigationWidth, primaryNavigationRange,
+        (unsigned long)primaryTables, (unsigned long)sApolloSimReflowPrimaryTableWidthChanges,
+        (unsigned long)detailTables, (unsigned long)sApolloSimReflowDetailTableWidthChanges,
+        sApolloSimReflowLargestTextureWidthJump, pass];
+}
+
+static void ApolloSimDebugWriteReflowStatus(void) {
+    NSString *status = ApolloSimDebugReflowStatus();
+    [status writeToFile:@"/tmp/apollofix-reflow-status.txt"
+             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[PaneReflowTest] %@", status);
+}
+
+static void ApolloSimDebugAppendReadableViews(UIView *view, NSMutableArray<NSString *> *lines,
+                                              NSUInteger depth) {
+    if (!view || depth > 12) return;
+    BOOL interesting = [view isKindOfClass:[UITableView class]] ||
+        [view isKindOfClass:[UITableViewCell class]] ||
+        [NSStringFromClass(view.class) containsString:@"CellContentView"] ||
+        [NSStringFromClass(view.class) containsString:@"ASTable"];
+    if (interesting) {
+        SEL nodeSelector = NSSelectorFromString(@"asyncdisplaykit_node");
+        id node = [view respondsToSelector:nodeSelector]
+            ? ((id (*)(id, SEL))objc_msgSend)(view, nodeSelector) : nil;
+        CGRect safe = [view convertRect:view.safeAreaLayoutGuide.layoutFrame fromView:view];
+        CGRect readable = [view convertRect:view.readableContentGuide.layoutFrame fromView:view];
+        [lines addObject:[NSString stringWithFormat:
+            @"depth=%lu class=%@ node=%@ frame=%@ bounds=%@ safe=%@ readable=%@ margins=%@",
+            (unsigned long)depth, NSStringFromClass(view.class),
+            NSStringFromClass([node class]),
+            NSStringFromCGRect(view.frame), NSStringFromCGRect(view.bounds),
+            NSStringFromCGRect(safe), NSStringFromCGRect(readable),
+            NSStringFromUIEdgeInsets(view.layoutMargins)]];
+    }
+    for (UIView *subview in view.subviews) {
+        ApolloSimDebugAppendReadableViews(subview, lines, depth + 1);
+    }
+}
+
+static void ApolloSimDebugWriteReadableStatus(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    UINavigationController *detail =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnSecondary];
+    UIViewController *top = detail.topViewController;
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    if (top.isViewLoaded) {
+        [lines addObject:[NSString stringWithFormat:
+            @"top=%@ bounds=%@ safeInsets=%@ safe=%@ readable=%@ additional=%@",
+            NSStringFromClass(top.class), NSStringFromCGRect(top.view.bounds),
+            NSStringFromUIEdgeInsets(top.view.safeAreaInsets),
+            NSStringFromCGRect(top.view.safeAreaLayoutGuide.layoutFrame),
+            NSStringFromCGRect(top.view.readableContentGuide.layoutFrame),
+            NSStringFromUIEdgeInsets(top.additionalSafeAreaInsets)]];
+        ApolloSimDebugAppendReadableViews(top.view, lines, 0);
+    } else {
+        [lines addObject:[NSString stringWithFormat:@"top=%@ unloaded=1",
+            NSStringFromClass(top.class)]];
+    }
+    NSString *status = [lines componentsJoinedByString:@"\n"];
+    [status writeToFile:@"/tmp/apollofix-readable-status.txt"
+             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[PaneReadableTest] %@", status);
+}
+
+static void ApolloSimDebugWritePaneWidthStatus(void) {
+    UIViewController *controller = ApolloMainTabBarController();
+    UITabBarController *tabs = [controller isKindOfClass:[UITabBarController class]]
+        ? (UITabBarController *)controller : nil;
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    for (UIViewController *child in tabs.viewControllers) {
+        if (![child isKindOfClass:[ApolloPaneSplitViewController class]]) continue;
+        [lines addObject:[(ApolloPaneSplitViewController *)child
+            apollo_simPreferredPrimaryColumnWidthState]];
+    }
+    NSString *status = lines.count > 0
+        ? [lines componentsJoinedByString:@"\n"] : @"no panes";
+    [status writeToFile:@"/tmp/apollofix-pane-width-status.txt"
+             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[PaneWidthTest] %@", status);
+}
+
+static void ApolloSimDebugSetPaneWidth(CGFloat width) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    [pane apollo_simSetPreferredPrimaryColumnWidth:width];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApolloSimDebugWritePaneWidthStatus();
+    });
+}
+
+static void ApolloSimDebugAdjustPaneDivider(NSString *operation) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    BOOL adjusted = [pane apollo_simAdjustDivider:operation];
+    ApolloLog(@"[PaneWidthTest] adjust=%@ accepted=%d", operation, adjusted);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApolloSimDebugWritePaneWidthStatus();
+    });
+}
+
+static void ApolloSimDebugWritePaneThemeStatus(void) {
+    UIViewController *controller = ApolloMainTabBarController();
+    UITabBarController *tabs = [controller isKindOfClass:[UITabBarController class]]
+        ? (UITabBarController *)controller : nil;
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    for (UIViewController *child in tabs.viewControllers) {
+        if (![child isKindOfClass:[ApolloPaneSplitViewController class]]) continue;
+        [lines addObject:[(ApolloPaneSplitViewController *)child apollo_simThemeState]];
+    }
+    NSString *status = lines.count > 0
+        ? [lines componentsJoinedByString:@"\n"] : @"no panes";
+    [status writeToFile:@"/tmp/apollofix-pane-theme-status.txt"
+             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[PaneThemeTest] %@", status);
+}
+
+static void ApolloSimDebugPostThemeNotification(void) {
+    [NSNotificationCenter.defaultCenter
+        postNotificationName:@"com.christianselig.ApolloSpecificThemeChanged" object:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApolloSimDebugWritePaneThemeStatus();
+    });
+}
+
+static void ApolloSimDebugSampleReflow(NSUInteger generation) {
+    if (!sApolloSimReflowActive || generation != sApolloSimReflowGeneration) return;
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    UITabBarController *tabs = [pane.tabBarController isKindOfClass:[UITabBarController class]]
+        ? pane.tabBarController : nil;
+    if (!pane || !tabs) {
+        sApolloSimReflowActive = NO;
+        ApolloSimDebugWriteReflowStatus();
+        return;
+    }
+
+    BOOL sidebarAvailable = NO;
+    BOOL sidebarHidden = NO;
+    if (@available(iOS 18.0, *)) {
+        sidebarAvailable = tabs.sidebar != nil;
+        sidebarHidden = tabs.sidebar.isHidden;
+    }
+    CGFloat primaryColumnWidth = pane.primaryColumnWidth;
+    UINavigationController *primary =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnPrimary];
+    UINavigationController *detail =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnSecondary];
+    CGFloat primaryNavigationWidth = CGRectGetWidth(primary.viewIfLoaded.bounds);
+
+    if (sApolloSimReflowSamples == 0) {
+        sApolloSimReflowSidebarAvailable = sidebarAvailable;
+        sApolloSimReflowInitialSidebarHidden = sidebarHidden;
+        sApolloSimReflowLastSidebarHidden = sidebarHidden;
+        sApolloSimReflowInitialPrimaryColumnWidth = primaryColumnWidth;
+        sApolloSimReflowMinPrimaryColumnWidth = primaryColumnWidth;
+        sApolloSimReflowMaxPrimaryColumnWidth = primaryColumnWidth;
+        sApolloSimReflowInitialPrimaryNavigationWidth = primaryNavigationWidth;
+        sApolloSimReflowMinPrimaryNavigationWidth = primaryNavigationWidth;
+        sApolloSimReflowMaxPrimaryNavigationWidth = primaryNavigationWidth;
+    } else if (sidebarAvailable && sidebarHidden != sApolloSimReflowLastSidebarHidden) {
+        sApolloSimReflowSidebarChanges++;
+    }
+
+    sApolloSimReflowLastSidebarHidden = sidebarHidden;
+    sApolloSimReflowLastPrimaryColumnWidth = primaryColumnWidth;
+    sApolloSimReflowMinPrimaryColumnWidth =
+        MIN(sApolloSimReflowMinPrimaryColumnWidth, primaryColumnWidth);
+    sApolloSimReflowMaxPrimaryColumnWidth =
+        MAX(sApolloSimReflowMaxPrimaryColumnWidth, primaryColumnWidth);
+    sApolloSimReflowLastPrimaryNavigationWidth = primaryNavigationWidth;
+    sApolloSimReflowMinPrimaryNavigationWidth =
+        MIN(sApolloSimReflowMinPrimaryNavigationWidth, primaryNavigationWidth);
+    sApolloSimReflowMaxPrimaryNavigationWidth =
+        MAX(sApolloSimReflowMaxPrimaryNavigationWidth, primaryNavigationWidth);
+    ApolloSimDebugRecordTextureWidths(primary.viewIfLoaded,
+        sApolloSimReflowPrimaryTableWidths, &sApolloSimReflowPrimaryTableWidthChanges);
+    ApolloSimDebugRecordTextureWidths(detail.viewIfLoaded,
+        sApolloSimReflowDetailTableWidths, &sApolloSimReflowDetailTableWidthChanges);
+    sApolloSimReflowSamples++;
+
+    // Twelve seconds covers clear -> first load -> clear -> repeated load with
+    // plenty of settling time, while keeping this bounded simulator-only work.
+    if (sApolloSimReflowSamples >= 240) {
+        sApolloSimReflowActive = NO;
+        ApolloSimDebugWriteReflowStatus();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ApolloSimDebugSampleReflow(generation);
+    });
+}
+
+static void ApolloSimDebugStartReflowProbe(void) {
+    sApolloSimReflowGeneration++;
+    sApolloSimReflowActive = YES;
+    sApolloSimReflowSamples = 0;
+    sApolloSimReflowSidebarAvailable = NO;
+    sApolloSimReflowSidebarChanges = 0;
+    sApolloSimReflowInitialPrimaryColumnWidth = 0.0;
+    sApolloSimReflowLastPrimaryColumnWidth = 0.0;
+    sApolloSimReflowMinPrimaryColumnWidth = 0.0;
+    sApolloSimReflowMaxPrimaryColumnWidth = 0.0;
+    sApolloSimReflowInitialPrimaryNavigationWidth = 0.0;
+    sApolloSimReflowLastPrimaryNavigationWidth = 0.0;
+    sApolloSimReflowMinPrimaryNavigationWidth = 0.0;
+    sApolloSimReflowMaxPrimaryNavigationWidth = 0.0;
+    sApolloSimReflowPrimaryTableWidths = [NSMapTable weakToStrongObjectsMapTable];
+    sApolloSimReflowDetailTableWidths = [NSMapTable weakToStrongObjectsMapTable];
+    sApolloSimReflowPrimaryTableWidthChanges = 0;
+    sApolloSimReflowDetailTableWidthChanges = 0;
+    sApolloSimReflowLargestTextureWidthJump = 0.0;
+    ApolloSimDebugSampleReflow(sApolloSimReflowGeneration);
+    ApolloLog(@"[PaneReflowTest] started 12-second width-stability probe");
+}
+
+// Task 13 resolved-layout harness. Drive only the selected pane through public
+// trait/split APIs so untouched tabs retain their production lazy state.
+static void ApolloSimDebugSetPaneMode(NSString *mode) {
+    UITabBarController *tabBarController = (UITabBarController *)ApolloMainTabBarController();
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    if (![tabBarController isKindOfClass:[UITabBarController class]] || !pane) {
+        ApolloLog(@"[PaneDisplayTest] panemode unavailable");
+        return;
+    }
+    NSString *normalized = mode.lowercaseString;
+    if ([normalized isEqualToString:@"compact"]) {
+        [pane apollo_simSetResolvedLayoutMode:@"reset"];
+        UITraitCollection *compact = [UITraitCollection
+            traitCollectionWithHorizontalSizeClass:UIUserInterfaceSizeClassCompact];
+        [tabBarController setOverrideTraitCollection:compact forChildViewController:pane];
+    } else {
+        UITraitCollection *regular = [UITraitCollection
+            traitCollectionWithHorizontalSizeClass:UIUserInterfaceSizeClassRegular];
+        [tabBarController setOverrideTraitCollection:regular forChildViewController:pane];
+        [pane apollo_simSetResolvedLayoutMode:normalized];
+        if ([normalized isEqualToString:@"reset"]) {
+            [tabBarController setOverrideTraitCollection:nil forChildViewController:pane];
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ApolloLog(@"[PaneDisplayTest] mode=%@ %@", normalized,
+                  [pane apollo_simResolvedLayoutState]);
+    });
+}
+
+extern "C" NSDictionary *ApolloPaneSimFind(UIViewController *, NSString *);
+static void ApolloSimDebugOpenVisiblePost(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    UIViewController *controller = [pane apollo_navigationControllerForColumn:ApolloPaneColumnPrimary].topViewController;
+    Ivar tableIvar = class_getInstanceVariable(controller.class, "tableNode");
+    id node = tableIvar ? object_getIvar(controller, tableIvar) : nil;
+    UITableView *table = [node respondsToSelector:@selector(view)] ? (id)[node view] : nil;
+    if (![table isKindOfClass:UITableView.class]) return;
+    for (NSIndexPath *path in table.indexPathsForVisibleRows) {
+        id cell = ((id (*)(id, SEL, id))objc_msgSend)(node, NSSelectorFromString(@"nodeForRowAtIndexPath:"), path);
+        Ivar linkIvar = class_getInstanceVariable([cell class], "link");
+        id link = linkIvar ? object_getIvar(cell, linkIvar) : nil;
+        SEL selector = NSSelectorFromString(@"permalink");
+        if (![link respondsToSelector:selector]) continue;
+        id permalink = ((id (*)(id, SEL))objc_msgSend)(link, selector);
+        if ([permalink isKindOfClass:NSURL.class]) permalink = [permalink path];
+        if (![permalink isKindOfClass:NSString.class] || ![permalink hasPrefix:@"/"]) continue;
+        NSURLComponents *components = [NSURLComponents new];
+        components.scheme = @"apollo"; components.host = @"reddit.com"; components.path = permalink;
+        BOOL routed = ApolloRouteURLThroughAppInScene(components.URL, controller.viewIfLoaded.window.windowScene);
+        ApolloLog(@"[PaneReadPost] native route=%d", routed);
+        return;
+    }
+    ApolloLog(@"[PaneReadPost] no visible post model");
+}
+
+static void ApolloSimDebugWritePaneSnapshot(void) {
+    NSMutableArray *scenes = [NSMutableArray array];
+    for (UIScene *candidate in UIApplication.sharedApplication.connectedScenes) {
+        if (![candidate isKindOfClass:UIWindowScene.class]) continue;
+        UIWindowScene *scene = (id)candidate;
+        UITabBarController *tabs = (id)ApolloMainTabBarControllerForScene(scene);
+        if (![tabs isKindOfClass:UITabBarController.class] || tabs.viewIfLoaded.window.windowScene != scene) continue;
+        NSMutableArray *panes = [NSMutableArray array];
+        for (UIViewController *child in tabs.viewControllers) {
+            if ([child isKindOfClass:ApolloPaneSplitViewController.class])
+                [panes addObject:[(ApolloPaneSplitViewController *)child apollo_simStructuredSnapshot]];
+        }
+        // Session identifier is opaque system identity, never account identity.
+        [scenes addObject:@{@"scene": scene.session.persistentIdentifier, @"activation": @(scene.activationState),
+            @"bounds": NSStringFromCGRect(scene.coordinateSpace.bounds), @"selectedTab": @(tabs.selectedIndex), @"panes": panes}];
+    }
+    NSUInteger copies = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && [@((const char *)name).lastPathComponent isEqualToString:@"ApolloReborn.dylib"]) copies++;
+    }
+    NSDictionary *snapshot = @{@"schema": @1, @"uptime": @(NSProcessInfo.processInfo.systemUptime),
+        @"runtime": UIDevice.currentDevice.systemVersion, @"idiom": @(UIDevice.currentDevice.userInterfaceIdiom),
+        @"loadedTweakCopies": @(copies), @"scenes": scenes,
+        @"paneSupported": @(ApolloPaneLayoutSupported()),
+        @"paneEnabled": @(ApolloPaneLayoutEnabled()),
+        @"paneActive": @(ApolloPaneLayoutActive()),
+        @"paneDesired": @([NSUserDefaults.standardUserDefaults boolForKey:UDKeyIPadPaneLayout])};
+    NSData *data = [NSJSONSerialization dataWithJSONObject:snapshot options:NSJSONWritingPrettyPrinted error:nil];
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/ApolloPaneSnapshot.json"];
+    [data writeToFile:path atomically:YES];
+    ApolloLog(@"[PaneSnapshot] wrote %lu scenes, tweak copies=%lu", (unsigned long)scenes.count, (unsigned long)copies);
+}
+
+static void ApolloSimDebugLogPaneStatus(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    ApolloLog(@"[PaneDisplayTest] status %@",
+              pane ? [pane apollo_simResolvedLayoutState] : @"no pane");
+}
+
+static void ApolloSimDebugLogLayoutPassState(BOOL reset) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    NSString *state = pane
+        ? [pane apollo_simLayoutPassStateReset:reset] : @"no pane pass=0";
+    [state writeToFile:@"/tmp/apollofix-layout-pass.txt"
+             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    ApolloLog(@"[PaneLayoutPassTest] %@ %@", reset ? @"reset" : @"status", state);
+}
+
+static void ApolloSimDebugLogMasterSelectionStatus(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    ApolloLog(@"[PaneSelectionTest] %@",
+              pane ? [pane apollo_simMasterSelectionState] : @"no pane pass=0");
+}
+
+static void ApolloSimDebugClearMasterSelection(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    [pane apollo_clearDetailColumn];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApolloSimDebugLogMasterSelectionStatus();
+    });
+}
+
+static void ApolloSimDebugPushSelectionContinuation(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    UINavigationController *detail =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnSecondary];
+    if (!pane || pane.apollo_detailIsEmpty || !detail) {
+        ApolloLog(@"[PaneSelectionTest] continuation unavailable");
+        return;
+    }
+    UIViewController *continuation = [UIViewController new];
+    continuation.title = @"Task 14 Continuation";
+    continuation.view.backgroundColor = UIColor.systemBackgroundColor;
+    [detail pushViewController:continuation animated:NO];
+    ApolloLog(@"[PaneSelectionTest] continuation pushed depth=%lu %@",
+              (unsigned long)detail.viewControllers.count,
+              [pane apollo_simMasterSelectionState]);
+}
+
+static void ApolloSimDebugActivateShowList(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    BOOL activated = [pane apollo_simActivateShowPrimaryItem];
+    ApolloLog(@"[PaneDisplayTest] activate showlist=%d before={%@}", activated,
+              pane ? [pane apollo_simResolvedLayoutState] : @"no pane");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ApolloLog(@"[PaneDisplayTest] activate settled={%@}",
+                  pane ? [pane apollo_simResolvedLayoutState] : @"no pane");
+    });
+}
+
+// Deterministic serialization harness for Task 11. Holding the pane's test gate
+// emulates a live transition without relying on Xcode 27's broken HID events.
+// Multiple `transitionselect` commands exercise the real push hook and must
+// coalesce to the last identifier; `transitiongate off` releases the queue.
+static void ApolloSimDebugSetTransitionGate(NSString *operation) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    if (!pane) {
+        ApolloLog(@"[SimDebugTap][transition] gate unavailable");
+        return;
+    }
+    if ([operation isEqualToString:@"on"] || [operation isEqualToString:@"off"]) {
+        [pane apollo_simSetCrossColumnNavigationBlocked:[operation isEqualToString:@"on"]];
+    }
+    ApolloLog(@"[SimDebugTap][transition] %@", [pane apollo_simCrossColumnNavigationState]);
+}
+
+static void ApolloSimDebugSelectTransitionProbe(NSString *identifier) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    UINavigationController *primary =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnPrimary];
+    if (!pane || !primary.topViewController) {
+        ApolloLog(@"[SimDebugTap][transition] selection unavailable");
+        return;
+    }
+    NSString *normalized = identifier.length > 0 ? identifier : @"unnamed";
+    ApolloPaneTransitionProbeViewController *probe =
+        [[ApolloPaneTransitionProbeViewController alloc] initWithIdentifier:normalized];
+    [primary pushViewController:probe animated:NO];
+    UINavigationController *detail =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnSecondary];
+    ApolloLog(@"[SimDebugTap][transition] selected=%@ immediatePrimary=%@ immediateDetail=%@ state={%@}",
+              normalized, primary.topViewController.title ?: @"(nil)",
+              detail.topViewController.title ?: @"(nil)",
+              [pane apollo_simCrossColumnNavigationState]);
+}
+
+static void ApolloSimDebugDumpTransitionState(void) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    UINavigationController *primary =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnPrimary];
+    UINavigationController *detail =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnSecondary];
+    ApolloLog(@"[SimDebugTap][transition] primary=%@ depth=%lu detail=%@ depth=%lu state={%@}",
+              primary.topViewController.title ?: NSStringFromClass(primary.topViewController.class),
+              (unsigned long)primary.viewControllers.count,
+              detail.topViewController.title ?: NSStringFromClass(detail.topViewController.class),
+              (unsigned long)detail.viewControllers.count,
+              pane ? [pane apollo_simCrossColumnNavigationState] : @"no pane");
+}
+
+static UIGestureRecognizer *ApolloSimDebugNavigationGesture(UINavigationController *navigationController,
+                                                            const char *ivarName) {
+    if (!navigationController || !ivarName) return nil;
+    @try {
+        Ivar ivar = class_getInstanceVariable(navigationController.class, ivarName);
+        id value = ivar ? object_getIvar(navigationController, ivar) : nil;
+        return [value isKindOfClass:[UIGestureRecognizer class]] ? value : nil;
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+// Drive Apollo's real detail edge recognizer while two newer primary selections
+// arrive. This is intentionally slower than an ordinary swipe so both pushes
+// deterministically land after the recognizer begins and before it terminates.
+static BOOL sApolloSimTransitionRaceRunning = NO;
+
+static void ApolloSimDebugRunInteractiveTransitionRace(BOOL shouldCommit) {
+    ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+    UINavigationController *detail =
+        [pane apollo_navigationControllerForColumn:ApolloPaneColumnSecondary];
+    if (!pane || !detail.viewIfLoaded.window ||
+        detail.transitionCoordinator || sApolloSimTransitionRaceRunning) {
+        ApolloLog(@"[SimDebugTap][transitionrace] detail unavailable");
+        return;
+    }
+    // Always isolate the gesture from real Reddit content. The synthetic Back
+    // pops only this inert probe even when the live detail stack was already deep.
+    ApolloPaneTransitionProbeViewController *child =
+        [[ApolloPaneTransitionProbeViewController alloc] initWithIdentifier:@"Gesture Child"];
+    [detail pushViewController:child animated:NO];
+    if (detail.viewControllers.count < 2) {
+        ApolloLog(@"[SimDebugTap][transitionrace] could not prepare detail child");
+        return;
+    }
+
+    // The nonanimated fixture push still delivers appearance/gesture policy on
+    // the next run-loop turn. Begin the touch after that real settlement, as a
+    // user does after a completed push; a touch begun on a disabled recognizer
+    // cannot be recovered by enabling it midway through the same sequence.
+    sApolloSimTransitionRaceRunning = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIGestureRecognizer *apolloEdge =
+            ApolloSimDebugNavigationGesture(detail, "leftScreenEdgePanGestureRecognizer");
+        if (!apolloEdge) {
+            ApolloLog(@"[SimDebugTap][transitionrace] ERROR Apollo edge recognizer unavailable");
+            sApolloSimTransitionRaceRunning = NO;
+            return;
+        }
+
+        UIWindow *window = detail.view.window;
+        // Stay clear of the divider's intentional 44-point hit region at mid-height.
+        CGPoint localStart = CGPointMake(8.0, CGRectGetHeight(detail.view.bounds) * 0.25);
+        CGPoint localEnd = CGPointMake(shouldCommit ? detail.view.bounds.size.width * 0.72 : 42.0,
+                                       localStart.y);
+        CGPoint start = [detail.view convertPoint:localStart toView:window];
+        CGPoint end = [detail.view convertPoint:localEnd toView:window];
+        UIView *hitView = [window hitTest:start withEvent:nil];
+        if (!hitView || ![hitView isDescendantOfView:detail.view]) {
+            ApolloLog(@"[SimDebugTap][transitionrace] invalid edge hit view=%@", hitView);
+            sApolloSimTransitionRaceRunning = NO;
+            return;
+        }
+
+        UITouch *touch = [UITouch new];
+        [touch setWindow:window];
+        [touch setView:hitView];
+        [touch setTapCount:1];
+        if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) {
+            [touch _setIsFirstTouchForView:YES];
+        }
+        [touch _setLocationInWindow:start resetPrevious:YES];
+        [touch setPhase:UITouchPhaseBegan];
+        sApolloSimTransitionRaceRunning = YES;
+        ApolloSimDebugSendTouch(touch);
+
+        const int steps = 24;
+        __block BOOL raceVerified = NO;
+        for (int index = 1; index <= steps; index++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                (int64_t)(index * 0.022 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    CGFloat progress;
+                    if (!shouldCommit && index <= 4) {
+                        // Cross pan-recognition hysteresis promptly, then crawl to
+                        // the cancellation endpoint so terminal velocity stays low.
+                        progress = (28.0 - localStart.x) * ((CGFloat)index / 4.0) /
+                            (localEnd.x - localStart.x);
+                    } else if (!shouldCommit) {
+                        CGFloat tail = (CGFloat)(index - 4) / (CGFloat)(steps - 4);
+                        progress = ((28.0 - localStart.x) +
+                            (localEnd.x - 28.0) * tail) / (localEnd.x - localStart.x);
+                    } else {
+                        progress = (CGFloat)index / (CGFloat)steps;
+                    }
+                    CGPoint point = CGPointMake(start.x + (end.x - start.x) * progress,
+                                                start.y + (end.y - start.y) * progress);
+                    [touch _setLocationInWindow:point resetPrevious:NO];
+                    [touch setPhase:UITouchPhaseMoved];
+                    ApolloSimDebugSendTouch(touch);
+                });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            id<UIViewControllerTransitionCoordinator> coordinator = detail.transitionCoordinator;
+            UIGestureRecognizerState state = apolloEdge.state;
+            raceVerified = (state == UIGestureRecognizerStateBegan ||
+                            state == UIGestureRecognizerStateChanged) && coordinator.isInteractive;
+            ApolloLog(@"[SimDebugTap][transitionrace] verified=%d edgeState=%ld interactive=%d",
+                      raceVerified, (long)state, coordinator.isInteractive);
+            if (!raceVerified) {
+                ApolloLog(@"[SimDebugTap][transitionrace] ERROR interactive transition did not begin");
+            }
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.14 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (raceVerified) ApolloSimDebugSelectTransitionProbe(@"Race A");
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.24 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (raceVerified) ApolloSimDebugSelectTransitionProbe(@"Race B");
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.56 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [touch _setLocationInWindow:end resetPrevious:NO];
+            [touch setPhase:shouldCommit ? UITouchPhaseEnded : UITouchPhaseCancelled];
+            ApolloSimDebugSendTouch(touch);
+            ApolloLog(@"[SimDebugTap][transitionrace] gesture ended commit=%d verified=%d start=(%.0f,%.0f) end=(%.0f,%.0f)",
+                      shouldCommit, raceVerified, start.x, start.y, end.x, end.y);
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            ApolloSimDebugDumpTransitionState();
+            sApolloSimTransitionRaceRunning = NO;
+        });
+    });
+}
+
+static NSString *ApolloSimDebugNavigationItemSummary(UINavigationItem *item) {
+    NSMutableArray<NSString *> *leftItems = [NSMutableArray array];
+    for (UIBarButtonItem *barItem in item.leftBarButtonItems ?: @[]) {
+        [leftItems addObject:barItem.title ?: barItem.accessibilityIdentifier ?: @"(untitled)"];
+    }
+    return [NSString stringWithFormat:@"hides=%d supplements=%d left=[%@] back=%@",
+        item.hidesBackButton, item.leftItemsSupplementBackButton,
+        [leftItems componentsJoinedByString:@", "],
+        item.backBarButtonItem.title ?: item.backButtonTitle ?: @"(nil)"];
+}
+
+// "navitemdump [primary|detail]" records the top controller's complete leading-
+// item policy so real Apollo destinations can be compared before and after a
+// pane route without relying on pixels alone.
+static void ApolloSimDebugDumpNavigationItem(NSString *columnName) {
+    UINavigationController *navigationController =
+        ApolloSimDebugSelectedNavigationController(columnName);
+    UIViewController *top = navigationController.topViewController;
+    ApolloLog(@"[SimDebugTap] navitem column=%@ top=%@ depth=%lu %@",
+              columnName ?: @"primary", NSStringFromClass(top.class),
+              (unsigned long)navigationController.viewControllers.count,
+              ApolloSimDebugNavigationItemSummary(top.navigationItem));
+}
+
+// "navitemprobe [primary|detail]" pushes an intentionally unknown controller
+// whose native policy hides Back and owns a leading item. The pane router must
+// leave every property and object identity untouched, then the original stack
+// is restored without creating Forward history.
+static void ApolloSimDebugProbeUnknownNavigationItem(NSString *columnName) {
+    UINavigationController *navigationController =
+        ApolloSimDebugSelectedNavigationController(columnName);
+    if (!navigationController) {
+        ApolloLog(@"[SimDebugTap] navitemprobe unavailable column=%@", columnName);
+        return;
+    }
+    NSArray<UIViewController *> *originalStack = navigationController.viewControllers;
+    UIViewController *probe = [UIViewController new];
+    probe.title = @"Unknown Navigation Item Probe";
+    UIBarButtonItem *nativeItem = [[UIBarButtonItem alloc]
+        initWithTitle:@"Native" style:UIBarButtonItemStylePlain target:nil action:nil];
+    probe.navigationItem.leftBarButtonItems = @[ nativeItem ];
+    probe.navigationItem.hidesBackButton = YES;
+    probe.navigationItem.leftItemsSupplementBackButton = NO;
+
+    [navigationController pushViewController:probe animated:NO];
+    BOOL retained = navigationController.topViewController == probe &&
+        probe.navigationItem.hidesBackButton &&
+        !probe.navigationItem.leftItemsSupplementBackButton &&
+        probe.navigationItem.leftBarButtonItems.count == 1 &&
+        probe.navigationItem.leftBarButtonItems.firstObject == nativeItem;
+    ApolloLog(@"[SimDebugTap] navitemprobe column=%@ retained=%d %@",
+              columnName ?: @"primary", retained,
+              ApolloSimDebugNavigationItemSummary(probe.navigationItem));
+    [navigationController setViewControllers:originalStack animated:NO];
+}
+
+// "navitemmutate [primary|detail]" simulates a destination changing its own
+// leading items and Back policy while compact. Expansion must remove only the
+// pane-owned item and preserve these native changes.
+static void ApolloSimDebugMutateNavigationItem(NSString *columnName) {
+    UINavigationController *navigationController =
+        ApolloSimDebugSelectedNavigationController(columnName);
+    UIViewController *top = navigationController.topViewController;
+    if (!top) {
+        ApolloLog(@"[SimDebugTap] navitemmutate unavailable column=%@", columnName);
+        return;
+    }
+    UIBarButtonItem *dynamicItem = [[UIBarButtonItem alloc]
+        initWithTitle:@"Dynamic" style:UIBarButtonItemStylePlain target:nil action:nil];
+    dynamicItem.accessibilityIdentifier = @"ApolloPaneTask10Dynamic";
+    NSArray<UIBarButtonItem *> *existing = top.navigationItem.leftBarButtonItems ?: @[];
+    top.navigationItem.leftBarButtonItems = [existing arrayByAddingObject:dynamicItem];
+    top.navigationItem.leftItemsSupplementBackButton = YES;
+    top.navigationItem.hidesBackButton = YES;
+    ApolloLog(@"[SimDebugTap] navitemmutate column=%@ top=%@ %@",
+              columnName ?: @"detail", NSStringFromClass(top.class),
+              ApolloSimDebugNavigationItemSummary(top.navigationItem));
+}
+
+// "railpad <n>" pads the top controller's trailing items with n dummy icons
+// (0 removes them), so a Duo rail can be pushed into UIKit's overflow without
+// a Live Activity, which the simulator can't show for another app.
+// The rail shows the trailing items of the visible page, which can sit inside
+// a container (the Duo split host): take the first controller that has some.
+static UIViewController *ApolloSimDebugTrailingItemsOwner(UIViewController *controller) {
+    if (!controller.isViewLoaded || !controller.view.window) return nil;
+    for (UIViewController *child in controller.childViewControllers) {
+        UIViewController *owner = ApolloSimDebugTrailingItemsOwner(child);
+        if (owner) return owner;
+    }
+    return controller.navigationItem.rightBarButtonItems.count ? controller : nil;
+}
+
+// "railprobe" logs every bar button view in the window (frame, labels and
+// identifier) and the rail page's trailing items.
+static void ApolloSimDebugProbeRailView(UIView *view) {
+    if ([NSStringFromClass(view.class) isEqualToString:@"_UIButtonBarButton"]) {
+        CGRect frame = [view convertRect:view.bounds toView:nil];
+        ApolloLog(@"[SimDebugTap] railprobe %@ label=%@ id=%@ hidden=%d alpha=%.2f",
+                  NSStringFromCGRect(frame), view.accessibilityLabel, view.accessibilityIdentifier,
+                  view.hidden, view.alpha);
+    }
+    for (UIView *subview in view.subviews) ApolloSimDebugProbeRailView(subview);
+}
+
+static void ApolloSimDebugPadRail(NSInteger count) {
+    UIViewController *top = ApolloSimDebugSelectedNavigationController(@"primary").topViewController;
+    top = ApolloSimDebugTrailingItemsOwner(top) ?: top;
+    UINavigationItem *item = top.navigationItem;
+    NSMutableArray<UIBarButtonItem *> *items = [NSMutableArray array];
+    for (UIBarButtonItem *candidate in item.rightBarButtonItems ?: @[]) {
+        if (![candidate.accessibilityIdentifier isEqualToString:@"ApolloSimRailPad"]) [items addObject:candidate];
+    }
+    for (NSInteger index = 0; index < count; index++) {
+        UIBarButtonItem *pad = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"circle"]
+                                                                style:UIBarButtonItemStylePlain target:nil action:nil];
+        pad.accessibilityIdentifier = @"ApolloSimRailPad";
+        pad.title = [NSString stringWithFormat:@"Test space %ld", (long)index + 1];
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
+        if (@available(iOS 27.0, *)) pad.visibilityPriority = UIBarButtonItemVisibilityPriorityHigh + 1;
+#endif
+        [items insertObject:pad atIndex:0];
+    }
+    [item setRightBarButtonItems:items animated:NO];
+    ApolloLog(@"[SimDebugTap] railpad %ld on %@ (%lu trailing items)", (long)count,
+              NSStringFromClass(top.class), (unsigned long)items.count);
+}
+
+// "navback [primary|detail]" command: perform the navigation-controller pop that UIKit's Back
+// button would request. Xcode 27 currently drops idb HID events, so this keeps
+// compact ownership tests deterministic while still exercising the real stack
+// mutation and navigation-controller delegate callbacks.
+static void ApolloSimDebugPerformNavigationBack(NSString *columnName) {
+    UINavigationController *navigationController =
+        ApolloSimDebugSelectedNavigationController(columnName);
+    if (navigationController.viewControllers.count <= 1) {
+        ApolloLog(@"[SimDebugTap] navback unavailable column=%@ depth=%lu",
+                  columnName ?: @"primary",
+                  (unsigned long)navigationController.viewControllers.count);
+        return;
+    }
+
+    UIViewController *popped = [navigationController popViewControllerAnimated:NO];
+    ApolloLog(@"[SimDebugTap] navback column=%@ popped=%@ remaining=%@ depth=%lu",
+              columnName ?: @"primary",
+              NSStringFromClass(popped.class),
+              NSStringFromClass(navigationController.topViewController.class),
+              (unsigned long)navigationController.viewControllers.count);
+}
+
+// "navforward [primary|detail]" pairs with navback and invokes ApolloNavigationController's
+// real forward-history action. Re-pushing through that path also passes through
+// the pane router, which is the behavior the compact ownership test needs to
+// verify before expansion.
+static void ApolloSimDebugPerformNavigationForward(NSString *columnName) {
+    UINavigationController *navigationController =
+        ApolloSimDebugSelectedNavigationController(columnName);
+    SEL forward = NSSelectorFromString(@"goForward");
+    if (![navigationController respondsToSelector:forward]) {
+        ApolloLog(@"[SimDebugTap] navforward unavailable column=%@ nav=%@",
+                  columnName ?: @"primary", NSStringFromClass(navigationController.class));
+        return;
+    }
+
+    NSUInteger beforeDepth = navigationController.viewControllers.count;
+    NSString *beforeTop = NSStringFromClass(navigationController.topViewController.class);
+    ((void (*)(id, SEL))objc_msgSend)(navigationController, forward);
+    ApolloLog(@"[SimDebugTap] navforward column=%@ nav=%@ depth=%lu->%lu top=%@->%@",
+              columnName ?: @"primary",
+              NSStringFromClass(navigationController.class),
+              (unsigned long)beforeDepth,
+              (unsigned long)navigationController.viewControllers.count,
+              beforeTop, NSStringFromClass(navigationController.topViewController.class));
+}
+
+// "navset primary same|root": deterministically exercise Apollo's
+// setViewControllers: entry point. `same` proves a no-op replacement retains a
+// valid detail branch; `root` proves removing its owner clears detail and
+// forward history. Simulator-only because production never needs a synthetic
+// stack mutation.
+static void ApolloSimDebugSetNavigationStack(NSString *arguments) {
+    NSArray<NSString *> *parts = [arguments componentsSeparatedByCharactersInSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    for (NSString *part in parts) {
+        if (part.length > 0) [tokens addObject:part];
+    }
+    NSString *column = tokens.count > 0 ? tokens[0] : @"primary";
+    NSString *operation = tokens.count > 1 ? tokens[1] : @"same";
+    UINavigationController *navigationController =
+        ApolloSimDebugSelectedNavigationController(column);
+    NSArray<UIViewController *> *before = navigationController.viewControllers;
+    NSArray<UIViewController *> *replacement = before;
+    if ([operation isEqualToString:@"root"] && before.firstObject) {
+        replacement = @[ before.firstObject ];
+    }
+    [navigationController setViewControllers:replacement animated:NO];
+    ApolloLog(@"[SimDebugTap] navset column=%@ operation=%@ depth=%lu->%lu",
+              column, operation, (unsigned long)before.count,
+              (unsigned long)navigationController.viewControllers.count);
+}
+
+// Exercise the same unambiguous active-account notification that production
+// observes, without changing or exposing any saved credentials.
+static void ApolloSimDebugPostAccountContextChange(void) {
+    [NSNotificationCenter.defaultCenter
+        postNotificationName:@"com.christianselig.RedditCurrentAccountChanged"
+                      object:nil];
+    ApolloLog(@"[SimDebugTap] posted active-account context change");
+}
+
+// "tab N" command: select a tab through UITabBarController's public API. This
+// avoids Xcode 27's broken HID path while still exercising Apollo's ordinary
+// tab-child attachment and pane lifecycle for the smoke loop.
+static void ApolloSimDebugSelectTab(NSInteger index) {
+    UIViewController *controller = ApolloMainTabBarController();
+    if (![controller isKindOfClass:[UITabBarController class]]) {
+        ApolloLog(@"[SimDebugTap] tab selection unavailable");
+        return;
+    }
+    UITabBarController *tabBarController = (UITabBarController *)controller;
+    if (index < 0 || index >= (NSInteger)tabBarController.viewControllers.count) {
+        ApolloLog(@"[SimDebugTap] tab selection out of range: %ld", (long)index);
+        return;
+    }
+    tabBarController.selectedIndex = index;
+    ApolloLog(@"[SimDebugTap] selected tab %ld child=%@", (long)index,
+              NSStringFromClass(tabBarController.selectedViewController.class));
+}
+
+// "routeurl <url>": invoke Apollo's real AppDelegate URL entry point. The
+// simulator's URL-scheme dispatcher is unreliable for this re-signed app on
+// Xcode 27, so this provides deterministic warm-entry coverage without
+// replacing any production routing logic.
+static void ApolloSimDebugRouteURL(NSString *rawURL) {
+    NSURL *url = [NSURL URLWithString:rawURL];
+    BOOL routed = url && ApolloRouteURLThroughApp(url);
+    ApolloLog(@"[SimDebugTap] routeurl routed=%d scheme=%@",
+              routed, url.scheme.lowercaseString ?: @"invalid");
+}
+
+// "useractivity <url>": invoke Apollo's real SceneDelegate Handoff/universal-
+// link entry point with a browsing-web activity.
+static void ApolloSimDebugContinueUserActivity(NSString *rawURL) {
+    NSURL *url = [NSURL URLWithString:rawURL];
+    NSString *scheme = url.scheme.lowercaseString;
+    if (!([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"])) {
+        ApolloLog(@"[SimDebugTap] useractivity rejected non-web scheme=%@",
+                  scheme ?: @"invalid");
+        return;
+    }
+    NSUserActivity *activity = [[NSUserActivity alloc]
+        initWithActivityType:NSUserActivityTypeBrowsingWeb];
+    @try {
+        activity.webpageURL = url;
+    } @catch (NSException *exception) {
+        ApolloLog(@"[SimDebugTap] useractivity could not set webpage URL: %@", exception);
+        return;
+    }
+
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        id delegate = scene.delegate;
+        SEL selector = @selector(scene:continueUserActivity:);
+        if (![delegate respondsToSelector:selector]) continue;
+        ((void (*)(id, SEL, id, id))objc_msgSend)(delegate, selector, scene, activity);
+        ApolloLog(@"[SimDebugTap] useractivity delivered=%d scheme=%@",
+                  url != nil, url.scheme.lowercaseString ?: @"invalid");
+        return;
+    }
+    ApolloLog(@"[SimDebugTap] useractivity: no scene delegate accepted the activity");
+}
+
+// "shortcut Search" and "shortcut FavoriteSubreddit <name>": drive the two
+// exact UIApplicationShortcutItem types Apollo 1.15.11 accepts through the
+// real SceneDelegate callback. Search is especially useful here because the
+// native implementation indexes viewControllers[3] and casts it to a nav.
+static void ApolloSimDebugPerformShortcut(NSString *arguments) {
+    NSArray<NSString *> *parts = [arguments componentsSeparatedByCharactersInSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    for (NSString *part in parts) if (part.length > 0) [tokens addObject:part];
+    NSString *type = tokens.firstObject;
+    if (!([type isEqualToString:@"Search"] || [type isEqualToString:@"FavoriteSubreddit"])) {
+        ApolloLog(@"[SimDebugTap] shortcut rejected unknown type=%@", type ?: @"missing");
+        return;
+    }
+
+    NSDictionary *userInfo = nil;
+    if ([type isEqualToString:@"FavoriteSubreddit"]) {
+        if (tokens.count < 2) {
+            ApolloLog(@"[SimDebugTap] FavoriteSubreddit shortcut requires a subreddit");
+            return;
+        }
+        userInfo = @{ @"subreddit": tokens[1] };
+    }
+    UIApplicationShortcutItem *item = [[UIApplicationShortcutItem alloc]
+        initWithType:type localizedTitle:type localizedSubtitle:nil icon:nil userInfo:userInfo];
+
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        id delegate = scene.delegate;
+        SEL selector = @selector(windowScene:performActionForShortcutItem:completionHandler:);
+        if (![delegate respondsToSelector:selector]) continue;
+        void (^completion)(BOOL) = ^(BOOL succeeded) {
+            ApolloLog(@"[SimDebugTap] shortcut type=%@ completed=%d", type, succeeded);
+        };
+        ((void (*)(id, SEL, id, id, id))objc_msgSend)(delegate, selector, scene, item, completion);
+        return;
+    }
+    ApolloLog(@"[SimDebugTap] shortcut: no scene delegate accepted the item");
+}
+
+void ApolloSubredditListDiagRearm(void);
+
+#pragma mark - gifmem probe (issue #1000)
+
+static double ApolloSimDebugFootprintMB(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return -1.0;
+    return info.phys_footprint / 1048576.0;
+}
+
+// Keeps the probe's view + image alive between samples.
+static UIImageView *sApolloSimDebugGIFView = nil;
+static UIImage *sApolloSimDebugGIFImage = nil;
+
+static void ApolloSimDebugSampleGIFMemory(NSInteger remaining, double baseline) {
+    ApolloLog(@"[gifmem] t+%lds footprint %.0f MB (+%.0f)",
+              (long)(6 - remaining), ApolloSimDebugFootprintMB(), ApolloSimDebugFootprintMB() - baseline);
+    if (remaining <= 0) {
+        [sApolloSimDebugGIFView removeFromSuperview];
+        sApolloSimDebugGIFView = nil;
+        sApolloSimDebugGIFImage = nil;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            ApolloLog(@"[gifmem] released: footprint %.0f MB (+%.0f)",
+                      ApolloSimDebugFootprintMB(), ApolloSimDebugFootprintMB() - baseline);
+        });
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ApolloSimDebugSampleGIFMemory(remaining - 1, baseline);
+    });
+}
+
+static void ApolloSimDebugMeasureGIFMemory(NSString *source) {
+    double baseline = ApolloSimDebugFootprintMB();
+    ApolloLog(@"[gifmem] baseline footprint %.0f MB, source %@", baseline, source);
+
+    void (^measure)(NSData *) = ^(NSData *data) {
+        if (data.length == 0) { ApolloLog(@"[gifmem] no bytes"); return; }
+        ApolloLog(@"[gifmem] %.1f MB of source bytes", data.length / 1048576.0);
+
+        UIWindow *window = ApolloKeyWindow() ?: ApolloAllWindows().firstObject;
+        if (!window) { ApolloLog(@"[gifmem] no window"); return; }
+
+        NSDate *start = NSDate.date;
+        ApolloGalleryDecodedImage *decoded = [ApolloGalleryImageLoader apollo_debugDecodeData:data];
+        if (!decoded) { ApolloLog(@"[gifmem] decode returned nil"); return; }
+        ApolloLog(@"[gifmem] decoded %.0fx%.0f in %.2fs, animated=%@",
+                  decoded.image.size.width, decoded.image.size.height,
+                  -[start timeIntervalSinceNow], decoded.animatedImage ? @"YES" : @"NO");
+
+        // Mounted exactly the way a viewer page mounts it, so the sample covers
+        // the frame traffic UIKit generates during playback and not just the
+        // decode.
+        Class viewClass = objc_getClass("FLAnimatedImageView") ?: UIImageView.class;
+        UIImageView *view = [[viewClass alloc] initWithFrame:window.bounds];
+        if (decoded.animatedImage && [view respondsToSelector:@selector(setAnimatedImage:)]) {
+            [view setValue:decoded.animatedImage forKey:@"animatedImage"];
+        } else {
+            view.image = decoded.image;
+        }
+        sApolloSimDebugGIFImage = decoded.image;
+        double afterDecode = ApolloSimDebugFootprintMB();
+        ApolloLog(@"[gifmem] after build: footprint %.0f MB (+%.0f)", afterDecode, afterDecode - baseline);
+
+        view.contentMode = UIViewContentModeScaleAspectFit;
+        [window addSubview:view];
+        sApolloSimDebugGIFView = view;
+        ApolloLog(@"[gifmem] installed on screen, sampling for 6s…");
+        ApolloSimDebugSampleGIFMemory(6, baseline);
+    };
+
+    if ([source hasPrefix:@"http"]) {
+        NSURL *url = [NSURL URLWithString:source];
+        [[NSURLSession.sharedSession dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+            dispatch_async(dispatch_get_main_queue(), ^{ measure(data); });
+        }] resume];
+    } else {
+        measure([NSData dataWithContentsOfFile:source]);
+    }
+}
+
+// "navchurn" command: pop the top controller and push it straight back in the
+// same turn. UIKit queues the push and starts it synchronously from inside the
+// pop's completeTransition: (the same shape as a push issued from
+// didShowViewController:, which nickclyde raised on #1018), so two transitions
+// overlap on the stack and ApolloInterruptibleNavTransition must hand each its
+// own animator. 1.5 s later this logs what the pair left behind: the stack, the
+// interaction flags UIKit/our completion should have restored, the interactive
+// in-flight counter, and every sibling of the top view in the transition
+// container (a leftover dim/shadow view shows up there as a plain UIView).
+static UINavigationController *ApolloSimDebugNavChurnNavigationController(void) {
+    UIViewController *vc = ApolloKeyWindow().rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if ([vc isKindOfClass:UITabBarController.class]) vc = ((UITabBarController *)vc).selectedViewController;
+    if ([vc isKindOfClass:UINavigationController.class]) return (UINavigationController *)vc;
+    return vc.navigationController;
+}
+
+static void ApolloSimDebugNavChurnReport(UINavigationController *nav, NSString *phase) {
+    UIViewController *top = nav.topViewController;
+    UIViewController *below = nav.viewControllers.count >= 2
+        ? nav.viewControllers[nav.viewControllers.count - 2] : nil;
+    NSMutableArray<NSString *> *siblings = [NSMutableArray array];
+    for (UIView *view in top.view.superview.subviews) {
+        [siblings addObject:[NSString stringWithFormat:@"%@%@%@", NSStringFromClass(view.class),
+            view.accessibilityIdentifier ? [@"#" stringByAppendingString:view.accessibilityIdentifier] : @"",
+            view == top.view ? @"(top)" : @""]];
+    }
+    ApolloLog(@"[SimDebugTap] navchurn %@: stack=%lu top=%@ topInteractive=%d belowInteractive=%d "
+              "inFlight=%d containerSubviews=[%@]",
+              phase, (unsigned long)nav.viewControllers.count, NSStringFromClass(top.class),
+              top.view.userInteractionEnabled, below.view.userInteractionEnabled,
+              ApolloNavTransitionInFlight(), [siblings componentsJoinedByString:@", "]);
+}
+
+// "navchurn appear" variant: the push is issued from the revealed controller's
+// viewDidAppear:, which UIKit runs inside the pop's completeTransition:, so the
+// pop's completion block is still on the stack when the push is requested.
+static __weak UIViewController *sApolloSimNavChurnRevealed;
+static __weak UIViewController *sApolloSimNavChurnPopped;
+
+static void ApolloSimDebugNavChurn(NSString *mode) {
+    UINavigationController *nav = ApolloSimDebugNavChurnNavigationController();
+    if ([mode isEqualToString:@"report"] && nav) {
+        ApolloSimDebugNavChurnReport(nav, @"report");
+        return;
+    }
+    if (!nav || nav.viewControllers.count < 2) {
+        ApolloLog(@"[SimDebugTap] navchurn: needs a pushed controller (nav=%@ depth=%lu)",
+                  nav, (unsigned long)nav.viewControllers.count);
+        return;
+    }
+    ApolloSimDebugNavChurnReport(nav, @"before");
+    UIViewController *top = nav.topViewController;
+    if ([mode isEqualToString:@"appear"]) {
+        sApolloSimNavChurnRevealed = nav.viewControllers[nav.viewControllers.count - 2];
+        sApolloSimNavChurnPopped = top;
+        ApolloLog(@"[SimDebugTap] navchurn appear: pop %@, push it back from %@'s viewDidAppear:",
+                  NSStringFromClass(top.class), NSStringFromClass(sApolloSimNavChurnRevealed.class));
+        [nav popViewControllerAnimated:YES];
+    } else {
+        ApolloLog(@"[SimDebugTap] navchurn: pop %@ and push it back in the same turn",
+                  NSStringFromClass(top.class));
+        [nav popViewControllerAnimated:YES];
+        [nav pushViewController:top animated:YES];
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ApolloSimDebugNavChurnReport(nav, @"after");
+    });
+}
+
+// Grouped on purpose: an ungrouped %hook makes Logos append its registration
+// after the closing #endif, where the device build (no APOLLO_SIM_BUILD) has
+// none of these declarations. %init(ApolloSimNavChurn) lives in the %ctor below.
+%group ApolloSimNavChurn
+%hook UIViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    UIViewController *popped = sApolloSimNavChurnPopped;
+    if (!popped || self != sApolloSimNavChurnRevealed) return;
+    sApolloSimNavChurnRevealed = nil;
+    sApolloSimNavChurnPopped = nil;
+    UINavigationController *nav = self.navigationController;
+    [nav pushViewController:popped animated:YES];
+    ApolloLog(@"[SimDebugTap] navchurn appear: pushed %@ from viewDidAppear:; coordinator now %@ "
+              "(non-nil means the push started synchronously, inside the pop's completeTransition:)",
+              NSStringFromClass(popped.class), nav.transitionCoordinator);
+}
+%end
+%end
+
+// "shortpane" state: while set, Apollo's normal-level windows keep the
+// simulated bottom-pane frame. Apollo's canvas fit (ApolloDeviceDisplay) and
+// UIKit's scene layout otherwise snap them back to the full scene.
+static CGFloat sApolloSimShortPaneHeight;
+
+static BOOL ApolloSimShortPaneFrame(UIWindow *window, CGRect *frame) {
+    if (sApolloSimShortPaneHeight <= 0.0 || window.windowLevel != UIWindowLevelNormal
+        || !window.windowScene) return NO;
+    CGRect full = window.windowScene.coordinateSpace.bounds;
+    CGFloat height = MIN(sApolloSimShortPaneHeight, CGRectGetHeight(full));
+    *frame = CGRectMake(0.0, CGRectGetHeight(full) - height, CGRectGetWidth(full), height);
+    return YES;
+}
+
+%group ApolloSimShortPane
+%hook UIWindow
+- (void)setFrame:(CGRect)frame {
+    ApolloSimShortPaneFrame(self, &frame);
+    %orig(frame);
+}
+%end
+// UIKit derives the root controller's overlay insets as if its window began
+// at the scene origin, so the full display's 82pt status inset survives on a
+// window moved to the bottom pane. The window's own safe area is right; a
+// real pane (its own scene) gives the root controller exactly that.
+%hook UIViewController
+- (void)_setContentOverlayInsets:(UIEdgeInsets)insets {
+    UIWindow *window = self.viewIfLoaded.window;
+    CGRect pane;
+    if (window && window.rootViewController == self && ApolloSimShortPaneFrame(window, &pane)) {
+        insets = window.safeAreaInsets;
+    }
+    %orig(insets);
+}
+- (void)_setContentOverlayInsets:(UIEdgeInsets)insets andLeftMargin:(CGFloat)left rightMargin:(CGFloat)right {
+    UIWindow *window = self.viewIfLoaded.window;
+    CGRect pane;
+    if (window && window.rootViewController == self && ApolloSimShortPaneFrame(window, &pane)) {
+        insets = window.safeAreaInsets;
+    }
+    %orig(insets, left, right);
+}
+%end
+%end
+
+// "scrollto Y" command support: pin the tallest on-screen scroll view (the
+// comments table on a thread) to a content offset, so a test can land on the
+// same comments every run — a synthesized flick's inertia varies run to run.
+static UIScrollView *ApolloSimDebugTallestScrollViewIn(UIView *view) {
+    UIScrollView *best = nil;
+    if ([view isKindOfClass:[UIScrollView class]] && !view.hidden && view.window) {
+        best = (UIScrollView *)view;
+    }
+    for (UIView *sub in view.subviews) {
+        UIScrollView *candidate = ApolloSimDebugTallestScrollViewIn(sub);
+        if (candidate && (!best || candidate.contentSize.height > best.contentSize.height)) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+static void ApolloSimDebugScrollTo(CGFloat y) {
+    UIScrollView *best = nil;
+    for (UIWindow *window in ApolloAllWindows()) {
+        if (window.hidden) continue;
+        UIScrollView *candidate = ApolloSimDebugTallestScrollViewIn(window);
+        if (candidate && (!best || candidate.contentSize.height > best.contentSize.height)) {
+            best = candidate;
+        }
+    }
+    if (!best) { ApolloLog(@"[SimDebugTap] scrollto: no scroll view"); return; }
+    CGFloat top = best.adjustedContentInset.top;
+    CGFloat maxY = MAX(-top, best.contentSize.height - best.bounds.size.height + best.adjustedContentInset.bottom);
+    CGFloat target = MIN(MAX(y - top, -top), maxY);
+    [best setContentOffset:CGPointMake(best.contentOffset.x, target) animated:NO];
+    ApolloLog(@"[SimDebugTap] scrollto %.0f -> offset %.0f (%@ content %.0f)",
+              y, target, NSStringFromClass([best class]), best.contentSize.height);
+}
+
+// "lpm on|off" command support: the simulator has no Battery settings pane,
+// so Low Power Mode can't be toggled there. Force -[NSProcessInfo
+// isLowPowerModeEnabled] instead and post the real power-state notification,
+// so the inline-GIF autoplay rules (which must ignore LPM — #634/#1004) and
+// anything else listening to the power state react exactly as on a device.
+// Swizzled by hand on the CONCRETE class of +[NSProcessInfo processInfo]
+// (swift-foundation hands back an _NSSwiftProcessInfo subclass on current
+// iOS, so a plain `%hook NSProcessInfo` never sees the call).
+static BOOL sApolloSimForceLowPowerMode = NO;
+static BOOL (*sApolloSimOrigIsLowPowerModeEnabled)(id, SEL) = NULL;
+
+static BOOL ApolloSimHookedIsLowPowerModeEnabled(id self, SEL _cmd) {
+    if (sApolloSimForceLowPowerMode) return YES;
+    return sApolloSimOrigIsLowPowerModeEnabled ? sApolloSimOrigIsLowPowerModeEnabled(self, _cmd) : NO;
+}
+
+static void ApolloSimInstallLowPowerModeOverride(void) {
+    Class cls = object_getClass(NSProcessInfo.processInfo);
+    Method m = class_getInstanceMethod(cls, @selector(isLowPowerModeEnabled));
+    if (!m) {
+        ApolloLog(@"[SimDebugTap] lpm override: no isLowPowerModeEnabled on %@", NSStringFromClass(cls));
+        return;
+    }
+    sApolloSimOrigIsLowPowerModeEnabled = (BOOL (*)(id, SEL))method_getImplementation(m);
+    ApolloSetMethodImplementation(cls, m, (IMP)ApolloSimHookedIsLowPowerModeEnabled);
+    ApolloLog(@"[SimDebugTap] lpm override installed on %@", NSStringFromClass(cls));
+}
+
+@interface ASDisplayNode (ApolloSimDebugDisplayGuard)
+- (void)setBounds:(CGRect)bounds;
+- (CALayer *)layer;
+- (void)displayImmediately;
+@end
+
+// "bitmapassert" command: push UIKit's legacy image context with a size
+// CGBitmapContextCreate rejects, so the SDK-gated assert behind #1097 can be
+// observed directly. A glass shell (Apollo relinked against the iOS 26 SDK)
+// raises NSInternalInconsistencyException; a classic shell pushes no context
+// and raises nothing.
+static void ApolloSimDebugBitmapAssert(void) {
+    @try {
+        UIGraphicsBeginImageContextWithOptions(CGSizeZero, NO, 0);
+        CGContextRef context = UIGraphicsGetCurrentContext();
+        ApolloLog(@"[SimDebugTap] bitmapassert: no exception, context %@", context ? @"pushed" : @"absent");
+        if (context) UIGraphicsEndImageContext();
+    } @catch (NSException *exception) {
+        ApolloLog(@"[SimDebugTap] bitmapassert: raised %@: %@", exception.name, exception.reason);
+    }
+}
+
+// "displayguard W H [capMP]" command: synchronously display a throwaway
+// ASTextNode with W x H pt bounds through the same
+// _displayBlockWithAsynchronous: path the display queue uses, optionally
+// setting ApolloAsyncDisplayGuard's pixel budget to capMP megapixels first
+// (restored afterwards), and log whether the node rendered, went to tiles
+// (ApolloTiledText takes text over the budget) or rendered nothing (skipped,
+// or its bitmap failed). A node that rendered nothing is displayed once more
+// a moment later, with the same budget: after a failed bitmap it comes back
+// in tiles.
+static ASTextNode *sApolloSimDebugDisplayGuardNode;
+
+static void ApolloSimDebugDisplayGuardTest(NSString *payload) {
+    NSMutableArray<NSString *> *numbers = [NSMutableArray array];
+    for (NSString *part in [payload componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
+        if (part.length > 0) [numbers addObject:part];
+    }
+    if (numbers.count < 2) { ApolloLog(@"[SimDebugTap] malformed displayguard: %@", payload); return; }
+    double width = numbers[0].doubleValue;
+    double height = numbers[1].doubleValue;
+    double capPixels = numbers.count >= 3 ? numbers[2].doubleValue * 1e6 : 0;
+    ApolloAsyncDisplayGuardSetMaxPixelsForTesting(capPixels);
+
+    ASTextNode *node = [[objc_getClass("ASTextNode") alloc] init];
+    node.attributedText = [[NSAttributedString alloc] initWithString:@"display guard test"
+                                                          attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:17]}];
+    [node setBounds:CGRectMake(0, 0, width, height)];
+    CALayer *layer = [node layer];
+    ApolloLog(@"[SimDebugTap] displayguard: displaying ASTextNode %.0fx%.0f pt (cap %.0f MP)",
+              width, height, ApolloAsyncDisplayGuardMaxPixels() / 1e6);
+    @try {
+        [node displayImmediately];
+        ApolloLog(@"[SimDebugTap] displayguard: returned, contents %@, tiled %@",
+                  layer.contents ? @"set" : @"nil", ApolloTiledTextNodeIsTiled(node) ? @"YES" : @"no");
+    } @catch (NSException *exception) {
+        ApolloLog(@"[SimDebugTap] displayguard: exception ESCAPED the guard, %@: %@", exception.name, exception.reason);
+    }
+    if (layer.contents || ApolloTiledTextNodeIsTiled(node)) {
+        ApolloAsyncDisplayGuardSetMaxPixelsForTesting(0);
+        return;
+    }
+    // Rendered nothing: if the bitmap failed, the guard has queued the switch
+    // to tiles on the main queue. Display again after it, under the same budget.
+    sApolloSimDebugDisplayGuardNode = node;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        ASTextNode *retried = sApolloSimDebugDisplayGuardNode;
+        sApolloSimDebugDisplayGuardNode = nil;
+        @try {
+            [retried displayImmediately];
+            ApolloLog(@"[SimDebugTap] displayguard: second display, contents %@, tiled %@",
+                      [retried layer].contents ? @"set" : @"nil", ApolloTiledTextNodeIsTiled(retried) ? @"YES" : @"no");
+        } @catch (NSException *exception) {
+            ApolloLog(@"[SimDebugTap] displayguard: exception ESCAPED the guard on the second display, %@: %@", exception.name, exception.reason);
+        }
+        ApolloAsyncDisplayGuardSetMaxPixelsForTesting(0);
+    });
+}
+
+// Exercises the installed album responder and comment adapter using recorded
+// fixtures. No media or comment is sent to Reddit or Imgur.
+static void ApolloSimDebugUploadAlbumTest(void) {
+    NSArray<NSString *> *ids = @[@"simfixtureasset1", @"simfixtureasset2"];
+    NSArray<NSString *> *keys = @[@"simfixturekey1.jpg", @"simfixturekey2.jpg"];
+    for (NSUInteger i = 0; i < ids.count; i++) {
+        NSURL *url = [NSURL URLWithString:[@"https://reddit-uploaded-media.s3-accelerate.amazonaws.com/" stringByAppendingString:keys[i]]];
+        ApolloRegisterRedditUploadedMedia(url, ids[i], @"image/jpeg", nil);
+    }
+    for (NSUInteger count = 1; count <= ids.count; count++) {
+        NSMutableURLRequest *album = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://imgur-apiv3.p.rapidapi.com/3/album"]];
+        album.HTTPMethod = @"POST";
+        album.HTTPBody = [[@"deletehashes=" stringByAppendingString:[[keys subarrayWithRange:NSMakeRange(0, count)] componentsJoinedByString:@","]] dataUsingEncoding:NSUTF8StringEncoding];
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:album completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            NSDictionary *root = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            NSDictionary *payload = [root[@"data"] isKindOfClass:NSDictionary.class] ? root[@"data"] : nil;
+            NSString *albumID = [payload[@"id"] isKindOfClass:NSString.class] ? payload[@"id"] : nil;
+            BOOL passed = !error && [response isKindOfClass:NSHTTPURLResponse.class] &&
+                [(NSHTTPURLResponse *)response statusCode] == 200 && [payload[@"images_count"] unsignedIntegerValue] == count && albumID.length > 0;
+            if (passed) {
+                NSString *text = [NSString stringWithFormat:@"Before [Album](https://imgur.com/a/%@/) after", albumID];
+                NSString *resolved = ApolloImageUploadResolveAlbumText(text);
+                passed = ![resolved containsString:@"imgur.com"];
+                for (NSUInteger i = 0; i < count; i++) passed &= [resolved containsString:keys[i]];
+                NSMutableURLRequest *comment = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://oauth.reddit.com/api/comment"]];
+                comment.HTTPMethod = @"POST";
+                NSCharacterSet *unreserved = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"];
+                comment.HTTPBody = [[@"thing_id=t3_fixture&text=" stringByAppendingString:[text stringByAddingPercentEncodingWithAllowedCharacters:unreserved]] dataUsingEncoding:NSUTF8StringEncoding];
+                NSURLRequest *rewritten = ApolloRedditMaybeRewriteCommentRequest(comment);
+                NSString *body = [[NSString alloc] initWithData:rewritten.HTTPBody encoding:NSUTF8StringEncoding];
+                NSString *decoded = body.stringByRemovingPercentEncoding;
+                passed &= [decoded containsString:@"richtext_json="] && ![decoded containsString:albumID];
+                for (NSUInteger i = 0; i < count; i++) passed &= [decoded containsString:ids[i]];
+            }
+            ApolloLog(@"[SimDebugTap] uploadalbumtest: %lu image(s) %@", (unsigned long)count, passed ? @"PASS" : @"FAIL");
+            NSString *path = [NSString stringWithFormat:@"/tmp/apollo-upload-album-%lu-result.txt", (unsigned long)count];
+            [(passed ? @"PASS" : @"FAIL") writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }];
+        [task resume];
+    }
+}
+
+// "duogeom": log the Duo pose numbers the short-pane feed layout depends on:
+// window/screen geometry, safe area, mode, tab bar placement, and each
+// visible feed table's measured width against its visible cells.
+static void ApolloSimDebugCollectFeedTables(UIView *view, NSMutableArray<UITableView *> *out, NSUInteger depth) {
+    if (!view || depth > 30) return;
+    if (ApolloClassASTableView && [view isKindOfClass:ApolloClassASTableView]) [out addObject:(UITableView *)view];
+    for (UIView *subview in view.subviews) ApolloSimDebugCollectFeedTables(subview, out, depth + 1);
+}
+
+static void ApolloSimDebugLogDuoGeometry(void) {
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    UIWindow *window = tabs.isViewLoaded ? tabs.view.window : nil;
+    UIWindowScene *scene = window.windowScene;
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"mode=%d unfolded=%d unfoldedPortrait=%d shortPane=%d sideBar=%d coverInsets=%d\n",
+        ApolloDuoCurrentMode(), ApolloDuoSplitIsUnfolded(), ApolloDuoSplitIsUnfoldedPortrait(),
+        ApolloDuoSplitIsShortPane(), ApolloDuoRailHasVisibleSideBar(), ApolloDuoUsesCoverContentInsets()];
+    [out appendFormat:@"window frame=%@ bounds=%@ safe=%@\n", NSStringFromCGRect(window.frame),
+        NSStringFromCGRect(window.bounds), NSStringFromUIEdgeInsets(window.safeAreaInsets)];
+    [out appendFormat:@"screen bounds=%@ scene=%@ screens=%lu hsc=%ld vsc=%ld\n",
+        NSStringFromCGRect(scene.screen.bounds), NSStringFromCGRect(scene.coordinateSpace.bounds),
+        (unsigned long)UIScreen.screens.count, (long)window.traitCollection.horizontalSizeClass,
+        (long)window.traitCollection.verticalSizeClass];
+    UITabBar *bar = tabs.tabBar;
+    UIViewController *root = window.rootViewController;
+    [out appendFormat:@"root %@ view=%@ safe=%@ additional=%@ tabsAdditional=%@\n", NSStringFromClass(root.class),
+        NSStringFromCGRect(root.view.frame), NSStringFromUIEdgeInsets(root.view.safeAreaInsets),
+        NSStringFromUIEdgeInsets(root.additionalSafeAreaInsets),
+        NSStringFromUIEdgeInsets(tabs.additionalSafeAreaInsets)];
+    [out appendFormat:@"tabs view=%@ safe=%@ bar=%@ hidden=%d\n", NSStringFromCGRect(tabs.view.bounds),
+        NSStringFromUIEdgeInsets(tabs.view.safeAreaInsets),
+        NSStringFromCGRect([bar convertRect:bar.bounds toView:tabs.view]), bar.hidden];
+    NSMutableArray<UITableView *> *tables = [NSMutableArray array];
+    ApolloSimDebugCollectFeedTables(tabs.selectedViewController.viewIfLoaded, tables, 0);
+    for (UITableView *table in tables) {
+        if (!table.window) continue;
+        [out appendFormat:@"table %p bounds=%@ safe=%@ inset=%@ feedWidth=%.1f\n", table,
+            NSStringFromCGRect(table.bounds), NSStringFromUIEdgeInsets(table.safeAreaInsets),
+            NSStringFromUIEdgeInsets(table.contentInset), ApolloDuoRailFeedContentWidth(table)];
+        NSUInteger count = 0;
+        for (UITableViewCell *cell in table.visibleCells) {
+            if (count++ >= 3) break;
+            UIView *nodeView = cell.contentView.subviews.firstObject;
+            [out appendFormat:@"  cell width=%.1f content=%.1f node=%@\n", CGRectGetWidth(cell.bounds),
+                CGRectGetWidth(cell.contentView.bounds), NSStringFromCGRect(nodeView.frame)];
+        }
+    }
+    ApolloLog(@"[SimDebugTap] duogeom\n%@", out);
+}
+
+// "shortpane <height>|off": sim-only stand-in for the inner display's bottom
+// split pane (the simulator cannot tile a second app or PiP above Apollo).
+// Pins Apollo's windows on this scene to the full display width x <height>
+// (default 440), at the bottom edge; "off" restores the scene frame.
+// A real pane resize reaches the root controller as viewWillTransitionToSize:
+// with an animating coordinator; a bare window.frame write skips that, so the
+// command drives the same sequence through this minimal coordinator.
+@interface ApolloSimResizeCoordinator : NSObject <UIViewControllerTransitionCoordinator>
+@property (nonatomic, strong) NSMutableArray *alongside;
+@property (nonatomic, strong) NSMutableArray *completions;
+@property (nonatomic, weak) UIView *container;
+@end
+
+@implementation ApolloSimResizeCoordinator
+- (instancetype)init {
+    if ((self = [super init])) {
+        _alongside = [NSMutableArray array];
+        _completions = [NSMutableArray array];
+    }
+    return self;
+}
+- (BOOL)animateAlongsideTransition:(void (^)(id<UIViewControllerTransitionCoordinatorContext>))animation
+                        completion:(void (^)(id<UIViewControllerTransitionCoordinatorContext>))completion {
+    if (animation) [self.alongside addObject:[animation copy]];
+    if (completion) [self.completions addObject:[completion copy]];
+    return YES;
+}
+- (BOOL)animateAlongsideTransitionInView:(UIView *)view
+                               animation:(void (^)(id<UIViewControllerTransitionCoordinatorContext>))animation
+                              completion:(void (^)(id<UIViewControllerTransitionCoordinatorContext>))completion {
+    return [self animateAlongsideTransition:animation completion:completion];
+}
+- (void)notifyWhenInteractionEndsUsingBlock:(void (^)(id<UIViewControllerTransitionCoordinatorContext>))handler {}
+- (void)notifyWhenInteractionChangesUsingBlock:(void (^)(id<UIViewControllerTransitionCoordinatorContext>))handler {}
+- (BOOL)isAnimated { return YES; }
+- (UIModalPresentationStyle)presentationStyle { return UIModalPresentationNone; }
+- (BOOL)initiallyInteractive { return NO; }
+- (BOOL)isInterruptible { return NO; }
+- (BOOL)isInteractive { return NO; }
+- (BOOL)isCancelled { return NO; }
+- (NSTimeInterval)transitionDuration { return 0.3; }
+- (CGFloat)percentComplete { return 0.0; }
+- (CGFloat)completionVelocity { return 1.0; }
+- (UIViewAnimationCurve)completionCurve { return UIViewAnimationCurveEaseInOut; }
+- (UIViewController *)viewControllerForKey:(UITransitionContextViewControllerKey)key { return nil; }
+- (UIView *)viewForKey:(UITransitionContextViewKey)key { return nil; }
+- (UIView *)containerView { return self.container; }
+- (CGAffineTransform)targetTransform { return CGAffineTransformIdentity; }
+@end
+
+static void ApolloSimDebugSetShortPane(NSString *arg) {
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    UIWindowScene *scene = tabs.view.window.windowScene;
+    if (!scene) { ApolloLog(@"[SimDebugTap] shortpane: no window scene"); return; }
+    sApolloSimShortPaneHeight = [arg isEqualToString:@"off"] ? 0.0 : (arg.doubleValue > 0.0 ? arg.doubleValue : 440.0);
+    CGRect frame = scene.coordinateSpace.bounds;
+    UIWindow *main = tabs.view.window;
+    ApolloSimShortPaneFrame(main, &frame);
+    ApolloSimResizeCoordinator *coordinator = [ApolloSimResizeCoordinator new];
+    coordinator.container = main;
+    UIViewController *root = main.rootViewController;
+    [root viewWillTransitionToSize:frame.size withTransitionCoordinator:coordinator];
+    [UIView animateWithDuration:coordinator.transitionDuration animations:^{
+        for (UIWindow *window in scene.windows) {
+            // Only the app's own full-scene windows; leave keyboards and overlays.
+            if (window.windowLevel != UIWindowLevelNormal) continue;
+            window.frame = frame;
+            [window layoutIfNeeded];
+        }
+        for (void (^block)(id) in coordinator.alongside) block(coordinator);
+    } completion:^(BOOL finished) {
+        // Re-derive the root's overlay insets (see the _setContentOverlayInsets:
+        // hook) now that the window has its pane frame.
+        SEL refresh = NSSelectorFromString(@"_updateContentOverlayInsetsForSelfAndChildren");
+        if ([root respondsToSelector:refresh]) {
+            ((void (*)(id, SEL))objc_msgSend)(root, refresh);
+            [root.view setNeedsLayout];
+            [root.view layoutIfNeeded];
+        }
+        for (void (^block)(id) in coordinator.completions) block(coordinator);
+        ApolloLog(@"[SimDebugTap] shortpane settled %@ (shortPane=%d)", NSStringFromCGRect(main.frame),
+                  ApolloDuoSplitIsShortPane());
+    }];
+    ApolloLog(@"[SimDebugTap] shortpane -> %@", NSStringFromCGRect(frame));
+}
+
+static BOOL ApolloSimDebugHandleIntegratedMainCommand(NSString *contents) {
+    if ([contents hasPrefix:@"duogeom"]) {
+        ApolloSimDebugLogDuoGeometry();
+        return YES;
+    }
+    if ([contents hasPrefix:@"safemethods"]) {
+        UIWindow *window = ((UIViewController *)ApolloMainTabBarController()).view.window;
+        NSMutableString *out = [NSMutableString string];
+        for (id target in @[window, window.rootViewController, window.rootViewController.view]) {
+            for (Class cls = [target class]; cls && cls != NSObject.class; cls = class_getSuperclass(cls)) {
+                unsigned count = 0;
+                Method *methods = class_copyMethodList(cls, &count);
+                for (unsigned i = 0; i < count; i++) {
+                    SEL sel = method_getName(methods[i]);
+                    NSString *name = NSStringFromSelector(sel);
+                    if (![name.lowercaseString containsString:@"safearea"] && ![name containsString:@"OverlayInset"]) continue;
+                    const char *type = method_getTypeEncoding(methods[i]);
+                    NSString *value = @"";
+                    // Read-only no-argument UIEdgeInsets getters only.
+                    if (type && strncmp(type, "{UIEdgeInsets=dddd}16@0:8", 25) == 0) {
+                        UIEdgeInsets insets = ((UIEdgeInsets (*)(id, SEL))objc_msgSend)(target, sel);
+                        value = NSStringFromUIEdgeInsets(insets);
+                    }
+                    [out appendFormat:@"%@ %@ %@\n", NSStringFromClass(cls), name, value];
+                }
+                free(methods);
+            }
+        }
+        [out writeToFile:@"/tmp/apollofix-safemethods.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        ApolloLog(@"[SimDebugTap] safemethods written");
+        return YES;
+    }
+    if ([contents hasPrefix:@"saferefresh"]) {
+        UIViewController *root = ((UIViewController *)ApolloMainTabBarController()).view.window.rootViewController;
+        for (NSString *name in @[@"_updateContentOverlayInsetsFromParentIfNecessary",
+                                 @"_updateContentOverlayInsetsForSelfAndChildren", @"_updateSafeAreaInsets"]) {
+            SEL sel = NSSelectorFromString(name);
+            id target = [name isEqualToString:@"_updateSafeAreaInsets"] ? root.view : root;
+            BOOL responds = [target respondsToSelector:sel];
+            if (responds) ((void (*)(id, SEL))objc_msgSend)(target, sel);
+            ApolloLog(@"[SimDebugTap] saferefresh %@ responds=%d -> safe=%@", name, responds,
+                      NSStringFromUIEdgeInsets(root.view.safeAreaInsets));
+        }
+        return YES;
+    }
+    if ([contents hasPrefix:@"shortpane"]) {
+        ApolloSimDebugSetShortPane([[contents substringFromIndex:9]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]);
+        return YES;
+    }
+    if ([contents hasPrefix:@"listdiag"]) {
+        ApolloSubredditListDiagRearm();
+        return YES;
+    }
+    if ([contents hasPrefix:@"gifmode "]) {
+        NSInteger mode = [[contents substringFromIndex:8] integerValue];
+        [NSUserDefaults.standardUserDefaults setInteger:mode forKey:UDKeyAutoplayInlineGIFs];
+        ApolloLog(@"[SimDebugTap] gifmode -> %ld", (long)mode);
+        return YES;
+    }
+    if ([contents hasPrefix:@"scrollto "]) {
+        ApolloSimDebugScrollTo([[contents substringFromIndex:9] doubleValue]);
+        return YES;
+    }
+    // "routeblock <route>[,<route>…]" or "routeblock off": make API-Key-Free
+    // routes (www-dotjson, old, api, oauth) get Reddit's real block page, to exercise
+    // the fallback (ApolloWebJSONRoutes.m).
+    if ([contents hasPrefix:@"routeblock "]) {
+        NSString *list = [[contents substringFromIndex:11]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSUInteger mask = 0;
+        for (NSString *name in [list componentsSeparatedByString:@","]) {
+            for (NSInteger r = ApolloWebJSONRouteWww; r <= ApolloWebJSONRouteLast; r++) {
+                if ([ApolloWebJSONRouteName((ApolloWebJSONRoute)r) isEqualToString:name]) mask |= (1u << r);
+            }
+        }
+        ApolloWebJSONSimSetBlockedRoutes(mask);
+        return YES;
+    }
+    // "routegate <route>[,<route>…]" or "routegate off": send those routes
+    // with a cookie Reddit doesn't know, so old.reddit.com answers with its
+    // sign-in gate, as it does an account it won't serve.
+    if ([contents hasPrefix:@"routegate "]) {
+        NSString *list = [[contents substringFromIndex:10]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSUInteger mask = 0;
+        for (NSString *name in [list componentsSeparatedByString:@","]) {
+            for (NSInteger r = ApolloWebJSONRouteWww; r <= ApolloWebJSONRouteLast; r++) {
+                if ([ApolloWebJSONRouteName((ApolloWebJSONRoute)r) isEqualToString:name]) mask |= (1u << r);
+            }
+        }
+        ApolloWebJSONSimSetGatedRoutes(mask);
+        return YES;
+    }
+    // "oauthblock on|off": an API-key account's /api/info and /api/morechildren
+    // get oauth.reddit.com's real block page at their usual path, to exercise
+    // the /.json retry (ApolloOAuthReadPathAfterResponse).
+    if ([contents hasPrefix:@"oauthblock "]) {
+        BOOL on = [[contents substringFromIndex:11] hasPrefix:@"on"];
+        if (!on) ApolloOAuthReadReset();
+        ApolloWebJSONSimSetOAuthBlockedReads(on);
+        return YES;
+    }
+    // "routehealth" logs the API-Key-Free route health; "routehealth reset" clears it.
+    if ([contents hasPrefix:@"routehealth"]) {
+        if ([contents containsString:@"reset"]) ApolloWebJSONRouteHealthReset();
+        ApolloLog(@"[SimDebugTap] route health:\n%@", ApolloWebJSONRouteHealthDescription([NSDate timeIntervalSinceReferenceDate]));
+        return YES;
+    }
+    if ([contents hasPrefix:@"lpm "]) {
+        NSString *payload = [[contents substringFromIndex:4]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        sApolloSimForceLowPowerMode = [payload isEqualToString:@"on"];
+        [NSNotificationCenter.defaultCenter
+            postNotificationName:NSProcessInfoPowerStateDidChangeNotification
+                          object:NSProcessInfo.processInfo];
+        ApolloLog(@"[SimDebugTap] lpm -> %d (isLowPowerModeEnabled=%d)",
+                  sApolloSimForceLowPowerMode, NSProcessInfo.processInfo.isLowPowerModeEnabled);
+        return YES;
+    }
+    if ([contents hasPrefix:@"devvitjs "]) {
+        extern void ApolloDevvitDebugEvaluateJS(NSString *js);
+        ApolloDevvitDebugEvaluateJS([contents substringFromIndex:9]);
+        return YES;
+    }
+    if ([contents hasPrefix:@"devvitsweep"]) {
+        extern void ApolloDevvitDebugSweep(void);
+        ApolloDevvitDebugSweep();
+        return YES;
+    }
+    if ([contents hasPrefix:@"rotate "]) {
+        NSString *direction = [[contents substringFromIndex:7]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (@available(iOS 16.0, *)) {
+            UIInterfaceOrientationMask mask = [direction isEqualToString:@"landscape"]
+                ? UIInterfaceOrientationMaskLandscapeRight
+                : UIInterfaceOrientationMaskPortrait;
+            UIWindowScene *scene = ApolloAllWindows().firstObject.windowScene;
+            if (!scene) {
+                ApolloLog(@"[SimDebugTap] rotate: no window scene");
+                return YES;
+            }
+            UIWindowSceneGeometryPreferencesIOS *preferences =
+                [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
+            [scene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError *error) {
+                ApolloLog(@"[SimDebugTap] rotate error: %@", error.localizedDescription);
+            }];
+            ApolloLog(@"[SimDebugTap] rotate -> %@", direction);
+        } else {
+            ApolloLog(@"[SimDebugTap] rotate: needs iOS 16+");
+        }
+        return YES;
+    }
+    if ([contents hasPrefix:@"gifmem "]) {
+        NSString *argument = [[contents substringFromIndex:7]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        ApolloSimDebugMeasureGIFMemory(argument);
+        return YES;
+    }
+    if ([contents hasPrefix:@"linkpreview "]) {
+        NSString *urlString = [[contents substringFromIndex:12]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSURL *previewURL = urlString.length > 0 ? [NSURL URLWithString:urlString] : nil;
+        if (!previewURL) {
+            ApolloLog(@"[SimDebugTap] malformed linkpreview url: %@", urlString);
+            return YES;
+        }
+        [ApolloLinkPreviewFetcher requestPreviewForURL:previewURL
+                                            completion:^(ApolloLinkPreview *preview) {
+            ApolloLog(@"[SimDebugTap] linkpreview %@\n  site=%@\n  title=%@\n  desc=%@\n  image=%@",
+                      urlString, preview.siteName ?: @"(nil)", preview.title ?: @"(nil)",
+                      preview.desc ?: @"(nil)", preview.imageURL.absoluteString ?: @"(nil)");
+        }];
+        return YES;
+    }
+    if ([contents hasPrefix:@"translate "]) {
+        NSString *spec = [[contents substringFromIndex:10]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        ApolloTranslationDebugProbe(spec);
+        return YES;
+    }
+    if ([contents hasPrefix:@"floattab "]) {
+        NSString *payload = [[contents substringFromIndex:9]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        ApolloFloatingTabsDebugCommand(payload);
+        return YES;
+    }
+    return NO;
+}
+
+static void ApolloSimDebugTapNotification(CFNotificationCenterRef center, void *observer,
+                                          CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    // Capture at notification receipt, before queueing main-thread delivery.
+    // Reading the shared command file later can execute a newer swipe twice.
+    NSString *contents = [NSString stringWithContentsOfFile:ApolloSimTapFile()
+                                                   encoding:NSUTF8StringEncoding error:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([contents hasPrefix:@"uploadalbumtest"]) {
+            ApolloSimDebugUploadAlbumTest();
+            return;
+        }
+        if (ApolloSimDebugHandleIntegratedMainCommand(contents)) return;
+        if ([contents hasPrefix:@"bitmapassert"]) {
+            ApolloSimDebugBitmapAssert();
+            return;
+        }
+        if ([contents hasPrefix:@"displayguard "]) {
+            ApolloSimDebugDisplayGuardTest([contents substringFromIndex:13]);
+            return;
+        }
+        if ([contents hasPrefix:@"insetbottom "]) {
+            ApolloSimDebugForceBottomInset([[contents substringFromIndex:12] doubleValue]);
+            return;
+        }
+        // "theme apollo|custom" command: switch to Apollo's stock theme (custom
+        // theme runtime off) so the stock search field material can be tested,
+        // or back to the last custom theme (the backup's), through the same
+        // store calls the theme picker makes.
+        if ([contents hasPrefix:@"theme "]) {
+            NSString *which = [[contents substringFromIndex:6] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([which isEqualToString:@"apollo"]) {
+                [[ApolloThemeStore shared] selectApolloTheme];
+                ApolloThemeRuntimeReload();
+                ApolloLog(@"[SimDebugTap] theme -> apollo (custom runtime off)");
+            } else if ([which isEqualToString:@"custom"]) {
+                BOOL restored = [[ApolloThemeStore shared] restoreLastCustomSelection];
+                ApolloThemeRuntimeReload();
+                ApolloLog(@"[SimDebugTap] theme -> custom (restored=%d)", (int)restored);
+            }
+            return;
+        }
+        if ([contents hasPrefix:@"sbprobe "]) {
+            NSArray<NSString *> *ps = [[[contents substringFromIndex:8] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet] componentsSeparatedByString:@" "];
+            if (ps.count >= 2) {
+                ApolloSimDebugSearchBarProbe(CGPointMake(ps[0].doubleValue, ps[1].doubleValue),
+                                             ps.count >= 3 ? ps[2].doubleValue : 1.2,
+                                             ps.count >= 4 ? ps[3].doubleValue : 0.0);
+            }
+            return;
+        }
+        if ([contents hasPrefix:@"constraintprobe "]) {
+            ApolloSimDebugConstraintProbe([[contents substringFromIndex:16]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]);
+            return;
+        }
+        if ([contents hasPrefix:@"responderprobe"]) {
+            ApolloSimDebugResponderProbe();
+            return;
+        }
+        if ([contents hasPrefix:@"focusprobe"]) {
+            ApolloSimDebugFocusProbe();
+            return;
+        }
+        if ([contents hasPrefix:@"titleprobe"]) {
+            ApolloSimDebugTitleProbe();
+            return;
+        }
+        if ([contents hasPrefix:@"fieldprobe"]) {
+            NSString *tag = [[contents substringFromIndex:10] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugFieldProbe(tag.length ? tag : @"probe");
+            return;
+        }
+        if ([contents hasPrefix:@"tabselect "]) {
+            UITabBarController *tabs = (id)ApolloMainTabBarController();
+            NSUInteger index = [[contents substringFromIndex:10] integerValue];
+            if (index < tabs.viewControllers.count) tabs.selectedIndex = index;
+            return;
+        }
+        if ([contents hasPrefix:@"dump"]) {
+            ApolloSimDebugDumpHierarchy();
+            return;
+        }
+        // Re-test the first-use guide on the next gallery entry without
+        // deleting account credentials or other simulator preferences.
+        if ([contents hasPrefix:@"galleryintroreset"]) {
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:@"ApolloGalleryPinchIntroductionAcknowledged"];
+            ApolloLog(@"[SimDebugTap] gallery pinch introduction reset");
+            return;
+        }
+        // "compact on|off": force every split view controller under the tab bar
+        // to a compact horizontal size class, which is what makes a
+        // UISplitViewController collapse. Slide Over and small Stage Manager
+        // windows are the real-world trigger and neither can be driven from a
+        // script, so this is the only way to exercise the iPad pane layout's
+        // collapse/expand path in the simulator loop.
+        if ([contents hasPrefix:@"compact "]) {
+            BOOL on = [[contents substringFromIndex:8] hasPrefix:@"on"];
+            ApolloSimDebugForceCompactSplitColumns(on);
+            return;
+        }
+        if ([contents isEqualToString:@"panereadpost"]) { ApolloSimDebugOpenVisiblePost(); return; }
+        if ([contents isEqualToString:@"panenewwindow"]) { ApolloPaneOpenDetailInNewWindow(ApolloSimDebugSelectedPane()); return; }
+        if ([contents hasPrefix:@"panefind "]) {
+            UIViewController *detail = [ApolloSimDebugSelectedPane() apollo_navigationControllerForColumn:ApolloPaneColumnSecondary].topViewController;
+            ApolloLog(@"[PaneFindTest] %@", ApolloPaneSimFind(detail, [contents substringFromIndex:9])); return;
+        }
+        if ([contents hasPrefix:@"sidebar "]) {
+            if (@available(iOS 18.0, *)) ApolloSimDebugSelectedPane().tabBarController.sidebar.hidden = [[contents substringFromIndex:8] isEqualToString:@"hide"];
+            return;
+        }
+        if ([contents isEqualToString:@"panesnapshot"]) { ApolloSimDebugWritePaneSnapshot(); return; }
+        // Persist the same preference as the UI, without changing this process's
+        // install decision. Tests must relaunch, exactly as users do.
+        if ([contents isEqualToString:@"panesetting on"] || [contents isEqualToString:@"panesetting off"]) {
+            [NSUserDefaults.standardUserDefaults setBool:[contents hasSuffix:@" on"] forKey:UDKeyIPadPaneLayout];
+            ApolloSimDebugWritePaneSnapshot();
+            return;
+        }
+        if ([contents hasPrefix:@"panemode "]) {
+            NSString *mode = [[contents substringFromIndex:9]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugSetPaneMode(mode);
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"panestatus"]) {
+            ApolloSimDebugLogPaneStatus();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"layoutreset"]) {
+            ApolloSimDebugLogLayoutPassState(YES);
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"layoutstatus"]) {
+            ApolloSimDebugLogLayoutPassState(NO);
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"reflowreset"]) {
+            ApolloSimDebugStartReflowProbe();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"reflowstatus"]) {
+            ApolloSimDebugWriteReflowStatus();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"readablestatus"]) {
+            ApolloSimDebugWriteReadableStatus();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"widthstatus"]) {
+            ApolloSimDebugWritePaneWidthStatus();
+            return;
+        }
+        if ([contents hasPrefix:@"widthset "]) {
+            ApolloSimDebugSetPaneWidth([[contents substringFromIndex:9] doubleValue]);
+            return;
+        }
+        if ([contents hasPrefix:@"widthadjust "]) {
+            NSString *operation = [[contents substringFromIndex:12]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugAdjustPaneDivider(operation);
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"themestatus"]) {
+            ApolloSimDebugWritePaneThemeStatus();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"themenotify"]) {
+            ApolloSimDebugPostThemeNotification();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"selectionstatus"]) {
+            ApolloSimDebugLogMasterSelectionStatus();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"selectionclear"]) {
+            ApolloSimDebugClearMasterSelection();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"selectioncontinue"]) {
+            ApolloSimDebugPushSelectionContinuation();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"paneactivate showlist"]) {
+            ApolloSimDebugActivateShowList();
+            return;
+        }
+        if ([contents hasPrefix:@"navdump"]) {
+            ApolloSimDebugDumpNavigationControllers();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"loadstatus"]) {
+            ApolloSimDebugDumpPaneLoadStatus();
+            return;
+        }
+        if ([contents hasPrefix:@"autohidescan"]) {
+            ApolloSimDebugRunAutoHideScan(contents);
+            return;
+        }
+        if ([contents hasPrefix:@"autohidepolicy "]) {
+            ApolloSimDebugSetAutoHidePolicy(contents);
+            return;
+        }
+        if ([contents hasPrefix:@"transitiongate "]) {
+            NSString *operation = [[contents substringFromIndex:@"transitiongate ".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugSetTransitionGate(operation);
+            return;
+        }
+        if ([contents hasPrefix:@"transitionselect "]) {
+            NSString *identifier = [[contents substringFromIndex:@"transitionselect ".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugSelectTransitionProbe(identifier);
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"transitionstatus"]) {
+            ApolloSimDebugDumpTransitionState();
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"transitionstale"]) {
+            [ApolloPaneSplitViewController apollo_simRunDeallocatedSourceProbe];
+            return;
+        }
+        if ([contents hasPrefix:@"transitionrace "]) {
+            NSString *outcome = [[contents substringFromIndex:@"transitionrace ".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (![@[ @"commit", @"cancel" ] containsObject:outcome]) {
+                ApolloLog(@"[SimDebugTap][transitionrace] expected commit|cancel, got %@", outcome);
+                return;
+            }
+            ApolloSimDebugRunInteractiveTransitionRace([outcome isEqualToString:@"commit"]);
+            return;
+        }
+        if ([contents hasPrefix:@"railprobe"]) {
+            for (UIWindow *window in ApolloAllWindows()) ApolloSimDebugProbeRailView(window);
+            UIViewController *top = ApolloSimDebugSelectedNavigationController(@"primary").topViewController;
+            top = ApolloSimDebugTrailingItemsOwner(top) ?: top;
+            ApolloLog(@"[SimDebugTap] railprobe owner %@ nav=%@ depth=%lu hidesBack=%d leftItems=%lu backItem=%@ stack=%@",
+                      NSStringFromClass(top.class), NSStringFromClass(top.navigationController.class),
+                      (unsigned long)top.navigationController.viewControllers.count, top.navigationItem.hidesBackButton,
+                      (unsigned long)top.navigationItem.leftBarButtonItems.count, top.navigationItem.backBarButtonItem,
+                      [top.navigationController.viewControllers valueForKey:@"class"]);
+            for (UIBarButtonItem *item in top.navigationItem.rightBarButtonItems) {
+                ApolloLog(@"[SimDebugTap] railprobe item on %@: label=%@ id=%@ custom=%@ image=%d",
+                          NSStringFromClass(top.class), item.accessibilityLabel, item.accessibilityIdentifier,
+                          item.customView ? NSStringFromClass(item.customView.class) : @"-", item.image != nil);
+            }
+            return;
+        }
+        if ([contents hasPrefix:@"railmethods"]) {
+            // Every method/ivar on the rail button classes whose name mentions an item.
+            NSMutableString *out = [NSMutableString string];
+            for (NSString *name in @[ @"_UIButtonBarButton", @"_UIModernBarButton" ]) {
+                for (Class cls = objc_getClass(name.UTF8String); cls && cls != UIView.class; cls = class_getSuperclass(cls)) {
+                    unsigned int count = 0;
+                    Method *methods = class_copyMethodList(cls, &count);
+                    for (unsigned int index = 0; index < count; index++) {
+                        NSString *selector = NSStringFromSelector(method_getName(methods[index]));
+                        if ([selector.lowercaseString containsString:@"item"] || [selector.lowercaseString containsString:@"overflow"])
+                            [out appendFormat:@"%s -%@\n", class_getName(cls), selector];
+                    }
+                    free(methods);
+                    Ivar *ivars = class_copyIvarList(cls, &count);
+                    for (unsigned int index = 0; index < count; index++) {
+                        [out appendFormat:@"%s ivar %s %s\n", class_getName(cls), ivar_getName(ivars[index]), ivar_getTypeEncoding(ivars[index]) ?: ""];
+                    }
+                    free(ivars);
+                }
+            }
+            [out writeToFile:@"/tmp/apollofix-railmethods.txt" atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return;
+        }
+        if ([contents hasPrefix:@"railpad"]) {
+            ApolloSimDebugPadRail([[contents substringFromIndex:@"railpad".length] integerValue]);
+            return;
+        }
+        if ([contents hasPrefix:@"navitemdump"]) {
+            NSString *columnName = [[contents substringFromIndex:@"navitemdump".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugDumpNavigationItem(columnName.length ? columnName : @"primary");
+            return;
+        }
+        if ([contents hasPrefix:@"navitemprobe"]) {
+            NSString *columnName = [[contents substringFromIndex:@"navitemprobe".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugProbeUnknownNavigationItem(columnName.length ? columnName : @"detail");
+            return;
+        }
+        if ([contents hasPrefix:@"navitemmutate"]) {
+            NSString *columnName = [[contents substringFromIndex:@"navitemmutate".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugMutateNavigationItem(columnName.length ? columnName : @"detail");
+            return;
+        }
+        if ([contents hasPrefix:@"navback"]) {
+            NSString *columnName = [[contents substringFromIndex:@"navback".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugPerformNavigationBack(columnName.length ? columnName : @"primary");
+            return;
+        }
+        if ([contents hasPrefix:@"navforward"]) {
+            NSString *columnName = [[contents substringFromIndex:@"navforward".length]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugPerformNavigationForward(columnName.length ? columnName : @"primary");
+            return;
+        }
+        if ([contents hasPrefix:@"navset "]) {
+            NSString *arguments = [[contents substringFromIndex:7]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugSetNavigationStack(arguments);
+            return;
+        }
+        if ([[contents stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                isEqualToString:@"accountchange"]) {
+            ApolloSimDebugPostAccountContextChange();
+            return;
+        }
+        if ([contents hasPrefix:@"tab "]) {
+            ApolloSimDebugSelectTab([[contents substringFromIndex:4] integerValue]);
+            return;
+        }
+        if ([contents hasPrefix:@"routeurl "]) {
+            NSString *rawURL = [[contents substringFromIndex:9]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugRouteURL(rawURL);
+            return;
+        }
+        if ([contents hasPrefix:@"useractivity "]) {
+            NSString *rawURL = [[contents substringFromIndex:13]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugContinueUserActivity(rawURL);
+            return;
+        }
+        if ([contents hasPrefix:@"shortcut "]) {
+            NSString *arguments = [[contents substringFromIndex:9]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugPerformShortcut(arguments);
+            return;
+        }
+        if ([contents hasPrefix:@"accessibilityescape"]) {
+            ApolloSimDebugPerformAccessibilityEscape();
+            return;
+        }
+        if ([contents hasPrefix:@"visibleprobe "]) {
+            NSString *operation = [[contents substringFromIndex:13]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugVisiblePresenterProbe(operation);
+            return;
+        }
+        // "headerdump" command: log every visible scroll view's topEdgeEffect
+        // state (pointer, hidden, style, tweak stamps) for header debugging.
+        if ([contents hasPrefix:@"headerdump"]) {
+            ApolloSimDebugDumpHeaderEffects();
+            return;
+        }
+        // "listdiag" command: re-arm the subreddit-list launch geometry
+        // recorder (ApolloSubredditListLaunchSettle) against the list
+        // controller, so the settle can be observed on a pop-back without a
+        // cold launch.
+        if ([contents hasPrefix:@"listdiag"]) {
+            ApolloSubredditListDiagRearm();
+            return;
+        }
+        // "indexdiag" command: log every known subreddit table's section-index
+        // state (native index color, captured native state, overlay) — see
+        // ApolloSubredditIndexDebugDescribeTables in ApolloSubredditIndexPolish.
+        if ([contents hasPrefix:@"indexdiag"]) {
+            ApolloSubredditIndexDebugDescribeTables();
+            return;
+        }
+        // "headerstyle N" command: switch the Header Style setting through the
+        // same path as the settings picker (global + persisted default +
+        // change notification), so mode switches — including the live
+        // install/remove machinery — can be driven from the host. simctl's
+        // `defaults write` can't reach the app container's prefs domain.
+        if ([contents hasPrefix:@"headerstyle "]) {
+            NSInteger mode = [[contents substringFromIndex:12] integerValue];
+            sScrollEdgeEffectStyle = mode;
+            [[NSUserDefaults standardUserDefaults] setInteger:mode forKey:UDKeyScrollEdgeEffectStyle];
+            [[NSNotificationCenter defaultCenter] postNotificationName:ApolloScrollEdgeEffectStyleChangedNotification object:nil];
+            ApolloLog(@"[SimDebugTap] headerstyle -> %ld", (long)mode);
+            return;
+        }
+        if ([contents hasPrefix:@"crash "]) {
+            NSString *payload = [[contents substringFromIndex:6] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugPerformCrash(payload);
+            return;
+        }
+        if ([contents hasPrefix:@"navchurn"]) {
+            NSString *mode = [[contents substringFromIndex:8] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugNavChurn(mode);
+            return;
+        }
+        // Validate and dispatch the real pane actions through the responder
+        // chain. This fixture does not synthesize hardware keyboard events.
+        if ([contents hasPrefix:@"panemenu "]) {
+            ApolloPaneSplitViewController *pane = ApolloSimDebugSelectedPane();
+            NSString *name = [[contents substringFromIndex:9] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([name isEqualToString:@"check"]) {
+                NSMutableArray *states = [NSMutableArray array];
+                for (UIKeyCommand *command in ApolloPaneMenuKeyCommands()) {
+                    [states addObject:[NSString stringWithFormat:@"%@=%d", NSStringFromSelector(command.action),
+                        ApolloPaneMenuCanPerform(pane, command.action)]];
+                }
+                ApolloLog(@"[PaneMenuTest] tab=%ld focused=%@ %@", (long)pane.apollo_tabIndex,
+                    NSStringFromClass(ApolloPaneFocusedController(pane).class), [states componentsJoinedByString:@","]);
+            } else {
+                SEL action = NSSelectorFromString([NSString stringWithFormat:@"apollo_menu%@:", name]);
+                BOOL allowed = ApolloPaneMenuOwnsAction(action) && ApolloPaneMenuCanPerform(pane, action);
+                if (allowed) {
+                    [pane becomeFirstResponder];
+                    [UIApplication.sharedApplication sendAction:action to:nil from:nil forEvent:nil];
+                }
+                ApolloLog(@"[PaneMenuTest] %@ allowed=%d", name, allowed);
+            }
+            return;
+        }
+        // Unread Badges QA without creating messages or touching the account:
+        // "inboxbadge <value|none>" sends the value through the Inbox tab item's
+        // real -setBadgeValue: (so the ChatsFilter hook treats it as Apollo's
+        // own count), "chatbadge <unread> [requests]" publishes a poll-shaped
+        // Chat status for the active account. Apollo's next inbox refresh and
+        // the Chat poller's next poll put the real values back.
+        if ([contents hasPrefix:@"inboxbadge "]) {
+            NSString *value = [[contents substringFromIndex:11]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            UITabBarController *tabs = (id)ApolloMainTabBarController();
+            UITabBarItem *inboxItem = nil;
+            if ([tabs isKindOfClass:UITabBarController.class]) {
+                // By the tab's root controller (Apollo's Inbox tab roots at its
+                // mailbox list, an Inbox* class): Icon-Only Tab Bar clears titles.
+                for (UIViewController *child in tabs.viewControllers) {
+                    UIViewController *root = [child isKindOfClass:UINavigationController.class]
+                        ? ((UINavigationController *)child).viewControllers.firstObject : child;
+                    if (!inboxItem && [NSStringFromClass(root.class) containsString:@"Inbox"]) {
+                        inboxItem = child.tabBarItem;
+                    }
+                }
+            }
+            inboxItem.badgeValue = [value isEqualToString:@"none"] ? nil : value;
+            ApolloLog(@"[SimDebugTap] inboxbadge %@ -> item=%@ shown=%@ spoken=%@", value,
+                      inboxItem ? @"found" : @"MISSING", inboxItem.badgeValue ?: @"(nil)",
+                      inboxItem.accessibilityValue ?: @"(nil)");
+            return;
+        }
+        // "unreadbadges <tab|inbox|theme|icononly> <on|off>": the Interface >
+        // Unread Badges setters the switches call, so a style change can be
+        // made while the Inbox is on screen. "icononly" flips Icon-Only Tab Bar
+        // the way its switch does, to watch the dot follow the icon.
+        if ([contents hasPrefix:@"unreadbadges "]) {
+            NSArray<NSString *> *parts = [[[contents substringFromIndex:13]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                componentsSeparatedByString:@" "];
+            NSString *which = parts.firstObject ?: @"";
+            BOOL on = parts.count > 1 && [parts[1] isEqualToString:@"on"];
+            if ([which isEqualToString:@"tab"]) ApolloUnreadBadgesSetCompactTabBar(on);
+            else if ([which isEqualToString:@"inbox"]) ApolloUnreadBadgesSetCompactInbox(on);
+            else if ([which isEqualToString:@"theme"]) ApolloUnreadBadgesSetThemeColor(on);
+            else if ([which isEqualToString:@"icononly"]) ApolloSetHideTabBarTitlesEnabled(on);
+            return;
+        }
+        if ([contents hasPrefix:@"chatbadge "]) {
+            NSArray<NSString *> *parts = [[[contents substringFromIndex:10]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                componentsSeparatedByString:@" "];
+            NSInteger unread = MAX(0, parts.firstObject.integerValue);
+            NSInteger requests = parts.count > 1 ? MAX(0, parts[1].integerValue) : 0;
+            NSString *username = ApolloActiveWebSessionUsername().lowercaseString ?: @"";
+            ApolloModernChatPublishPolledStatus(@{ @"username": username,
+                                                   @"unreadCount": @(unread),
+                                                   @"requestsCount": @(requests) });
+            ApolloLog(@"[SimDebugTap] chatbadge unread=%ld requests=%ld for u/%@",
+                      (long)unread, (long)requests, username);
+            return;
+        }
+        // Exercise the real native badge setter without creating messages or
+        // changing account state. Restore the original presentation afterwards.
+        if ([contents hasPrefix:@"panebadge "]) {
+            static __weak UITabBarItem *originalItem;
+            static NSString *originalBadge;
+            static BOOL captured;
+            UITabBarController *tabs = (id)ApolloMainTabBarController();
+            NSArray *roots = ApolloPaneSidebarRootControllers(tabs);
+            if (roots.count <= 1 || ![roots[1] isKindOfClass:ApolloPaneSplitViewController.class]) return;
+            ApolloPaneSplitViewController *pane = roots[1];
+            UITabBarItem *item = [pane apollo_navigationControllerForColumn:ApolloPaneColumnPrimary].tabBarItem;
+            NSString *value = [[contents substringFromIndex:10] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if ([value isEqualToString:@"restore"]) {
+                if (captured) originalItem.badgeValue = originalBadge;
+                captured = NO; originalItem = nil; originalBadge = nil;
+            } else {
+                if (!captured) { originalItem = item; originalBadge = item.badgeValue; captured = YES; }
+                item.badgeValue = [value isEqualToString:@"none"] ? nil : value;
+            }
+            return;
+        }
+        // Reset just the invitation marker for cold-launch QA. The tester
+        // controls the real layout switch separately; no preferences/account
+        // reset or fake launch-time layout state is involved.
+        if ([contents isEqualToString:@"ipadwelcomereset"]) {
+            [NSUserDefaults.standardUserDefaults removeObjectForKey:UDKeyIPadLayoutWelcomeSeen];
+            ApolloLog(@"[iPadWelcome] reset invitation marker for simulator QA");
+            return;
+        }
+        // Replay only: never clears first-run history or toggles the layout.
+        if ([contents isEqualToString:@"ipadwelcome"]) {
+            ApolloIPadLayoutWelcomePresentForDebug(nil);
+            return;
+        }
+        // "openurl <url>" command: route a reddit / apollo:// URL through
+        // Apollo's own scheme handling from INSIDE the process. `simctl openurl`
+        // goes through SpringBoard, which on iOS 26 fronts an "Open in Apollo?"
+        // confirmation that no in-process bridge can tap — this skips it.
+        if ([contents hasPrefix:@"openurl "]) {
+            NSString *raw = [[contents substringFromIndex:8]
+                             stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            NSURL *url = [NSURL URLWithString:raw];
+            NSURL *apolloURL = [url.scheme.lowercaseString isEqualToString:@"apollo"]
+                ? url : ApolloURLByConvertingResolvedURLToApolloScheme(url);
+            BOOL routed = apolloURL && ApolloRouteResolvedURLViaApolloScheme(apolloURL);
+            ApolloLog(@"[SimDebugTap] openurl %@ -> %@", raw, routed ? @"routed" : @"NOT routed");
+            return;
+        }
+        // "gsearch [p=N t=d|w|m|y x=1 |] <query>": run a Google (Reddit-only)
+        // search the way the Search tab's Google mode does and log every result;
+        // "gsearchjs <js>": evaluate JS in the last results page (kept alive in
+        // sim builds); "gsearchdebug <knobs>": the Google mode test switches
+        // (verification sheet, Reddit read off, error, saved page, link delay,
+        // the pre-iOS 17 cookie jar, a listing of the jar's cookies).
+        // See ApolloGoogleSearch.{h,m}.
+        if ([contents hasPrefix:@"gsearch "]) {
+            ApolloGoogleSearchDebugRun([contents substringFromIndex:8]);
+            return;
+        }
+        if ([contents hasPrefix:@"gsearchdebug "]) {
+            ApolloGoogleSearchDebugConfigure([contents substringFromIndex:13]);
+            return;
+        }
+        if ([contents hasPrefix:@"gsearchjs "]) {
+            ApolloGoogleSearchDebugEvaluateJS([contents substringFromIndex:10]);
+            return;
+        }
+        // "ksearch [p=N t=d|w|m|y x=1 |] <query>": run a Kagi (Reddit-only)
+        // search with the saved Session Link and log every result;
+        // "ksearchdebug <knobs>": Kagi mode test switches (saved page instead
+        // of the network, signed-out answer, error, Reddit read off). See
+        // ApolloKagiSearch.{h,m}.
+        if ([contents hasPrefix:@"ksearch "]) {
+            ApolloKagiSearchDebugRun([contents substringFromIndex:8]);
+            return;
+        }
+        if ([contents hasPrefix:@"ksearchdebug "]) {
+            ApolloKagiSearchDebugConfigure([contents substringFromIndex:13]);
+            return;
+        }
+        // "searchtab <query>": submit a query in the Search tab's Google/Kagi
+        // mode through the tab's own submit path (list, cards, paging).
+        if ([contents hasPrefix:@"searchtab "]) {
+            ApolloGoogleSearchTabDebugSubmit([contents substringFromIndex:10]);
+            return;
+        }
+        // "devvitjs <js>" command: evaluate JS in the live interactive-post
+        // widget's web view and log the result (DOM inspection without a web
+        // inspector). See ApolloDevvitDebugEvaluateJS in ApolloDevvitPosts.xm.
+        if ([contents hasPrefix:@"devvitjs "]) {
+            extern void ApolloDevvitDebugEvaluateJS(NSString *js);
+            ApolloDevvitDebugEvaluateJS([contents substringFromIndex:9]);
+            return;
+        }
+        // "chatjs <js>" command: evaluate JS in the most recently created
+        // modern Chat/Modmail web view (the Inbox hub's, normally) and log
+        // the result. Lets a sim reproduce web-side states the sim's own
+        // WebKit never produces — e.g. `chatjs history.replaceState(null,"",
+        // "/chat")` inside a room mimics the device's room-under-a-list-URL
+        // desync. See ApolloDirectChatDebugEvaluateJS in ApolloDirectChatWeb.xm.
+        // "profilejs <js>": the same for the open Edit Profile web view
+        // (ApolloProfileEditorWebViewController.m).
+        if ([contents hasPrefix:@"profilejs "]) {
+            ApolloProfileEditorDebugEvaluateJS([contents substringFromIndex:10]);
+            return;
+        }
+        if ([contents hasPrefix:@"chatjs "]) {
+            extern void ApolloDirectChatDebugEvaluateJS(NSString *js);
+            ApolloDirectChatDebugEvaluateJS([contents substringFromIndex:7]);
+            return;
+        }
+        // "chatrooms": log the cached chat room directory (names, participants,
+        // newest-message timestamps). "chatresolve <subject>|<partner>|<ts>":
+        // resolve a chat mirror's room the way a tapped inbox row does and log
+        // the result — exercises the titled-subject corroboration guard with
+        // arbitrary partner / timestamp combinations.
+        if ([contents hasPrefix:@"chatrooms"]) {
+            ApolloChatRoomDirectoryDebugDump();
+            return;
+        }
+        if ([contents hasPrefix:@"chatresolve "]) {
+            NSArray<NSString *> *parts = [[contents substringFromIndex:12] componentsSeparatedByString:@"|"];
+            NSString *subject = parts.count > 0 ? parts[0] : @"";
+            NSString *partner = parts.count > 1 && parts[1].length > 0 ? parts[1] : nil;
+            NSTimeInterval timestamp = parts.count > 2 ? parts[2].doubleValue : 0;
+            ApolloChatRoomDirectoryResolve(subject, partner, timestamp, ^(NSString *chatPath) {
+                ApolloLog(@"[SimDebugTap] chatresolve subject=%@ partner=%@ ts=%.0f -> %@",
+                          subject, partner ?: @"(nil)", timestamp, chatPath ?: @"(nil: legacy thread)");
+            });
+            return;
+        }
+        // "chatunread <t4_fullname>" / "chatread <t4_fullname> [shared]": flip a
+        // legacy-inbox message's read state on Reddit through the client the
+        // chat-mirror tap uses (the signed-in account's), or with `shared`
+        // through RDKClient.sharedClient — Apollo's app-only bootstrap client,
+        // whose read mark Reddit ignores. Re-arms a read mirror as unread so the
+        // tap -> back -> refresh cycle can be repeated, and shows both outcomes
+        // in the log. Main thread: ApolloActiveAccountClient() requires it.
+        if ([contents hasPrefix:@"chatunread "] || [contents hasPrefix:@"chatread "]) {
+            BOOL unread = [contents hasPrefix:@"chatunread "];
+            NSArray<NSString *> *parts = [[[contents substringFromIndex:unread ? 11 : 9]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+                componentsSeparatedByString:@" "];
+            NSString *fullName = parts.firstObject ?: @"";
+            BOOL useShared = parts.count > 1 && [parts[1] isEqualToString:@"shared"];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                Class clientClass = objc_getClass("RDKClient");
+                id client = useShared
+                    ? ((id (*)(id, SEL))objc_msgSend)(clientClass, @selector(sharedClient))
+                    : ApolloActiveAccountClient();
+                SEL selector = NSSelectorFromString(unread ? @"markMessageWithFullNameAsUnread:completion:"
+                                                           : @"markMessageWithFullNameAsRead:completion:");
+                NSString *label = [NSString stringWithFormat:@"%@ %@ via %@ client",
+                                   unread ? @"chatunread" : @"chatread", fullName,
+                                   useShared ? @"shared (app-only)" : @"active account"];
+                if (!client || ![client respondsToSelector:selector]) {
+                    ApolloLog(@"[SimDebugTap] %@ -> no client (%@)", label, client ? @"selector missing" : @"nil");
+                    return;
+                }
+                void (^completion)(NSError *) = ^(NSError *error) {
+                    ApolloLog(@"[SimDebugTap] %@ -> %@", label,
+                              error ? [NSString stringWithFormat:@"FAILED: %@", error] : @"ok");
+                };
+                ((id (*)(id, SEL, id, id))objc_msgSend)(client, selector, fullName, completion);
+            });
+            return;
+        }
+        // "devvitload <url>": load another URL in the first on-window widget.
+        if ([contents hasPrefix:@"devvitload "]) {
+            extern void ApolloDevvitDebugLoadURL(NSString *urlString);
+            ApolloDevvitDebugLoadURL([[contents substringFromIndex:11]
+                                      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]);
+            return;
+        }
+        // "devvitstats": live/parked/detached widget population + prewarm state.
+        if ([contents hasPrefix:@"devvitstats"]) {
+            extern void ApolloDevvitDebugStats(void);
+            ApolloDevvitDebugStats();
+            return;
+        }
+        // "devvittoggle posts|feed on|off": flip a Devvit setting like its switch.
+        if ([contents hasPrefix:@"devvittoggle "]) {
+            extern void ApolloDevvitDebugToggle(NSString *which, BOOL on);
+            NSArray *parts = [[contents substringFromIndex:13] componentsSeparatedByString:@" "];
+            if (parts.count >= 2) ApolloDevvitDebugToggle(parts[0], [parts[1] isEqualToString:@"on"]);
+            return;
+        }
+        // "memwarn": simulate a memory warning in-process.
+        if ([contents hasPrefix:@"memwarn"]) {
+            SEL sel = @selector(_performMemoryWarning);
+            UIApplication *app = UIApplication.sharedApplication;
+            if ([app respondsToSelector:sel]) {
+                ((void (*)(id, SEL))objc_msgSend)(app, sel);
+                ApolloLog(@"[SimDebugTap] memory warning simulated");
+            } else {
+                ApolloLog(@"[SimDebugTap] memory warning: _performMemoryWarning unavailable");
+            }
+            return;
+        }
+        // "devvitlayout": dump widget-vs-host geometry, force a host layout
+        // pass, dump again.
+        if ([contents hasPrefix:@"devvitlayout"]) {
+            extern void ApolloDevvitDebugLayout(void);
+            ApolloDevvitDebugLayout();
+            return;
+        }
+        // "devvitsweep": run the interactive-post stale-width sweep now, with
+        // a per-surface geometry dump.
+        if ([contents hasPrefix:@"devvitsweep"]) {
+            extern void ApolloDevvitDebugSweep(void);
+            ApolloDevvitDebugSweep();
+            return;
+        }
+        if ([contents hasPrefix:@"mediastate"]) {
+            ApolloSimDebugDumpMediaState();
+            return;
+        }
+        // "rotate <landscape|portrait>" command: rotate the scene from inside
+        // the app — Simulator.app menu automation needs accessibility grants a
+        // headless agent doesn't have, and simctl has no rotate.
+        if ([contents hasPrefix:@"rotate "]) {
+            NSString *dir = [[contents substringFromIndex:7] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (@available(iOS 16.0, *)) {
+                UIInterfaceOrientationMask mask = [dir isEqualToString:@"landscape"]
+                    ? UIInterfaceOrientationMaskLandscapeRight
+                    : UIInterfaceOrientationMaskPortrait;
+                UIWindowScene *scene = ApolloAllWindows().firstObject.windowScene;
+                if (!scene) { ApolloLog(@"[SimDebugTap] rotate: no window scene"); return; }
+                UIWindowSceneGeometryPreferencesIOS *prefs =
+                    [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
+                [scene requestGeometryUpdateWithPreferences:prefs errorHandler:^(NSError *error) {
+                    ApolloLog(@"[SimDebugTap] rotate error: %@", error.localizedDescription);
+                }];
+                ApolloLog(@"[SimDebugTap] rotate -> %@", dir);
+            } else {
+                ApolloLog(@"[SimDebugTap] rotate: needs iOS 16+");
+            }
+            return;
+        }
+        if ([contents hasPrefix:@"insight "]) {
+            NSString *fullName = [[contents substringFromIndex:8]
+                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            NSString *username = ApolloActiveAccountUsername();
+            ApolloFetchCommentVoteInsight(fullName, username,
+                ^(ApolloCommentVoteInsight *insight, NSError *error) {
+                    ApolloLog(@"[SimDebugTap] insight %@ ratio=%.1f upvotes=%lld error=%@",
+                              fullName, insight.upvotePercent, insight.reportedUpvotes,
+                              error.localizedDescription ?: @"none");
+                });
+            return;
+        }
+        // "linkpreview <url>" command: run the real link-preview fetch against
+        // an arbitrary page and log what came back. Exercising the fetcher
+        // needs no Reddit account, so metadata extraction — charset handling
+        // above all (issue #945) — can be verified against live foreign-language
+        // pages on a signed-out simulator.
+        // "gifmem <path-or-url>" command: measure what the gallery viewer's
+        // animated-GIF path actually costs in resident memory. Decodes with the
+        // shipping loader entry point, hangs the result on a real on-screen
+        // UIImageView, and samples phys_footprint across the first animation
+        // loops — the point where issue #1000's jetsam happened.
+        if ([contents hasPrefix:@"gifmem "]) {
+            NSString *arg = [[contents substringFromIndex:7] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloSimDebugMeasureGIFMemory(arg);
+            return;
+        }
+        if ([contents hasPrefix:@"linkpreview "]) {
+            NSString *urlString = [[contents substringFromIndex:12] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            NSURL *previewURL = urlString.length > 0 ? [NSURL URLWithString:urlString] : nil;
+            if (!previewURL) { ApolloLog(@"[SimDebugTap] malformed linkpreview url: %@", urlString); return; }
+            [ApolloLinkPreviewFetcher requestPreviewForURL:previewURL completion:^(ApolloLinkPreview *preview) {
+                ApolloLog(@"[SimDebugTap] linkpreview %@\n  site=%@\n  title=%@\n  desc=%@\n  image=%@",
+                          urlString, preview.siteName ?: @"(nil)", preview.title ?: @"(nil)",
+                          preview.desc ?: @"(nil)", preview.imageURL.absoluteString ?: @"(nil)");
+            }];
+            return;
+        }
+        // "safari <url>" command: present Apollo's own in-app browser
+        // (ApolloSafariViewController, the SFSafariViewController subclass
+        // behind "In-App Safari") for a URL from the topmost view controller,
+        // exactly as a link tap would. Needs no Reddit session, so the
+        // loading-state appearance (issue #1008) can be exercised headlessly.
+        if ([contents hasPrefix:@"safari "]) {
+            NSString *urlString = [[contents substringFromIndex:7] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            NSURL *url = urlString.length > 0 ? [NSURL URLWithString:urlString] : nil;
+            if (!url) { ApolloLog(@"[SimDebugTap] malformed safari url: %@", urlString); return; }
+            // Key window first; else the last visible window with a root.
+            UIWindow *keyWindow = ApolloKeyWindow();
+            UIViewController *top = keyWindow.hidden ? nil : keyWindow.rootViewController;
+            if (!top) {
+                for (UIWindow *window in ApolloAllWindows()) {
+                    if (window.hidden || !window.rootViewController) continue;
+                    top = window.rootViewController;
+                }
+            }
+            while (top.presentedViewController) top = top.presentedViewController;
+            Class safariClass = objc_getClass("_TtC6Apollo26ApolloSafariViewController");
+            if (!top || !safariClass) { ApolloLog(@"[SimDebugTap] safari: no presenter/class"); return; }
+            id (*msgSend)(id, SEL, NSURL *) = (id (*)(id, SEL, NSURL *))objc_msgSend;
+            UIViewController *safariVC = msgSend([safariClass alloc], @selector(initWithURL:), url);
+            ApolloLog(@"[SimDebugTap] safari: presenting %@ for %@ from %@",
+                      NSStringFromClass(safariVC.class), urlString, NSStringFromClass(top.class));
+            [top presentViewController:safariVC animated:YES completion:nil];
+            return;
+        }
+        // "translate <google|libre|auto> <text>" command: run text through the
+        // real translation provider pipeline and log the result. Needs no
+        // Reddit session — isolates provider/network failures (issue #995).
+        if ([contents hasPrefix:@"translate "]) {
+            NSString *spec = [[contents substringFromIndex:10] stringByTrimmingCharactersInSet:
+                NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            ApolloTranslationDebugProbe(spec);
+            return;
+        }
+        if ([contents hasPrefix:@"searchsubmit"]) {
+            ApolloSimDebugSubmitSearch();
+            return;
+        }
+        if ([contents hasPrefix:@"text "]) {
+            NSString *payload = [[contents substringFromIndex:5] stringByTrimmingCharactersInSet:
+                NSCharacterSet.newlineCharacterSet];
+            ApolloSimDebugTypeText(payload);
+            return;
+        }
+        BOOL isSwipe = [contents hasPrefix:@"swipe "];
+        BOOL isPinch = [contents hasPrefix:@"pinch "];
+        BOOL isHold = [contents hasPrefix:@"hold "];
+        BOOL isPress = [contents hasPrefix:@"press "];
+        NSString *coordString = (isSwipe || isPinch) ? [contents substringFromIndex:6]
+                              : isHold  ? [contents substringFromIndex:5]
+                              : isPress ? [contents substringFromIndex:6]
+                                        : contents;
+        NSArray<NSString *> *parts = [coordString componentsSeparatedByCharactersInSet:
+            NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSMutableArray<NSString *> *numbers = [NSMutableArray array];
+        for (NSString *part in parts) if (part.length > 0) [numbers addObject:part];
+        if (isPinch) {
+            if (numbers.count < 4) { ApolloLog(@"[SimDebugTap] malformed pinch"); return; }
+            ApolloSimDebugPerformPinch(CGPointMake(numbers[0].doubleValue, numbers[1].doubleValue),
+                                       numbers[2].doubleValue, numbers[3].doubleValue,
+                                       numbers.count >= 5 ? MAX(0.1, MIN(5.0, numbers[4].doubleValue)) : 0.6);
+            return;
+        }
+        if (isSwipe) {
+            if (numbers.count < 4) { ApolloLog(@"[SimDebugTap] malformed swipe: %@", contents); return; }
+            // Optional 5th/6th/7th numbers: step count, per-step interval in
+            // seconds, and a settle time (seconds) the finger holds still at
+            // the end point before lifting (0 = lift immediately, with momentum).
+            int steps = numbers.count >= 5 ? MAX(1, numbers[4].intValue) : 12;
+            NSTimeInterval interval = numbers.count >= 6 ? MAX(0.001, numbers[5].doubleValue) : 0.012;
+            NSTimeInterval settle = numbers.count >= 7 ? MAX(0.0, numbers[6].doubleValue) : 0.0;
+            ApolloSimDebugPerformSwipeTimed(CGPointMake(numbers[0].doubleValue, numbers[1].doubleValue),
+                                            CGPointMake(numbers[2].doubleValue, numbers[3].doubleValue),
+                                            steps, interval, settle);
+            return;
+        }
+        if (isHold) {
+            if (numbers.count < 2) { ApolloLog(@"[SimDebugTap] malformed hold: %@", contents); return; }
+            ApolloSimDebugPerformHold(CGPointMake(numbers[0].doubleValue, numbers[1].doubleValue));
+            return;
+        }
+        if (isPress) {
+            if (numbers.count < 2) { ApolloLog(@"[SimDebugTap] malformed press: %@", contents); return; }
+            NSTimeInterval duration = numbers.count >= 3 ? numbers[2].doubleValue : 0.8;
+            ApolloSimDebugPerformPress(CGPointMake(numbers[0].doubleValue, numbers[1].doubleValue),
+                                       duration);
+            return;
+        }
+        if (numbers.count < 2) {
+            ApolloLog(@"[SimDebugTap] malformed tap file: %@", contents ?: @"(missing)");
+            return;
+        }
+        ApolloSimDebugPerformTap(CGPointMake(numbers[0].doubleValue, numbers[1].doubleValue));
+    });
+}
+
+%ctor {
+    %init(ApolloSimNavChurn);
+    %init(ApolloSimShortPane);
+    ApolloSimInstallLowPowerModeOverride();
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+        ApolloSimDebugTapNotification, (__bridge CFStringRef)ApolloSimTapNotify(), NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+    ApolloLog(@"[SimDebugTap] listening for %@ (commands from %@)", ApolloSimTapNotify(), ApolloSimTapFile());
+    ApolloLog(@"[CommentInsights][parser] self-tests %@",
+              ApolloCommentVoteInsightsRunParserSelfTests() ? @"passed" : @"FAILED");
+    NSString *charsetFailure = nil;
+    BOOL charsetOK = ApolloWebTextDecodingRunSelfTests(&charsetFailure);
+    ApolloLog(@"[WebTextDecoding] self-tests %@", charsetOK ? @"passed"
+              : [NSString stringWithFormat:@"FAILED at \"%@\"", charsetFailure]);
+}
+
+#endif

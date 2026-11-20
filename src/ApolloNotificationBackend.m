@@ -1,0 +1,519 @@
+#import "ApolloNotificationBackend.h"
+#import "ApolloNotificationBackendPath.h"
+#import "ApolloBarkNotifications.h"
+#if defined(APOLLO_NOTIFICATION_BACKEND_TESTING)
+// The request/configuration code is Foundation-only. Host tests provide the
+// account/Bark dependencies and do not emit request URLs or credentials.
+#define ApolloLog(...) do {} while (0)
+#else
+#import "ApolloCommon.h"
+#endif
+#import "ApolloState.h"
+#import "UserDefaultConstants.h"
+#import "ApolloAccountCredentials.h"
+
+// Legacy hosts that previously routed to christianselig/apollo-backend. All
+// three are blocked by the existing blocklist in Tweak.xm; when a backend URL
+// is configured, this module rewrites any request to one of these hosts so it
+// reaches the user's self-hosted fork instead.
+static NSSet<NSString *> *ApolloLegacyBackendHosts(void) {
+    static NSSet<NSString *> *hosts;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        hosts = [NSSet setWithArray:@[
+            @"apollopushserver.xyz",
+            @"apollonotifications.com",
+            @"beta.apollonotifications.com",
+        ]];
+    });
+    return hosts;
+}
+
+// Do not cache these objects in mutable globals. Defaults changes can be posted
+// from any thread while URLSession workers rewrite requests. The old cache's
+// unsynchronized load/store/release let invalidation free a backend URL while
+// Foundation bridged it into NSURLComponents (crash #980). NSUserDefaults owns
+// synchronization; each caller now owns its values for the duration of use.
+static NSURL *ApolloParseBackendBaseURL(id raw) {
+    if (![raw isKindOfClass:[NSString class]]) return nil;
+    NSString *value = [raw copy];
+    if (value.length == 0) return nil;
+
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    while ([trimmed hasSuffix:@"/"]) {
+        trimmed = [trimmed substringToIndex:trimmed.length - 1];
+    }
+    if (trimmed.length == 0) return nil;
+
+    NSURL *url = [NSURL URLWithString:trimmed];
+    if (!url) return nil;
+    NSString *scheme = url.scheme.lowercaseString;
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return nil;
+    if (url.host.length == 0) return nil;
+    return url;
+}
+
+static NSString *ApolloParseRegistrationToken(id raw) {
+    if (![raw isKindOfClass:[NSString class]]) return nil;
+    NSString *value = [raw copy];
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmed.length > 0 ? trimmed : nil;
+}
+
+BOOL ApolloIsNotificationBackendConfigured(void) {
+    return ApolloNotificationBackendBaseURL() != nil;
+}
+
+NSURL *ApolloNotificationBackendBaseURL(void) {
+    return ApolloParseBackendBaseURL([[NSUserDefaults standardUserDefaults] objectForKey:UDKeyNotificationBackendURL]);
+}
+
+NSString *ApolloNotificationBackendRegistrationToken(void) {
+    return ApolloParseRegistrationToken([[NSUserDefaults standardUserDefaults] objectForKey:UDKeyNotificationBackendRegistrationToken]);
+}
+
+// MARK: - Path classification
+
+// Match `/v1/device` exactly (device registration — header-gated; the body is
+// augmented with the delivery transport, see
+// ApolloAugmentDeviceRegistrationBody below).
+static BOOL ApolloPathIsDeviceRegistration(NSString *path) {
+    return [path isEqualToString:@"/v1/device"];
+}
+
+// Match `/v1/device/<apns>/account` (singular account upsert — JSON object body).
+static BOOL ApolloPathIsAccountUpsertSingular(NSString *path) {
+    NSArray<NSString *> *parts = [path componentsSeparatedByString:@"/"];
+    // ["", "v1", "device", "<apns>", "account"]
+    return parts.count == 5
+        && [parts[1] isEqualToString:@"v1"]
+        && [parts[2] isEqualToString:@"device"]
+        && parts[3].length > 0
+        && [parts[4] isEqualToString:@"account"];
+}
+
+// Match `/v1/device/<apns>/accounts` (bulk account upsert — JSON array body).
+static BOOL ApolloPathIsAccountUpsertBulk(NSString *path) {
+    NSArray<NSString *> *parts = [path componentsSeparatedByString:@"/"];
+    return parts.count == 5
+        && [parts[1] isEqualToString:@"v1"]
+        && [parts[2] isEqualToString:@"device"]
+        && parts[3].length > 0
+        && [parts[4] isEqualToString:@"accounts"];
+}
+
+// Match `/v1/live_activities` (Live Activity registration — the backend polls
+// the thread and pushes ActivityKit updates).
+static BOOL ApolloPathIsLiveActivityRegistration(NSString *path) {
+    return [path isEqualToString:@"/v1/live_activities"];
+}
+
+// MARK: - JSON body augmentation
+
+// Inject the four per-account Reddit OAuth fields the forked backend's
+// accountRegistrationRequest struct requires. Snake_case keys match the
+// struct's explicit json tags. Empty strings are sent for unset settings so
+// the backend returns a clear 422 instead of the tweak silently dropping.
+//
+// Resolved per-account: `username` (already present on every account-upsert
+// body item — it's Apollo's own registration payload, one item per account)
+// looks up that account's stored credential override via
+// ApolloAccountCredentialsFor; missing/empty fields fall back to the global
+// default. This keeps backend push registration correct even when different
+// accounts use different Reddit API clients (see ApolloAccountCredentials.h).
+// A nil username returns the global defaults — used for the X-Apollo-Reddit-*
+// header channel, which is per-request and can't carry per-account overrides.
+static NSDictionary<NSString *, NSString *> *ApolloRedditCredentialsForRegistration(NSString *username) {
+    ApolloAccountCredentialEntry *entry = username.length > 0 ? ApolloAccountCredentialsFor(username) : nil;
+    NSString *clientId = (entry && entry.clientId.length > 0) ? entry.clientId : (sRedditClientId ?: @"");
+    NSString *clientSecret = (entry && entry.clientSecret.length > 0) ? entry.clientSecret : (sRedditClientSecret ?: @"");
+    NSString *redirectURI = (entry && entry.redirectURI.length > 0) ? entry.redirectURI : (sRedirectURI ?: @"");
+    return @{
+        @"reddit_client_id":     clientId,
+        @"reddit_client_secret": clientSecret,
+        @"reddit_redirect_uri":  redirectURI,
+        @"reddit_user_agent":    sUserAgent ?: @"",
+    };
+}
+
+static NSDictionary *ApolloAccountObjectWithRedditCredentials(NSDictionary *original) {
+    NSMutableDictionary *augmented = [original mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSString *username = [original[@"username"] isKindOfClass:[NSString class]] ? original[@"username"] : nil;
+    NSDictionary<NSString *, NSString *> *creds = ApolloRedditCredentialsForRegistration(username);
+    for (NSString *key in creds) {
+        // Don't clobber a field Apollo's body somehow already provides — the
+        // user's setting is the fallback, not an override.
+        if (augmented[key] == nil) {
+            augmented[key] = creds[key];
+        }
+    }
+    return augmented;
+}
+
+// Returns the augmented body data on success, or nil if augmentation isn't
+// possible (no body, parse error, unexpected shape). Caller falls through to
+// sending Apollo's original body — backend will 422 and surface the error.
+static NSData *ApolloAugmentAccountUpsertBody(NSData *originalBody, BOOL bulk) {
+    if (originalBody.length == 0) return nil;
+
+    NSError *err = nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:originalBody options:NSJSONReadingMutableContainers error:&err];
+    if (err || !parsed) {
+        ApolloLog(@"[NotifBackend] Could not parse account-upsert body as JSON: %@", err);
+        return nil;
+    }
+
+    id augmented = nil;
+    if (bulk) {
+        if (![parsed isKindOfClass:[NSArray class]]) {
+            ApolloLog(@"[NotifBackend] Bulk account-upsert body wasn't an array (was %@)", [parsed class]);
+            return nil;
+        }
+        NSMutableArray *out = [NSMutableArray arrayWithCapacity:[(NSArray *)parsed count]];
+        for (id item in (NSArray *)parsed) {
+            if ([item isKindOfClass:[NSDictionary class]]) {
+                [out addObject:ApolloAccountObjectWithRedditCredentials(item)];
+            } else {
+                [out addObject:item];
+            }
+        }
+        augmented = out;
+    } else {
+        if (![parsed isKindOfClass:[NSDictionary class]]) {
+            ApolloLog(@"[NotifBackend] Singular account-upsert body wasn't an object (was %@)", [parsed class]);
+            return nil;
+        }
+        augmented = ApolloAccountObjectWithRedditCredentials((NSDictionary *)parsed);
+    }
+
+    NSData *out = [NSJSONSerialization dataWithJSONObject:augmented options:0 error:&err];
+    if (err) {
+        ApolloLog(@"[NotifBackend] Could not re-serialize augmented body: %@", err);
+        return nil;
+    }
+    return out;
+}
+
+// Inject the delivery transport into Apollo's `POST /v1/device` body (which
+// natively carries only the APNs token + sandbox flag). With Bark mode active
+// the device registers as transport=bark with its Bark push URL; otherwise
+// transport=apns is set EXPLICITLY rather than omitted, so the backend's
+// upsert self-heals a row that previously registered as bark (Bark disabled,
+// entitlement state changed, …). Returns nil when augmentation isn't possible
+// (no body, parse error, unexpected shape) — the caller falls through to
+// Apollo's original body and the backend defaults the transport to apns.
+static NSData *ApolloAugmentDeviceRegistrationBody(NSData *originalBody) {
+    if (originalBody.length == 0) return nil;
+
+    NSError *err = nil;
+    id parsed = [NSJSONSerialization JSONObjectWithData:originalBody options:NSJSONReadingMutableContainers error:&err];
+    if (err || ![parsed isKindOfClass:[NSDictionary class]]) {
+        ApolloLog(@"[NotifBackend] Could not parse device-registration body as a JSON object: %@", err);
+        return nil;
+    }
+
+    NSMutableDictionary *augmented = [(NSDictionary *)parsed mutableCopy];
+    if (ApolloBarkModeActive()) {
+        augmented[@"transport"] = @"bark";
+        augmented[@"transport_endpoint"] = ApolloBarkEffectivePushURL().absoluteString;
+    } else {
+        augmented[@"transport"] = @"apns";
+    }
+
+    NSData *out = [NSJSONSerialization dataWithJSONObject:augmented options:0 error:&err];
+    if (err) {
+        ApolloLog(@"[NotifBackend] Could not re-serialize augmented device body: %@", err);
+        return nil;
+    }
+    return out;
+}
+
+// MARK: - Request rewrite
+
+#if !defined(APOLLO_NOTIFICATION_BACKEND_TESTING)
+// ApolloActiveAccountClient deliberately permits only main-thread access: it
+// reads Apollo's live Swift account array without retaining that array's
+// storage. NSURLSession resumes on an internal queue, so cross to main before
+// reading currentUser.identifier and copy only the immutable identifier back.
+static NSString *ApolloActiveNotificationAccountIdentifier(void) {
+    __block NSString *accountIdentifier = nil;
+    void (^resolve)(void) = ^{
+        id client = ApolloActiveAccountClient();
+        if (!client) return;
+
+        id candidate = nil;
+        @try {
+            id currentUser = [client valueForKey:@"currentUser"];
+            candidate = [currentUser valueForKey:@"identifier"];
+        } @catch (__unused NSException *exception) {
+            candidate = nil;
+        }
+        if ([candidate isKindOfClass:[NSString class]]) {
+            accountIdentifier = [candidate copy];
+        }
+    };
+
+    if ([NSThread isMainThread]) {
+        resolve();
+    } else {
+        // Do not synchronously dispatch back to main from NSURLSession's
+        // `_onqueue_resume`: a future Foundation implementation could have
+        // main waiting for that queue. Bound the hop so this request fails
+        // closed instead of creating a reverse-queue deadlock.
+        dispatch_semaphore_t resolved = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            resolve();
+            dispatch_semaphore_signal(resolved);
+        });
+        dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC);
+        if (dispatch_semaphore_wait(resolved, deadline) != 0) {
+            return nil;
+        }
+    }
+    return accountIdentifier;
+}
+#endif
+// `/v1/device/<apns>/account/<id>` for a log line: every segment after
+// `device`, `account`, `accounts` or `watcher(s)` is an identifier.
+__attribute__((unused)) // only referenced from ApolloLog, which host tests compile out
+static NSString *ApolloNotificationBackendLogRoute(NSString *path) {
+    NSArray<NSString *> *segments = [path componentsSeparatedByString:@"/"];
+    NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:segments.count];
+    NSSet<NSString *> *identifierParents = [NSSet setWithArray:@[ @"device", @"account", @"accounts", @"watcher", @"watchers" ]];
+    for (NSUInteger i = 0; i < segments.count; i++) {
+        BOOL identifier = i > 0 && segments[i].length > 0 &&
+            [identifierParents containsObject:segments[i - 1].lowercaseString] &&
+            ![identifierParents containsObject:segments[i].lowercaseString];
+        [out addObject:identifier ? @"<id>" : segments[i]];
+    }
+    return [out componentsJoinedByString:@"/"];
+}
+
+NSURLRequest *ApolloRewriteRequestForNotificationBackend(NSURLRequest *request) {
+    if (!request) return nil;
+    NSURL *requestURL = request.URL;
+    NSString *host = requestURL.host.lowercaseString;
+    if (host.length == 0) return nil;
+    if (![ApolloLegacyBackendHosts() containsObject:host]) return nil;
+
+    // Capture URL and token from one defaults snapshot. A configuration update
+    // during rewriting must not swap in another backend's registration token.
+    NSDictionary *configuration = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    NSURL *base = ApolloParseBackendBaseURL(configuration[UDKeyNotificationBackendURL]);
+    if (!base) return nil;
+    // This is a request-local snapshot, despite the historical variable name
+    // retained for the source regression test. It is never shared or cached
+    // across defaults changes.
+    NSString *sCachedRegistrationToken = ApolloParseRegistrationToken(configuration[UDKeyNotificationBackendRegistrationToken]);
+
+    NSURLComponents *components = [NSURLComponents componentsWithURL:requestURL resolvingAgainstBaseURL:NO];
+    if (!components) return nil;
+
+    NSURLComponents *baseComponents = [NSURLComponents componentsWithURL:base resolvingAgainstBaseURL:NO];
+    if (!baseComponents) return nil;
+
+    components.scheme = baseComponents.scheme;
+    components.host = baseComponents.host;
+    components.port = baseComponents.port;
+    components.user = baseComponents.user;
+    components.password = baseComponents.password;
+
+    NSString *method = request.HTTPMethod.uppercaseString ?: @"GET";
+
+    // Some native Apollo notification/watcher calls are built while its
+    // temporary account object is empty, producing `/account//`. Repair only
+    // that literal empty component from the active RDKUser identifier. The
+    // pure helper leaves valid and unrelated paths untouched. If it signals
+    // that repair is required, but no valid identifier can be resolved, fail
+    // closed: returning nil lets the existing legacy-host blocklist suppress
+    // the malformed request instead of forwarding it to the self-host.
+#if defined(APOLLO_NOTIFICATION_BACKEND_TESTING)
+    // The host-side configuration stress test compiles this file alone. Path
+    // repair and Apollo's live account lookup have their own focused tests and
+    // are linked normally in tweak builds.
+    BOOL repairedEmptyAccountComponent = NO;
+#else
+    NSString *percentEncodedPath = components.percentEncodedPath ?: @"";
+    NSString *repairedPath = ApolloNotificationBackendPathByRepairingEmptyAccountComponent(
+        percentEncodedPath,
+        method,
+        nil
+    );
+    BOOL repairedEmptyAccountComponent = repairedPath == nil;
+    if (repairedEmptyAccountComponent) {
+        repairedPath = ApolloNotificationBackendPathByRepairingEmptyAccountComponent(
+            percentEncodedPath,
+            method,
+            ApolloActiveNotificationAccountIdentifier()
+        );
+        if (!repairedPath) {
+            ApolloLog(@"[NotifBackend] Blocked malformed account-scoped request: active account identifier unavailable");
+            return nil;
+        }
+        components.percentEncodedPath = repairedPath;
+    }
+#endif
+
+    NSURL *rewrittenURL = components.URL;
+    if (!rewrittenURL) return nil;
+
+    if (repairedEmptyAccountComponent) {
+        ApolloLog(@"[NotifBackend] Repaired empty account component from the active account");
+    }
+
+    NSMutableURLRequest *mutable = [request mutableCopy];
+    mutable.URL = rewrittenURL;
+
+    // A configured backend token authenticates the rewritten backend request,
+    // not a small historical set of registration paths. Attach it before any
+    // method/path-specific compatibility work so DELETE, PATCH, GET, receipt,
+    // and diagnostic requests all keep working when the backend requires it.
+    // Requests that are not rewritten return above unchanged; an unset token
+    // intentionally adds no header.
+    if (sCachedRegistrationToken.length > 0) {
+        [mutable setValue:sCachedRegistrationToken forHTTPHeaderField:@"X-Registration-Token"];
+    }
+
+    NSString *path = requestURL.path ?: @"";
+
+    // Credential injection for the two account-upsert endpoints. The forked
+    // backend's accountRegistrationRequest requires four Reddit OAuth fields
+    // that Apollo's wire format never carried; inject them from the tweak's
+    // saved settings.
+    if ([method isEqualToString:@"POST"]) {
+        BOOL singular = ApolloPathIsAccountUpsertSingular(path);
+        BOOL bulk = !singular && ApolloPathIsAccountUpsertBulk(path);
+        if (singular || bulk) {
+            // Headers are the reliable channel for the global-default
+            // credentials: like /v1/device below, Apollo can post these
+            // upserts as upload tasks whose body data rides outside the
+            // request object (`fromData:`), in which case the body rewrite
+            // below never reaches the wire and the backend sees Apollo's raw
+            // payload (no reddit_client_id -> 422). Headers set on the
+            // request always reach the wire. The backend fills missing
+            // fields body > header > env, so the per-account overrides
+            // (body-only) still win whenever the body rewrite does land.
+            NSDictionary<NSString *, NSString *> *globalCreds = ApolloRedditCredentialsForRegistration(nil);
+            NSDictionary<NSString *, NSString *> *headerForBodyKey = @{
+                @"reddit_client_id":     @"X-Apollo-Reddit-Client-Id",
+                @"reddit_client_secret": @"X-Apollo-Reddit-Client-Secret",
+                @"reddit_redirect_uri":  @"X-Apollo-Reddit-Redirect-Uri",
+                @"reddit_user_agent":    @"X-Apollo-Reddit-User-Agent",
+            };
+            for (NSString *bodyKey in headerForBodyKey) {
+                NSString *value = globalCreds[bodyKey];
+                if (value.length > 0) {
+                    [mutable setValue:value forHTTPHeaderField:headerForBodyKey[bodyKey]];
+                }
+            }
+
+            NSData *augmented = ApolloAugmentAccountUpsertBody(mutable.HTTPBody, bulk);
+            if (augmented) {
+                mutable.HTTPBody = augmented;
+                [mutable setValue:[NSString stringWithFormat:@"%lu", (unsigned long)augmented.length] forHTTPHeaderField:@"Content-Length"];
+                if ([mutable valueForHTTPHeaderField:@"Content-Type"] == nil) {
+                    [mutable setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+                }
+            }
+            ApolloLog(@"[NotifBackend] %@ upsert: reddit_* creds in headers%@",
+                      singular ? @"account" : @"accounts",
+                      augmented ? @" + body augmented" : @" (body not reachable, header-only)");
+        } else if (ApolloPathIsDeviceRegistration(path)) {
+            // Headers are the authoritative channel: Apollo posts /v1/device
+            // as an upload task whose body data is attached outside the
+            // request object, so the body rewrite below doesn't always reach
+            // the wire — headers set on _originalRequest/_currentRequest
+            // reliably do (proven by X-Registration-Token above). The backend
+            // prefers these headers over body fields.
+            BOOL bark = ApolloBarkModeActive();
+            [mutable setValue:(bark ? @"bark" : @"apns") forHTTPHeaderField:@"X-Apollo-Transport"];
+            if (bark) {
+                // Effective URL = push URL + ?icon= pin for the user's
+                // selected app icon (see ApolloBarkEffectivePushURL).
+                [mutable setValue:ApolloBarkEffectivePushURL().absoluteString forHTTPHeaderField:@"X-Apollo-Transport-Endpoint"];
+            }
+            NSData *augmented = ApolloAugmentDeviceRegistrationBody(mutable.HTTPBody);
+            if (augmented) {
+                mutable.HTTPBody = augmented;
+                [mutable setValue:[NSString stringWithFormat:@"%lu", (unsigned long)augmented.length] forHTTPHeaderField:@"Content-Length"];
+                if ([mutable valueForHTTPHeaderField:@"Content-Type"] == nil) {
+                    [mutable setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+                }
+            }
+            ApolloLog(@"[NotifBackend] Tagged /v1/device registration (transport=%@%@)",
+                      bark ? @"bark" : @"apns",
+                      augmented ? @", body augmented" : @", header-only");
+        } else if (ApolloPathIsLiveActivityRegistration(path)) {
+            // Opt the followed thread in to commenter avatars when Show User
+            // Profile Pictures (UDKeyShowUserAvatars) is on: the backend then
+            // embeds each comment author's picture in the Live Activity pushes
+            // (a Live Activity can't fetch images itself). Sent explicitly
+            // either way so a re-registration also turns it off. Read from the
+            // same defaults snapshot as the backend URL; a header because the
+            // body may be out of reach.
+            id showAvatars = configuration[UDKeyShowUserAvatars];
+            BOOL avatars = [showAvatars respondsToSelector:@selector(boolValue)] && [showAvatars boolValue];
+            [mutable setValue:(avatars ? @"1" : @"0") forHTTPHeaderField:@"X-Apollo-Live-Activity-Avatars"];
+            ApolloLog(@"[NotifBackend] Tagged /v1/live_activities registration (avatars=%d)", avatars);
+        }
+    }
+
+    // Route template only: the path carries the APNs device token and Reddit
+    // account IDs, and the rewritten host (maybe with user:password@) is the
+    // user's own server.
+    ApolloLog(@"[NotifBackend] Rewriting %@ %@ -> custom backend", method, ApolloNotificationBackendLogRoute(path));
+    return [mutable copy];
+}
+
+void ApolloTestNotificationBackendConnection(void(^completion)(BOOL ok, NSString *message)) {
+    if (!completion) return;
+
+    NSURL *base = ApolloNotificationBackendBaseURL();
+    if (!base) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(NO, @"Backend URL is empty or invalid.");
+        });
+        return;
+    }
+
+    NSURL *healthURL = [base URLByAppendingPathComponent:@"v1/health"];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:healthURL
+                                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                       timeoutInterval:5.0];
+    request.HTTPMethod = @"GET";
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request
+                                                                 completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        BOOL ok = NO;
+        NSString *message = nil;
+
+        if (error) {
+            message = [NSString stringWithFormat:@"Request failed: %@", error.localizedDescription];
+        } else if (![response isKindOfClass:[NSHTTPURLResponse class]]) {
+            message = @"Unexpected response (not HTTP).";
+        } else {
+            NSInteger status = [(NSHTTPURLResponse *)response statusCode];
+            if (status == 200) {
+                ok = YES;
+                message = [NSString stringWithFormat:@"Connected — HTTP 200 (%@)", healthURL.host];
+                if (data.length > 0) {
+                    NSError *jsonErr = nil;
+                    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
+                    if ([parsed isKindOfClass:[NSDictionary class]]) {
+                        NSString *statusField = [parsed[@"status"] isKindOfClass:[NSString class]] ? parsed[@"status"] : nil;
+                        if (statusField.length > 0) {
+                            message = [NSString stringWithFormat:@"Connected — HTTP 200, status: %@", statusField];
+                        }
+                    }
+                }
+            } else {
+                message = [NSString stringWithFormat:@"Backend returned HTTP %ld", (long)status];
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(ok, message ?: @"Unknown error");
+        });
+    }];
+    [task resume];
+}

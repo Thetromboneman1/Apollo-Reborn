@@ -1,0 +1,264 @@
+// MARK: - Saved Categories Sort Fix
+// This fixes a long-standing Apollo bug where saved categories appear in random order in various menus.
+// 
+// Apollo iterates a Swift Dictionary to build the categories action sheet / context menu.
+// Swift Dictionary iteration order is non-deterministic (hash-based), so categories
+// appear in random order on each invocation. Two UI flows are affected:
+//
+// 1. ActionController (SavedPostsCommentsView) — bookmark button or title label tap
+//    Fix: sort the actions array in-place after Apollo builds the controller.
+//
+// 2. UIContextMenu (SetSavedCategoryButton on the "Saved!" toast)
+//    Fix: wrap the actionProvider block to sort UIMenu children before display.
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+
+#import "ApolloCommon.h"
+#import "ApolloGallerySource.h"
+#import "ApolloGalleryViewController.h"
+#import "ApolloSavedItemsDeduplicator.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloThemeRuntime.h"
+
+@class RDKPagination;
+typedef void (^ApolloSavedItemsCompletion)(NSArray *items, RDKPagination *pagination, NSError *error);
+static NSString *const ApolloSavedListingDidLoadNotification = @"ApolloSavedListingDidLoadNotification";
+
+// MARK: - Saved-list refresh de-duplication
+
+// SavedPostsCommentsViewController uses this category-aware API for both the
+// unfiltered Saved screen (nil category) and category filters. Apollo replaces
+// its savedPostsComments array with the response on a pull-to-refresh. Reddit
+// can return the same thing twice in that response, so normalize at this data
+// boundary before the Swift controller or ListAdapter sees it. Pagination and
+// errors pass through untouched.
+%hook RDKClient
+
+- (id)savedLinksAndCommentsWithCategory:(id)category
+                              pagination:(RDKPagination *)pagination
+                              completion:(ApolloSavedItemsCompletion)completion {
+    if (!completion) return %orig;
+
+    ApolloSavedItemsCompletion deduplicatingCompletion = ^(NSArray *items,
+                                                            RDKPagination *responsePagination,
+                                                            NSError *error) {
+        NSArray *deduplicated = ApolloDeduplicateSavedItems(items);
+        if (deduplicated.count != items.count) {
+            ApolloLog(@"[SavedItems] Removed %lu duplicate item(s) from refresh response",
+                      (unsigned long)(items.count - deduplicated.count));
+        }
+        completion(deduplicated, responsePagination, error);
+        if (!error) {
+            // Let the native completion publish its array/cursor first. Warm
+            // Gallery's first screen while the user is still browsing Saved.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[NSNotificationCenter defaultCenter] postNotificationName:ApolloSavedListingDidLoadNotification
+                                                                    object:nil];
+            });
+        }
+    };
+    return %orig(category, pagination, deduplicatingCompletion);
+}
+
+%end
+
+// MARK: - ActionController In-Place Sort
+
+// Sort the category entries in an ActionController's actions array in-place.
+// Keeps "All" (index 0) fixed; sorts only the category entries after it.
+//
+// ActionController.actions is a Swift Array of 0x30-byte value-type structs:
+//   buffer+0x10 = count, elements at buffer+0x20, stride 0x30
+//   Each element: +0x08 = title word0, +0x10 = title word1
+//   (Verified from assembly: madd x8, idx, #0x30, buf; str [x8, #0x20..#0x48])
+//
+// ActionController.actionHandlers is a Swift Dictionary (NOT a parallel array)
+// keyed by description string — handler lookup is by key, not position, so
+// only the actions array needs to be reordered.
+static void sortActionControllerCategories(id actionController) {
+    Class cls = object_getClass(actionController);
+    Ivar actionsIvar = class_getInstanceVariable(cls, "actions");
+    if (!actionsIvar) return;
+
+    uint8_t *acBase = (uint8_t *)(__bridge void *)actionController;
+    void *actBuf = *(void **)(acBase + ivar_getOffset(actionsIvar));
+    if (!actBuf) return;
+
+    int64_t count = *(int64_t *)((uint8_t *)actBuf + 0x10);
+    if (count < 3) return; // Need "All" + ≥2 categories
+
+    // Sort range: indices 1..count-1 (skip "All" at index 0)
+    int64_t lo = 1, hi = count - 1;
+
+    // Insertion sort (category count is small, elements are pure value types)
+    uint8_t tmpAct[0x30];
+    for (int64_t i = lo + 1; i <= hi; i++) {
+        uint8_t *elemI = (uint8_t *)actBuf + 0x20 + i * 0x30;
+        NSString *titleI = ApolloDecodeSwiftString(*(uint64_t *)(elemI + 0x08), *(uint64_t *)(elemI + 0x10));
+        if (!titleI) continue;
+
+        int64_t j = i - 1;
+        while (j >= lo) {
+            uint8_t *elemJ = (uint8_t *)actBuf + 0x20 + j * 0x30;
+            NSString *titleJ = ApolloDecodeSwiftString(*(uint64_t *)(elemJ + 0x08), *(uint64_t *)(elemJ + 0x10));
+            if (!titleJ || [titleJ localizedCaseInsensitiveCompare:titleI] <= 0) break;
+            j--;
+        }
+        if (j + 1 == i) continue; // already in place
+
+        // Save element[i], shift [j+1..i-1] right, insert at j+1
+        int64_t ins = j + 1;
+        memcpy(tmpAct, elemI, 0x30);
+
+        memmove((uint8_t *)actBuf + 0x20 + (ins + 1) * 0x30,
+                (uint8_t *)actBuf + 0x20 + ins * 0x30,
+                (i - ins) * 0x30);
+
+        memcpy((uint8_t *)actBuf + 0x20 + ins * 0x30, tmpAct, 0x30);
+    }
+}
+
+static BOOL sSortNextActionController = NO;
+
+// Keep Apollo's category item as the anchor, preserving any other navigation
+// actions. Install once per controller and restore only if Apollo rebuilds its
+// items on return; never change navigation geometry from a layout callback.
+static char kApolloSavedGalleryButtonKey;
+static void ApolloInstallSavedGalleryButton(UIViewController *controller) {
+    UIBarButtonItem *categoryButton = ApolloObjectIvar(controller, "savedCategoriesBarButtonItem");
+    if (![categoryButton isKindOfClass:UIBarButtonItem.class]) return;
+    UINavigationItem *navigationItem = controller.navigationItem;
+    BOOL onLeft = [navigationItem.leftBarButtonItems containsObject:categoryButton];
+    NSArray<UIBarButtonItem *> *existing = onLeft
+        ? navigationItem.leftBarButtonItems : navigationItem.rightBarButtonItems;
+    NSUInteger categoryIndex = [existing indexOfObjectIdenticalTo:categoryButton];
+    if (!existing || categoryIndex == NSNotFound) return;
+
+    UIBarButtonItem *galleryButton = objc_getAssociatedObject(controller, &kApolloSavedGalleryButtonKey);
+    if (!galleryButton) {
+        galleryButton = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"square.grid.2x2"]
+            style:UIBarButtonItemStylePlain target:controller action:@selector(apollo_savedGalleryTapped:)];
+        galleryButton.accessibilityLabel = @"Gallery View";
+        galleryButton.accessibilityIdentifier = @"ApolloSavedGallery";
+        objc_setAssociatedObject(controller, &kApolloSavedGalleryButtonKey, galleryButton,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    galleryButton.tintColor = ApolloThemeAccentColor() ?: controller.view.tintColor;
+    if ([existing containsObject:galleryButton]) return;
+    NSMutableArray<UIBarButtonItem *> *buttons = [existing mutableCopy];
+    [buttons insertObject:galleryButton atIndex:categoryIndex + 1];
+    if (onLeft) navigationItem.leftBarButtonItems = buttons;
+    else navigationItem.rightBarButtonItems = buttons;
+    ApolloLog(@"[SavedGallery] installed gallery button beside categories");
+}
+
+static void ApolloPrepareVisibleSavedGallery(UIViewController *controller) {
+    if (!controller.viewIfLoaded.window || controller.navigationController.topViewController != controller) return;
+    ApolloGalleryPrepareSource(controller);
+}
+
+%hook _TtC6Apollo32SavedPostsCommentsViewController
+
+- (void)viewDidLoad {
+    ApolloGalleryBindSavedSourceToCurrentAccount((UIViewController *)self);
+    %orig;
+    ApolloInstallSavedGalleryButton((UIViewController *)self);
+    [[NSNotificationCenter defaultCenter] addObserver:self
+        selector:@selector(apollo_prepareSavedGallery:)
+        name:ApolloSavedListingDidLoadNotification object:nil];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    ApolloInstallSavedGalleryButton((UIViewController *)self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    ApolloPrepareVisibleSavedGallery((UIViewController *)self);
+}
+
+%new
+- (void)apollo_prepareSavedGallery:(NSNotification *)notification {
+    ApolloPrepareVisibleSavedGallery((UIViewController *)self);
+}
+
+%new
+- (void)apollo_savedGalleryTapped:(id)sender {
+    // Read at tap time: the category picker can change the current filter
+    // without recreating the Saved controller or its navigation items.
+    NSString *category = ApolloReadSwiftStringIvar(self, "filteredSaveCategory");
+    [ApolloGalleryViewController presentGalleryForSavedCategory:category
+                                           fromViewController:(UIViewController *)self];
+}
+
+- (void)savedCategoriesButtonTappedWithSender:(id)sender {
+    sSortNextActionController = YES;
+    %orig;
+    sSortNextActionController = NO;
+}
+
+- (void)titleViewTappedWithSender:(id)sender {
+    sSortNextActionController = YES;
+    %orig;
+    sSortNextActionController = NO;
+}
+
+- (void)presentViewController:(UIViewController *)vc animated:(BOOL)animated completion:(void (^)(void))completion {
+    if (sSortNextActionController && [vc isKindOfClass:objc_getClass("_TtC6Apollo16ActionController")]) {
+        sSortNextActionController = NO;
+        sortActionControllerCategories(vc);
+    }
+    %orig;
+}
+
+%end
+
+// MARK: - Set Saved Category Context Menu Sort Fix
+// The "Set Category" button on the saved-post toast uses a UIContextMenu built
+// from the same non-deterministic Swift Dictionary iteration. Fix: intercept the
+// UIContextMenuConfiguration creation, wrap its actionProvider block with one
+// that sorts the resulting UIMenu children alphabetically before display.
+
+static BOOL sSortNextContextMenu = NO;
+
+%hook _TtC6Apollo22SetSavedCategoryButton
+
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    sSortNextContextMenu = YES;
+    UIContextMenuConfiguration *config = %orig;
+    sSortNextContextMenu = NO;
+    return config;
+}
+
+%end
+
+%hook UIContextMenuConfiguration
+
++ (instancetype)configurationWithIdentifier:(id)identifier previewProvider:(id)previewProvider actionProvider:(UIMenu *(^)(NSArray<UIMenuElement *> *))actionProvider {
+    if (sSortNextContextMenu && actionProvider) {
+        sSortNextContextMenu = NO;
+        UIMenu *(^sortedProvider)(NSArray<UIMenuElement *> *) = ^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+            UIMenu *menu = actionProvider(suggestedActions);
+            if (!menu) return menu;
+            NSArray<UIMenuElement *> *children = menu.children;
+            if (children.count < 3) return menu; // Need ≥2 categories + "Add"
+
+            // Last child is "Add Saved Category"
+            // Sort all preceding category actions alphabetically.
+            NSMutableArray<UIMenuElement *> *sortable = [[children subarrayWithRange:NSMakeRange(0, children.count - 1)] mutableCopy];
+            [sortable sortUsingComparator:^NSComparisonResult(UIMenuElement *a, UIMenuElement *b) {
+                return [a.title localizedCaseInsensitiveCompare:b.title];
+            }];
+            [sortable addObject:children.lastObject];
+
+            return [UIMenu menuWithTitle:menu.title image:menu.image identifier:menu.identifier options:menu.options children:sortable];
+        };
+        return %orig(identifier, previewProvider, sortedProvider);
+    }
+    return %orig;
+}
+
+%end

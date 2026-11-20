@@ -1,0 +1,1451 @@
+#import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
+#import <AVKit/AVKit.h>
+#import <MediaPlayer/MediaPlayer.h>
+#import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <pthread.h>
+#import <stdatomic.h>
+
+#import "ApolloCommon.h"
+#import "ApolloDuoCompatibility.h"
+#import "ApolloGiphyClient.h"
+#import "ApolloInlineImageMetadata.h"
+#import "ApolloMediaAutoplay.h"
+#import "ApolloState.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloMediaMetadata.h"
+#import "ApolloImageUploadHost.h"
+#import "ApolloTextureDecls.h"
+#import "ApolloMarkdownToolbarGif.h"
+#import "Tweak.h"
+#import "ApolloClasses.h"
+#import "ApolloDuoRail.h"
+
+// FFmpegKit's static libs are device-arm64 only, so simulator/dev builds
+// (APOLLO_SIM_BUILD, see Makefile + scripts/run-in-sim.sh) compile without it.
+// The v.redd.it CMAF/MPEG-TS audio fix below is stubbed to %orig in that mode.
+#if !APOLLO_SIM_BUILD
+#import "ffmpeg-kit/ffmpeg-kit/include/MediaInformationSession.h"
+#import "ffmpeg-kit/ffmpeg-kit/include/MediaInformation.h"
+#import "ffmpeg-kit/ffmpeg-kit/include/FFmpegKit.h"
+#import "ffmpeg-kit/ffmpeg-kit/include/FFprobeKit.h"
+#endif
+
+// Regex patterns for v.redd.it CMAF audio streams (Reddit switched from MPEG-TS to CMAF around November 2025)
+static NSString *const HLSAudioRegexPattern = @"#EXT-X-MEDIA:.*?\"(HLS_AUDIO.*?)\\.m3u8";
+static NSString *const CMAFAudioRegexPattern = @"#EXT-X-MEDIA:.*?\"((?:HLS|CMAF)_AUDIO.*?)\\.m3u8";
+static NSString *const CMAFAudioIdentifier = @"CMAF_AUDIO";
+
+// Regex patterns for Streamable URLs (some Streamable links have new query strings)
+static NSString *const StreamableRegexPattern = @"^(?:(?:https?:)?//)?(?:www\\.)?streamable\\.com/(?:edit/)?(\\w+)$";
+static NSString *const StreamableRegexPatternWithQueryString = @"^(?:(?:https?:)?//)?(?:www\\.)?streamable\\.com/(?:edit/)?(\\w+)(?:\\?.*)?$";
+
+static const void *kApolloRouteIconRepairLoggedKey = &kApolloRouteIconRepairLoggedKey;
+static const void *kApolloRouteButtonStyleLoggedKey = &kApolloRouteButtonStyleLoggedKey;
+
+// The presentation layer owns the entire background fade. Its solid black
+// color hides the feed at rest, while view alpha supplies the smooth opening,
+// drag, dismissal, and cancelled-drag transitions.
+static UIView *ApolloMediaPresentationView(id owner, const char *name) {
+    id value = ApolloObjectIvar(owner, name);
+    return [value isKindOfClass:UIView.class] ? value : nil;
+}
+
+// Only the viewer's plain UIView wrapper uses this subclass; no extra ivars
+// and no global UIView hook. Apollo paints it black when loading media
+// (0x10034a064) and again after a cancelled pan (0x10036053c). That opaque
+// fill covers the presenter's animated dimming layer and causes a brightness
+// jump when the opening animation hands over to the real viewer. Keep the
+// wrapper transparent for its lifetime so cancellation cannot bring it back.
+@interface ApolloMediaTransparentWrapperView : UIView
+@end
+
+@implementation ApolloMediaTransparentWrapperView
+- (void)setBackgroundColor:(UIColor *)color {
+    [super setBackgroundColor:UIColor.clearColor];
+}
+@end
+
+static void ApolloMediaPrepareTransparentWrapper(UIViewController *viewer) {
+    UIView *wrapper = ApolloMediaPresentationView(viewer, "wrapperView");
+    if (object_getClass(wrapper) != UIView.class) return;
+    object_setClass(wrapper, ApolloMediaTransparentWrapperView.class);
+    wrapper.opaque = NO;
+    wrapper.backgroundColor = UIColor.clearColor;
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [MediaBackdrop] transparent media wrapper installed");
+}
+
+// Apollo turns the presenter snapshot behind the viewer +/-90 degrees whenever
+// the scene is landscape (containerViewDidLayoutSubviews, 0x1006f9b68), since
+// an iPhone feed is always portrait. The Duo's opened display lays the feed out
+// in landscape, so a dragged viewer showed it sideways. The live feed stays in
+// the window behind the viewer (shouldRemovePresentersView == NO), so hide the
+// snapshot there. It stays hidden after a fold, when it no longer matches.
+static void ApolloMediaHideDuoSnapshot(UIPresentationController *presentation) {
+    if (!ApolloDeviceIsDuo()) return;
+    UIView *snapshot = ApolloMediaPresentationView(presentation, "snapshotView");
+    UIWindow *window = presentation.containerView.window;
+    if (!snapshot || snapshot.hidden || !window) return;
+    CGSize screen = (window.windowScene.screen ?: window.screen).bounds.size;
+    if (MIN(screen.width, screen.height) < (CGFloat)ApolloDuoUnfoldedMinimumSide) return;
+    snapshot.hidden = YES;
+    ApolloLog(@"[MediaBackdrop] presenter snapshot hidden on the Duo's opened display");
+}
+
+%hook _TtC6Apollo33MediaViewerPresentationController
+
+- (void)presentationTransitionWillBegin {
+    UIView *dim = ApolloMediaPresentationView(self, "dimmingView");
+    dim.backgroundColor = UIColor.blackColor;
+    %orig;
+}
+
+- (void)presentationTransitionDidEnd:(BOOL)completed {
+    %orig;
+    ApolloMediaHideDuoSnapshot((UIPresentationController *)self);
+}
+
+- (void)containerViewDidLayoutSubviews {
+    %orig;
+    ApolloMediaHideDuoSnapshot((UIPresentationController *)self);
+}
+
+- (void)dismissalTransitionWillBegin {
+    UIPresentationController *presentation = (UIPresentationController *)self;
+    UIViewController *page = presentation.presentedViewController;
+    // The native close-method enum is one byte (closeButton=0, flick=1,
+    // comments=2). Its comments path deliberately leaves this background to
+    // the navigation transition; do not change that separate handoff.
+    Ivar closeMethod = class_getInstanceVariable(page.class, "closeMethod");
+    if (closeMethod) {
+        uint8_t method = 0;
+        memcpy(&method, (const uint8_t *)(__bridge const void *)page +
+               ivar_getOffset(closeMethod), sizeof(method));
+        if (method == 2) {
+            %orig;
+            return;
+        }
+    }
+    UIView *dim = ApolloMediaPresentationView(self, "dimmingView");
+    UIView *snapshot = ApolloMediaPresentationView(self, "snapshotView");
+    CGFloat visibleAlpha = dim.layer.presentationLayer
+        ? ((CALayer *)dim.layer.presentationLayer).opacity : dim.alpha;
+    %orig;
+    if (!dim) return;
+
+    id<UIViewControllerTransitionCoordinator> coordinator =
+        presentation.presentedViewController.transitionCoordinator;
+    if (coordinator.isInteractive) {
+        // Let UIKit scrub/reverse this along with the interactive dismissal.
+        [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+            dim.alpha = 0.0;
+            snapshot.alpha = 0.0;
+        } completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+            if (context.isCancelled) {
+                dim.alpha = 1.0;
+                snapshot.alpha = 1.0;
+            }
+        }];
+        return;
+    }
+
+    // Native dismissal leaves the rotation snapshot until completion.
+    // Finish both background layers from the visible drag state, before the
+    // image's longer settling animation ends. The presenter keeps the live
+    // feed attached (shouldRemovePresentersView == NO), so fading the snapshot
+    // reveals that feed instead of leaving a second brightness jump at teardown.
+    [dim.layer removeAnimationForKey:@"opacity"];
+    [UIView performWithoutAnimation:^{ dim.alpha = visibleAlpha; }];
+    [UIView animateWithDuration:0.18 delay:0.0
+                       options:UIViewAnimationOptionBeginFromCurrentState |
+                               UIViewAnimationOptionCurveEaseOut |
+                               UIViewAnimationOptionOverrideInheritedDuration
+                    animations:^{
+        dim.alpha = 0.0;
+        snapshot.alpha = 0.0;
+    } completion:nil];
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [MediaBackdrop] finishing dismissal fade from %.3f snapshot=%d",
+                   visibleAlpha, snapshot != nil);
+}
+
+%end
+
+%hook _TtC6Apollo21MediaViewerController
+
+- (void)viewDidLoad {
+    %orig;
+    ApolloMediaPrepareTransparentWrapper((UIViewController *)self);
+}
+
+- (void)scrollViewPanned:(UIPanGestureRecognizer *)recognizer {
+    %orig;
+    if (recognizer.state != UIGestureRecognizerStateChanged) return;
+    // Apollo ignores this handler while its zoom view is double-tapped. Keep
+    // zoom/pan gestures from fading the backdrop when no dismissal is active.
+    UIView *scrollView = ApolloMediaPresentationView(self, "scrollView");
+    SEL doubleTappedSelector = @selector(doubleTapped);
+    if (!scrollView || ([scrollView respondsToSelector:doubleTappedSelector] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(scrollView, doubleTappedSelector))) return;
+    UIViewController *page = ((UIViewController *)self).parentViewController;
+    UIPresentationController *presentation = page.presentationController;
+    if (![presentation isMemberOfClass:ApolloClassMediaViewerPresentationController]) return;
+    UIView *dim = ApolloMediaPresentationView(presentation, "dimmingView");
+    if (!dim || page.isBeingDismissed) return;
+
+    // Native tracking uses abs(translation.y) only (0x10035fa54), leaving
+    // sideways drags dark. Use distance in either axis, with the same travel
+    // distance in portrait and landscape. Preserve any faster native fade.
+    CGPoint translation = [recognizer translationInView:recognizer.view];
+    CGSize size = recognizer.view.bounds.size;
+    CGFloat travel = MAX(1.0, MIN(size.width, size.height) * 0.5);
+    CGFloat alpha = MAX(0.0, 1.0 - hypot(translation.x, translation.y) / travel);
+    dim.alpha = MIN(dim.alpha, alpha);
+}
+
+%end
+
+// MARK: - Viewer fit
+//
+// Fullscreen media fills the screen height, and the open zoom lands on that
+// same rect (Apollo 1.15.11):
+//   * SMScrollView::_setMinimumZoomScaleToFit (0x100042e08) fits inside its
+//     bounds minus safeAreaInsets, so tall media stopped short of the Dynamic
+//     Island and home indicator (and a vertical video 17pt short on an opened
+//     Duo).
+//   * MediaViewerAnimationController (0x10020898c) sizes the landing rect from
+//     the presenting view's safeAreaInsets (top unless exactly 20, plus
+//     bottom). When those differ from the viewer's (116pt vs 34pt on an opened
+//     Duo), the zoom lands on one rect and the media jumps to another.
+// The viewer drops its vertical insets, and Apollo's animator reads zero
+// vertical insets from the presenter while it sets up. Chrome (Close, page
+// count, the post row) still lays out in the safe area, over the media.
+
+@interface SMScrollView : UIScrollView
+@end
+
+@interface UILayoutContainerView : UIView
+@end
+
+// The presenter while Apollo's animator sets up a presentation (main thread);
+// NULL otherwise.
+static _Atomic(const void *) sApolloMediaFitPresenterView;
+static NSUInteger sApolloMediaFitPresenterReads;
+// Apollo's own image. Only its reads are rewritten, so UIKit layout of the
+// presenter never sees zero insets.
+static const void *sApolloMediaFitApolloImage;
+// The root view of navigation and tab bar controllers, which present every
+// viewer. Nil (native landing rect) if UIKit drops the class.
+static Class sApolloMediaFitPresenterClass;
+static BOOL sApolloMediaFitIsDuo;
+
+static char kApolloMediaFitViewerScrollKey;
+
+// A zoom view's owner is fixed once it is in a window, so the answer is cached
+// from then on.
+static BOOL ApolloMediaFitIsViewerScroll(UIScrollView *scroll) {
+    Class viewerClass = ApolloClassMediaViewerController;
+    if (!viewerClass) return NO;
+    NSNumber *cached = objc_getAssociatedObject(scroll, &kApolloMediaFitViewerScrollKey);
+    if (cached) return cached.boolValue;
+    BOOL viewer = [(id)scroll.delegate isKindOfClass:viewerClass];
+    for (UIResponder *next = scroll.nextResponder; !viewer && next; next = next.nextResponder) {
+        viewer = [next isKindOfClass:viewerClass];
+    }
+    if (scroll.window) {
+        objc_setAssociatedObject(scroll, &kApolloMediaFitViewerScrollKey, @(viewer), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return viewer;
+}
+
+%hook SMScrollView
+- (UIEdgeInsets)safeAreaInsets {
+    UIEdgeInsets insets = %orig;
+    if (!ApolloMediaFitIsViewerScroll((UIScrollView *)self)) return insets;
+    insets.top = 0.0;
+    insets.bottom = 0.0;
+    // On an opened Duo the viewer also inherits the tab rail's trailing
+    // inset, which would shrink even a square image by 84pt.
+    if (sApolloMediaFitIsDuo && ApolloDuoCurrentMode() != ApolloDuoModePhone) {
+        insets.left = 0.0;
+        insets.right = 0.0;
+    }
+    return insets;
+}
+%end
+
+%group ApolloMediaFitPresenterHooks
+%hook UILayoutContainerView
+- (UIEdgeInsets)safeAreaInsets {
+    // One relaxed load outside a media presentation.
+    const void *presenter = atomic_load_explicit(&sApolloMediaFitPresenterView, memory_order_relaxed);
+    if (__builtin_expect(presenter == NULL, 1)) return %orig;
+    UIEdgeInsets insets = %orig;
+    if ((__bridge const void *)self != presenter || !pthread_main_np()) return insets;
+    Dl_info info;
+    if (!dladdr(__builtin_return_address(0), &info) || info.dli_fbase != sApolloMediaFitApolloImage) return insets;
+    insets.top = 0.0;
+    insets.bottom = 0.0;
+    sApolloMediaFitPresenterReads++;
+    return insets;
+}
+%end
+%end
+
+%hook _TtC6Apollo30MediaViewerAnimationController
+- (void)animateTransition:(id<UIViewControllerContextTransitioning>)context {
+    // Presentation only: dismissal reads no safe-area insets.
+    UIViewController *to = [context viewControllerForKey:UITransitionContextToViewControllerKey];
+    Class pageClass = ApolloClassMediaPageViewController;
+    UIView *presenter = nil;
+    if (pageClass && [to isKindOfClass:pageClass] && pthread_main_np() && sApolloMediaFitApolloImage) {
+        presenter = [context viewControllerForKey:UITransitionContextFromViewControllerKey].viewIfLoaded;
+    }
+    if (!presenter || atomic_load_explicit(&sApolloMediaFitPresenterView, memory_order_relaxed)) {
+        %orig;
+        return;
+    }
+    if (!sApolloMediaFitPresenterClass || ![presenter isKindOfClass:sApolloMediaFitPresenterClass]) {
+        ApolloLog(@"[MediaViewerFit] presentation from %@ is not a layout container view; native landing rect",
+                  NSStringFromClass(presenter.class));
+        %orig;
+        return;
+    }
+    sApolloMediaFitPresenterReads = 0;
+    atomic_store_explicit(&sApolloMediaFitPresenterView, (__bridge const void *)presenter, memory_order_relaxed);
+    @try {
+        %orig;
+    } @finally {
+        atomic_store_explicit(&sApolloMediaFitPresenterView, NULL, memory_order_relaxed);
+    }
+    // Zero is expected for a fade (no zoom image). For a zoom it means Apollo
+    // no longer reads the presenter's insets here, and the landing rect is
+    // native.
+    ApolloLog(@"[MediaViewerFit] presentation from %@ rewrote %lu presenter inset reads",
+              NSStringFromClass(presenter.class), (unsigned long)sApolloMediaFitPresenterReads);
+}
+%end
+
+// #1346: when a swipe between pages of the fullscreen viewer settles,
+// UIPageViewController looks up the controller of the page it ended on and
+// asserts "No view controller managing visible view" when there is none
+// (-queuingScrollView:didEndManualScroll:..., UIPageViewController.m:2072 on
+// iOS 27.0). It finds that controller one of two ways:
+//   - a finished swipe (or a programmatic page change): the controller whose
+//     root view is revealView (+[UIViewController viewControllerForView:]);
+//   - a swipe that bounced back: the outgoing controller recorded when the
+//     finger lifted, in _incomingAndOutgoingViewControllersForManualTransition.
+// Apollo's pager is exposed to both. Its data source builds a new page
+// controller on every before/after call, and its async media loads
+// (loadViewControllers(), 0x100264814) change the page with an animated
+// setViewControllers:, whose commit replaces that record with an empty one.
+// When the lookup would come back empty, finish the swipe on the page that is
+// showing so UIKit's appearance and delegate bookkeeping still run.
+static NSString *const kApolloMediaPagerOutgoingKey = @"UIPageCurlControllerOutgoingLeftViewControllerKey";
+
+// The same lookup UIKit makes (the view's __viewDelegate). nextResponder is
+// the fallback: for a controller's root view it returns that controller.
+static UIViewController *ApolloMediaPagerOwner(UIView *view) {
+    if (!view) return nil;
+    static BOOL hasLookup;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        hasLookup = [UIViewController respondsToSelector:@selector(viewControllerForView:)];
+        if (!hasLookup) ApolloLog(@"[MediaPagerGuard] +viewControllerForView: missing; using nextResponder to find page owners");
+    });
+    id owner = hasLookup
+        ? ((id (*)(id, SEL, id))objc_msgSend)(UIViewController.class, @selector(viewControllerForView:), view)
+        : view.nextResponder;
+    return [owner isKindOfClass:UIViewController.class] ? owner : nil;
+}
+
+static UIView *ApolloMediaPagerVisibleView(id queuingScrollView) {
+    id view = ApolloSendObject(queuingScrollView, @selector(visibleView));
+    return [view isKindOfClass:UIView.class] ? view : nil;
+}
+
+// The page on screen, else the pager's current page.
+static UIViewController *ApolloMediaPagerShowingPage(UIPageViewController *pager, id queuingScrollView) {
+    UIViewController *page = ApolloMediaPagerOwner(ApolloMediaPagerVisibleView(queuingScrollView));
+    if (page.parentViewController == pager) return page;
+    page = pager.viewControllers.firstObject;
+    return (page.parentViewController == pager && page.isViewLoaded) ? page : nil;
+}
+
+static Ivar ApolloMediaPagerTransitionIvar(void) {
+    static Ivar ivar;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ivar = class_getInstanceVariable(UIPageViewController.class,
+                                         "_incomingAndOutgoingViewControllersForManualTransition");
+        if (!ivar) ApolloLog(@"[MediaPagerGuard] manual transition record missing; bounced-back swipes go straight to UIKit");
+    });
+    return ivar;
+}
+
+// UIKit owns this ivar strongly (objc_storeStrong); store it the same way.
+static void ApolloMediaPagerStoreTransition(UIPageViewController *pager, Ivar ivar, NSDictionary *transition) {
+    void **slot = (void **)((uint8_t *)(__bridge void *)pager + ivar_getOffset(ivar));
+    void *previous = *slot;
+    *slot = (void *)CFBridgingRetain(transition);
+    if (previous) CFRelease(previous);
+}
+
+// A page left on screen without a controller can't page any further (the
+// data source has nothing to step from), so put the pager's current page
+// back once the scroll has stopped.
+static void ApolloMediaPagerRestoreLivePage(UIPageViewController *pager, UIScrollView *queuingScrollView) {
+    __weak UIPageViewController *weakPager = pager;
+    __weak UIScrollView *weakScrollView = queuingScrollView;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIPageViewController *strongPager = weakPager;
+        UIScrollView *scrollView = weakScrollView;
+        if (!strongPager.viewIfLoaded.window || !scrollView) return;
+        if (scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating) return;
+        UIView *visible = ApolloMediaPagerVisibleView(scrollView);
+        if (!visible || ApolloMediaPagerOwner(visible)) return;
+        UIViewController *page = strongPager.viewControllers.firstObject;
+        if (page.parentViewController != strongPager) return;
+        ApolloLog(@"[MediaPagerGuard] page on screen has no controller; showing the pager's current page again");
+        [strongPager setViewControllers:@[page]
+                              direction:UIPageViewControllerNavigationDirectionForward
+                               animated:NO
+                             completion:nil];
+    });
+}
+
+%hook _TtC6Apollo23MediaPageViewController
+
+- (void)queuingScrollView:(UIScrollView *)queuingScrollView didEndManualScroll:(BOOL)manual
+             toRevealView:(UIView *)revealView direction:(NSInteger)direction animated:(BOOL)animated
+                didFinish:(BOOL)finished didComplete:(BOOL)completed {
+    UIPageViewController *pager = (UIPageViewController *)self;
+    if (!manual || completed) {
+        if (ApolloMediaPagerOwner(revealView)) {
+            %orig;
+            return;
+        }
+        UIViewController *showing = ApolloMediaPagerShowingPage(pager, queuingScrollView);
+        ApolloLog(@"[MediaPagerGuard] swipe settled on a page with no controller (manual=%d); %@", manual,
+                  showing ? @"finishing it on the page that is showing" : @"no live page, skipping UIKit's update");
+        if (showing) %orig(queuingScrollView, manual, showing.view, direction, animated, finished, completed);
+        ApolloMediaPagerRestoreLivePage(pager, queuingScrollView);
+        return;
+    }
+
+    Ivar ivar = ApolloMediaPagerTransitionIvar();
+    id transition = ivar ? object_getIvar(self, ivar) : nil;
+    if (!ivar || ([transition isKindOfClass:NSDictionary.class] &&
+                  ((NSDictionary *)transition)[kApolloMediaPagerOutgoingKey])) {
+        %orig;
+        return;
+    }
+    UIViewController *showing = ApolloMediaPagerShowingPage(pager, queuingScrollView);
+    ApolloLog(@"[MediaPagerGuard] bounced-back swipe lost the page it started from; %@",
+              showing ? @"finishing it on the page that is showing" : @"no live page, skipping UIKit's update");
+    if (showing) {
+        NSMutableDictionary *repaired = [transition isKindOfClass:NSDictionary.class]
+            ? [(NSDictionary *)transition mutableCopy] : [NSMutableDictionary dictionary];
+        repaired[kApolloMediaPagerOutgoingKey] = showing;
+        ApolloMediaPagerStoreTransition(pager, ivar, repaired);
+        %orig;
+    }
+    // As after a finished swipe: a page left on screen without a controller
+    // gets the pager's current page back once scrolling stops (a no-op when
+    // the page on screen has one).
+    ApolloMediaPagerRestoreLivePage(pager, queuingScrollView);
+}
+
+%end
+
+static BOOL ApolloMediaStringContains(NSString *haystack, NSString *needle) {
+    return [haystack isKindOfClass:[NSString class]] && needle.length > 0 &&
+        [haystack rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static BOOL ApolloMediaViewIsInClassNamed(UIView *view, NSString *needle) {
+    for (UIResponder *responder = view; responder; responder = responder.nextResponder) {
+        if (ApolloMediaStringContains(NSStringFromClass(responder.class), needle)) return YES;
+    }
+    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
+        if (ApolloMediaStringContains(NSStringFromClass(ancestor.class), needle)) return YES;
+    }
+    return NO;
+}
+
+static BOOL ApolloMediaRouteControlIsInMediaViewer(UIView *view) {
+    return ApolloMediaViewIsInClassNamed(view, @"MediaViewer") ||
+        ApolloMediaViewIsInClassNamed(view, @"MediaPage") ||
+        ApolloMediaViewIsInClassNamed(view, @"Player") ||
+        ApolloMediaViewIsInClassNamed(view, @"VideoControlsView");
+}
+
+static void ApolloMediaClearRouteButtonLayer(CALayer *layer, CALayer *primaryImageLayer) {
+    if (!layer) return;
+
+    layer.masksToBounds = NO;
+    layer.cornerRadius = 0.0;
+    layer.borderWidth = 0.0;
+    layer.shadowOpacity = 0.0;
+    if (layer != primaryImageLayer) layer.backgroundColor = nil;
+
+    for (CALayer *sublayer in layer.sublayers) {
+        ApolloMediaClearRouteButtonLayer(sublayer, primaryImageLayer);
+    }
+}
+
+static void ApolloMediaStyleVideoControlsAirPlayButton(UIButton *button, NSString *reason) {
+    if (![button isKindOfClass:[UIButton class]] || !ApolloMediaViewIsInClassNamed(button, @"VideoControlsView")) return;
+
+    static UIImage *airPlayImage;
+    if (!airPlayImage) {
+        airPlayImage = [[UIImage imageNamed:@"video-player-airplay"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+    if (!airPlayImage) return;
+
+    if ([button respondsToSelector:@selector(setConfiguration:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(button, @selector(setConfiguration:), nil);
+    }
+    if ([button respondsToSelector:@selector(setConfigurationUpdateHandler:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(button, @selector(setConfigurationUpdateHandler:), nil);
+    }
+
+    const UIControlState states[] = {
+        UIControlStateNormal,
+        UIControlStateHighlighted,
+        UIControlStateSelected,
+        UIControlStateSelected | UIControlStateHighlighted,
+        UIControlStateDisabled,
+        UIControlStateFocused,
+        UIControlStateSelected | UIControlStateFocused,
+        UIControlStateApplication,
+        UIControlStateSelected | UIControlStateApplication,
+    };
+    for (NSUInteger i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
+        [button setImage:airPlayImage forState:states[i]];
+        [button setBackgroundImage:nil forState:states[i]];
+    }
+
+    BOOL activeRoute = button.selected || ((button.state & UIControlStateSelected) == UIControlStateSelected);
+    if (activeRoute) {
+        button.tintColor = [UIColor systemBlueColor];
+    } else {
+        button.tintColor = [UIColor whiteColor];
+    }
+
+    button.backgroundColor = [UIColor clearColor];
+    button.adjustsImageWhenHighlighted = NO;
+    button.clipsToBounds = NO;
+    button.contentMode = UIViewContentModeScaleAspectFit;
+    button.imageView.hidden = NO;
+    button.imageView.image = airPlayImage;
+    button.imageView.highlightedImage = airPlayImage;
+    button.imageView.tintColor = button.tintColor;
+    button.imageView.backgroundColor = [UIColor clearColor];
+    button.imageView.clipsToBounds = NO;
+    button.imageView.contentMode = UIViewContentModeScaleAspectFit;
+
+    for (UIView *subview in button.subviews) {
+        subview.backgroundColor = [UIColor clearColor];
+        subview.clipsToBounds = NO;
+        subview.layer.masksToBounds = NO;
+        if ([subview isKindOfClass:[UIImageView class]] && subview != button.imageView) {
+            subview.hidden = YES;
+        }
+    }
+    ApolloMediaClearRouteButtonLayer(button.layer, button.imageView.layer);
+
+    if (objc_getAssociatedObject(button, kApolloRouteButtonStyleLoggedKey) == nil) {
+        objc_setAssociatedObject(button, kApolloRouteButtonStyleLoggedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[MediaRouteIcon] styled VideoControlsView AirPlay button class=%@ state=%lu reason=%@", NSStringFromClass(button.class) ?: @"(unknown)", (unsigned long)button.state, reason ?: @"(unknown)");
+    }
+}
+
+static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *reason) {
+    // The tabletop picker owns its icon sizing and keeps UIKit's native route
+    // button intact. Applying the legacy-player image repair duplicates its
+    // animated system artwork and overwrites its native button configuration.
+    if ([routeView.accessibilityIdentifier isEqualToString:@"ApolloDuoTabletopAirPlay"]) return;
+    if (![routeView isKindOfClass:[UIView class]] || !ApolloMediaRouteControlIsInMediaViewer(routeView)) return;
+    routeView.clipsToBounds = NO;
+    routeView.contentMode = UIViewContentModeScaleAspectFit;
+    routeView.layer.masksToBounds = NO;
+    routeView.superview.clipsToBounds = NO;
+    routeView.superview.layer.masksToBounds = NO;
+
+    // UIKit sizes and centers this control inside the player's glass button.
+    // Enlarging it here shifts the glyph away from that center.
+
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:routeView];
+    NSUInteger inspected = 0;
+    while (stack.count > 0 && inspected++ < 80) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        view.clipsToBounds = NO;
+        view.layer.masksToBounds = NO;
+        view.contentMode = UIViewContentModeScaleAspectFit;
+        if ([view isKindOfClass:[UIButton class]]) {
+            UIButton *button = (UIButton *)view;
+            button.imageView.contentMode = UIViewContentModeScaleAspectFit;
+            ApolloMediaStyleVideoControlsAirPlayButton(button, reason);
+        } else if ([view isKindOfClass:[UIImageView class]]) {
+            ((UIImageView *)view).contentMode = UIViewContentModeScaleAspectFit;
+        }
+        for (UIView *subview in view.subviews) [stack addObject:subview];
+    }
+
+    if (objc_getAssociatedObject(routeView, kApolloRouteIconRepairLoggedKey) == nil) {
+        objc_setAssociatedObject(routeView, kApolloRouteIconRepairLoggedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[MediaRouteIcon] repaired route control layout class=%@ frame=%@ reason=%@", NSStringFromClass(routeView.class) ?: @"(unknown)", NSStringFromCGRect(routeView.frame), reason ?: @"(unknown)");
+    }
+}
+
+%hook AVRoutePickerView
+
+- (void)layoutSubviews {
+    %orig;
+    ApolloMediaRepairRouteControlLayout((UIView *)self, @"AVRoutePickerView layoutSubviews");
+}
+
+%end
+
+%hook MPVolumeView
+
+- (void)layoutSubviews {
+    %orig;
+    ApolloMediaRepairRouteControlLayout((UIView *)self, @"MPVolumeView layoutSubviews");
+}
+
+%end
+
+%hook _TtC6Apollo17VideoControlsView
+
+- (void)layoutSubviews {
+    %orig;
+    UIButton *airPlayButton = MSHookIvar<UIButton *>(self, "airPlayButton");
+    ApolloMediaStyleVideoControlsAirPlayButton(airPlayButton, @"VideoControlsView layoutSubviews");
+}
+
+- (void)observeValueForKeyPath:(id)keyPath ofObject:(id)object change:(id)change context:(void *)context {
+    %orig(keyPath, object, change, context);
+    UIButton *airPlayButton = MSHookIvar<UIButton *>(self, "airPlayButton");
+    ApolloMediaStyleVideoControlsAirPlayButton(airPlayButton, @"VideoControlsView KVO");
+}
+
+%end
+
+// Implementation derived from https://github.com/dankrichtofen/apolloliquidglass/blob/main/Tweak.x
+// Credits to @dankrichtofen for the original implementation
+%hook ASImageNode
+
++ (UIImage *)createContentsForkey:(id)key drawParameters:(id)parameters isCancelled:(id)cancelled {
+    @try {
+        return %orig;
+    }
+    @catch (NSException *exception) {
+        return nil;
+    }
+}
+
+%end
+
+// Fix GIF looping playback speed on 120Hz ProMotion displays
+// Implementation derived from https://github.com/Flipboard/FLAnimatedImage/pull/266
+// Credits to @yoshimura-qcul for the original fix
+%hook FLAnimatedImageView
+
+- (void)setAnimatedImage:(FLAnimatedImage *)animatedImage {
+    %orig;
+    ApolloApplyFLAnimatedImageViewAutoplayGate(self);
+}
+
+- (void)startAnimating {
+    if (!ApolloInlineGIFViewShouldAutoplay(self)) {
+        MSHookIvar<BOOL>(self, "_shouldAnimate") = NO;
+        return;
+    }
+    %orig;
+}
+
+- (void)displayDidRefresh:(CADisplayLink *)displayLink {
+    // Get required ivars
+    FLAnimatedImage *animatedImage = MSHookIvar<FLAnimatedImage *>(self, "_animatedImage");
+    if (!animatedImage) {
+        return;
+    }
+
+    BOOL &shouldAnimate = MSHookIvar<BOOL>(self, "_shouldAnimate");
+    if (!ApolloInlineGIFViewShouldAutoplay(self)) {
+        shouldAnimate = NO;
+        return;
+    }
+    if (!shouldAnimate) {
+        return;
+    }
+
+    NSUInteger &currentFrameIndex = MSHookIvar<NSUInteger>(self, "_currentFrameIndex");
+    BOOL &needsDisplay = MSHookIvar<BOOL>(self, "_needsDisplayWhenImageBecomesAvailable");
+    NSNumber *delayTimeNumber = [[animatedImage delayTimesForIndexes] objectForKey:@(currentFrameIndex)];
+
+    if (delayTimeNumber != nil) {
+        NSTimeInterval delayTime = [delayTimeNumber doubleValue];
+        UIImage *image = [animatedImage imageLazilyCachedAtIndex:currentFrameIndex];
+
+        if (image) {
+            MSHookIvar<UIImage *>(self, "_currentFrame") = image;
+
+            if (needsDisplay) {
+                [self.layer setNeedsDisplay];
+                needsDisplay = NO;
+            }
+
+            // Fix for 120Hz displays: use preferredFramesPerSecond instead of duration * frameInterval
+            double &accumulator = MSHookIvar<double>(self, "_accumulator");
+            NSInteger preferredFPS = displayLink.preferredFramesPerSecond;
+            if (preferredFPS > 0) {
+                accumulator += 1.0 / (double)preferredFPS;
+            } else {
+                accumulator += displayLink.duration;
+            }
+
+            NSUInteger frameCount = [animatedImage frameCount];
+            NSUInteger loopCount = [animatedImage loopCount];
+
+            while (accumulator >= delayTime) {
+                accumulator -= delayTime;
+                currentFrameIndex++;
+
+                if (currentFrameIndex >= frameCount) {
+                    NSUInteger &loopCountdown = MSHookIvar<NSUInteger>(self, "_loopCountdown");
+                    loopCountdown--;
+
+                    void (^loopCompletionBlock)(NSUInteger) = MSHookIvar<void (^)(NSUInteger)>(self, "_loopCompletionBlock");
+                    if (loopCompletionBlock) {
+                        loopCompletionBlock(loopCountdown);
+                    }
+
+                    if (loopCountdown == 0 && loopCount > 0) {
+                        [self stopAnimating];
+                        return;
+                    }
+                    currentFrameIndex = 0;
+                }
+                needsDisplay = YES;
+            }
+        } else {
+            needsDisplay = YES;
+        }
+    } else {
+        currentFrameIndex++;
+    }
+}
+
+%end
+
+// Fix MP4 GIF loop freeze in MediaViewerController fullscreen player
+//
+// Stock Apollo bug: on every loop boundary, the didPlayToEnd handler
+// (sub_10036da80) dispatches two `seekToTime:kCMTimeZero` calls ~1 ms apart
+// from sibling DispatchQueue.main.async blocks. The second seek interrupts
+// the first mid-flight, double-resetting the decode pipeline and causing a
+// ~0.5–1.5s freeze at a random mid-video frame on every loop after the first.
+//
+// Scoping: `-[AVPlayer setActionAtItemEnd:]` has exactly one xref in Apollo
+// (inside createPlayer(withURL:) at sub_100363c90, called with
+// AVPlayerActionAtItemEndNone). We use that single call as a tag for the
+// MediaViewer non-shareable player; shareable v.redd.it, comments header,
+// and feed cell players leave actionAtItemEnd at its default and are not
+// touched. Fix: on tagged players, dedupe seek-to-zero calls within a
+// 250 ms window — first call goes through to %orig, subsequent ones invoke
+// only their completionHandler so caller state machinery still runs.
+static const void *kApolloGifLoopFixKey = &kApolloGifLoopFixKey;
+static const void *kApolloGifLoopLastSeekKey = &kApolloGifLoopLastSeekKey;
+static const void *kApolloGifLoopDedupeLoggedKey = &kApolloGifLoopDedupeLoggedKey;
+static const NSTimeInterval kApolloGifLoopSeekDedupeWindow = 0.25;
+
+%hook AVPlayer
+
+- (void)setActionAtItemEnd:(AVPlayerActionAtItemEnd)action {
+    %orig;
+    if (action == AVPlayerActionAtItemEndNone) {
+        if (objc_getAssociatedObject(self, kApolloGifLoopFixKey) != nil) {
+            return;
+        }
+        objc_setAssociatedObject(self, kApolloGifLoopFixKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[GifLoopFix] Marked AVPlayer %p (actionAtItemEnd=None)", self);
+    }
+}
+
+- (void)seekToTime:(CMTime)time toleranceBefore:(CMTime)toleranceBefore toleranceAfter:(CMTime)toleranceAfter completionHandler:(void (^)(BOOL))completionHandler {
+    BOOL isLoopFixPlayer = (objc_getAssociatedObject(self, kApolloGifLoopFixKey) != nil);
+    BOOL isZeroSeek = CMTIME_IS_VALID(time) && CMTimeCompare(time, kCMTimeZero) == 0;
+
+    if (isLoopFixPlayer && isZeroSeek) {
+        NSTimeInterval now = CACurrentMediaTime();
+        NSNumber *lastSeek = objc_getAssociatedObject(self, kApolloGifLoopLastSeekKey);
+        NSTimeInterval delta = lastSeek ? (now - lastSeek.doubleValue) : INFINITY;
+
+        if (delta < kApolloGifLoopSeekDedupeWindow) {
+            // Sibling seek from same didPlayToEnd handler — skip %orig but
+            // still invoke completionHandler so caller state logic runs.
+            if (objc_getAssociatedObject(self, kApolloGifLoopDedupeLoggedKey) == nil) {
+                objc_setAssociatedObject(self, kApolloGifLoopDedupeLoggedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                ApolloLog(@"[GifLoopFix] Deduping sibling seek-to-zero on %p (%.1fms after first); will suppress further per-loop logs",
+                          self, delta * 1000.0);
+            }
+            if (completionHandler) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completionHandler(YES);
+                });
+            }
+            return;
+        }
+
+        objc_setAssociatedObject(self, kApolloGifLoopLastSeekKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    %orig;
+}
+
+%end
+
+%hook NSRegularExpression
+
+- (instancetype)initWithPattern:(NSString *)pattern options:(NSRegularExpressionOptions)options error:(NSError **)error {
+    // Around November 2025, Reddit started using CMAF instead of MPEG-TS for audio streams (v.redd.it).
+    // Apollo's regex only matches HLS_AUDIO naming pattern, so update to also match CMAF_AUDIO
+    if ([pattern isEqualToString:HLSAudioRegexPattern]) {
+        return %orig(CMAFAudioRegexPattern, options, error);
+    }
+    // Handle newer Streamable links with query strings like "?src=player-page-share"
+    if ([pattern isEqualToString:StreamableRegexPattern]) {
+        return %orig(StreamableRegexPatternWithQueryString, options, error);
+    }
+    return %orig;
+}
+
+- (NSArray<NSTextCheckingResult *> *)matchesInString:(NSString *)string options:(NSMatchingOptions)options range:(NSRange)range {
+    NSArray *results = %orig;
+
+    // CMAF manifests list audio in descending bitrate order:
+    //   #EXT-X-MEDIA:URI="CMAF_AUDIO_128.m3u8",...
+    //   #EXT-X-MEDIA:URI="CMAF_AUDIO_64.m3u8",...
+    // but Apollo expects ascending order (how older MPEG-TS streams were ordered),
+    // so we need to reorder the results so Apollo downloads the highest quality audio.
+    if (results.count >= 2 && [self.pattern isEqualToString:CMAFAudioRegexPattern]) {
+        // Sort by extracting bitrate number from captured text
+        results = [results sortedArrayUsingComparator:^NSComparisonResult(NSTextCheckingResult *result1, NSTextCheckingResult *result2) {
+            if (result1.numberOfRanges > 1 && result2.numberOfRanges > 1) {
+                NSString *text1 = [string substringWithRange:[result1 rangeAtIndex:1]];
+                NSString *text2 = [string substringWithRange:[result2 rangeAtIndex:1]];
+
+                // Use NSScanner to extract first integer from each string
+                NSScanner *scanner1 = [NSScanner scannerWithString:text1];
+                NSScanner *scanner2 = [NSScanner scannerWithString:text2];
+                NSInteger bitrate1 = 0, bitrate2 = 0;
+
+                [scanner1 scanUpToCharactersFromSet:[NSCharacterSet decimalDigitCharacterSet] intoString:nil];
+                [scanner1 scanInteger:&bitrate1];
+                [scanner2 scanUpToCharactersFromSet:[NSCharacterSet decimalDigitCharacterSet] intoString:nil];
+                [scanner2 scanInteger:&bitrate2];
+
+                return [@(bitrate1) compare:@(bitrate2)];
+            }
+            return NSOrderedSame;
+        }];
+    }
+    return results;
+}
+
+%end
+
+%hook NSURLRequest
+
++ (instancetype)requestWithURL:(NSURL *)URL {
+    // Fix CMAF audio URLs: Apollo tries to download .aac but CMAF uses .mp4
+    if ([URL.pathExtension isEqualToString:@"aac"] && [URL.absoluteString containsString:CMAFAudioIdentifier]) {
+        NSURL *fixedURL = [[URL URLByDeletingPathExtension] URLByAppendingPathExtension:@"mp4"];
+        ApolloLog(@"[NSURLRequest] Fixed CMAF audio URL: %@ -> %@", URL.absoluteString, fixedURL.absoluteString);
+        return %orig(fixedURL);
+    }
+    return %orig;
+}
+
+%end
+
+// MARK: - ShareMediaManager Download Cleanup
+
+// Apollo copies every ShareMediaManager download (Download Video…, GIF
+// conversion, v.redd.it audio + video) to
+// NSTemporaryDirectory()/<ProcessInfo.globallyUniqueString>_gifvideo.mp4, or
+// _gifaudio.aac for v.redd.it's separate audio track, in
+// -URLSession:downloadTask:didFinishDownloadingToURL: (0x1004bfffc). The copy
+// is then exported to tmp/Video.mov or converted to tmp/Image.gif, which is
+// what the share sheet gets. Apollo's removeTemporaryFiles(audioFileURL:
+// videoFileURL:) (0x1004bed04) deletes the copies on only some paths:
+//   - Video and GIF shares (completions 0x1004b73d8, 0x1004b51bc): only
+//     after Apollo's own Copy and Save activities. Messages, Mail, AirDrop,
+//     Save to Files, other apps and Cancel keep the download.
+//   - v.redd.it audio + video share (completion 0x1004bd480): deletes the
+//     video copy, but calls reset() (0x1004bd9d4), which clears
+//     downloadedAudioLocation, before reading that URL, so the audio copy is
+//     always kept.
+// Each copy has a unique name, so tmp grows by one download per share until
+// iOS purges it. When the next share's first download finishes, delete copies
+// older than a few minutes. Video.mov, Image.gif and anything else in tmp are
+// never touched.
+static const NSTimeInterval kApolloShareMediaStaleDownloadAge = 5 * 60;
+
+// "<UUID>-<pid>-<hex>_gifvideo.mp4": globallyUniqueString starts with a UUID.
+static BOOL ApolloShareMediaIsDownloadCopyName(NSString *name) {
+    static NSRegularExpression *pattern;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        pattern = [NSRegularExpression regularExpressionWithPattern:@"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}(-[0-9A-F]+)*_gif(video\\.mp4|audio\\.aac)$"
+                                                            options:NSRegularExpressionCaseInsensitive
+                                                              error:nil];
+    });
+    return name.length > 0 && [pattern firstMatchInString:name options:0 range:NSMakeRange(0, name.length)] != nil;
+}
+
+// YES only when `task` is the first of the manager's current downloads to
+// finish. The task ivars only hold this share's downloads: the video start
+// (0x1004aa2c4) calls reset() (0x1004bd9d4) before creating its task, and the
+// v.redd.it start (0x1004ad7a4) won't run unless both ivars are nil before
+// its manifest completion (0x1004adf54) sets them. A v.redd.it share
+// downloads video and audio in parallel; when the second one finishes, the
+// first one's copy is still waiting for the merge however long ago it
+// finished, so that finish must not sweep. Unknown layouts or tasks keep
+// everything.
+static BOOL ApolloShareMediaIsFirstFinishedDownload(id manager, NSURLSessionTask *task) {
+    Class managerClass = object_getClass(manager);
+    Ivar videoIvar = class_getInstanceVariable(managerClass, "videoDownloadTask");
+    Ivar audioIvar = class_getInstanceVariable(managerClass, "audioDownloadTask");
+    if (!videoIvar || !audioIvar) {
+        ApolloLog(@"[ShareMediaTmp] download task ivars missing; skipping cleanup");
+        return NO;
+    }
+    id videoTask = object_getIvar(manager, videoIvar);
+    id audioTask = object_getIvar(manager, audioIvar);
+    id sibling = nil;
+    if (task == videoTask) {
+        sibling = audioTask;
+    } else if (task == audioTask) {
+        sibling = videoTask;
+    } else {
+        ApolloLog(@"[ShareMediaTmp] finished task %lu isn't the manager's current download; skipping cleanup", (unsigned long)task.taskIdentifier);
+        return NO;
+    }
+    if (!sibling) return YES;
+    if (![sibling isKindOfClass:[NSURLSessionTask class]]) return NO;
+    NSURLSessionTaskState siblingState = ((NSURLSessionTask *)sibling).state;
+    if (siblingState == NSURLSessionTaskStateRunning || siblingState == NSURLSessionTaskStateSuspended) return YES;
+    ApolloLog(@"[ShareMediaTmp] task %lu finished after task %lu; keeping the earlier copy for the merge", (unsigned long)task.taskIdentifier, (unsigned long)((NSURLSessionTask *)sibling).taskIdentifier);
+    return NO;
+}
+
+static void ApolloShareMediaRemoveStaleDownloadCopies(id manager, NSURLSessionTask *task) {
+    if (!ApolloShareMediaIsFirstFinishedDownload(manager, task)) return;
+
+    static dispatch_queue_t sweepQueue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sweepQueue = dispatch_queue_create("com.apolloreborn.sharemedia-tmp-sweep",
+                                           dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    });
+
+    // ShareMediaManager's delegate queue is the main queue, so list and
+    // delete on a utility queue. %orig's copy of this download lands
+    // meanwhile; it is seconds old, so the age check keeps it.
+    NSUInteger taskIdentifier = task.taskIdentifier;
+    dispatch_async(sweepQueue, ^{
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        NSURL *tmpURL = [NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES];
+        NSArray<NSURLResourceKey> *keys = @[NSURLIsRegularFileKey, NSURLCreationDateKey, NSURLContentModificationDateKey, NSURLFileSizeKey];
+        NSError *error = nil;
+        NSArray<NSURL *> *entries = [fileManager contentsOfDirectoryAtURL:tmpURL includingPropertiesForKeys:keys options:NSDirectoryEnumerationSkipsHiddenFiles error:&error];
+        if (!entries) {
+            ApolloLog(@"[ShareMediaTmp] couldn't list tmp: %@", error.localizedDescription);
+            return;
+        }
+
+        NSDate *now = [NSDate date];
+        NSUInteger removedCount = 0;
+        NSUInteger keptCount = 0;
+        unsigned long long removedBytes = 0;
+        for (NSURL *entry in entries) {
+            NSString *name = entry.lastPathComponent;
+            if (!ApolloShareMediaIsDownloadCopyName(name)) continue;
+            NSDictionary<NSURLResourceKey, id> *values = [entry resourceValuesForKeys:keys error:nil];
+            if (![values[NSURLIsRegularFileKey] boolValue]) continue;
+
+            // Age from the newest timestamp; a file without dates is kept.
+            NSDate *created = values[NSURLCreationDateKey];
+            NSDate *modified = values[NSURLContentModificationDateKey];
+            NSDate *newest = (created && modified) ? [created laterDate:modified] : (created ?: modified);
+            NSTimeInterval age = newest ? [now timeIntervalSinceDate:newest] : 0;
+            if (!newest || age < kApolloShareMediaStaleDownloadAge) {
+                keptCount++;
+                continue;
+            }
+
+            unsigned long long size = [values[NSURLFileSizeKey] unsignedLongLongValue];
+            NSError *removeError = nil;
+            if ([fileManager removeItemAtURL:entry error:&removeError]) {
+                removedCount++;
+                removedBytes += size;
+                ApolloLog(@"[ShareMediaTmp] removed %@ (%llu bytes, %.0fs old)", name, size, age);
+            } else {
+                ApolloLog(@"[ShareMediaTmp] couldn't remove %@: %@", name, removeError.localizedDescription);
+            }
+        }
+        ApolloLog(@"[ShareMediaTmp] sweep after task %lu: removed %lu (%llu bytes), kept %lu recent", (unsigned long)taskIdentifier, (unsigned long)removedCount, removedBytes, (unsigned long)keptCount);
+    });
+}
+
+%hook _TtC6Apollo17ShareMediaManager
+
+// Patches to fix audio container formats for v.redd.it videos:
+// - Some streams use MPEG-TS containers (fix: convert to ADTS)
+// - Newer streams use CMAF/MP4 containers (fix: extract AAC and wrap in ADTS)
+- (void)URLSession:(NSURLSession *)urlSession downloadTask:(NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(NSURL *)fileUrl {
+    // Before %orig copies this download into tmp; see ShareMediaManager
+    // Download Cleanup above.
+    ApolloShareMediaRemoveStaleDownloadCopies(self, downloadTask);
+
+    NSURL *originalURL = downloadTask.originalRequest.URL;
+#if !APOLLO_SIM_BUILD
+    // Only the FFmpeg remux paths use these; the simulator build stubs them out.
+    NSString *path = fileUrl.absoluteString;
+    NSString *fixedPath = [path stringByAppendingString:@".fixed"];
+#endif
+
+    BOOL isCMAFAudio = [originalURL.absoluteString containsString:@"CMAF_AUDIO"] && [originalURL.pathExtension isEqualToString:@"mp4"];
+    BOOL isHLSAudio = [originalURL.pathExtension isEqualToString:@"aac"];
+
+    if (!isCMAFAudio && !isHLSAudio) {
+        %orig;
+        return;
+    }
+
+#if APOLLO_SIM_BUILD
+    // Simulator/dev build: FFmpegKit is unavailable, so skip the audio container
+    // remux and let Apollo download the stream unmodified. Affected v.redd.it
+    // audio won't play correctly here — test that path on a device build.
+    ApolloLog(@"[-URLSession:downloadTask:didFinishDownloadingToURL:] APOLLO_SIM_BUILD: skipping FFmpeg audio fix for %@", originalURL);
+    %orig;
+    return;
+#else
+    if (isCMAFAudio) {
+        // CMAF audio is MP4 container with AAC - extract to ADTS format
+        ApolloLog(@"[-URLSession:downloadTask:didFinishDownloadingToURL:] Converting CMAF MP4 audio to ADTS: %@", originalURL);
+        NSString *ffmpegCommand = [NSString stringWithFormat:@"-y -loglevel info -i '%@' -vn -acodec copy -f adts '%@.fixed'", path, path];
+        FFmpegSession *session = [FFmpegKit execute:ffmpegCommand];
+        ReturnCode *returnCode = [session getReturnCode];
+        if ([ReturnCode isSuccess:returnCode]) {
+            // Replace original file with fixed version
+            NSURL *fixedUrl = [NSURL URLWithString:fixedPath];
+            NSFileManager *fileManager = [NSFileManager defaultManager];
+            [fileManager removeItemAtURL:fileUrl error:nil];
+            [fileManager moveItemAtURL:fixedUrl toURL:fileUrl error:nil];
+        }
+        %orig;
+        return;
+    }
+
+    // MPEG-TS AAC processing
+    ApolloLog(@"[-URLSession:downloadTask:didFinishDownloadingToURL:] Processing AAC file: %@", originalURL);
+
+    MediaInformationSession *probeSession = [FFprobeKit getMediaInformation:path];
+    ReturnCode *returnCode = [probeSession getReturnCode];
+    if (![ReturnCode isSuccess:returnCode]) {
+        %orig;
+        return;
+    }
+
+    MediaInformation *mediaInformation = [probeSession getMediaInformation];
+    if (!mediaInformation || ![mediaInformation.getFormat isEqualToString:@"mpegts"]) {
+        %orig;
+        return;
+    }
+
+    NSString *ffmpegCommand = [NSString stringWithFormat:@"-y -loglevel info -i '%@' -map 0 -dn -ignore_unknown -c copy -f adts '%@.fixed'", path, path];
+    FFmpegSession *session = [FFmpegKit execute:ffmpegCommand];
+    returnCode = [session getReturnCode];
+    if ([ReturnCode isSuccess:returnCode]) {
+        // Replace original file with fixed version
+        NSURL *fixedUrl = [NSURL URLWithString:fixedPath];
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        [fileManager removeItemAtURL:fileUrl error:nil];
+        [fileManager moveItemAtURL:fixedUrl toURL:fileUrl error:nil];
+    }
+    %orig;
+#endif
+}
+
+%end
+
+// MARK: - Giphy Media Metadata Fix
+
+static NSString *ApolloExtractGiphyIDFromToken(NSString *token) {
+    if (![token isKindOfClass:[NSString class]] || token.length == 0) {
+        return nil;
+    }
+    NSRange prefixRange = [token rangeOfString:@"giphy|"];
+    if (prefixRange.location == NSNotFound) {
+        return nil;
+    }
+    NSString *suffix = [token substringFromIndex:(prefixRange.location + prefixRange.length)];
+    if (suffix.length == 0) {
+        return nil;
+    }
+    NSRange nextPipe = [suffix rangeOfString:@"|"];
+    NSString *giphyID = (nextPipe.location == NSNotFound) ? suffix : [suffix substringToIndex:nextPipe.location];
+    return giphyID.length > 0 ? giphyID : nil;
+}
+
+static NSDictionary *ApolloFixInvalidGiphyMetadata(NSDictionary *orig) {
+    if (![orig isKindOfClass:[NSDictionary class]] || orig.count == 0) {
+        return orig;
+    }
+
+    NSMutableDictionary *fixed = nil;
+
+    for (NSString *key in orig) {
+        if (![key isKindOfClass:[NSString class]] || ![key hasPrefix:@"giphy|"]) {
+            continue;
+        }
+
+        NSDictionary *entry = orig[key];
+        if (![entry isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+
+        NSString *status = entry[@"status"];
+        if ([status isKindOfClass:[NSString class]] && [status isEqualToString:@"valid"]) {
+            continue;
+        }
+
+        NSString *giphyID = ApolloExtractGiphyIDFromToken(key);
+        NSURL *gifMediaURL = [ApolloGiphyClient mediaURLForGIFID:giphyID];
+        if (!gifMediaURL) continue;
+
+        if (!fixed) {
+            fixed = [orig mutableCopy];
+        }
+
+        NSString *extURL = [NSString stringWithFormat:@"https://giphy.com/gifs/%@", giphyID];
+        NSString *gifURL = gifMediaURL.absoluteString;
+        NSString *thumbURL = [NSString stringWithFormat:@"https://media.giphy.com/media/%@/200w_s.gif", giphyID];
+
+        fixed[key] = @{
+            @"status": @"valid",
+            @"e": @"AnimatedImage",
+            @"m": @"image/gif",
+            @"ext": extURL,
+            @"p": @[@{@"y": @200, @"x": @200, @"u": thumbURL}],
+            // Must use gifURL for 'mp4' or else will open in webview
+            @"s": @{@"y": @200, @"gif": gifURL, @"mp4": gifURL, @"x": @200},
+            @"t": @"giphy",
+            @"id": key,
+        };
+    }
+
+    return fixed ?: orig;
+}
+
+static NSDictionary *ApolloFixMediaMetadata(NSDictionary *orig) {
+    if (![orig isKindOfClass:[NSDictionary class]] || orig.count == 0) return orig;
+    return ApolloFixRedditHostedGifMetadata(ApolloFixInvalidGiphyMetadata(orig), NULL);
+}
+
+// MARK: - "Processing img" Placeholder Fix (shared between RDKComment and RDKLink)
+
+// Resolve a single media ID to an image URL from media_metadata.
+// Returns nil if the ID is not found or invalid.
+static NSString *ApolloResolveMediaURL(NSString *mediaId, NSDictionary *metadata, NSString **outLabel) {
+    if (outLabel) *outLabel = @"Image";
+
+    NSDictionary *entry = metadata[mediaId];
+    if (![entry isKindOfClass:[NSDictionary class]]) return nil;
+    if (![[entry objectForKey:@"status"] isEqualToString:@"valid"]) return nil;
+
+    BOOL preferMP4 = (sPreferredGIFFallbackFormat != 0);
+    NSString *url = ApolloMediaDisplayURLFromMetadataEntry(mediaId, entry, preferMP4);
+    if (url.length == 0) return nil;
+
+    if (outLabel && [[entry objectForKey:@"e"] isEqualToString:@"AnimatedImage"]) *outLabel = @"GIF";
+    return url;
+}
+
+// Replace "*Processing img <id>...*" placeholders with markdown image links.
+// Uses media_metadata for URL resolution, with an optional i.redd.it fallback extension
+// for when metadata is unavailable (e.g. posts where media_metadata hasn't been populated yet).
+static NSString *ApolloFixProcessingImgPlaceholders(NSString *text, NSDictionary *metadata, NSString *fallbackExtension) {
+    if (!text || ![text containsString:@"Processing img "]) return text;
+
+    BOOL hasMetadata = [metadata isKindOfClass:[NSDictionary class]] && metadata.count > 0;
+    if (!hasMetadata && !fallbackExtension) return text;
+
+    static NSRegularExpression *regex;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        regex = [NSRegularExpression regularExpressionWithPattern:@"\\*Processing img ([a-zA-Z0-9_]+)\\.{3}\\*" options:0 error:nil];
+    });
+
+    NSArray *matches = [regex matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (matches.count == 0) return text;
+    NSMutableString *fixed = [text mutableCopy];
+
+    NSUInteger replacedCount = 0;
+    for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
+        NSString *mediaId = [fixed substringWithRange:[match rangeAtIndex:1]];
+
+        NSString *label = nil;
+        NSString *url = hasMetadata ? ApolloResolveMediaURL(mediaId, metadata, &label) : nil;
+
+        // Fallback: construct i.redd.it URL
+        if (!url && fallbackExtension) {
+            url = [NSString stringWithFormat:@"https://i.redd.it/%@.%@", mediaId, fallbackExtension];
+            label = @"Image";
+        }
+
+        if (!url) continue;
+
+        NSString *replacement = [NSString stringWithFormat:@"[%@](%@)", label, url];
+        [fixed replaceCharactersInRange:match.range withString:replacement];
+        replacedCount++;
+    }
+
+    if (replacedCount > 0) {
+        ApolloLog(@"[ProcessingImg] Replaced %lu placeholder%@ in text",
+            (unsigned long)replacedCount, (replacedCount == 1 ? @"" : @"s"));
+    }
+
+    return replacedCount > 0 ? fixed : text;
+}
+
+// Rewrite Reddit-native Giphy markdown tokens `![gif](giphy|<id>)` (which our
+// markdown toolbar inserts and Reddit's server recognizes natively) into real
+// Giphy CDN URLs so Apollo's inline-image renderer can display the GIF in the
+// optimistic local view right after submit — before Reddit's canonical
+// response (with proper `mediaMetadata` entries keyed by `giphy|<id>`) comes
+// back. Without this, Apollo tries to load `giphy|<id>` as a URL, fails, and
+// shows its built-in "If you are looking for an image, it was probably
+// deleted." placeholder.
+//
+// CRITICAL: only rewrite per-token when there is NO matching `mediaMetadata`
+// entry for that giphy ID. Once Reddit returns canonical metadata, Apollo's
+// own renderer uses the `giphy|<id>` token to look up the metadata entry and
+// render the GIF inline — rewriting the token would break that path and
+// produce "[Unknown Image]". The optimistic local case (no metadata yet) is
+// the only one where we want the rewrite.
+static NSString *ApolloRewriteNativeGiphyTokens(NSString *text, NSDictionary *metadata) {
+    if (text.length == 0) return text;
+    if ([text rangeOfString:@"(giphy|"].location == NSNotFound) return text;
+
+    NSRegularExpression *regex = ApolloNativeGiphyMarkdownTokenRegex();
+    if (!regex) return text;
+
+    NSArray *matches = [regex matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (matches.count == 0) return text;
+
+    BOOL hasMetadata = [metadata isKindOfClass:[NSDictionary class]] && metadata.count > 0;
+    NSMutableString *fixed = [text mutableCopy];
+    NSUInteger replacedCount = 0;
+    NSUInteger skippedHasMetadataCount = 0;
+    for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
+        NSString *giphyID = [fixed substringWithRange:[match rangeAtIndex:1]];
+        if (giphyID.length == 0) continue;
+
+        // Skip if Apollo's native renderer can handle this token via mediaMetadata.
+        if (hasMetadata) {
+            NSString *metadataKey = [NSString stringWithFormat:@"giphy|%@", giphyID];
+            id entry = metadata[metadataKey];
+            if ([entry isKindOfClass:[NSDictionary class]]) {
+                skippedHasMetadataCount++;
+                continue;
+            }
+        }
+
+        NSString *replacement = [NSString stringWithFormat:@"![GIF](https://media.giphy.com/media/%@/giphy.gif)", giphyID];
+        [fixed replaceCharactersInRange:match.range withString:replacement];
+        replacedCount++;
+    }
+
+    if (replacedCount > 0 || skippedHasMetadataCount > 0) {
+        ApolloLog(@"[NativeGiphyBody] rewrote=%lu skipped(hasMetadata)=%lu",
+            (unsigned long)replacedCount, (unsigned long)skippedHasMetadataCount);
+    }
+    return replacedCount > 0 ? fixed : text;
+}
+
+%hook RDKComment
+
+- (void)setMediaMetadata:(NSDictionary *)mediaMetadata {
+    NSDictionary *fixed = ApolloFixMediaMetadata(mediaMetadata);
+    %orig(fixed);
+    ApolloInlineImageRegisterMediaMetadata(fixed);
+}
+
+- (NSString *)body {
+    NSDictionary *metadata = self.mediaMetadata;
+    NSString *body = %orig;
+    NSString *fixed = ApolloFixProcessingImgPlaceholders(body, metadata, nil);
+    return ApolloRewriteNativeGiphyTokens(fixed, metadata);
+}
+
+%end
+
+// MARK: - Failed gallery items (#1587)
+
+@interface RDKLink (ApolloGalleryRepair)
+- (id)galleryData;
+- (NSURL *)thumbnailURL;
+@end
+
+static const void *kApolloGalleryRepairCacheKey = &kApolloGalleryRepairCacheKey;
+
+// Galleries posted through Reddit's API come back with every photo "failed"
+// (see ApolloRepairFailedRedditGalleryMetadata). This runs on read rather than
+// in -setMediaMetadata: because the gallery order and thumbnail it needs are
+// separate Mantle properties that may not be set yet when the metadata is.
+// Everything reads through the getter: RDKLink.gallery, Save All, thumbnails.
+static NSDictionary *ApolloGalleryRepairedMetadata(RDKLink *link, NSDictionary *metadata) {
+    if (![metadata isKindOfClass:[NSDictionary class]] || metadata.count == 0) return metadata;
+    NSArray *items = [(id)link respondsToSelector:@selector(galleryData)] ? [link galleryData] : nil;
+    if (![items isKindOfClass:[NSArray class]] || items.count == 0) return metadata;
+
+    NSURL *thumbnailURL = [(id)link respondsToSelector:@selector(thumbnailURL)] ? [link thumbnailURL] : nil;
+    id thumbnail = [thumbnailURL isKindOfClass:[NSURL class]] ? thumbnailURL.absoluteString : nil;
+    // Cached per metadata instance and thumbnail: the getter runs on every
+    // layout pass. One array holds key and result, so a reader on another
+    // thread never pairs one call's key with another call's result.
+    NSArray *cached = objc_getAssociatedObject(link, kApolloGalleryRepairCacheKey);
+    if (cached.count == 3 && cached[0] == metadata && [cached[1] isEqual:thumbnail ?: NSNull.null]) {
+        return cached[2] == NSNull.null ? metadata : cached[2];
+    }
+
+    // Photos this device just uploaded, with the extension they went up with.
+    NSMutableDictionary<NSString *, NSString *> *ownExtensions = nil;
+    for (NSDictionary *item in items) {
+        NSString *mediaID = [item isKindOfClass:[NSDictionary class]] ? item[@"media_id"] : nil;
+        NSString *extension = [mediaID isKindOfClass:[NSString class]] ? ApolloRedditUploadedImageExtensionForAssetID(mediaID) : nil;
+        if (!extension) continue;
+        if (!ownExtensions) ownExtensions = [NSMutableDictionary dictionary];
+        ownExtensions[mediaID] = extension;
+    }
+    NSDictionary *repaired = ApolloRepairFailedRedditGalleryMetadata(metadata, items, thumbnail, ownExtensions);
+    // Atomic: Texture lays cells out off the main thread, and a nonatomic get
+    // can be handed an array another thread's set is releasing.
+    objc_setAssociatedObject(link, kApolloGalleryRepairCacheKey, @[metadata, thumbnail ?: NSNull.null, repaired ?: NSNull.null],
+                             OBJC_ASSOCIATION_RETAIN);
+    if (repaired) {
+        NSUInteger rebuilt = 0;
+        for (NSString *key in repaired) {
+            if (repaired[key] != metadata[key]) rebuilt++;
+        }
+        ApolloLog(@"[GalleryRepair] Rebuilt %lu of %lu gallery photos from i.redd.it (own uploads=%lu, thumbnail ext=%@)",
+                  (unsigned long)rebuilt, (unsigned long)items.count, (unsigned long)ownExtensions.count,
+                  thumbnailURL.path.pathExtension.length > 0 ? thumbnailURL.path.pathExtension : @"(none)");
+    }
+    return repaired ?: metadata;
+}
+
+%hook RDKLink
+
+- (void)setMediaMetadata:(NSDictionary *)mediaMetadata {
+    NSDictionary *fixed = ApolloFixMediaMetadata(mediaMetadata);
+    %orig(fixed);
+    ApolloInlineImageRegisterMediaMetadata(fixed);
+}
+
+- (NSDictionary *)mediaMetadata {
+    NSDictionary *originalMetadata = %orig;
+    return ApolloGalleryRepairedMetadata(self, originalMetadata);
+}
+
+- (NSString *)selfText {
+    // Determine fallback extension from preview source image URL
+    NSString *fallbackExt = nil;
+    NSDictionary *metadata = self.mediaMetadata;
+    if (![metadata isKindOfClass:[NSDictionary class]] || metadata.count == 0) {
+        RDKLinkPreviewItem *sourceImage = self.previewMedia.sourceImage;
+        if (sourceImage.URL) {
+            fallbackExt = sourceImage.URL.path.pathExtension;
+        }
+        if (fallbackExt.length == 0) fallbackExt = @"png";
+    }
+
+    NSString *selfText = %orig;
+    NSString *fixed = ApolloFixProcessingImgPlaceholders(selfText, metadata, fallbackExt);
+    return ApolloRewriteNativeGiphyTokens(fixed, metadata);
+}
+
+%end
+
+// Hide legacy Reddit upload labels before title/flair measurement.
+static Ivar sTitleURLNodeIvar;
+static Ivar sURLTextNodeIvar;
+
+static void ApolloHideUploadLabel(id titleNode) {
+    id URLNode = object_getIvar(titleNode, sTitleURLNodeIvar);
+    if (!URLNode) return;
+    ASTextNode *textNode = object_getIvar(URLNode, sURLTextNodeIvar);
+    NSString *label = textNode.attributedText.string;
+    NSString *host = @"reddit-uploaded-media.s3-accelerate.amazonaws.com";
+    NSString *videoHost = @"reddit-uploaded-video.s3-accelerate.amazonaws.com";
+    for (NSString *candidate in @[host, videoHost]) {
+        if ([label isEqualToString:candidate] ||
+            [label isEqualToString:[NSString stringWithFormat:@"(%@)", candidate]]) {
+            textNode.attributedText = [[NSAttributedString alloc] initWithString:@""];
+            return;
+        }
+    }
+}
+
+%group ApolloPostTitleUploadLabelHooks
+%hook _TtC6Apollo13PostTitleNode
+
+- (CGSize)calculateSizeThatFits:(CGSize)constrainedSize {
+    ApolloHideUploadLabel(self);
+    return %orig;
+}
+
+%end
+%end
+
+%ctor {
+    %init;
+    ApolloLog(@"[ShareMediaTmp] download cleanup hook installed");
+    ApolloLog(@"[GalleryRepair] RDKLink mediaMetadata hook installed (failed gallery photos rebuilt from i.redd.it)");
+    ApolloLog(@"[MediaPagerGuard] swipe-end hook installed");
+    Class titleClass = objc_getClass("_TtC6Apollo13PostTitleNode");
+    Class URLClass = objc_getClass("_TtC6Apollo16PostTitleURLNode");
+    sTitleURLNodeIvar = titleClass ? class_getInstanceVariable(titleClass, "urlNode") : NULL;
+    sURLTextNodeIvar = URLClass ? class_getInstanceVariable(URLClass, "textNode") : NULL;
+    if (sTitleURLNodeIvar && sURLTextNodeIvar) {
+        %init(ApolloPostTitleUploadLabelHooks);
+        ApolloLog(@"[PostTitleUploadLabel] Reddit upload label hook installed");
+    }
+
+    sApolloMediaFitIsDuo = ApolloDeviceIsDuo();
+    const char *imageName = ApolloClassMediaPageViewController
+        ? class_getImageName(ApolloClassMediaPageViewController) : NULL;
+    for (uint32_t i = 0; imageName && i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strcmp(name, imageName) == 0) {
+            sApolloMediaFitApolloImage = _dyld_get_image_header(i);
+            break;
+        }
+    }
+    sApolloMediaFitPresenterClass = objc_getClass("UILayoutContainerView");
+    if (sApolloMediaFitPresenterClass) {
+        %init(ApolloMediaFitPresenterHooks);
+    }
+    ApolloLog(@"[MediaViewerFit] hooks installed duo=%d nativeImage=%d presenterHook=%d",
+              (int)sApolloMediaFitIsDuo, (int)(sApolloMediaFitApolloImage != NULL),
+              (int)(sApolloMediaFitPresenterClass != Nil));
+}

@@ -1,0 +1,739 @@
+// Adapt Apollo's content to UIKit's native trailing tab rail. UIKit owns the
+// tab bar and UISplitViewController owns columns; no replacement rail or
+// manual navigation/table frame expansion is installed here.
+#import "ApolloDuoSplitView.h"
+#import "ApolloDuoRail.h"
+#import "ApolloDuoRailLayout.h"
+#import "ApolloCommon.h"
+#import "ApolloDuoCompatibility.h"
+#import "ApolloDeviceDisplay.h"
+#import "ApolloAutoHideTabBar.h"
+#import "ApolloClasses.h"
+#import "ApolloThemeRuntime.h"
+#import <objc/message.h>
+#import <objc/runtime.h>
+#import <string.h>
+#import <stdbool.h>
+#import <stdatomic.h>
+
+static char kApolloDuoRailModeKey;
+static char kApolloDuoAdaptiveBarsKey;
+static char kApolloDuoRailSavedIndicatorInsetsKey;
+static char kApolloDuoRailJumpButtonKey;
+
+// Cheap per-sync gate for ApolloDuoRailAlignFeedScrollIndicator, which runs in
+// every Texture table's layoutSubviews. NO only when the tab bar is not a tall
+// narrow bar in a window (looser than the indicator's own window-space test).
+// Starts YES so nothing is skipped before the first sync.
+static BOOL sApolloDuoRailMaybeVisible = YES;
+
+// Weak holder so a cached jump button never outlives its view.
+@interface ApolloDuoRailWeakView : NSObject
+@property (nonatomic, weak) UIView *view;
+@end
+@implementation ApolloDuoRailWeakView
+@end
+
+// Cached dual-display answer: the FloatingActionButton frame/center hooks reach
+// this on every scroll frame, and the uncached walk allocates arrays + NSValues.
+// Invalidated on screen/scene connect and disconnect. Main thread only; off
+// main it is computed uncached.
+static BOOL sApolloDuoRailDualCacheValid;
+static BOOL sApolloDuoRailDualCache;
+
+static BOOL ApolloDuoRailComputeDualDisplays(void) {
+    NSMutableArray<NSValue *> *sizes = [NSMutableArray array];
+    for (UIScreen *screen in [UIScreen screens]) {
+        // AirPlay / cable mirroring adds another, usually larger screen on
+        // ordinary iPhones. It must not enable Duo-only chrome or disable
+        // Pixel Pals on the phone's own display.
+        if (screen.mirroredScreen) continue;
+        CGSize size = screen.bounds.size;
+        if (size.width <= 0.0 || size.height <= 0.0) continue;
+        BOOL seen = NO;
+        for (NSValue *value in sizes) {
+            CGSize existing = value.CGSizeValue;
+            if (fabs(existing.width - size.width) < 1.0 && fabs(existing.height - size.height) < 1.0) {
+                seen = YES;
+                break;
+            }
+        }
+        if (!seen) [sizes addObject:[NSValue valueWithCGSize:size]];
+    }
+    if (sizes.count < 2) return NO;
+    CGSize a = sizes[0].CGSizeValue;
+    CGSize b = sizes[1].CGSizeValue;
+    return ApolloDisplayScreensAreDual(a.width, a.height, b.width, b.height);
+}
+
+static BOOL ApolloDuoRailDualDisplays(void) {
+    if (!NSThread.isMainThread) return ApolloDuoRailComputeDualDisplays();
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void (^invalidate)(NSNotification *) = ^(__unused NSNotification *note) {
+            sApolloDuoRailDualCacheValid = NO;
+        };
+        for (NSNotificationName name in @[UIScreenDidConnectNotification,
+                                          UIScreenDidDisconnectNotification,
+                                          UISceneDidActivateNotification,
+                                          UISceneDidDisconnectNotification]) {
+            [[NSNotificationCenter defaultCenter] addObserverForName:name object:nil
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:invalidate];
+        }
+    });
+    if (!sApolloDuoRailDualCacheValid) {
+        sApolloDuoRailDualCache = ApolloDuoRailComputeDualDisplays();
+        sApolloDuoRailDualCacheValid = YES;
+    }
+    return sApolloDuoRailDualCache;
+}
+
+static int ApolloDuoRailModeForTabs(UITabBarController *tabs) {
+    // Regular phones are always Phone mode, whatever the window geometry.
+    if (!ApolloDeviceIsDuo()) return ApolloDuoModePhone;
+    if (![tabs isKindOfClass:[UITabBarController class]] || !tabs.isViewLoaded) {
+        return ApolloDuoModePhone;
+    }
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        return ApolloDuoModePhone;
+    }
+    UIWindow *window = tabs.view.window ?: ApolloDeviceAppWindow();
+    if (!window) return ApolloDuoModePhone;
+    CGSize size = ApolloDuoLayoutSize(window.bounds.size);
+    return ApolloDuoModeFromBounds(ApolloDuoRailDualDisplays() ? 1 : 0, size.width, size.height);
+}
+
+static int ApolloDuoRailCurrentMode(void) {
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    NSNumber *stored = objc_getAssociatedObject(tabs, &kApolloDuoRailModeKey);
+    if (stored) return stored.intValue;
+    return ApolloDuoRailModeForTabs(tabs);
+}
+
+int ApolloDuoCurrentMode(void) {
+    return ApolloDuoRailCurrentMode();
+}
+
+BOOL ApolloDuoDeviceDetected(void) {
+    // Once the cover/inner displays or native Duo canvas prove the capability,
+    // keep it through folds and temporarily detached bars. Never cache an early
+    // NO, and never inspect UIKit geometry from a SpriteKit background callback.
+    static atomic_bool knownDuo = false;
+    if (!ApolloDeviceIsDuo()) return NO;
+    if (atomic_load_explicit(&knownDuo, memory_order_relaxed)) return YES;
+    if (!NSThread.isMainThread ||
+        UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return NO;
+    BOOL duo = ApolloDuoRailDualDisplays() ||
+        ApolloDuoRailCurrentMode() != ApolloDuoModePhone || ApolloDuoRailHasVisibleSideBar();
+    if (duo) atomic_store_explicit(&knownDuo, true, memory_order_relaxed);
+    return duo;
+}
+
+BOOL ApolloDuoUsesAdaptiveBars(void) {
+    if (!ApolloDeviceIsDuo() || !IsLiquidGlass() || UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPhone) return NO;
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    if (![tabs isKindOfClass:UITabBarController.class]) return NO;
+    NSNumber *known = objc_getAssociatedObject(tabs, &kApolloDuoAdaptiveBarsKey);
+    if (!known) {
+        // Cache device capability rather than a visible-bar test. A hidden or
+        // temporarily detached rail must never enable bottom-bar animations.
+        BOOL duo = ApolloDuoRailCurrentMode() != ApolloDuoModePhone || ApolloDuoRailDualDisplays();
+        known = @(duo);
+        objc_setAssociatedObject(tabs, &kApolloDuoAdaptiveBarsKey, known, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return known.boolValue;
+}
+
+BOOL ApolloDuoAllowsTabBarScrollHiding(void) {
+    // Scroll hiding needs the bottom tab bar: the opened portrait display, or
+    // a short pane under a Picture in Picture, which keeps the bottom bar too.
+    return !ApolloDuoUsesAdaptiveBars() ||
+        (!ApolloDuoSplitIsResizing()
+            && (ApolloDuoSplitIsUnfoldedPortrait() || ApolloDuoSplitIsShortPane()));
+}
+
+BOOL ApolloDuoRailHasVisibleSideBar(void) {
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    if (![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return NO;
+    UITabBar *bar = tabs.tabBar;
+    if (!bar.window || bar.hidden) return NO;
+    CGRect frame = [bar convertRect:bar.bounds toView:tabs.view];
+    return CGRectGetWidth(frame) < 100.0
+        && CGRectGetHeight(frame) > 250.0
+        && CGRectGetMaxX(frame) >= CGRectGetWidth(tabs.view.bounds) - 2.0;
+}
+
+// Closed-display alphabet indexes remain immediately beside the native rail.
+void ApolloDuoRailPinSectionIndex(UITableView *tableView) {
+    if (!tableView || !ApolloDuoRailHasVisibleSideBar()
+        || ApolloDuoRailCurrentMode() != ApolloDuoModeClosed) return;
+    CGFloat wantMaxX = CGRectGetWidth(tableView.bounds) - ApolloDuoRailWidthClosed;
+    for (UIView *subview in tableView.subviews) {
+        const char *name = class_getName(subview.class);
+        if (!name || !strstr(name, "TableViewIndex")) continue;
+        CGRect frame = subview.frame;
+        if (fabs(CGRectGetMaxX(frame) - wantMaxX) < 0.5) continue;
+        frame.origin.x = MAX(0.0, wantMaxX - CGRectGetWidth(frame));
+        subview.frame = frame;
+    }
+}
+
+// UIKit normally propagates the vertical UITabBar's occluded width into the
+// selected content controller. During a push on Closed Duo that propagation
+// can arrive one layout late, so the first feed/post frame is built beneath
+// the rail. Reserve the rail plus the same 15pt content gap explicitly on the
+// content view controllers. Keep the navigation controller itself full-width
+// so its title and vertical navigation-action pills stay in their native rail.
+static CGFloat ApolloDuoClosedContentRightInset(UITabBarController *tabs) {
+    UITabBar *bar = tabs.tabBar;
+    if (bar.window && !bar.hidden) {
+        CGRect frame = [bar convertRect:bar.bounds toView:tabs.view];
+        if (CGRectGetWidth(frame) < 100.0 && CGRectGetHeight(frame) > 250.0) {
+            return MAX(0.0, CGRectGetWidth(tabs.view.bounds) - CGRectGetMinX(frame) + 15.0);
+        }
+    }
+    // The stock Closed rail is 69pt in the current runtime. Use the declared
+    // 72pt rail width plus a 12pt fallback gap until its first frame is live.
+    return (CGFloat)ApolloDuoRailWidthClosed + 12.0;
+}
+
+static BOOL ApolloDuoRailIsFeedContentController(UIViewController *controller) {
+    NSString *name = NSStringFromClass(controller.class);
+    return [name isEqualToString:@"Apollo.PostsViewController"]
+        || [name isEqualToString:@"Apollo.CommentsViewController"]
+        // Account > Comments uses its own Texture controller, including
+        // inline media and the attached post preview beneath each comment.
+        || [name isEqualToString:@"Apollo.UserCommentsViewController"]
+        || [name isEqualToString:@"Apollo.ProfileViewController"]
+        // Inbox rows change height in place when Translation swaps a body.
+        // Unlisted, Texture re-measured such a row at the full table width
+        // and left its node shorter than the row, clipping the footer.
+        || [name isEqualToString:@"Apollo.InboxViewController"];
+}
+
+static char kApolloDuoFeedTableKey;
+
+void ApolloDuoRailPrepareFeedContent(UIViewController *controller) {
+    if (!ApolloDuoRailIsFeedContentController(controller)) return;
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    if (![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return;
+    if (ApolloDuoRailModeForTabs(tabs) != ApolloDuoModeClosed
+        && !ApolloDuoRailHasVisibleSideBar()) return;
+    // UIKit supplies the native rail safe area once this view is attached.
+    // Do not pre-add that width as additionalSafeAreaInsets: on the first
+    // attachment UIKit would add it again and narrow post content twice.
+    // The measurement hook below covers Texture's pre-attachment sizing.
+    [controller loadViewIfNeeded];
+    Ivar ivar = class_getInstanceVariable(controller.class, "tableNode");
+    id node = ivar ? object_getIvar(controller, ivar) : nil;
+    UIView *table = [node respondsToSelector:@selector(view)]
+        ? ((UIView *(*)(id, SEL))objc_msgSend)(node, @selector(view)) : nil;
+    if ([table isKindOfClass:UITableView.class]) {
+        objc_setAssociatedObject(table, &kApolloDuoFeedTableKey, @YES,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+CGFloat ApolloDuoRailFeedContentWidth(UITableView *table) {
+    if (!NSThread.isMainThread) return 0.0;
+    if (![objc_getAssociatedObject(table, &kApolloDuoFeedTableKey) boolValue]) return 0.0;
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    if (![tabs isKindOfClass:UITabBarController.class]) return 0.0;
+    // During a display resize the bar may be detached and the table may
+    // still carry its old bounds. Neither is a valid measurement fallback.
+    // A short pane (another window stacked above or below Apollo on the opened
+    // display) is landscape-shaped but keeps the bottom tab bar, so it must not
+    // reserve the trailing rail: that clipped feed media 84pt short of the edge.
+    CGFloat railInset = ApolloDuoSplitIsShortPane() ? 0.0 : (CGFloat)ApolloDuoRailWidthClosed + 12.0;
+    CGFloat transitionWidth = ApolloDuoSplitTransitionContentWidth(table, railInset);
+    if (transitionWidth > 0.0) return transitionWidth;
+    if (ApolloDuoSplitIsUnfoldedPortrait()) return 0.0;
+    if (ApolloDuoRailModeForTabs(tabs) != ApolloDuoModeClosed
+        && !ApolloDuoRailHasVisibleSideBar()) return 0.0;
+    CGFloat width = CGRectGetWidth(tabs.view.bounds) - ApolloDuoClosedContentRightInset(tabs);
+    if (table.window) {
+        // UIKit keeps the secondary table full-screen beneath the primary
+        // column. Texture must measure in the visible safe area on *every*
+        // reload (including a sort change), not in that backing surface.
+        UIEdgeInsets safe = table.safeAreaInsets;
+        width = MIN(width, CGRectGetWidth(table.bounds) - safe.left - safe.right);
+    }
+    return MIN(CGRectGetWidth(table.bounds), MAX(0.0, width));
+}
+
+static BOOL ApolloDuoCoverShouldApplyForTabs(UITabBarController *tabs) {
+    if (![tabs isKindOfClass:[UITabBarController class]] || !tabs.isViewLoaded) return NO;
+    if (tabs.traitCollection.horizontalSizeClass == UIUserInterfaceSizeClassRegular) return NO;
+    return ApolloDuoCoverChromeShouldApply(0, ApolloDuoRailDualDisplays() ? 1 : 0);
+}
+
+BOOL ApolloDuoCoverChromeIsActive(void) {
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    return ApolloDuoCoverShouldApplyForTabs(tabs);
+}
+
+BOOL ApolloDuoUsesCoverContentInsets(void) {
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    return ApolloDeviceIsDuo()
+        && UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPhone
+        && [tabs isKindOfClass:UITabBarController.class] && tabs.isViewLoaded
+        && !ApolloDuoSplitIsUnfolded();
+}
+
+static BOOL ApolloDuoCoverClassLooksLikeComments(Class cls) {
+    const char *name = class_getName(cls);
+    return name && strstr(name, "CommentsViewController");
+}
+
+static UIView *ApolloDuoCoverFindJumpButton(UIViewController *comments) {
+    Ivar ivar = class_getInstanceVariable(comments.class, "commentJumpButton");
+    id buttonObject = ivar ? object_getIvar(comments, ivar) : nil;
+    UIView *button = [buttonObject isKindOfClass:[UIView class]] ? buttonObject : nil;
+    if ([button isKindOfClass:[UIView class]]) return button;
+    if ([buttonObject respondsToSelector:@selector(view)]) {
+        id nodeView = ((id (*)(id, SEL))objc_msgSend)(buttonObject, @selector(view));
+        if ([nodeView isKindOfClass:[UIView class]]) return nodeView;
+    }
+
+    UIView *root = comments.view;
+    if (!root) return nil;
+    // Reuse the button an earlier search found for this controller while it is
+    // still alive and attached; the BFS below is the expensive fallback.
+    ApolloDuoRailWeakView *cached = objc_getAssociatedObject(comments, &kApolloDuoRailJumpButtonKey);
+    UIView *cachedButton = cached.view;
+    if (cachedButton.window && [cachedButton isDescendantOfView:root]) return cachedButton;
+    CGFloat rootW = CGRectGetWidth(root.bounds);
+    CGFloat rootH = CGRectGetHeight(root.bounds);
+    UIView *best = nil;
+    CGFloat bestScore = 0.0;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger inspected = 0;
+    while (stack.count > 0 && inspected++ < 120) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        for (UIView *subview in view.subviews) {
+            [stack addObject:subview];
+        }
+        if (![view isKindOfClass:[UIControl class]]) continue;
+        CGFloat w = CGRectGetWidth(view.bounds);
+        CGFloat h = CGRectGetHeight(view.bounds);
+        if (w < 36.0 || w > 72.0 || h < 36.0 || h > 72.0) continue;
+        if (fabs(w - h) > 8.0) continue;
+        CGRect inRoot = [root convertRect:view.bounds fromView:view];
+        if (CGRectGetMidX(inRoot) < rootW * 0.55) continue;
+        if (CGRectGetMidY(inRoot) < rootH * 0.55) continue;
+        CGFloat score = CGRectGetMaxX(inRoot) + CGRectGetMaxY(inRoot);
+        if (score > bestScore) {
+            bestScore = score;
+            best = view;
+        }
+    }
+    if (best) {
+        ApolloDuoRailWeakView *box = [ApolloDuoRailWeakView new];
+        box.view = best;
+        objc_setAssociatedObject(comments, &kApolloDuoRailJumpButtonKey, box,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return best;
+}
+
+// Apollo's push/pop animator sets the leaving page's final (off-screen) frame
+// as Back starts; only the presentation layer moves.
+static BOOL ApolloDuoJumpButtonPageIsSliding(UIViewController *comments) {
+    UIView *page = comments.viewIfLoaded;
+    UIWindow *window = page.window;
+    if (!page || !window) return NO;
+    CGRect onScreen = [page convertRect:page.bounds toView:nil];
+    if (CGRectGetMinX(onScreen) >= CGRectGetMaxX(window.bounds) - 0.5 || CGRectGetMaxX(onScreen) <= CGRectGetMinX(window.bounds) + 0.5) {
+        return YES;
+    }
+    for (UIView *view = page; view && view != window; view = view.superview) {
+        if (fabs(view.transform.tx) > 0.5 || fabs(view.layer.sublayerTransform.m41) > 0.5) return YES;
+    }
+    UINavigationController *navigation = comments.navigationController;
+    UIView *navigationView = navigation.viewIfLoaded;
+    if (!navigationView || fabs([page convertPoint:CGPointZero toView:navigationView].x) <= 0.5) return NO;
+    if (navigation.transitionCoordinator) return YES;
+    for (UIView *view = page; view && view != navigationView; view = view.superview) {
+        if (view.layer.animationKeys.count > 0) return YES;
+    }
+    return NO;
+}
+
+static char kApolloDuoJumpButtonRestingXKey;
+
+static void ApolloDuoJumpButtonRememberRestingX(UIView *button, CGFloat x, CGFloat containerWidth) {
+    objc_setAssociatedObject(button, &kApolloDuoJumpButtonRestingXKey,
+                             [NSValue valueWithCGPoint:CGPointMake(x, containerWidth)], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// Mid-slide, the off-screen frame makes Apollo and the clamps below place the
+// button at the leading edge. Keep its resting x so it rides with the page.
+static BOOL ApolloDuoJumpButtonHoldDuringSlide(UIViewController *comments, UIView *button, BOOL coverChrome) {
+    UIView *container = button.superview;
+    if (!ApolloDuoJumpButtonPageIsSliding(comments)) return NO;
+    NSValue *resting = objc_getAssociatedObject(button, &kApolloDuoJumpButtonRestingXKey);
+    CGPoint rest = resting ? resting.CGPointValue : CGPointZero; // x, container width
+    if (!ApolloDuoJumpButtonKeepsRestingX(YES, resting != nil, rest.y, CGRectGetWidth(container.bounds))) return YES;
+    CGRect frame = button.frame;
+    BOOL moved = NO;
+    if (fabs(frame.origin.x - rest.x) > 0.5) {
+        ApolloLog(@"[DuoRail] jump button held at x=%.1f during a slide (was %.1f)", rest.x, frame.origin.x);
+        frame.origin.x = rest.x;
+        moved = YES;
+    }
+    if (coverChrome) {
+        CGFloat limitY = CGRectGetMaxY(container.bounds) - (CGFloat)ApolloDuoCoverPillBottom;
+        if (CGRectGetMaxY(frame) > limitY + 0.5) {
+            frame.origin.y -= (CGRectGetMaxY(frame) - limitY);
+            moved = YES;
+        }
+    }
+    if (moved) button.frame = frame;
+    return YES;
+}
+
+void ApolloDuoCoverAdjustJumpButton(UIViewController *comments) {
+    if (!comments || !ApolloDuoCoverClassLooksLikeComments(comments.class)) return;
+    if (!comments.isViewLoaded) return;
+    UIView *button = ApolloDuoCoverFindJumpButton(comments);
+    if (![button isKindOfClass:[UIView class]] || !button.superview) return;
+    BOOL coverChrome = ApolloDuoCoverChromeIsActive();
+    if (ApolloDuoJumpButtonHoldDuringSlide(comments, button, coverChrome)) return;
+    UIView *container = button.superview;
+    BOOL trailingRail = ApolloDuoRailHasVisibleSideBar();
+    NSString *position = [NSUserDefaults.standardUserDefaults stringForKey:@"CommentJumpButtonPosition"];
+    int kind = ApolloDuoJumpButtonPositionKind(position.UTF8String);
+    if (!coverChrome && !trailingRail && CGRectIsNull(ApolloDuoSplitContentFrame(comments, comments.view))) {
+        ApolloDuoJumpButtonRememberRestingX(button, CGRectGetMinX(button.frame), CGRectGetWidth(container.bounds));
+        return;
+    }
+
+    CGRect frame = button.frame;
+    BOOL moved = NO;
+    CGRect railFrame = CGRectNull;
+    if (trailingRail) {
+        UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+        UIView *sideBar = nil;
+        if ([tabs isKindOfClass:[UITabBarController class]]) {
+            sideBar = tabs.tabBar;
+        }
+        if (sideBar.window) {
+            railFrame = [sideBar convertRect:sideBar.bounds toView:container];
+        }
+    }
+    // Apollo's x for each position comes from geometry a split pane does not
+    // match (the full-screen table beneath the posts column, or a narrower
+    // width for right positions). Place every position from the visible pane
+    // instead, in the button's (content) coordinates, and keep Apollo's Y.
+    CGRect pane = ApolloDuoSplitContentFrame(comments, container);
+    BOOL split = !CGRectIsNull(pane) && CGRectGetWidth(pane) > 0.0;
+    if (split) {
+        // Book posture: the divider can rest at or inside the fold, so the
+        // pane's leading edge is the hinge. Keep every position past it.
+        CGRect fold = ApolloDuoActiveVerticalDivision(container);
+        CGFloat leading = ApolloDuoJumpButtonPaneAfterFold(CGRectGetMinX(pane), CGRectGetWidth(pane), !CGRectIsNull(fold),
+                                                           CGRectGetMinX(fold), CGRectGetMaxX(fold));
+        pane.size.width -= leading - CGRectGetMinX(pane);
+        pane.origin.x = leading;
+    }
+    CGFloat paneX = ApolloDuoJumpButtonPaneX(kind, split, CGRectGetMinX(pane), CGRectGetWidth(pane),
+                                             !CGRectIsNull(railFrame), CGRectGetMinX(railFrame),
+                                             CGRectGetWidth(frame), CGRectGetMinX(frame));
+    if (fabs(paneX - CGRectGetMinX(frame)) > 0.5) {
+        frame.origin.x = paneX;
+        moved = YES;
+    }
+    if (!coverChrome && !trailingRail) {
+        if (moved) button.frame = frame;
+        ApolloDuoJumpButtonRememberRestingX(button, frame.origin.x, CGRectGetWidth(container.bounds));
+        return;
+    }
+    // The button is a child of ASTableView. Its frame is in *content*
+    // coordinates, while bounds.origin tracks scrolling. Using height alone
+    // clamps the native contentOffset-adjusted Y back to a fixed content Y,
+    // which makes the button scroll away with the comments.
+    CGFloat limitX = CGRectGetMaxX(container.bounds);
+    CGFloat limitY = CGRectGetMaxY(container.bounds);
+    if (coverChrome) {
+        limitX -= (CGFloat)ApolloDuoCoverPillWidth;
+        limitY -= (CGFloat)ApolloDuoCoverPillBottom;
+    }
+    if (!CGRectIsNull(railFrame)) {
+        // Match the 15pt gap used by Duo settings rows and profile cards.
+        limitX = MIN(limitX, CGRectGetMinX(railFrame) - (CGFloat)ApolloDuoJumpButtonRailGap);
+    }
+    if (CGRectGetMaxX(frame) > limitX + 0.5) {
+        frame.origin.x -= (CGRectGetMaxX(frame) - limitX);
+        moved = YES;
+    }
+    if (CGRectGetMaxY(frame) > limitY + 0.5) {
+        frame.origin.y -= (CGRectGetMaxY(frame) - limitY);
+        moved = YES;
+    }
+    // The clamps must not push the button behind the posts column.
+    CGFloat minX = split ? MAX(CGRectGetMinX(container.bounds), CGRectGetMinX(pane))
+                         : CGRectGetMinX(container.bounds);
+    if (frame.origin.x < minX) {
+        frame.origin.x = minX;
+        moved = YES;
+    }
+    if (frame.origin.y < CGRectGetMinY(container.bounds)) {
+        frame.origin.y = CGRectGetMinY(container.bounds);
+        moved = YES;
+    }
+    if (moved) button.frame = frame;
+    ApolloDuoJumpButtonRememberRestingX(button, frame.origin.x, CGRectGetWidth(container.bounds));
+}
+
+void ApolloDuoRailAdjustHideReadButton(UIViewController *posts) {
+    if (!ApolloClassPostsViewController || ![posts isKindOfClass:ApolloClassPostsViewController]
+        || !posts.isViewLoaded || !ApolloDuoRailHasVisibleSideBar()) return;
+    Ivar ivar = class_getInstanceVariable(posts.class, "hideReadPostsButton");
+    id object = ivar ? object_getIvar(posts, ivar) : nil;
+    UIView *button = [object isKindOfClass:UIView.class] ? object : nil;
+    UIView *container = button.superview;
+    if (!container.window || container.window != posts.view.window) return;
+
+    // Native feed layout and scroll callbacks position this button using the
+    // backing table's full width. The table can extend underneath both the
+    // trailing rail and the comments pane. Convert the feed's *visible* safe
+    // area into the button parent's coordinates; a scrolling parent's bounds
+    // origin is its content offset, not zero.
+    CGRect pane = [posts.view convertRect:posts.view.safeAreaLayoutGuide.layoutFrame toView:container];
+    UITabBarController *tabs = (id)ApolloMainTabBarController();
+    CGRect rail = [tabs.tabBar convertRect:tabs.tabBar.bounds toView:container];
+    CGFloat leading = MAX(CGRectGetMinX(container.bounds), CGRectGetMinX(pane));
+    CGFloat trailing = MIN(CGRectGetMaxX(container.bounds), CGRectGetMaxX(pane));
+    trailing = MIN(trailing, CGRectGetMinX(rail) - 15.0);
+    CGRect frame = button.frame;
+    if (trailing - leading < CGRectGetWidth(frame)) return;
+    CGFloat x = MIN(MAX(CGRectGetMinX(frame), leading), trailing - CGRectGetWidth(frame));
+    // Preserve Apollo's vertical scroll/hide animation and avoid another
+    // geometry write once the button already clears the rail.
+    if (fabs(x - frame.origin.x) > 0.5) {
+        frame.origin.x = x;
+        button.frame = frame;
+    }
+}
+
+void ApolloDuoRailAlignFeedScrollIndicator(UIScrollView *scrollView) {
+    if (!scrollView) return;
+    // Cheapest disqualifiers first. An inset we adjusted earlier must still be
+    // restored once the rail goes away, so only early-out with nothing saved.
+    if (!objc_getAssociatedObject(scrollView, &kApolloDuoRailSavedIndicatorInsetsKey)
+        && (!scrollView.window || !sApolloDuoRailMaybeVisible)) return;
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    UITabBar *bar = [tabs isKindOfClass:[UITabBarController class]] ? tabs.tabBar : nil;
+    BOOL trailingRail = NO;
+    if (bar && !bar.hidden && bar.window && scrollView.window) {
+        CGRect railFrame = [scrollView.window convertRect:bar.bounds fromView:bar];
+        trailingRail = CGRectGetWidth(railFrame) < 100.0
+            && CGRectGetHeight(railFrame) > 200.0
+            && CGRectGetMidX(railFrame) > CGRectGetWidth(scrollView.window.bounds) * 0.70;
+    }
+
+    NSValue *saved = objc_getAssociatedObject(scrollView,
+                                               &kApolloDuoRailSavedIndicatorInsetsKey);
+    if (!trailingRail) {
+        if (saved) {
+            scrollView.verticalScrollIndicatorInsets = saved.UIEdgeInsetsValue;
+            objc_setAssociatedObject(scrollView, &kApolloDuoRailSavedIndicatorInsetsKey,
+                                     nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return;
+    }
+
+    UIEdgeInsets insets = scrollView.verticalScrollIndicatorInsets;
+    if (!saved) {
+        objc_setAssociatedObject(scrollView, &kApolloDuoRailSavedIndicatorInsetsKey,
+                                 [NSValue valueWithUIEdgeInsets:insets],
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // UIKit automatically adds safeAreaInsets.right to this value. A matching
+    // negative explicit inset cancels only that horizontal adjustment while
+    // leaving its automatic top and bottom indicator geometry intact.
+    CGFloat right = -scrollView.safeAreaInsets.right;
+    if (fabs(insets.right - right) > 0.5) {
+        insets.right = right;
+        scrollView.verticalScrollIndicatorInsets = insets;
+    }
+}
+
+// The side rail's tab platter is hosted by UIKit's floating-bar container, not
+// inside the UITabBar, so the accent Apollo assigns to tabBar.tintColor never
+// reaches it and the selected tab inherits the window's system blue. (The open
+// portrait bottom bar does sit in the UITabBar and shows the accent.) Give the
+// platter the theme accent directly.
+static BOOL ApolloDuoRailTintPlatters(UIView *view, UIColor *accent, NSUInteger depth) {
+    if (!view || depth > 16) return NO;
+    if ([view isKindOfClass:ApolloClassUITabBarItemPlatterView]) {
+        if (![view.tintColor isEqual:accent]) view.tintColor = accent;
+        return YES;
+    }
+    BOOL found = NO;
+    for (UIView *subview in view.subviews) found |= ApolloDuoRailTintPlatters(subview, accent, depth + 1);
+    return found;
+}
+
+static void ApolloDuoRailApplyAccent(UITabBarController *tabs) {
+    if (!ApolloClassUITabBarItemPlatterView || !ApolloDuoRailHasVisibleSideBar()) return;
+    UIColor *accent = ApolloThemeAccentColor() ?: tabs.tabBar.tintColor;
+    if (!accent) return;
+    // The platter lives under the tab container's floating-bar subtree only;
+    // never walk the content hierarchy.
+    for (UIView *container in tabs.view.subviews) {
+        if (![NSStringFromClass(container.class) isEqualToString:@"_UITabContainerView"]) continue;
+        for (UIView *floating in container.subviews) {
+            if ([NSStringFromClass(floating.class) isEqualToString:@"_UIFloatingBarContainerView"]) {
+                ApolloDuoRailTintPlatters(floating, accent, 0);
+            }
+        }
+    }
+}
+
+static CGRect ApolloDuoActiveDivision(UIView *view, BOOL horizontal) {
+    // Resolve the public iOS 27.1 API dynamically for the device build's iOS 26 SDK.
+    if (@available(iOS 27.1, *)) {
+        // A window's own `window` is nil.
+        UIWindow *window = [view isKindOfClass:UIWindow.class] ? (UIWindow *)view : view.window;
+        Class kindClass = ApolloClassUIViewReservedRegionKind;
+        SEL query = @selector(reservedRegionsOfKind:);
+        if (!window || !kindClass || ![window respondsToSelector:query]
+            || ![kindClass respondsToSelector:@selector(divisionRegionKind)]) return CGRectNull;
+        id kind = ((id (*)(id, SEL))objc_msgSend)(kindClass, @selector(divisionRegionKind));
+        NSArray *regions = ((id (*)(id, SEL, id))objc_msgSend)(window, query, kind);
+        for (id region in regions) {
+            if (![region respondsToSelector:@selector(isActive)] || ![region respondsToSelector:@selector(frame)]
+                || !((BOOL (*)(id, SEL))objc_msgSend)(region, @selector(isActive))) continue;
+            CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(region, @selector(frame));
+            // Book and tabletop are separate consumers of the same system
+            // geometry; neither infers a division from a hinge angle.
+            if (!isfinite(frame.origin.x) || !isfinite(frame.origin.y)
+                || !isfinite(frame.size.width) || !isfinite(frame.size.height)
+                || frame.size.width < 0 || frame.size.height < 0) continue;
+            if (horizontal ? CGRectGetWidth(frame) <= CGRectGetHeight(frame)
+                           : CGRectGetHeight(frame) <= CGRectGetWidth(frame)) continue;
+            return [view convertRect:frame fromView:window];
+        }
+    }
+    return CGRectNull;
+}
+
+CGRect ApolloDuoActiveVerticalDivision(UIView *view) {
+    return ApolloDuoActiveDivision(view, NO);
+}
+
+CGRect ApolloDuoActiveHorizontalDivision(UIView *view) {
+    return ApolloDuoActiveDivision(view, YES);
+}
+
+CGRect ApolloDuoLayoutVerticalDivision(UIView *view) {
+    if (!view || view.window) return ApolloDuoActiveVerticalDivision(view);
+    UIWindow *window = ((UIViewController *)ApolloMainTabBarController()).viewIfLoaded.window;
+    CGRect fold = window ? ApolloDuoActiveVerticalDivision(window) : CGRectNull;
+    if (CGRectIsNull(fold)) return fold;
+    // In `view`'s coordinates, with its detached tab filling the window.
+    UIView *root = view;
+    while (root.superview) root = root.superview;
+    return [view convertRect:fold fromView:root];
+}
+
+NSNotificationName const ApolloDuoFoldDidChangeNotification = @"ApolloDuoFoldDidChange";
+
+// UIKit sends no event when the division region changes, and it can publish
+// ~1.5s after the hinge. One tracker per window re-reads it after each hinge
+// update and posts when it changes.
+static const CFTimeInterval kApolloDuoFoldWatchSeconds = 4.0;
+static const int64_t kApolloDuoFoldWatchInterval = 150 * NSEC_PER_MSEC;
+static char kApolloDuoFoldTrackerKey;
+
+@interface ApolloDuoFoldTracker : NSObject
+@property(nonatomic, weak) UIWindow *window;
+@property(nonatomic, strong) id<UIInteraction> hinge;
+@property(nonatomic, copy) NSString *region;
+@property(nonatomic) NSInteger status;
+@property(nonatomic) CFTimeInterval watchUntil;
+@property(nonatomic) BOOL watching;
+@end
+
+@implementation ApolloDuoFoldTracker
+- (void)check {
+    UIWindow *window = self.window;
+    if (!window) return;
+    NSString *region = [NSString stringWithFormat:@"%@ %@", NSStringFromCGRect(ApolloDuoActiveVerticalDivision(window)),
+                        NSStringFromCGRect(ApolloDuoActiveHorizontalDivision(window))];
+    if ([region isEqualToString:self.region]) return;
+    self.region = region;
+    ApolloLog(@"[DuoFold] division region %@", region);
+    [NSNotificationCenter.defaultCenter postNotificationName:ApolloDuoFoldDidChangeNotification object:window];
+}
+- (void)tick {
+    __weak ApolloDuoFoldTracker *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kApolloDuoFoldWatchInterval), dispatch_get_main_queue(), ^{
+        ApolloDuoFoldTracker *tracker = weakSelf;
+        if (!tracker) return;
+        [tracker check];
+        if (CACurrentMediaTime() < tracker.watchUntil) [tracker tick];
+        else tracker.watching = NO;
+    });
+}
+- (void)hingeUpdated:(id)update {
+    id hinge = ((id (*)(id, SEL))objc_msgSend)(update, @selector(hinge));
+    NSInteger status = hinge ? ((NSInteger (*)(id, SEL))objc_msgSend)(hinge, @selector(status)) : 0;
+    if (status != self.status) {
+        ApolloLog(@"[DuoFold] hinge status %ld -> %ld", (long)self.status, (long)status);
+        self.status = status;
+    }
+    [self check];
+    // Each update extends one running watch.
+    self.watchUntil = CACurrentMediaTime() + kApolloDuoFoldWatchSeconds;
+    if (!self.watching) {
+        self.watching = YES;
+        [self tick];
+    }
+}
+@end
+
+void ApolloDuoTrackFold(UIWindow *window) {
+    if (!window || !ApolloDeviceIsDuo() || objc_getAssociatedObject(window, &kApolloDuoFoldTrackerKey)) return;
+    if (@available(iOS 27.1, *)) {
+        // Resolved dynamically for the device build's iOS 26 SDK.
+        Class cls = objc_getClass("UIHingeInteraction");
+        if (!cls || ![cls instancesRespondToSelector:@selector(initWithUpdateHandler:)]) return;
+        ApolloDuoFoldTracker *tracker = [ApolloDuoFoldTracker new];
+        tracker.window = window;
+        __weak ApolloDuoFoldTracker *weakTracker = tracker;
+        tracker.hinge = ((id (*)(id, SEL, id))objc_msgSend)([cls alloc], @selector(initWithUpdateHandler:),
+            ^(__unused id interaction, id update) { [weakTracker hingeUpdated:update]; });
+        objc_setAssociatedObject(window, &kApolloDuoFoldTrackerKey, tracker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // On the window, so a full-screen viewer doesn't cut off its updates.
+        [window addInteraction:tracker.hinge];
+        ApolloLog(@"[DuoFold] tracking the fold on %@", NSStringFromClass(window.class));
+    }
+}
+
+void ApolloDuoRailSync(void) {
+    if (!ApolloDeviceIsDuo()) return;
+    UITabBarController *tabs = (UITabBarController *)ApolloMainTabBarController();
+    if (![tabs isKindOfClass:UITabBarController.class] || !tabs.isViewLoaded) return;
+    int mode = ApolloDuoRailModeForTabs(tabs);
+    // The visible rail can precede the scene's Duo display signal.
+    if (mode == ApolloDuoModePhone && ApolloDuoRailHasVisibleSideBar()) {
+        mode = ApolloDuoModeClosed;
+    }
+    NSNumber *previous = objc_getAssociatedObject(tabs, &kApolloDuoRailModeKey);
+    if (!previous || previous.intValue != mode) {
+        objc_setAssociatedObject(tabs, &kApolloDuoRailModeKey, @(mode), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (mode != ApolloDuoModePhone &&
+        ![objc_getAssociatedObject(tabs, &kApolloDuoAdaptiveBarsKey) boolValue]) {
+        objc_setAssociatedObject(tabs, &kApolloDuoAdaptiveBarsKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    UITabBar *bar = tabs.tabBar;
+    sApolloDuoRailMaybeVisible = bar.window && !bar.hidden
+        && CGRectGetWidth(bar.bounds) < 100.0 && CGRectGetHeight(bar.bounds) > 200.0;
+    ApolloScheduleDuoBarPolicyUpdate(tabs);
+    if (mode != ApolloDuoModePhone) ApolloDuoRailApplyAccent(tabs);
+}

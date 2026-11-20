@@ -1,0 +1,40 @@
+#import <Foundation/Foundation.h>
+
+/// Bootstrap markdown toolbar Gif injection. Called from Tweak.xm %ctor.
+void ApolloMarkdownGifInstall(void);
+
+/// Cached regex matching the `![gif](giphy|<id>)` tokens this module inserts
+/// when the user picks a GIF from the toolbar. Shared with the submit-form
+/// rewriter (`ApolloImageUploadHost.xm`) and the body-text renderer
+/// (`ApolloMedia.xm`) so all three sites agree on the exact token shape.
+/// Capture group 1 is the bare Giphy GIF ID.
+NSRegularExpression *ApolloNativeGiphyMarkdownTokenRegex(void);
+
+/// Comment Link Host support (UDKeyCommentLinkHost / sCommentLinkHost). The
+/// markdown toolbar's photo-button hook in ApolloMarkdownToolbarGif.xm arms a
+/// short window when the tap comes from a comment/reply editor;
+/// ApolloImageUploadHost.xm consults it to route that upload to the chosen link
+/// host and post it as a plain link instead of native Reddit media.
+#ifdef __cplusplus
+extern "C" {
+#endif
+BOOL ApolloCommentLinkUploadPending(void);
+/// Auto mode (sCommentLinkPreferNative): the armed comment-editor window can be
+/// in NATIVE mode instead — the subreddit is known to allow image comments, so
+/// the upload is forced onto Reddit's native media path regardless of the Media
+/// Upload Host. Mutually exclusive with ApolloCommentLinkUploadPending().
+BOOL ApolloCommentNativeUploadPending(void);
+void ApolloCommentLinkClearUpload(void);
+/// Keyboard-anchored toast confirming the plain-link upload ("Uploaded to
+/// <hostName> — ..."), shown once per compose session.
+void ApolloCommentLinkShowUploadedToast(NSString *hostName);
+/// The subreddit of the comment/reply composer an upload is coming from, or nil
+/// when the active composer isn't composing a comment (post composer, chat).
+NSString *ApolloActiveCommentComposerSubreddit(void);
+/// The comment/reply composer itself (same rule as above), or nil. Only used as
+/// an identity: camera-roll GIFs kept for an upload belong to the composer they
+/// were picked in (ApolloUploadOriginalGIF.m).
+id ApolloActiveCommentComposer(void);
+#ifdef __cplusplus
+}
+#endif

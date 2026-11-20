@@ -1,0 +1,980 @@
+#import <Foundation/Foundation.h>
+#import <LocalAuthentication/LocalAuthentication.h>
+#import <objc/runtime.h>
+#import <QuartzCore/QuartzCore.h>
+#include <string.h>
+
+#import "ApolloCommon.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloDuoRail.h"
+#import "CustomAPIViewController.h"
+#import "ApolloBuyUsACoffeeViewController.h"
+#import "SavedCategoriesViewController.h"
+#import "TranslationSettingsViewController.h"
+#import "TagFiltersViewController.h"
+#import "ApolloThemeManagerViewController.h"
+#import "PictureInPictureViewController.h"
+#import "ApolloSettingsSearch.h"
+#import "ApolloReportViewController.h"
+#import "ApolloThemeRuntime.h"
+#import "ipad/ApolloPaneLayout.h"
+#import "ApolloDuoRail.h"
+#import "ApolloDuoCompatibility.h"
+#import "ApolloWallpapersViewController.h"
+#import "ApolloSettingsTableViewController.h"
+#import "ApolloSettingsForm.h"
+
+// MARK: - Settings View Controller (Custom API row injection)
+
+@interface SettingsViewController : UIViewController
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView;
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section;
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath;
+@end
+
+@interface SettingsAboutViewController : UIViewController
+@end
+
+@interface SettingsPortraitLockViewController : UIViewController
+@property (nonatomic, strong) UITableView *tableView;
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section;
+@end
+
+// When YES, the Settings VC didSelect hook will skip PR #294's "Buy Us a Coffee"
+// reroute for section 0 row 0 and fall through to Apollo's native Tip Jar tap
+// handler. Used by the About VC Tip Jar row to reuse Apollo's native
+// presentation path (the Swift designated init `init(summonLocation:)` is not
+// reachable from ObjC and its symbols are stripped, so calling Apollo's own
+// tap handler is the only safe way to construct + present TipJar2VC).
+static BOOL sApolloAboutTipJarBypassReskin = NO;
+
+// Reborn owns the primary Feature Requests board (Fider); Apollo's original
+// board is archived. When YES, a re-entrant didSelect on the native About row
+// skips the chooser and falls through to Apollo's original handler (the only
+// way to reach %orig from inside the chooser's action block).
+static BOOL sApolloAboutFeatureRequestsBypass = NO;
+
+// Reborn's feature-request board. Kept in sync with the prominent About row in
+// CustomAPIViewController.
+static NSString *const kApolloRebornFeatureRequestsURL = @"https://apolloreborn.fider.io/";
+
+// Weakly-held last-seen Apollo SettingsViewController instance. Captured in
+// viewDidAppear and used as a fallback when About is presented modally (in
+// which case the About VC's navigationController.viewControllers does NOT
+// contain SettingsVC).
+static __weak UIViewController *sApolloLastSettingsVC = nil;
+static char kApolloRootNativeSurfaceKey;
+static char kApolloRootNativeCellKey;
+static char kApolloRootHasPixelPalsRowKey;
+
+static BOOL ApolloRootSettingsHidesPixelPals(id controller, NSIndexPath *indexPath) {
+    // Apollo 1.15.11's native mainSettings card has General, Pixel Pals,
+    // Appearance, Notifications, App Icon, Passcode, Filters, and Gestures.
+    // Its seven-row form omits Pixel Pals. Preserve this native index space:
+    // changing it would pair dequeued cells with the wrong request index path.
+    return ApolloDuoDeviceDetected() && indexPath.section == 1 && indexPath.row == 1 &&
+        [objc_getAssociatedObject(controller, &kApolloRootHasPixelPalsRowKey) boolValue];
+}
+
+static BOOL ApolloRootSettingsIsPasscodeTitle(NSString *title) {
+    return [title isEqualToString:@"Passcode"] || [title isEqualToString:@"Touch ID & Passcode"] ||
+        [title isEqualToString:@"Face ID & Passcode"];
+}
+
+static NSString *ApolloRootSettingsPasscodeTitle(void) {
+    // Apollo's root uses an old device-model table to pick Face vs Touch ID.
+    // Ask LocalAuthentication, as its passcode screen already does; the Duo
+    // compatibility model override must not change the advertised biometric.
+    // This call populates biometryType even when authentication cannot proceed
+    // (for example, no fingerprint is enrolled or biometry is locked out).
+    // The row describes the device's sensor, not its current readiness to unlock.
+    LAContext *context = [LAContext new];
+    [context canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:nil];
+    if (context.biometryType == LABiometryTypeTouchID) return @"Touch ID & Passcode";
+    if (context.biometryType == LABiometryTypeFaceID) return @"Face ID & Passcode";
+    return @"Passcode";
+}
+
+static void ApolloRootSettingsExposeSelection(UITableViewCell *cell) {
+    if (![objc_getAssociatedObject(cell, &kApolloRootNativeCellKey) boolValue]) return;
+    // Apollo's native cells paint the card on both the cell and content view.
+    // UIKit's full-width selected background sits BETWEEN those two views;
+    // the opaque content therefore hides it everywhere except the disclosure
+    // accessory. Keep the native card on the cell, just as our injected rows
+    // do, and let UIKit own the entire pressed/selected background.
+    cell.contentView.backgroundColor = UIColor.clearColor;
+}
+
+static void ApolloRootSettingsPreparePaneText(UITableViewCell *cell, UIViewController *controller) {
+    if (!ApolloPaneSplitControllerFor(controller)) return;
+    cell.textLabel.numberOfLines = 0;
+}
+
+static void ApolloApplyRootNativeSurface(UITableViewCell *cell, UIColor *surface) {
+    if (!cell || !surface) return;
+    cell.backgroundColor = surface;
+    cell.contentView.backgroundColor = [UIColor clearColor];
+}
+
+static BOOL ApolloRootCellCopiesNativeSurface(NSIndexPath *indexPath) {
+    // Both cards are made from tweak-owned cells. They must follow a freshly
+    // themed native donor rather than retaining a resolved surface from the
+    // appearance in which they were first created.
+    return indexPath.section == 0 || indexPath.section == 2;
+}
+
+// `cellForRowAtIndexPath:` runs inside UITableView's update transaction. UIKit
+// asserts if code asks for visibleCells from that callback, so propagate the
+// native donor surface only after the table has committed. Theme/appearance
+// transitions can span more than one run-loop turn; retry briefly instead of
+// racing the update or retaining a stale surface on the tweak-owned cards.
+static void ApolloApplyRootNativeSurfaceWhenStable(UITableView *tableView, UIColor *surface,
+                                                    NSUInteger retriesRemaining) {
+    __weak UITableView *weakTable = tableView;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableView *liveTable = weakTable;
+        if (!liveTable) return;
+        if (liveTable.hasUncommittedUpdates) {
+            if (retriesRemaining > 0) {
+                ApolloApplyRootNativeSurfaceWhenStable(liveTable, surface, retriesRemaining - 1);
+            }
+            return;
+        }
+        for (UITableViewCell *visibleCell in liveTable.visibleCells) {
+            NSIndexPath *visiblePath = [liveTable indexPathForCell:visibleCell];
+            if (ApolloRootCellCopiesNativeSurface(visiblePath)) {
+                ApolloApplyRootNativeSurface(visibleCell, surface);
+            }
+        }
+    });
+}
+
+// Apollo's root Settings screen adds an Export button for its legacy settings
+// archive. Reborn owns Backup/Restore in its Data section, so two export paths
+// with different formats are ambiguous. Remove only Apollo's export action and
+// preserve any other trailing item (for example a wallpaper promotion).
+static void ApolloRemoveLegacySettingsExportButton(UIViewController *vc) {
+    NSArray<UIBarButtonItem *> *items = vc.navigationItem.rightBarButtonItems;
+    if (items.count == 0 && vc.navigationItem.rightBarButtonItem) {
+        items = @[ vc.navigationItem.rightBarButtonItem ];
+    }
+    if (items.count == 0) return;
+
+    SEL exportAction = @selector(exportBarButtonItemTappedWithSender:);
+    NSMutableArray<UIBarButtonItem *> *kept = [NSMutableArray arrayWithCapacity:items.count];
+    for (UIBarButtonItem *item in items) {
+        BOOL titleIsExport = item.title.length > 0 &&
+            [item.title compare:@"Export" options:NSCaseInsensitiveSearch] == NSOrderedSame;
+        BOOL isExport = item.action == exportAction || titleIsExport;
+        if (!isExport) [kept addObject:item];
+    }
+    if (kept.count != items.count) {
+        vc.navigationItem.rightBarButtonItems = kept.count > 0 ? kept : nil;
+        ApolloLog(@"[Settings] removed legacy Export bar button");
+    }
+}
+
+static UIImage *createSettingsIcon(NSString *sfSymbolName, UIColor *color, UITraitCollection *traits) {
+    return ApolloSettingsTileImage(color, 29.0, traits, ^(BOOL dark, UIColor *resolvedColor) {
+        UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightMedium];
+        UIImage *symbol = [UIImage systemImageNamed:sfSymbolName withConfiguration:config];
+        UIImage *tinted = [symbol imageWithTintColor:(dark ? resolvedColor : UIColor.whiteColor)
+                                     renderingMode:UIImageRenderingModeAlwaysOriginal];
+        CGSize size = tinted.size;
+        [tinted drawInRect:CGRectMake((29 - size.width) / 2, (29 - size.height) / 2, size.width, size.height)];
+    });
+}
+
+// Use the current pet's transparent sprite, without its baked-in yellow circle.
+static UIImage *ApolloPixelPalsSettingsIcon(UIImage *artwork, UITraitCollection *traits) {
+    static char sourceArtworkKey;
+    artwork = objc_getAssociatedObject(artwork.imageAsset, &sourceArtworkKey) ?: artwork;
+    if (!artwork.CGImage) return nil;
+    static NSCache<UIImage *, UIImage *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSCache new]; });
+    UIImage *pet = [cache objectForKey:artwork];
+    if (!pet) {
+        NSArray<NSString *> *animals = @[@"cat", @"dog", @"hedgehog", @"fox", @"otter", @"panda",
+                                        @"parrot", @"platypus", @"borzoi", @"axolotl", @"bat",
+                                        @"butterfly", @"raccoon", @"superAI", @"tiger", @"trex"];
+        NSData *sourceData = nil;
+        UIImage *sprite = nil;
+        for (NSString *animal in animals) {
+            UIImage *candidate = [UIImage imageNamed:[@"settings-" stringByAppendingString:animal]];
+            if (!candidate) continue;
+            BOOL matches = artwork == candidate || artwork.CGImage == candidate.CGImage;
+            if (!matches) {
+                // UIKit can return different UIImage wrappers for the same asset.
+                sourceData = sourceData ?: UIImagePNGRepresentation(artwork);
+                matches = [sourceData isEqualToData:UIImagePNGRepresentation(candidate)];
+            }
+            if (matches) {
+                sprite = [UIImage imageNamed:[animal stringByAppendingString:@"-sit"]];
+                break;
+            }
+        }
+        if (!sprite.CGImage) return nil;
+        CGImageRef source = sprite.CGImage;
+        size_t width = CGImageGetWidth(source), height = CGImageGetHeight(source);
+        // Crop the sprite's transparent margins before fitting it into the tile.
+        if (!width || !height || width > 512 || height > 512) return nil;
+        uint8_t *alpha = (uint8_t *)calloc(width * height, 1);
+        if (!alpha) return nil;
+        CGContextRef context = CGBitmapContextCreate(alpha, width, height, 8, width, NULL, kCGImageAlphaOnly);
+        if (!context) { free(alpha); return nil; }
+        CGContextDrawImage(context, CGRectMake(0, 0, width, height), source);
+        size_t minX = width, minY = height, maxX = 0, maxY = 0;
+        for (size_t y = 0; y < height; y++) {
+            for (size_t x = 0; x < width; x++) {
+                if (!alpha[y * width + x]) continue;
+                minX = MIN(minX, x); minY = MIN(minY, y);
+                maxX = MAX(maxX, x); maxY = MAX(maxY, y);
+            }
+        }
+        CGContextRelease(context);
+        free(alpha);
+        if (minX == width) return nil;
+        CGImageRef cropped = CGImageCreateWithImageInRect(source, CGRectMake(minX, minY, maxX - minX + 1, maxY - minY + 1));
+        if (!cropped) return nil;
+        pet = [UIImage imageWithCGImage:cropped scale:1 orientation:UIImageOrientationUp];
+        CGImageRelease(cropped);
+        [cache setObject:pet forKey:artwork];
+    }
+    UIImage *tile = ApolloSettingsTileImage([UIColor colorWithRed:1 green:214.0 / 255 blue:150.0 / 255 alpha:1],
+                                          29.0, traits, ^(__unused BOOL dark, __unused UIColor *resolvedColor) {
+        CGFloat displayScale = traits.displayScale ?: UIScreen.mainScreen.scale;
+        // Whole screen pixels per sprite pixel keep the original pixel art crisp.
+        CGFloat factor = floor(24.0 * displayScale / MAX(pet.size.width, pet.size.height)) / displayScale;
+        CGSize size = CGSizeMake(pet.size.width * factor, pet.size.height * factor);
+        CGPoint origin = CGPointMake(round((29 - size.width) * displayScale / 2) / displayScale,
+                                     round((29 - size.height) * displayScale / 2) / displayScale);
+        CGContextSetInterpolationQuality(UIGraphicsGetCurrentContext(), kCGInterpolationNone);
+        [pet drawInRect:(CGRect){ origin, size }];
+    });
+    // Preserve the source when native cell reuse hands our tile back to us.
+    objc_setAssociatedObject(tile.imageAsset, &sourceArtworkKey, artwork, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return tile;
+}
+
+// Apollo's older root icons mix circular color fields with newer rounded-square
+// artwork. Normalize the standard destinations to 29pt rounded-square tiles;
+// Pixel Pals uses the same tile with its original pet artwork above.
+static UIImage *ApolloRootSettingsIconForTitle(NSString *title, UITraitCollection *traits) {
+    if ([title isEqualToString:@"General"]) {
+        return createSettingsIcon(@"gearshape.fill", [UIColor systemGrayColor], traits);
+    }
+    if ([title isEqualToString:@"Appearance"]) {
+        return createSettingsIcon(@"paintbrush.fill", [UIColor systemBlueColor], traits);
+    }
+    if ([title isEqualToString:@"Notifications"]) {
+        return createSettingsIcon(@"bell.fill", [UIColor systemRedColor], traits);
+    }
+    if (ApolloRootSettingsIsPasscodeTitle(title)) {
+        return createSettingsIcon(@"lock.fill", [UIColor systemPinkColor], traits);
+    }
+    if ([title isEqualToString:@"Filters & Blocks"]) {
+        return createSettingsIcon(@"nosign", [UIColor systemGreenColor], traits);
+    }
+    if ([title isEqualToString:@"Gestures"]) {
+        return createSettingsIcon(@"hand.tap.fill", [UIColor systemIndigoColor], traits);
+    }
+    if ([title isEqualToString:@"About"]) {
+        return createSettingsIcon(@"info.circle.fill", [UIColor systemGray2Color], traits);
+    }
+    return nil;
+}
+
+static UIImage *ApolloRootSettingsArtworkAtStandardSize(UIImage *artwork) {
+    if (!artwork) return nil;
+    CGSize size = CGSizeMake(29.0, 29.0);
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+    return [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        UIBezierPath *clip = [UIBezierPath bezierPathWithRoundedRect:(CGRect){ CGPointZero, size } cornerRadius:6.0];
+        [clip addClip];
+        [artwork drawInRect:(CGRect){ CGPointZero, size }];
+    }];
+}
+
+// Matches UIKit's inset-grouped spacing between two adjacent groups, which is
+// what Apollo's own sections use; see the first-section note in -viewWillAppear:.
+static const CGFloat kApolloRootFirstSectionTopPadding = 18.0;
+
+static UITableView *ApolloRootSettingsTableInView(UIView *view) {
+    if ([view isKindOfClass:UITableView.class]) return (UITableView *)view;
+    for (UIView *subview in view.subviews) {
+        UITableView *tableView = ApolloRootSettingsTableInView(subview);
+        if (tableView) return tableView;
+    }
+    return nil;
+}
+
+%hook SettingsViewController
+
+// Settings search lives on the root screen's navigation item (see
+// ApolloSettingsSearch.h). Attached in viewDidLoad so the bar exists before
+// the first appearance; the attach is idempotent per VC.
+- (void)viewDidLoad {
+    %orig;
+    ApolloSettingsSearchAttach((UIViewController *)self);
+    ApolloRemoveLegacySettingsExportButton((UIViewController *)self);
+
+    // The final group contains Wallpapers and About. Ultra remains available
+    // inside About; its duplicate root row and purchase-status footer are hidden.
+    ApolloLog(@"[Settings] Wallpapers row installed in native About group");
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    ApolloRemoveLegacySettingsExportButton((UIViewController *)self);
+
+    // Apollo's Settings root takes all of its group spacing from the headers of
+    // sections AFTER the first: section 0's header measures 0pt, so the first
+    // card butts straight against the navigation bar — and against the search
+    // field once the bar is on screen (issue #756). Give the table the
+    // first-section top padding it never had.
+    //
+    // A spacer rather than extra contentInset, because Apollo's own
+    // scroll-to-top compares contentOffset against safeAreaInsets.top: added
+    // inset would leave a tab double-tap resting short of the real top with the
+    // search bar half collapsed. A header is plain content, so that arithmetic
+    // is untouched. It goes in here rather than -viewDidLoad because Apollo
+    // clears the header again before the first appearance; re-checking on every
+    // appearance also repairs it if that ever happens later.
+    UITableView *tableView = ApolloRootSettingsTableInView(((UIViewController *)self).view);
+    if (tableView && !tableView.tableHeaderView) {
+        UIView *spacer = [[UIView alloc] initWithFrame:CGRectMake(0.0, 0.0, CGRectGetWidth(tableView.bounds),
+                                                                  kApolloRootFirstSectionTopPadding)];
+        spacer.backgroundColor = [UIColor clearColor];
+        spacer.userInteractionEnabled = NO;
+        tableView.tableHeaderView = spacer;
+    }
+}
+
+// Capture the live SettingsVC instance for the About > Tip Jar fallback path.
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    sApolloLastSettingsVC = (UIViewController *)self;
+    // The search bar is attached pinned so it's on screen the moment Settings
+    // opens; from here on it scrolls away and reveals like a stock iOS one.
+    ApolloSettingsSearchEnableScrollAway((UIViewController *)self);
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
+    %orig;
+    UIViewController *controller = (UIViewController *)self;
+    BOOL sizeChanged = ApolloPaneSplitControllerFor(controller) &&
+        ![previousTraitCollection.preferredContentSizeCategory isEqualToString:controller.traitCollection.preferredContentSizeCategory];
+    if (!previousTraitCollection || (!sizeChanged &&
+        previousTraitCollection.userInterfaceStyle == controller.traitCollection.userInterfaceStyle)) return;
+
+    // The native surface captured below may be a trait-resolved color. Drop
+    // it before rebuilding so the native rows donate their new appearance,
+    // then propagate that surface back to both tweak-owned cards.
+    objc_setAssociatedObject(self, &kApolloRootNativeSurfaceKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UITableView *tableView = ApolloRootSettingsTableInView(controller.view);
+    [tableView reloadData];
+}
+
+// Reborn and support form one compact primary card. The cells are tweak-owned
+// because UIKit requires a cell dequeued for an index path to be returned for
+// that same path. Their surface is copied from a real native row below after
+// Apollo has themed it (see the native branch in cellForRowAtIndexPath:).
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (section == 0) return 2;
+    if (section == 2) return 2;
+    NSInteger count = %orig;
+    if (section == 1) {
+        objc_setAssociatedObject(self, &kApolloRootHasPixelPalsRowKey, @(count == 8),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloRootSettingsHidesPixelPals(self, indexPath)) {
+        // A zero-height row can still be requested by UIKit or Settings search.
+        // Do not enter Apollo's index-path dequeue for this suppressed row:
+        // repeated offscreen requests violate UIKit's one-dequeue-per-request
+        // contract. An inert, non-index-path cell preserves native row indices.
+        NSString *reuseID = @"Cell_ApolloHiddenPixelPals";
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseID];
+        }
+        cell.hidden = YES;
+        cell.accessibilityElementsHidden = YES;
+        cell.userInteractionEnabled = NO;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        return cell;
+    }
+    if (indexPath.section == 0) {
+        NSString *reuseID = indexPath.row == 0 ? @"Cell_ApolloRebornRoot" : @"Cell_BuyCoffeeRoot";
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseID];
+        }
+        cell.textLabel.text = indexPath.row == 0 ? @"Apollo Reborn" : @"Buy Us a Coffee";
+        ApolloSettingsApplyCellTypography(cell);
+        ApolloRootSettingsPreparePaneText(cell, (UIViewController *)self);
+        UIColor *primaryText = ApolloSettingsPrimaryTextColor();
+        if (primaryText) cell.textLabel.textColor = primaryText;
+        cell.imageView.image = indexPath.row == 0
+            ? (ApolloRebornOptionsSettingsIcon(29.0) ?: createSettingsIcon(@"key.fill", [UIColor systemTealColor], tableView.traitCollection))
+            : ApolloBuyMeACoffeeSettingsIcon(29.0);
+        cell.accessoryView = nil;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        ApolloApplyRootNativeSurface(cell, objc_getAssociatedObject(self, &kApolloRootNativeSurfaceKey));
+        return cell;
+    }
+
+    if (indexPath.section == 2) {
+        NSArray<NSString *> *titles = @[ @"Wallpapers", @"About" ];
+        NSString *title = titles[indexPath.row];
+        NSString *reuseID = [@"Cell_ApolloInfoRoot_" stringByAppendingString:title];
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:reuseID];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:reuseID];
+        }
+        cell.textLabel.text = title;
+        ApolloSettingsApplyCellTypography(cell);
+        ApolloRootSettingsPreparePaneText(cell, (UIViewController *)self);
+        UIColor *primaryText = ApolloSettingsPrimaryTextColor();
+        if (primaryText) cell.textLabel.textColor = primaryText;
+        cell.imageView.image = indexPath.row == 0
+            ? createSettingsIcon(@"photo.on.rectangle.angled", UIColor.systemRedColor, tableView.traitCollection)
+            : ApolloRootSettingsIconForTitle(title, tableView.traitCollection);
+        cell.accessoryView = nil;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        ApolloApplyRootNativeSurface(cell, objc_getAssociatedObject(self, &kApolloRootNativeSurfaceKey));
+        return cell;
+    }
+
+    UITableViewCell *cell = %orig;
+    objc_setAssociatedObject(cell, &kApolloRootNativeCellKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // This owner configures every native Settings root row. Apollo can return
+    // cached/reconfigured cells without prepareForReuse, and UIKit does not
+    // reset their interaction state. Reapply the row's current availability
+    // here, while retaining the colors/accessories Apollo just configured.
+    // Notifications remains a destination even without push entitlement: its
+    // own screen explains availability and offers the supported alternatives.
+    BOOL hiddenPixelPals = ApolloRootSettingsHidesPixelPals(self, indexPath);
+    cell.hidden = hiddenPixelPals;
+    cell.accessibilityElementsHidden = hiddenPixelPals;
+    cell.userInteractionEnabled = !hiddenPixelPals;
+    cell.selectionStyle = hiddenPixelPals ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
+    UIColor *nativeSurface = cell.backgroundColor ?: cell.contentView.backgroundColor;
+    if (nativeSurface) {
+        objc_setAssociatedObject(self, &kApolloRootNativeSurfaceKey, nativeSurface,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloApplyRootNativeSurfaceWhenStable(tableView, nativeSurface, 4);
+    }
+    if (ApolloRootSettingsIsPasscodeTitle(cell.textLabel.text)) {
+        cell.textLabel.text = ApolloRootSettingsPasscodeTitle();
+    }
+    UIImage *normalizedIcon = ApolloRootSettingsIconForTitle(cell.textLabel.text, tableView.traitCollection);
+    if (normalizedIcon) cell.imageView.image = normalizedIcon;
+    else if ([cell.textLabel.text isEqualToString:@"Pixel Pals"]) {
+        UIImage *petIcon = ApolloPixelPalsSettingsIcon(cell.imageView.image, tableView.traitCollection);
+        if (petIcon) cell.imageView.image = petIcon;
+    } else if ([cell.textLabel.text isEqualToString:@"App Icon"] &&
+             (cell.imageView.image.size.width > 29.5 || cell.imageView.image.size.height > 29.5)) {
+        cell.imageView.image = ApolloRootSettingsArtworkAtStandardSize(cell.imageView.image);
+    }
+    ApolloRootSettingsExposeSelection(cell);
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloRootSettingsHidesPixelPals(self, indexPath)) {
+        [tableView deselectRowAtIndexPath:indexPath animated:NO];
+        return;
+    }
+    if (indexPath.section == 0) {
+        if (sApolloAboutTipJarBypassReskin) {
+            // Routed from About → Tip Jar: skip the Buy Us a Coffee reroute and
+            // let Apollo's native Tip Jar tap handler run.
+            ApolloLog(@"[AboutTipJar] bypass active, invoking native Tip Jar tap via SettingsVC");
+            %orig;
+            return;
+        }
+        // These two tweak-owned rows return before Apollo's native Settings
+        // selection handler. Hand their selection to the iPad pane router
+        // before the immediate deselect/push so the still-visible master list
+        // keeps the row corresponding to its new detail controller selected.
+        ApolloPaneStageMasterTableSelectionIfNeeded(
+            (UIViewController *)self, tableView, indexPath);
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        if (indexPath.row == 0) {
+            CustomAPIViewController *vc = [[CustomAPIViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+            [((UIViewController *)self).navigationController pushViewController:vc animated:YES];
+            return;
+        }
+        if (indexPath.row == 1) {
+            ApolloBuyUsACoffeeViewController *vc = [[ApolloBuyUsACoffeeViewController alloc] init];
+            [((UIViewController *)self).navigationController pushViewController:vc animated:YES];
+            return;
+        }
+    }
+
+    if (indexPath.section == 2 && indexPath.row == 0) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        UITableViewCell *sourceCell = [tableView cellForRowAtIndexPath:indexPath];
+        [ApolloWallpapersViewController presentDevicePickerFromViewController:(UIViewController *)self
+                                                                   sourceView:sourceCell ?: ((UIViewController *)self).view];
+        return;
+    }
+
+    if (indexPath.section == 2 && indexPath.row == 1) {
+        NSIndexPath *nativePath = [NSIndexPath indexPathForRow:0 inSection:2];
+        %orig(tableView, nativePath);
+        return;
+    }
+
+    %orig;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (section == 0) return nil;
+    return %orig;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 0 || section == 2) return nil;
+    return %orig;
+}
+
+// The purchase footer has its own view and height, independent of its title.
+- (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
+    if (section == 2) return nil;
+    return %orig;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
+    if (section == 2) return CGFLOAT_MIN;
+    return %orig;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (ApolloRootSettingsHidesPixelPals(self, indexPath)) return 0.0;
+    if (ApolloRootCellCopiesNativeSurface(indexPath)) {
+        // Native cell text grows at accessibility sizes. Let UIKit measure the
+        // multiline label instead of clipping it inside the ordinary 52pt row.
+        // This is the existing single owner of the root table, not a second
+        // delegate/remapper layered onto Apollo's General screen.
+        if (ApolloPaneSplitControllerFor((UIViewController *)self) &&
+            UIContentSizeCategoryIsAccessibilityCategory(tableView.traitCollection.preferredContentSizeCategory)) {
+            return UITableViewAutomaticDimension;
+        }
+        // These replace native rows with different index paths. Ask Apollo for
+        // its ordinary General row's height in classic mode, rather than using
+        // the roomier Liquid Glass minimum for both designs.
+        if (!IsLiquidGlass()) {
+            return %orig(tableView, [NSIndexPath indexPathForRow:0 inSection:1]);
+        }
+        return MAX(52.0, ceil(ApolloSettingsFont(UIFontTextStyleBody, tableView.traitCollection).lineHeight) + 22.0);
+    }
+    return %orig;
+}
+
+%end
+
+// Native Apollo cells reapply their content background on every press/release.
+// Repair at that owner rather than a global cell layout hook; the marker limits
+// this to cells configured by the Settings root above, including cached cells
+// that never pass through prepareForReuse between taps.
+%hook _TtC6Apollo19ApolloTableViewCell
+
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    %orig;
+    ApolloRootSettingsExposeSelection((UITableViewCell *)self);
+}
+
+- (void)setSelected:(BOOL)selected animated:(BOOL)animated {
+    %orig;
+    ApolloRootSettingsExposeSelection((UITableViewCell *)self);
+}
+
+- (void)prepareForReuse {
+    %orig;
+    objc_setAssociatedObject(self, &kApolloRootNativeCellKey, nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+%end
+
+// NOTE: this module no longer touches the General screen. Its table geometry
+// (row hiding / injection / index remapping) has a single neutral owner —
+// src/settings/ApolloSettingsGeneralTable.{h,xm} — because two independent
+// %hook stacks on the same delegate methods disagree about index-path spaces
+// once one of them shifts rows (review finding on PR #570). Features register
+// what they need: the "Always Offer Translate" hiding registers from
+// ApolloTranslation.xm, the "Remember Post Sort" row from
+// ApolloPerPostCommentSort.xm, and the IA-restructure disclosure rows (Open in
+// App, Picture-in-Picture, Translation, Saved Categories) from
+// src/settings/ApolloSettingsNativeInjections.xm. Register any future
+// General-screen row work there too; never %hook that screen's table methods
+// directly.
+
+// MARK: - About View Controller (Tip Jar injection)
+//
+// PR #294 repurposes Settings section 0 into "Buy Us a Coffee" but leaves the
+// underlying native Tip Jar row in place (the reskin is purely visual + tap
+// reroute). To keep the actual Tip Jar feature reachable, we inject a new
+// standalone section 0 at the top of the native About screen with a single
+// "Tip Jar" row that presents `_TtC6Apollo21TipJar2ViewController` using its
+// own transitioning delegate (defined in the +Apollo category).
+
+// Present the new-vs-archived chooser for the native About > Feature Requests
+// row. "Apollo Reborn" opens Reborn's Fider board; "Apollo (Archived)" replays
+// the tap through the original handler by re-entering didSelect with the bypass
+// flag set (%orig can't be called from a block).
+static void ApolloPresentFeatureRequestsChooser(UIViewController *aboutVC,
+                                                 UITableView *tableView,
+                                                 NSIndexPath *indexPath) {
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"Feature Requests"
+                                            message:@"Apollo Reborn has its own board for suggesting and voting on ideas. Apollo's original board is archived and no longer monitored."
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Apollo Reborn"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        NSURL *url = [NSURL URLWithString:kApolloRebornFeatureRequestsURL];
+        if (!ApolloRouteResolvedURLViaApolloScheme(url)) {
+            ApolloPresentWebURLFromViewController(aboutVC, url);
+        }
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Apollo (Archived)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        sApolloAboutFeatureRequestsBypass = YES;
+        @try {
+            [(id)aboutVC tableView:tableView didSelectRowAtIndexPath:indexPath];
+        } @catch (NSException *e) {
+            ApolloLog(@"[FeatureRequests] archived tap threw: %@", e);
+        }
+        sApolloAboutFeatureRequestsBypass = NO;
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    // iPad: anchor the sheet to the tapped row.
+    UIPopoverPresentationController *pop = sheet.popoverPresentationController;
+    if (pop) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+        pop.sourceView = cell ?: tableView;
+        pop.sourceRect = cell ? cell.bounds : CGRectMake(CGRectGetMidX(tableView.bounds), CGRectGetMidY(tableView.bounds), 0, 0);
+    }
+    [aboutVC presentViewController:sheet animated:YES completion:nil];
+}
+
+%hook SettingsAboutViewController
+
+- (long long)numberOfSectionsInTableView:(UITableView *)tableView {
+    return %orig + 1;
+}
+
+- (long long)tableView:(UITableView *)tableView numberOfRowsInSection:(long long)section {
+    if (section == 0) return 1;
+    return %orig(tableView, section - 1);
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == 0) {
+        // Borrow a themed cell from original section 0 row 0 to inherit
+        // Apollo's About cell styling (fonts, colors, layout margins).
+        NSIndexPath *origFirst = [NSIndexPath indexPathForRow:0 inSection:0];
+        UITableViewCell *cell = %orig(tableView, origFirst);
+        cell.textLabel.text = @"Tip Jar";
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.imageView.image = ApolloEmojiSettingsIcon(@"\xF0\x9F\xAB\x99", [UIColor systemGreenColor], 29.0);
+        return cell;
+    }
+    NSIndexPath *adjusted = [NSIndexPath indexPathForRow:indexPath.row inSection:indexPath.section - 1];
+    return %orig(tableView, adjusted);
+}
+
+- (double)tableView:(UITableView *)tableView heightForHeaderInSection:(long long)section {
+    if (section == 0) {
+        // Mimic the original first-section header spacing so our standalone
+        // group sits cleanly under the app-icon hero tableHeaderView.
+        return %orig(tableView, 0);
+    }
+    return %orig(tableView, section - 1);
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(long long)section {
+    if (section == 0) return nil;
+    return %orig(tableView, section - 1);
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == 0) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        // Walk back through the nav stack to find Apollo's SettingsViewController.
+        // About is always pushed from Settings, so it lives below us in the stack.
+        UIViewController *aboutVC = (UIViewController *)self;
+        UIViewController *settingsVC = nil;
+        Class settingsClass = objc_getClass("_TtC6Apollo22SettingsViewController");
+        // 1) Nav stack (when About is pushed).
+        for (UIViewController *vc in [aboutVC.navigationController.viewControllers reverseObjectEnumerator]) {
+            if ([vc isKindOfClass:settingsClass]) {
+                settingsVC = vc;
+                break;
+            }
+        }
+        // 2) presentingViewController chain (when About is presented modally).
+        if (!settingsVC) {
+            UIViewController *p = aboutVC.presentingViewController;
+            while (p && !settingsVC) {
+                if ([p isKindOfClass:settingsClass]) { settingsVC = p; break; }
+                if ([p isKindOfClass:[UINavigationController class]]) {
+                    for (UIViewController *vc in [((UINavigationController *)p).viewControllers reverseObjectEnumerator]) {
+                        if ([vc isKindOfClass:settingsClass]) { settingsVC = vc; break; }
+                    }
+                }
+                p = p.presentingViewController;
+            }
+        }
+        // 3) Captured static (last SettingsVC that appeared).
+        if (!settingsVC) {
+            settingsVC = sApolloLastSettingsVC;
+            if (settingsVC) ApolloLog(@"[AboutTipJar] using captured SettingsVC fallback %p", settingsVC);
+        }
+        if (!settingsVC) {
+            ApolloLog(@"[AboutTipJar] SettingsVC not found (nav/present/captured all empty), cannot present Tip Jar");
+            return;
+        }
+        // Apollo's ApolloTableViewController stores `tableView` as a Swift
+        // stored property — KVC `valueForKey:` fails because there's no ObjC
+        // getter. Read the ivar via the ObjC runtime, then fall back to a
+        // subview walk if needed.
+        UITableView *settingsTable = nil;
+        id tableIvarValue = ApolloObjectIvar(settingsVC, "tableView");
+        if ([tableIvarValue isKindOfClass:[UITableView class]]) settingsTable = (UITableView *)tableIvarValue;
+        if (!settingsTable) settingsTable = ApolloRootSettingsTableInView(settingsVC.view);
+        if (!settingsTable) {
+            ApolloLog(@"[AboutTipJar] SettingsVC tableView not accessible (ivar/subview-walk both failed)");
+            return;
+        }
+        NSIndexPath *tipJarPath = [NSIndexPath indexPathForRow:0 inSection:0];
+        ApolloLog(@"[AboutTipJar] routing tap to SettingsVC native Tip Jar handler");
+        sApolloAboutTipJarBypassReskin = YES;
+        @try {
+            [(id)settingsVC tableView:settingsTable didSelectRowAtIndexPath:tipJarPath];
+        } @catch (NSException *e) {
+            ApolloLog(@"[AboutTipJar] native Tip Jar tap threw: %@", e);
+        }
+        sApolloAboutTipJarBypassReskin = NO;
+        return;
+    }
+    // Intercept the native "Feature Requests" row: route to Reborn's board (or
+    // the archived Apollo board) via a chooser. The bypass flag lets the
+    // archived action fall through to Apollo's original handler below.
+    if (!sApolloAboutFeatureRequestsBypass) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+        if ([cell.textLabel.text isEqualToString:@"Feature Requests"]) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
+            ApolloPresentFeatureRequestsChooser((UIViewController *)self, tableView, indexPath);
+            return;
+        }
+        if ([cell.textLabel.text isEqualToString:@"Bug Reports"]) {
+            [tableView deselectRowAtIndexPath:indexPath animated:YES];
+            ApolloReportViewController *controller = [[ApolloReportViewController alloc] init];
+            [((UIViewController *)self).navigationController pushViewController:controller animated:YES];
+            return;
+        }
+    }
+
+    NSIndexPath *adjusted = [NSIndexPath indexPathForRow:indexPath.row inSection:indexPath.section - 1];
+    %orig(tableView, adjusted);
+}
+
+%end
+
+// Apollo's SceneDelegate owns the "tap the selected tab to go back to the top"
+// behavior: it walks to the tab's table and scrolls it to -safeAreaInsets.top.
+// That measurement predates this screen having a navigation-item search bar, so
+// with the bar scrolled away it lands one search-bar short of the real top and
+// the field stays hidden. Restore the bar to the palette before Apollo measures
+// (so its own arithmetic carries the field along) and hand it back to
+// scroll-away once the scroll has settled.
+%hook _TtC6Apollo13SceneDelegate
+
+- (BOOL)tabBarController:(UITabBarController *)tabBarController shouldSelectViewController:(UIViewController *)viewController {
+    // Only when Settings itself is what's on screen: a re-tap from a pushed
+    // screen pops back without scrolling, so there is nothing to compensate for
+    // (and the next tap, with the root on top, gets the full treatment).
+    UIViewController *settingsVC = nil;
+    if (tabBarController.selectedViewController == viewController &&
+        [viewController isKindOfClass:UINavigationController.class]) {
+        UIViewController *top = ((UINavigationController *)viewController).topViewController;
+        if ([top isKindOfClass:objc_getClass("_TtC6Apollo22SettingsViewController")]) settingsVC = top;
+    }
+
+    ApolloSettingsSearchPrepareForScrollToTop(settingsVC);
+    BOOL result = %orig;
+    if (settingsVC) {
+        // After Apollo's animated scroll, so the bar isn't handed back to
+        // scroll-away while the table is still moving toward the top. Weak, so
+        // a Settings screen torn down in the meantime isn't kept alive for it.
+        __weak UIViewController *weakSettingsVC = settingsVC;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            ApolloSettingsSearchFinishScrollToTop(weakSettingsVC);
+        });
+    }
+    return result;
+}
+
+%end
+
+%group ApolloSafariBrowserLogging
+
+@interface ApolloSafariViewController : UIViewController
+- (instancetype)initWithURL:(NSURL *)url;
+@end
+
+%hook ApolloSafariViewController
+
+- (instancetype)initWithURL:(NSURL *)url {
+    ApolloLog(@"[Browser] ApolloSafari initWithURL: %@", url.absoluteString ?: @"(nil)");
+    return %orig;
+}
+
+%end
+
+%end
+
+%group ApolloSettingsGestureHeaders
+%hook ApolloSettingsGesturesViewController
+- (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
+    UIView *header = %orig;
+    ApolloSettingsApplySectionHeaderTypography(header);
+    return header;
+}
+- (void)tableView:(UITableView *)tableView willDisplayHeaderView:(UIView *)view forSection:(NSInteger)section {
+    %orig;
+    ApolloSettingsApplySectionHeaderTypography(view);
+}
+%end
+%end
+
+%group ApolloSettingsLivePicker
+%hook UIAlertController
+
+- (void)_dismissAnimated:(BOOL)animated
+    triggeringAction:(UIAlertAction *)action
+    triggeredByPopoverDimmingView:(BOOL)fromDimmingView
+    dismissCompletion:(void (^)(void))completion {
+    ApolloSettingsApplyLivePickerAction(action);
+    %orig(animated, action, fromDimmingView, completion);
+}
+
+%end
+%end
+
+// Apollo 1.15.11 builds both Section(header:footer:) explanations as strings
+// (native viewDidLoad at 0x100570888; simulator confirms titles and nil view).
+// Embedded Eureka's viewForFooterInSection at 0x1b5a0 dispatches footer.viewForSection;
+// its height helper at 0x1a9e8 prefers a supplied height / view.bounds.height
+// over the title. Opt ONLY these
+// matched Duo footers into UIKit's title-backed path, including automatic height,
+// rather than changing a title that a custom view can ignore or size too short.
+static NSString *ApolloPortraitLockFooterText(NSString *text, BOOL duo) {
+    if (!duo || ![text isKindOfClass:NSString.class]) return nil;
+    NSString *note = @"On iPhone Duo, this setting applies only to the cover display. Rotation offers are unavailable on the inner display.";
+    for (NSString *explanation in @[
+        @"Locks Apollo to portrait (vertical) orientation except for Media Viewer.",
+        @"If using the iOS Portrait Orientation Lock feature, Apollo will attempt to detect device rotations in Media Viewer and offer to let you rotate media."
+    ]) {
+        NSString *annotated = [explanation stringByAppendingFormat:@"\n\n%@", note];
+        if ([text isEqualToString:explanation] || [text isEqualToString:annotated]) return annotated;
+    }
+    return nil; // Unknown/localized sections fail soft; never guess section indices.
+}
+
+%hook SettingsPortraitLockViewController
+
+- (void)viewDidLoad {
+    // Supply the style before Eureka creates its default grouped table.
+    SettingsPortraitLockViewController *controller = (SettingsPortraitLockViewController *)self;
+    if (!controller.tableView) {
+        UITableView *tableView = [[UITableView alloc] initWithFrame:controller.view.bounds
+                                                            style:UITableViewStyleInsetGrouped];
+        tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        tableView.cellLayoutMarginsFollowReadableWidth = NO;
+        [controller.view addSubview:tableView];
+        controller.tableView = tableView;
+        ApolloLog(@"[Settings] Portrait Lock using inset-grouped sections");
+    }
+    %orig;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    NSString *original = %orig;
+    return ApolloPortraitLockFooterText(original, ApolloDeviceIsDuo()) ?: original;
+}
+
+- (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
+    if (ApolloDeviceIsDuo() && ApolloPortraitLockFooterText(
+            [(SettingsPortraitLockViewController *)self tableView:tableView titleForFooterInSection:section], YES)) {
+        return nil; // UIKit renders the annotated title, not Eureka's custom footer.
+    }
+    return %orig;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
+    if (ApolloDeviceIsDuo() && ApolloPortraitLockFooterText(
+            [(SettingsPortraitLockViewController *)self tableView:tableView titleForFooterInSection:section], YES)) {
+        return UITableViewAutomaticDimension; // Re-measure after fold/rotation and text-size changes.
+    }
+    return %orig;
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayFooterView:(UIView *)view forSection:(NSInteger)section {
+    %orig; // Keep Apollo's native theme handling for UITableViewHeaderFooterView.
+    if (!ApolloDeviceIsDuo() || !ApolloPortraitLockFooterText(
+            [(SettingsPortraitLockViewController *)self tableView:tableView titleForFooterInSection:section], YES)) return;
+    if ([view isKindOfClass:UITableViewHeaderFooterView.class]) {
+        UILabel *label = ((UITableViewHeaderFooterView *)view).textLabel;
+        label.numberOfLines = 0;
+        label.lineBreakMode = NSLineBreakByWordWrapping;
+        label.adjustsFontForContentSizeCategory = YES;
+    }
+}
+
+%end
+
+%ctor {
+    SEL dismissSelector = NSSelectorFromString(@"_dismissAnimated:triggeringAction:triggeredByPopoverDimmingView:dismissCompletion:");
+    Method dismissMethod = class_getInstanceMethod(UIAlertController.class, dismissSelector);
+    const char *dismissTypes = dismissMethod ? method_getTypeEncoding(dismissMethod) : NULL;
+    // Only hook the private selector's verified arm64 signature. The public
+    // action handler remains available if UIKit changes it.
+    if (dismissTypes && strcmp(dismissTypes, "v40@0:8B16@20B28@?32") == 0) {
+        %init(ApolloSettingsLivePicker);
+        ApolloLog(@"[SettingsForm] live picker dismissal hook installed");
+    } else {
+        ApolloLog(@"[SettingsForm] live picker uses public handler; dismissal signature: %s", dismissTypes ?: "missing");
+    }
+
+    if (@available(iOS 26.0, *)) {
+        %init(ApolloSettingsGestureHeaders, ApolloSettingsGesturesViewController = objc_getClass("Apollo.SettingsGesturesViewController"));
+    }
+    %init(SettingsViewController=objc_getClass("_TtC6Apollo22SettingsViewController"),
+          SettingsAboutViewController=objc_getClass("_TtC6Apollo27SettingsAboutViewController"),
+          SettingsPortraitLockViewController=objc_getClass("_TtC6Apollo34SettingsPortraitLockViewController"));
+
+    if (objc_getClass("_TtC6Apollo26ApolloSafariViewController")) {
+        %init(ApolloSafariBrowserLogging);
+    }
+}

@@ -1,0 +1,245 @@
+// ApolloGalleryFeed.h
+//
+// Gallery View — the paged media feed behind the subreddit "Gallery View"
+// screen (see ApolloGalleryViewController / ApolloGalleryImageViewer).
+//
+// Image-focused subreddits are painful to browse post-by-post: every picture
+// costs a tap into comments and a tap back out. Gallery View flattens the
+// subreddit's listing into a scrolling grid of just the pictures, and taps
+// straight through to a fullscreen pager.
+//
+// This file is the data layer only: fetch a listing page, keep the `after`
+// cursor, turn each post into zero or more ApolloGalleryItems, and hand the
+// new items back. It has no UI dependencies.
+//
+// Auth: the feed snapshots the active account's own bearer when it is created.
+//   • API-key (OAuth) accounts — the request goes to oauth.reddit.com with that
+//     account's real Authorization bearer.
+//   • Keyless (web-session) accounts — the request carries that account's
+//     per-user synthetic bearer; the __NSCFLocalSessionTask chokepoint in
+//     Tweak.xm hands it to ApolloWebJSONRewriteRequest, which selects the same
+//     user's harvested cookie. This matters when several accounts are signed
+//     in and background polling has made the process-wide latest bearer belong
+//     to somebody other than the visible account.
+//   • Signed out / neither — the www.reddit.com public JSON is used as-is.
+// If the first attempt comes back 401/403 the fetch retries once on the other
+// host, so a stale captured bearer can't strand the gallery. Private Saved
+// feeds only retry a rotated credential on the bound account, never anonymously.
+
+#import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+// What a tile actually is. A bitmask so the filter can allow any combination.
+typedef NS_OPTIONS(NSUInteger, ApolloGalleryMediaKind) {
+    ApolloGalleryMediaKindPhoto = 1 << 0,   // still image
+    ApolloGalleryMediaKindGIF   = 1 << 1,   // silent loop — animated GIF *or* an mp4 Reddit transcoded one into
+    ApolloGalleryMediaKindVideo = 1 << 2,   // real video, usually with sound
+};
+static ApolloGalleryMediaKind const ApolloGalleryMediaKindAll =
+    ApolloGalleryMediaKindPhoto | ApolloGalleryMediaKindGIF | ApolloGalleryMediaKindVideo;
+
+// One displayable piece of media. A single Reddit post yields one item for a
+// normal image/video post and N items for a gallery post (galleryCount > 1).
+@interface ApolloGalleryItem : NSObject
+
+@property (nonatomic) ApolloGalleryMediaKind kind;
+
+// Full-resolution still. For video/GIF items this is the poster frame, shown
+// while the stream spins up.
+@property (nonatomic, copy) NSURL *imageURL;
+
+// Playable stream for GIF-as-mp4 and video items, nil for stills and for GIFs
+// backed by an actual animated .gif file (those animate through the image
+// loader instead). May be HLS (.m3u8) or a progressive mp4.
+@property (nonatomic, copy, nullable) NSURL *videoURL;
+// The mp4 to save from. For v.redd.it this is the video-only fallback, which
+// ApolloGalleryVideoExport recognises and re-unites with the separate DASH
+// audio before writing to Photos; everywhere else it's already self-contained.
+@property (nonatomic, copy, nullable) NSURL *videoDownloadURL;
+// Reddit's silent mp4 rendition of an animated .gif file (the listing's
+// preview `variants.mp4`, or `s.mp4` in a gallery post's media_metadata),
+// for the GRID ONLY: a tile plays it through the hardware decoder instead of
+// animating the GIF frame by frame on the CPU. nil when Reddit offers none.
+// The viewer and Save/Share never read it — they keep the real .gif
+// (imageURL) so what you open and save stays a GIF.
+@property (nonatomic, copy, nullable) NSURL *gifMP4URL;
+// External video page (currently Redgifs / Streamable / supported sports
+// hosts). Reddit commonly supplies a convenient but silent re-encoded preview
+// for these posts; Gallery keeps that preview as a fallback, then resolves the
+// host's original audio-bearing MP4 only when the item is opened. Sports-clip
+// posts usually come with no preview at all, so for those the grid looks the
+// host up itself once the tile is on screen (see
+// -resolveHostedVideoForGridWithCompletion:), or the tile could never play.
+@property (nonatomic, readonly, copy, nullable) NSURL *hostedVideoPageURL;
+// YES until the one lazy host lookup has completed. The lookup is coalesced per
+// item, so repeated playback/layout passes never duplicate API requests.
+@property (nonatomic, readonly) BOOL needsHostedVideoResolution;
+@property (nonatomic, readonly, getter=isHostedVideoResolving) BOOL hostedVideoResolving;
+// YES when a grid tile may still look this item's host up for itself: the
+// lookup hasn't run (or is running), the grid's own attempt hasn't already
+// failed, and the host needs no API token (sports clips, Streamable). Redgifs
+// mints a token per lookup, so a screen of tiles would mint a dozen at once;
+// it stays a viewer-only lookup.
+@property (nonatomic, readonly) BOOL canResolveHostedVideoForGrid;
+// Runtime in seconds; 0 when Reddit didn't report one.
+@property (nonatomic) NSTimeInterval duration;
+// Smaller preview used by the grid; falls back to imageURL when Reddit gave
+// us no resolutions to pick from.
+@property (nonatomic, copy) NSURL *thumbnailURL;
+// Source pixel dimensions, used to lay the masonry grid out before the image
+// has loaded. CGSizeZero when Reddit didn't report them.
+@property (nonatomic) CGSize pixelSize;
+
+@property (nonatomic, copy, nullable) NSString *postTitle;
+@property (nonatomic, copy, nullable) NSString *author;      // no "u/" prefix
+@property (nonatomic, copy, nullable) NSString *subreddit;   // no "r/" prefix
+@property (nonatomic, copy, nullable) NSString *permalink;   // "/r/x/comments/..."
+@property (nonatomic, copy, nullable) NSString *postFullname; // "t3_..."
+
+@property (nonatomic) BOOL isNSFW;
+@property (nonatomic) BOOL isSpoiler;
+
+// Position within a multi-image gallery post (0-based). galleryCount is 1 for
+// ordinary image posts.
+@property (nonatomic) NSInteger galleryIndex;
+@property (nonatomic) NSInteger galleryCount;
+
+// Absolute reddit.com URL for the post, for share/open actions.
+@property (nonatomic, readonly, nullable) NSURL *postURL;
+// YES when the grid should blur this item's thumbnail.
+@property (nonatomic, readonly) BOOL shouldBlurThumbnail;
+// YES when the viewer should drive this item with AVPlayer rather than the
+// image loader.
+@property (nonatomic, readonly) BOOL playsAsVideo;
+// "0:42" / "1:23:45", or nil when the duration is unknown.
+@property (nonatomic, readonly, nullable) NSString *durationText;
+
+// Resolves hostedVideoPageURL once, preferring the original combined MP4 over
+// Reddit's silent preview. On failure videoURL remains/restores the Reddit
+// fallback. Completion is delivered on the main queue.
+- (void)resolveHostedVideoWithCompletion:(nullable void (^)(BOOL resolvedOriginal))completion;
+// The same lookup on behalf of a grid tile that has nothing else to play. It
+// joins (or starts) the item's one coalesced lookup. A failure that only the
+// grid saw is not final: the grid stops asking, but opening the item still
+// makes the viewer's own attempt, so a dropped request can't strand the clip.
+- (void)resolveHostedVideoForGridWithCompletion:(nullable void (^)(BOOL resolvedOriginal))completion;
+
+@end
+
+// Listing sorts offered by the gallery's own sort menu — the same set
+// Apollo's subreddit sort menu offers. `top` and `controversial` carry a
+// time window; the others ignore it.
+typedef NS_ENUM(NSInteger, ApolloGallerySort) {
+    ApolloGallerySortHot = 0,
+    ApolloGallerySortNew,
+    ApolloGallerySortTop,
+    ApolloGallerySortRising,
+    ApolloGallerySortBest,
+    ApolloGallerySortControversial,
+};
+
+typedef NS_ENUM(NSInteger, ApolloGalleryTopWindow) {
+    ApolloGalleryTopWindowDay = 0,
+    ApolloGalleryTopWindowWeek,
+    ApolloGalleryTopWindowMonth,
+    ApolloGalleryTopWindowYear,
+    ApolloGalleryTopWindowAll,
+};
+
+// Whether the sort's listing takes the `&t=` time window. The single source of
+// truth for it — the request builder, the feed's reset-on-window-change, and
+// the sort menu's checkmarks must all agree on which sorts a window applies to.
+static inline BOOL ApolloGallerySortUsesWindow(ApolloGallerySort sort) {
+    return sort == ApolloGallerySortTop || sort == ApolloGallerySortControversial;
+}
+
+// A subreddit's, multireddit's, or user profile's media feed. Not thread-safe:
+// drive it from the main thread (completions are always delivered there).
+@interface ApolloGalleryFeed : NSObject
+
+// The signed-in HOME front page (subscribed subreddits, root-path listings).
+- (instancetype)initWithHomeFeed NS_DESIGNATED_INITIALIZER;
+- (instancetype)initWithSubreddit:(NSString *)subreddit NS_DESIGNATED_INITIALIZER;
+- (instancetype)initWithMultiredditPath:(NSString *)multiredditPath NS_DESIGNATED_INITIALIZER;
+// `username` is the bare name, no "u/" prefix. Loads the user's submitted
+// posts (`/user/<name>/submitted`), defaulting to New — a person's gallery
+// reads most naturally in the order they posted.
+- (instancetype)initWithUsername:(NSString *)username NS_DESIGNATED_INITIALIZER;
+// The active account's Saved listing. A non-nil category selects Apollo's
+// local Saved category database; nil loads All. Captures the account when
+// opened, just like the other feeds, and keeps the native saved order.
+- (instancetype)initWithSavedCategory:(nullable NSString *)category NS_DESIGNATED_INITIALIZER;
+- (instancetype)init NS_UNAVAILABLE;
+
+// Populated for a single-subreddit feed and empty for every other feed kind.
+@property (nonatomic, readonly, copy) NSString *subreddit;
+// The items the UI should show: everything fetched so far, minus the kinds the
+// filter excludes. Filtering happens here rather than at parse time so toggling
+// a kind is instant and never costs a refetch.
+@property (nonatomic, readonly) NSArray<ApolloGalleryItem *> *items;
+// Everything fetched, whatever the filter says. Only useful for counts.
+@property (nonatomic, readonly) NSArray<ApolloGalleryItem *> *allItems;
+
+// Which kinds `items` includes. Never 0 — clearing the last kind is rejected,
+// since an empty gallery is never what someone meant. Scoped to THIS feed (one
+// gallery visit): every gallery opens with all kinds on, and a filter chosen in
+// one subreddit never follows you into another.
+@property (nonatomic) ApolloGalleryMediaKind allowedKinds;
+// How many of everything fetched so far are of `kind`, for the filter menu's
+// subtitles.
+- (NSUInteger)countOfKind:(ApolloGalleryMediaKind)kind;
+
+// NO for user-profile feeds: Reddit's user listing endpoint accepts
+// hot/new/top/controversial but not rising or best, so the sort menu drops
+// those entries there.
+@property (nonatomic, readonly) BOOL supportsRisingSort;
+@property (nonatomic, readonly) BOOL supportsBestSort;
+// Saved has its own order and does not accept subreddit listing sorts.
+@property (nonatomic, readonly) BOOL supportsSorting;
+
+// Changing either resets the feed (items cleared, cursor dropped). Use
+// -setSort:topWindow: to change both at once so only one reset happens.
+@property (nonatomic) ApolloGallerySort sort;
+@property (nonatomic) ApolloGalleryTopWindow topWindow;
+- (void)setSort:(ApolloGallerySort)sort topWindow:(ApolloGalleryTopWindow)topWindow;
+
+@property (nonatomic, readonly, getter=isLoading) BOOL loading;
+// YES once Reddit stops handing back a cursor, or after enough consecutive
+// media-free pages that continuing is pointless.
+@property (nonatomic, readonly, getter=isExhausted) BOOL exhausted;
+// Set when the last load failed; cleared by the next successful load.
+@property (nonatomic, readonly, copy, nullable) NSString *lastErrorMessage;
+
+// Human-readable label for the current sort, e.g. "Top: This Week".
+@property (nonatomic, readonly) NSString *sortDisplayName;
+
+// Loads through the next page with new media the CURRENT FILTER admits and
+// publishes it immediately, for both fresh and already-populated feeds. Pages
+// with no matching media are skipped within bounded request/empty-page limits.
+// The completion runs on the main thread with the range appended to `items`;
+// its length is 0 when no new matching media was found. A call made while a load
+// is already in flight, or after the feed is exhausted, completes immediately
+// with an empty range and does not start a second request.
+- (void)loadNextBatchWithCompletion:(nullable void (^)(NSRange addedRange, NSString *_Nullable errorMessage))completion;
+
+// Populate a fresh feed synchronously from the source screen's complete loaded
+// listing (the data dictionary: children + after). Uses the same media parser,
+// deduplication and filtering as network pages. The caller must match the source
+// account, listing and sort before handing over its continuation cursor.
+// Non-Saved snapshots with no media return NO without consuming the cursor.
+// Saved snapshots retain their continuation even when media-free, and finish
+// immediately when the listing or all category members have been inspected.
+- (BOOL)seedFromListing:(NSDictionary *)listing;
+
+// Saved-source entry point: also requires the source's selected category and
+// current account to match this feed before adopting its loaded listing.
+- (BOOL)seedFromSavedListing:(NSDictionary *)listing category:(nullable NSString *)category;
+
+// Drops every item and the cursor so the next load starts from the top.
+- (void)reset;
+
+@end
+
+NS_ASSUME_NONNULL_END

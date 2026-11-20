@@ -1,0 +1,330 @@
+// Deleted-comments shortcut in the comments "..." menu + passive per-thread mode.
+//
+// Adds a "Show Deleted Comments" / "Hide Deleted Comments" item to the comments
+// view's overflow menu. Row rendering on both the Liquid Glass UIMenu and the
+// legacy ActionController sheet is owned entirely by ApolloActionMenu.{h,xm} —
+// see that header for the single-owner rationale. This file supplies the
+// feature-specific parts: WHICH sheet is "the comments' ... menu" (arming
+// below), the title/icon toggling between Show and Hide, and what a tap does.
+//
+// Two behaviors, decided by the "Passive Deleted Comments" setting:
+//   - Passive OFF: the item is a plain shortcut for the global Show Deleted
+//     Comments toggle (with the same slowdown warning the settings switch shows).
+//   - Passive ON (and global toggle off): the item turns recovery on for THIS
+//     post's thread only, via a thread override in ApolloDeletedCommentsData.
+//     The override dies when the last comments view showing that post is popped
+//     or dismissed, so the next thread starts with recovery off again.
+//
+// After either toggle the thread is re-fetched through Apollo's own
+// pull-to-refresh action so the recovered (or re-hidden) comments appear
+// without leaving the screen.
+
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+
+#import "ApolloActionMenu.h"
+#import "ApolloCommon.h"
+#import "ApolloState.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloDeletedCommentsData.h"
+#import "UserDefaultConstants.h"
+
+static NSString *const kApolloDCMenuShowTitle = @"Show Deleted Comments";
+static NSString *const kApolloDCMenuHideTitle = @"Hide Deleted Comments";
+
+// The comments VC currently presenting its "..." menu. Armed in the tap hook
+// below; menu construction happens synchronously inside that tap (see
+// ApolloActionMenu's per-controller `matches` memoization), but a short grace
+// window keeps this robust if UIKit ever defers a runloop turn. The FIRST menu
+// built while armed consumes the arm (the ActionController gets tagged with the
+// owning VC below), so a different menu opened moments later can never pick
+// up the item.
+static __weak id sApolloDCMenuArmedVC = nil;
+static CFAbsoluteTime sApolloDCMenuArmedAt = 0;
+
+// Tag on the ActionController that IS the comments "..." menu: a weak-objects
+// hash table holding the owning CommentsViewController (a plain weak assoc
+// isn't possible with objc_setAssociatedObject).
+static char kApolloDCMenuOwnerVCKey;
+
+// linkFullName key -> weak set of CommentsViewController instances currently
+// showing that post's thread. Main-thread only. When the last live VC for an
+// overridden link leaves, the override is cleared.
+static NSMutableDictionary<NSString *, NSHashTable *> *sApolloDCOverrideVCsByLink = nil;
+
+// Every live CommentsViewController (weak, self-cleaning). Needed when an
+// override is enabled from a nested "Continue this thread" push: the ancestor
+// VCs showing the same post must be tracked too, or popping the nested VC
+// would clear the override out from under the still-visible ancestor.
+static NSHashTable *sApolloDCAllCommentsVCs = nil;
+
+#pragma mark - Helpers
+
+// Resolve and permanently tag the ActionController presenting the armed
+// comments menu. Both the ApolloActionMenu `matches` block and any later
+// re-ask (e.g. `title`, `perform`) use this same one-shot claim, whichever
+// asks first.
+static id ApolloDCMenuOwnerForController(id actionController) {
+    if (!actionController) return nil;
+    NSHashTable *holder = objc_getAssociatedObject(actionController, &kApolloDCMenuOwnerVCKey);
+    if (holder) return holder.anyObject;
+
+    id vc = sApolloDCMenuArmedVC;
+    if (!vc) return nil;
+    if (CFAbsoluteTimeGetCurrent() - sApolloDCMenuArmedAt > 1.5) {
+        sApolloDCMenuArmedVC = nil;
+        return nil;
+    }
+
+    holder = [NSHashTable weakObjectsHashTable];
+    [holder addObject:vc];
+    objc_setAssociatedObject(actionController, &kApolloDCMenuOwnerVCKey,
+                             holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    sApolloDCMenuArmedVC = nil;
+    return vc;
+}
+
+// Post fullName (t3_xxx, lowercased) for a CommentsViewController, from its
+// RDKLink ivar. Nil until the first fetch completes (URL-scheme opens), but by
+// the time the "..." menu is usable the link is loaded.
+static NSString *ApolloDCMenuLinkKeyForVC(id vc) {
+    id link = ApolloObjectIvar(vc, "link");
+    if (!link) return nil;
+    NSString *fullName = nil;
+    if ([link respondsToSelector:@selector(fullName)]) {
+        fullName = ((NSString *(*)(id, SEL))objc_msgSend)(link, @selector(fullName));
+    }
+    if (![fullName isKindOfClass:[NSString class]] || fullName.length == 0) {
+        if ([link respondsToSelector:@selector(identifier)]) {
+            NSString *identifier = ((NSString *(*)(id, SEL))objc_msgSend)(link, @selector(identifier));
+            if ([identifier isKindOfClass:[NSString class]] && identifier.length > 0) {
+                fullName = [@"t3_" stringByAppendingString:identifier];
+            }
+        }
+    }
+    if (![fullName isKindOfClass:[NSString class]] || fullName.length == 0) return nil;
+    return [fullName lowercaseString];
+}
+
+static void ApolloDCMenuTrackVC(NSString *key, id vc) {
+    if (key.length == 0 || !vc) return;
+    if (!sApolloDCOverrideVCsByLink) sApolloDCOverrideVCsByLink = [NSMutableDictionary dictionary];
+    NSHashTable *table = sApolloDCOverrideVCsByLink[key];
+    if (!table) {
+        table = [NSHashTable weakObjectsHashTable];
+        sApolloDCOverrideVCsByLink[key] = table;
+    }
+    [table addObject:vc];
+}
+
+static void ApolloDCMenuUntrackVCAndMaybeClear(NSString *key, id vc) {
+    if (key.length == 0) return;
+    NSHashTable *table = sApolloDCOverrideVCsByLink[key];
+    if (vc) [table removeObject:vc];
+    if (table.allObjects.count == 0) {
+        [sApolloDCOverrideVCsByLink removeObjectForKey:key];
+        ApolloDeletedCommentsSetThreadOverride(key, NO);
+        ApolloLog(@"[DeletedCommentsMenu] Cleared per-thread override for %@ (last thread view left)", key);
+    }
+}
+
+// Self-heal: an override whose every VC deallocated without a clean pop (e.g.
+// a torn-down navigation stack) would linger forever; drop those.
+static void ApolloDCMenuSweepDeadOverrides(void) {
+    if (sApolloDCOverrideVCsByLink.count == 0) return;
+    for (NSString *key in sApolloDCOverrideVCsByLink.allKeys) {
+        if ([sApolloDCOverrideVCsByLink[key] allObjects].count == 0) {
+            ApolloDCMenuUntrackVCAndMaybeClear(key, nil);
+        }
+    }
+}
+
+// Re-fetch the thread through Apollo's own pull-to-refresh action so the
+// recovered (or re-hidden) comments appear in place.
+static void ApolloDCMenuRefreshComments(id vc) {
+    if (!vc) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // vc is always a CommentsViewController, which implements this
+        // @objc action (-[_TtC6Apollo22CommentsViewController refreshControlActivatedWithSender:]).
+        ((void (*)(id, SEL, id))objc_msgSend)(vc, @selector(refreshControlActivatedWithSender:), nil);
+        ApolloLog(@"[DeletedCommentsMenu] Triggered comments refresh after toggle");
+    });
+}
+
+static void ApolloDCMenuPresentSlowdownWarning(id vc) {
+    // Give the context menu's / sheet's dismissal animation a beat before presenting.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIViewController *host = (UIViewController *)vc;
+        if (![host isKindOfClass:[UIViewController class]] || !host.viewLoaded || !host.view.window) return;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"⚠️ WARNING"
+                                                                       message:@"This feature can slow down comment loading. If you notice comments loading slowly, turn this feature off."
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        UIViewController *presenter = host.presentedViewController ?: host;
+        [presenter presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+static void ApolloDCMenuHandleToggle(id vc, NSString *linkKey, BOOL wasEffective) {
+    if (wasEffective) {
+        if (linkKey.length > 0 && ApolloDeletedCommentsHasThreadOverride(linkKey)) {
+            [sApolloDCOverrideVCsByLink removeObjectForKey:linkKey];
+            ApolloDeletedCommentsSetThreadOverride(linkKey, NO);
+        }
+        if (sShowDeletedComments) {
+            sShowDeletedComments = NO;
+            [[NSUserDefaults standardUserDefaults] setBool:NO forKey:UDKeyShowDeletedComments];
+            ApolloLog(@"[DeletedCommentsMenu] Global Show Deleted Comments turned OFF from comments menu");
+        }
+    } else if (sPassiveDeletedComments) {
+        // Never set an override without a live VC to hang it on — it could
+        // never be cleared (nothing would ever untrack it).
+        if (!vc) {
+            ApolloLog(@"[DeletedCommentsMenu] WARN: comments VC gone before toggle; ignoring");
+            return;
+        }
+        ApolloDeletedCommentsSetThreadOverride(linkKey, YES);
+        ApolloDCMenuTrackVC(linkKey, vc);
+        // Track ancestor/sibling comments views of the SAME post (nested
+        // "Continue this thread" pushes) so popping the one that enabled the
+        // override doesn't clear it while another is still on the stack.
+        for (id other in sApolloDCAllCommentsVCs.allObjects) {
+            if (other != vc && [ApolloDCMenuLinkKeyForVC(other) isEqualToString:linkKey]) {
+                ApolloDCMenuTrackVC(linkKey, other);
+            }
+        }
+        ApolloLog(@"[DeletedCommentsMenu] Passive per-thread override ON for %@", linkKey);
+    } else {
+        sShowDeletedComments = YES;
+        [[NSUserDefaults standardUserDefaults] setBool:YES forKey:UDKeyShowDeletedComments];
+        ApolloLog(@"[DeletedCommentsMenu] Global Show Deleted Comments turned ON from comments menu");
+        ApolloDCMenuPresentSlowdownWarning(vc);
+    }
+    ApolloDCMenuRefreshComments(vc);
+}
+
+#pragma mark - Resolving whether/how the row applies
+
+// Resolves the owning comments VC, its per-thread link key, and whether
+// deleted-comment recovery is CURRENTLY effective for it. Returns NO when this
+// isn't the comments "..." menu, or (passive mode) when there's no post to key
+// a per-thread override on. Called fresh from `matches`, `title`, and `perform`
+// — never memoized beyond ApolloActionMenu's own once-per-controller `matches`
+// call, so a change in global/per-thread state between build and tap is always
+// picked up.
+static BOOL ApolloDCMenuResolveState(id actionController, id *outVC,
+                                     NSString **outLinkKey, BOOL *outEffective) {
+    id vc = ApolloDCMenuOwnerForController(actionController);
+    if (!vc) return NO;
+    NSString *linkKey = ApolloDCMenuLinkKeyForVC(vc);
+    BOOL passive = sPassiveDeletedComments && !sShowDeletedComments;
+    if (passive && linkKey.length == 0) return NO;
+    BOOL effective = sShowDeletedComments ||
+        (linkKey.length > 0 && ApolloDeletedCommentsHasThreadOverride(linkKey));
+    if (outVC) *outVC = vc;
+    if (outLinkKey) *outLinkKey = linkKey;
+    if (outEffective) *outEffective = effective;
+    return YES;
+}
+
+#pragma mark - CommentsViewController lifecycle
+
+%hook _TtC6Apollo22CommentsViewController
+
+- (void)moreOptionsBarButtonItemTappedWithSender:(id)sender {
+    sApolloDCMenuArmedVC = self;
+    sApolloDCMenuArmedAt = CFAbsoluteTimeGetCurrent();
+    %orig;
+    // The arm is consumed by the first menu build (see ApolloDCMenuOwnerForController);
+    // the timestamp grace window expires it if no menu was built at all.
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    if (!sApolloDCAllCommentsVCs) sApolloDCAllCommentsVCs = [NSHashTable weakObjectsHashTable];
+    [sApolloDCAllCommentsVCs addObject:self];
+    ApolloDCMenuSweepDeadOverrides();
+    NSString *linkKey = ApolloDCMenuLinkKeyForVC(self);
+    if (linkKey.length > 0 && ApolloDeletedCommentsHasThreadOverride(linkKey)) {
+        // Nested "Continue this thread" pushes of the same post keep the
+        // override alive until the whole thread is left.
+        ApolloDCMenuTrackVC(linkKey, self);
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    // Only a pop/dismissal means the user left the thread; presentations
+    // (media viewer, share sheet) and pushes deeper must not clear anything.
+    UIViewController *vc = (UIViewController *)self;
+    BOOL leaving = [vc isMovingFromParentViewController] ||
+                   [vc isBeingDismissed] ||
+                   [vc.navigationController isBeingDismissed];
+    if (!leaving) return;
+    NSString *linkKey = ApolloDCMenuLinkKeyForVC(self);
+    if (linkKey.length == 0 || !ApolloDeletedCommentsHasThreadOverride(linkKey)) return;
+    ApolloDCMenuUntrackVCAndMaybeClear(linkKey, self);
+}
+
+%end
+
+#pragma mark - Row icon
+
+// Contributed vector icons (issue #962) drawn to sit with Apollo's own
+// `option-*` comment icons rather than the SF Symbol eye/eye.slash pair they
+// replace. The PDFs were drawn at the option-* assets' own ~24pt weight, and
+// ApolloActionMenuIconBoxSide is that same box (ApolloNativeActionMenuSizedIcon
+// fits Apollo's rows into it), so rendering to it shows the art at the size it
+// was drawn for next to same-weight neighbours in the Liquid Glass menu; the
+// legacy sheet aspect-fits it into the donor cell's icon frame either way.
+// Falls back to the original SF Symbols (through the same box, so the weight
+// still matches) when the tweak's resources aren't staged in this install
+// layout.
+static UIImage *ApolloDCMenuIcon(BOOL effective) {
+    NSString *name = effective ? @"option-hide-deleted-comments" : @"option-show-deleted-comments";
+    CGSize box = CGSizeMake(ApolloActionMenuIconBoxSide, ApolloActionMenuIconBoxSide);
+    UIImage *icon = ApolloBundledPDFTemplateImage(name, box);
+    if (icon) return icon;
+    NSString *symbolName = effective ? @"eye.slash" : @"eye";
+    return ApolloActionMenuSymbolIcon(symbolName) ?: [UIImage systemImageNamed:symbolName];
+}
+
+#pragma mark - Registration
+
+%ctor {
+    %init;
+
+    ApolloActionMenuSpec *spec = [ApolloActionMenuSpec new];
+    spec.identifier = @"DeletedComments";
+    spec.placement = ApolloActionMenuPlacementAppend;
+    spec.inlineSection = NO;
+    spec.legacyDismissesSheet = YES;
+
+    spec.matches = ^BOOL(id actionController, NSString *menuTitle) {
+        (void)menuTitle;
+        return ApolloDCMenuResolveState(actionController, NULL, NULL, NULL);
+    };
+    spec.title = ^NSString *(id actionController, UITableViewCell *donor) {
+        (void)donor;
+        BOOL effective = NO;
+        if (!ApolloDCMenuResolveState(actionController, NULL, NULL, &effective)) return nil;
+        return effective ? kApolloDCMenuHideTitle : kApolloDCMenuShowTitle;
+    };
+    spec.image = ^UIImage *(id actionController, UITableViewCell *donor) {
+        (void)donor;
+        BOOL effective = NO;
+        if (!ApolloDCMenuResolveState(actionController, NULL, NULL, &effective)) return nil;
+        return ApolloDCMenuIcon(effective);
+    };
+    spec.perform = ^(id actionController) {
+        id vc = nil;
+        NSString *linkKey = nil;
+        BOOL effective = NO;
+        if (!ApolloDCMenuResolveState(actionController, &vc, &linkKey, &effective)) return;
+        ApolloDCMenuHandleToggle(vc, linkKey, effective);
+    };
+
+    ApolloActionMenuRegister(spec);
+    ApolloLog(@"[DeletedCommentsMenu] Deleted-comments menu spec registered");
+}

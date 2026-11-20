@@ -1,0 +1,59 @@
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+typedef NS_ENUM(NSInteger, ApolloHiddenContentKind) {
+    ApolloHiddenContentKindPost = 0,
+    ApolloHiddenContentKindComment,
+};
+
+// Hidden: still intact live, just excluded from the account's own listing.
+// Removed: a moderator/AutoMod/admin took the content down (shell still
+// exists). Deleted: the user (or account) deleted it. See
+// ApolloHiddenContentClassify for how these are told apart.
+typedef NS_ENUM(NSInteger, ApolloHiddenContentReason) {
+    ApolloHiddenContentReasonHidden = 0,
+    ApolloHiddenContentReasonDeleted,
+    ApolloHiddenContentReasonRemoved,
+};
+
+@interface ApolloHiddenContentItem : NSObject
+@property (nonatomic, copy, nullable) NSString *author;
+@property (nonatomic, strong, nullable) NSNumber *score;
+@property (nonatomic, copy, nullable) NSString *parentPostTitle;
+@property (nonatomic, strong, nullable) NSURL *previewURL;
+@property (nonatomic, copy) NSArray<NSURL *> *mediaURLs;
+// Width divided by height for the first media item. Zero when the archive
+// did not retain dimensions.
+@property (nonatomic) CGFloat previewAspectRatio;
+@property (nonatomic, copy) NSString *fullName;   // e.g. t3_abc123 / t1_abc123
+@property (nonatomic, assign) ApolloHiddenContentKind kind;
+@property (nonatomic, assign) ApolloHiddenContentReason reason;
+// Human-readable "who" -- "Moderator"/"AutoMod"/"Reddit Admins" for Removed,
+// "Author" for Deleted. Nil for Hidden, or when unknown.
+@property (nonatomic, copy, nullable) NSString *removalDetail;
+@property (nonatomic, copy, nullable) NSString *title;       // post title; nil for comments
+@property (nonatomic, copy, nullable) NSString *body;        // selftext / comment body
+@property (nonatomic, copy, nullable) NSString *subreddit;
+@property (nonatomic, copy, nullable) NSString *permalink;
+@property (nonatomic, strong, nullable) NSDate *createdDate;
+// Reddit's JSON for the item (the archived copy, with live counts when it
+// still resolves), which the native lists turn into an RDKLink/RDKComment.
+@property (nonatomic, copy, nullable) NSDictionary *redditData;
+@end
+
+typedef void (^ApolloHiddenContentProgress)(double fraction, NSString *stage);
+
+typedef void (^ApolloHiddenContentFetchCompletion)(NSArray<ApolloHiddenContentItem *> * _Nullable items, NSString * _Nullable errorMessage);
+
+// Diffs `username`'s Arctic Shift archive against their live /submitted or
+// /comments listing; archived items missing from the live listing come back
+// classified hidden or deleted, newest-first. Scoped to one `kind` per call;
+// posts and comments can be fetched at the same time (each call's live listing
+// and archive search run in parallel, and archive searches queue so the shared,
+// rate-limited Arctic Shift only sees one at a time). Cached per username+kind;
+// pass forceRefresh:YES to bypass (e.g. pull-to-refresh). Main-thread progress
+// measures completed work: the two fetches, then the classification.
+void ApolloHiddenContentFetchWithProgress(NSString *username, ApolloHiddenContentKind kind, BOOL forceRefresh, ApolloHiddenContentProgress _Nullable progress, ApolloHiddenContentFetchCompletion completion);
+
+NS_ASSUME_NONNULL_END

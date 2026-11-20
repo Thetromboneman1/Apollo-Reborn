@@ -1,0 +1,2885 @@
+#import "ApolloActionMenu.h"
+#import "ApolloActionMenuLayout.h"
+#import "ApolloCommentNavigator.h"
+#import "ApolloCommon.h"
+#import "ApolloNativeActionMenus.h"
+#import "ApolloProfileMoreMenu.h"
+#import "ApolloNavigationActions.h"
+#import "ApolloNativeActionMetadata.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloThemeRuntime.h"
+#import "ipad/ApolloPaneChrome.h"
+
+#import <UIKit/UIKit.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+#include <dlfcn.h>
+#import "ApolloClasses.h"
+
+// Shared with Apollo's full-screen media hold; the returned block owns the
+// generator and ends its native interaction when the captured menu finishes.
+extern "C" dispatch_block_t ApolloMediaMenuBeginPreviewFeedback(UIView *source, CGPoint point);
+
+static char kApolloNativeActionMenuControllerKey;
+static char kApolloNativeActionMenuInvokingActionKey;
+static char kApolloNativeActionMenuWrappedModeratorActionKey;
+static char kApolloNativeActionMenuModeratorSelectionKey;
+static char kApolloNativeActionMenuLifecycleFallbackKey;
+static char kApolloNativeActionMenuPresenterKey;
+static char kApolloNativeActionMenuSourceViewKey;
+static char kApolloNativeActionMenuSourcePointKey;
+static char kApolloNativeActionMenuWrappedSourceActionKey;
+static char kApolloNativeActionMenuWindowPresenterKey;
+static char kApolloNativeActionMenuWindowRequestKey;
+static char kApolloNativeActionMenuCapturedSourcePresenterKey;
+static char kApolloNativeActionMenuSurfaceStateKey;
+
+static UIViewController *ApolloNativeActionMenuViewControllerForView(UIView *view);
+static UIViewController *ApolloNativeActionMenuContentControllerForView(UIView *view);
+static char kApolloMediaMenuPressLocationKey;
+
+static __weak UIView *sApolloNativeActionMenuSourceView = nil;
+// The finger position for a long press on a view with no control of its own
+// to anchor to (a message in a chat thread), in the coordinates of
+// sApolloNativeActionMenuSourcePointView and only used while that view is the
+// menu's source. Cleared together with the capture or prime that set it.
+static NSValue *sApolloNativeActionMenuSourcePoint = nil;
+static __weak UIView *sApolloNativeActionMenuSourcePointView = nil;
+static __weak UIView *sApolloNativeActionMenuConfigurationSourceView = nil;
+// Which customisable ••• menu (ApolloActionMenuLayout.h) the long-press menu
+// being configured mirrors. Set only while one of the long-press delegate
+// hooks below runs Apollo's own configurationForMenuAtLocation:, which builds
+// its UIContextMenuConfiguration synchronously; the configuration hook copies
+// it into that configuration's action provider, so no other menu can pick it
+// up later. Main thread only (UIKit delegate callbacks).
+static ApolloActionMenuContext sApolloActionMenuLongPressContext = nil;
+static __weak UIViewController *sApolloNativeDirectActionOwner = nil;
+static __weak UIView *sApolloNativeDirectActionSourceView = nil;
+static uint16_t sApolloNativeDirectActionKind = UINT16_MAX;
+static NSUInteger sApolloNativeActionMenuCaptureDepth = 0;
+static BOOL sApolloNativeActionMenuModeratorStyleStack[32];
+static BOOL sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
+
+// Rapid handoffs can share a source across presenters. Track each session's
+// identity without retaining its presenter or source view.
+@interface ApolloNativeActionMenuSurfaceState : NSObject
+@property (nonatomic, weak) UIView *surface;
+@property (nonatomic, weak) UIWindow *window;
+@property (nonatomic) NSUInteger requestGeneration;
+@property (nonatomic, strong) NSMutableSet<NSObject *> *identities;
+@property (nonatomic, strong) NSMutableOrderedSet<NSString *> *updateKeys;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, dispatch_block_t> *updates;
+@end
+
+@implementation ApolloNativeActionMenuSurfaceState
+- (instancetype)init {
+    if ((self = [super init])) {
+        _identities = [NSMutableSet set];
+        _updateKeys = [NSMutableOrderedSet orderedSet];
+        _updates = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+@end
+
+static void ApolloNativeActionMenuReleaseSurface(ApolloNativeActionMenuSurfaceState *state,
+                                                   NSObject *identity) {
+    if (![state.identities containsObject:identity]) return;
+    [state.identities removeObject:identity];
+    // Remove before invoking, then recheck: callbacks can open menus or replace keys.
+    while (state.identities.count == 0 && state.updateKeys.count) {
+        if (!state.surface) {
+            [state.updateKeys removeAllObjects];
+            [state.updates removeAllObjects];
+            break;
+        }
+        NSString *key = state.updateKeys.firstObject;
+        dispatch_block_t update = state.updates[key];
+        [state.updateKeys removeObjectAtIndex:0];
+        [state.updates removeObjectForKey:key];
+        if (update) update();
+    }
+    UIView *surface = state.surface;
+    if (!state.identities.count && !state.updateKeys.count &&
+        objc_getAssociatedObject(surface, &kApolloNativeActionMenuSurfaceStateKey) == state) {
+        objc_setAssociatedObject(surface, &kApolloNativeActionMenuSurfaceStateKey, nil,
+                                 OBJC_ASSOCIATION_ASSIGN);
+    }
+}
+
+@interface ApolloNativeActionMenuSurfaceLease : NSObject
+@property (nonatomic, strong) ApolloNativeActionMenuSurfaceState *state;
+@property (nonatomic, strong) NSObject *identity;
+- (void)invalidate;
+@end
+
+@implementation ApolloNativeActionMenuSurfaceLease
+- (void)invalidate {
+    if (!_identity) return;
+    // UIKit releases render assertions after our completion. Schedule release
+    // before the selected action's next-turn callback; autorelease-delayed
+    // deallocation must not change that order.
+    ApolloNativeActionMenuSurfaceState *state = _state;
+    NSObject *identity = _identity;
+    _state = nil;
+    _identity = nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ApolloNativeActionMenuReleaseSurface(state, identity);
+    });
+}
+- (void)dealloc {
+    // Release abandoned sessions too; invalidation is idempotent.
+    [self invalidate];
+}
+@end
+
+static ApolloNativeActionMenuSurfaceLease *ApolloNativeActionMenuAcquireSurface(UIView *surface,
+                                                                                 NSUInteger generation) {
+    if (!surface) return nil;
+    ApolloNativeActionMenuSurfaceState *state = objc_getAssociatedObject(surface, &kApolloNativeActionMenuSurfaceStateKey);
+    if (!state) {
+        state = [ApolloNativeActionMenuSurfaceState new];
+        state.surface = surface;
+        objc_setAssociatedObject(surface, &kApolloNativeActionMenuSurfaceStateKey, state,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    state.window = surface.window;
+    state.requestGeneration = generation;
+    ApolloNativeActionMenuSurfaceLease *lease = [ApolloNativeActionMenuSurfaceLease new];
+    lease.state = state;
+    lease.identity = [NSObject new];
+    [state.identities addObject:lease.identity];
+    return lease;
+}
+
+BOOL ApolloNativeActionMenuOwnsNavigationSurface(UIView *surface) {
+    ApolloNativeActionMenuSurfaceState *state = objc_getAssociatedObject(surface, &kApolloNativeActionMenuSurfaceStateKey);
+    return state.identities.count > 0;
+}
+
+BOOL ApolloNativeActionMenuDeferNavigationUpdate(UIView *surface, NSString *key, dispatch_block_t update) {
+    ApolloNativeActionMenuSurfaceState *state = objc_getAssociatedObject(surface, &kApolloNativeActionMenuSurfaceStateKey);
+    if (!state.identities.count || !key.length || !update) return NO;
+    [state.updateKeys addObject:key];
+    state.updates[key] = [update copy];
+    return YES;
+}
+
+@interface ApolloNativeActionMenuPresenter : NSObject <UIContextMenuInteractionDelegate>
+@property (nonatomic, strong) UIMenu *menu;
+@property (nonatomic, weak) UIView *sourceView;
+@property (nonatomic, strong) NSValue *sourcePoint;
+// The tapped control supplies its strip's entire glass surface when owned;
+// otherwise it supplies only geometry, never an arbitrary ancestor.
+@property (nonatomic, weak) UIView *morphSourceView;
+@property (nonatomic, strong) UIContextMenuInteraction *interaction;
+@property (nonatomic, assign) BOOL removeSourceViewOnEnd;
+@property (nonatomic, weak) id actionController;
+@property (nonatomic, copy) dispatch_block_t afterDismissalAction;
+@property (nonatomic, copy) dispatch_block_t didEnd;
+@property (nonatomic, copy) dispatch_block_t previewFeedbackEnd;
+@property (nonatomic, assign) BOOL notifiesCapturedCancellation;
+@property (nonatomic, strong) ApolloNativeActionMenuSurfaceLease *surfaceLease;
+// Keep the presentation window and anchor point for the menu's short lifetime.
+// A selected action may push another controller before UIKit asks for its
+// dismissal preview, detaching the nav-bar proxy from the window on iOS 27.
+@property (nonatomic, strong) UIWindow *presentationWindow;
+@property (nonatomic, assign) CGPoint presentationAnchorCenter;
+// Reuse the preview in both directions; its window-backed target survives detachment.
+@property (nonatomic, strong) UIView *morphStandInView;
+@property (nonatomic, strong) UIView *morphHostView;
+@property (nonatomic, strong) UITargetedPreview *morphPreview;
+// Navigation leaves the source page before the menu's return spring settles.
+// Keep its original live preview owned, but dismiss toward a separate clear
+// view so UIKit does not draw the old navigation pill over the new page.
+@property (nonatomic, assign) BOOL navigationHandoffStarted;
+@property (nonatomic, strong) UIView *navigationDismissalSource;
+@property (nonatomic, strong) UITargetedPreview *navigationDismissalPreview;
+@property (nonatomic, assign) BOOL didBeginPresentation;
+@property (nonatomic, assign) BOOL didRequestConfiguration;
+@property (nonatomic, assign) BOOL dismissing;
+@property (nonatomic, assign) BOOL ended;
+// Issue #1375: UIKit runs the dismissal animator's completion only once every
+// spring in the transition has settled (1.2-1.9 s after the tap on iOS 26/27),
+// but the menu itself has faded out after ~0.3 s. A follow-up menu queued
+// behind this one opens at that fade-out instead.
+@property (nonatomic, assign) BOOL menuFaded;
+@property (nonatomic, strong) CADisplayLink *fadeLink;
+@property (nonatomic, assign) CFTimeInterval dismissalStartTime;
+@property (nonatomic, copy) dispatch_block_t pendingPresentationAction;
+@property (nonatomic, weak) UIWindow *requestWindow;
+@property (nonatomic, assign) NSUInteger requestGeneration;
+@property (nonatomic, strong) id nativePresentation;
+- (BOOL)presentFromView:(UIView *)source completion:(dispatch_block_t)completion;
+- (id)nativeHandoffPresentationForSource:(UIView *)source;
+- (BOOL)hasFadedOutBeforePresentationFromSource:(UIView *)source;
+- (void)fadeLinkTick:(CADisplayLink *)link;
+- (UITargetedPreview *)previewForCurrentSource;
+- (UITargetedPreview *)navigationPreviewForDismissal;
+- (void)prepareForNavigationDismissal;
+- (void)captureNativePresentation;
+- (void)finishPresentation;
+@end
+
+// The fade-out watcher's display link retains its target; a weak hop keeps it
+// from holding the presenter (and its anchor) past -finishPresentation.
+@interface ApolloNativeActionMenuFadeLinkProxy : NSObject
+@property (nonatomic, weak) ApolloNativeActionMenuPresenter *presenter;
+- (void)tick:(CADisplayLink *)link;
+@end
+
+@implementation ApolloNativeActionMenuFadeLinkProxy
+- (void)tick:(CADisplayLink *)link {
+    ApolloNativeActionMenuPresenter *presenter = self.presenter;
+    if (presenter) [presenter fadeLinkTick:link];
+    else [link invalidate];
+}
+@end
+
+// Track the latest request separately from retiring sessions, which still own
+// their sources. A weak reference avoids a window/presenter retain cycle.
+static ApolloNativeActionMenuPresenter *ApolloNativeActionMenuActivePresenter(UIWindow *window) {
+    NSHashTable *holder = objc_getAssociatedObject(window, &kApolloNativeActionMenuWindowPresenterKey);
+    return holder.anyObject;
+}
+
+static void ApolloNativeActionMenuSetActivePresenter(UIWindow *window, ApolloNativeActionMenuPresenter *presenter) {
+    if (!window) return;
+    NSHashTable *holder = presenter ? [NSHashTable weakObjectsHashTable] : nil;
+    if (presenter) [holder addObject:presenter];
+    objc_setAssociatedObject(window, &kApolloNativeActionMenuWindowPresenterKey, holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+BOOL ApolloNativeActionMenuDeferNavigationCollapse(UIView *surface, dispatch_block_t collapse) {
+    ApolloNativeActionMenuSurfaceState *state = objc_getAssociatedObject(surface, &kApolloNativeActionMenuSurfaceStateKey);
+    if (!state.identities.count || !collapse) return NO;
+    __weak UIWindow *weakWindow = state.window;
+    NSUInteger generation = state.requestGeneration;
+    ApolloNativeActionMenuDeferNavigationUpdate(surface, @"native-menu.collapse", ^{
+        UIWindow *window = weakWindow;
+        NSUInteger latest = [objc_getAssociatedObject(window, &kApolloNativeActionMenuWindowRequestKey) unsignedIntegerValue];
+        ApolloNativeActionMenuPresenter *active = ApolloNativeActionMenuActivePresenter(window);
+        if (window && latest == generation && (!active || active.ended)) collapse();
+    });
+    // Ownership includes the completion-to-release gap. Reopening cancels only
+    // this collapse by generation, preserving unrelated geometry updates.
+    ApolloNativeActionMenuPresenter *presenter = ApolloNativeActionMenuActivePresenter(state.window);
+    if (presenter.surfaceLease.state == state && !presenter.ended && !presenter.dismissing) {
+        [presenter.interaction dismissMenu];
+    }
+    return YES;
+}
+
+// The anchor owns the presenter; its menu actions retain ActionController.
+// Keep this reverse lookup weak to avoid a cycle after session cleanup.
+static ApolloNativeActionMenuPresenter *ApolloNativeActionMenuPresenterForController(id actionController) {
+    NSHashTable *holder = objc_getAssociatedObject(actionController,
+                                                    &kApolloNativeActionMenuPresenterKey);
+    id presenter = holder.anyObject;
+    return [presenter isKindOfClass:[ApolloNativeActionMenuPresenter class]] ? presenter : nil;
+}
+
+static void ApolloNativeActionMenuSetPresenterForController(id actionController,
+                                                             ApolloNativeActionMenuPresenter *presenter) {
+    if (!actionController) return;
+    if (!presenter) {
+        objc_setAssociatedObject(actionController, &kApolloNativeActionMenuPresenterKey, nil,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        return;
+    }
+
+    NSHashTable *holder = [NSHashTable weakObjectsHashTable];
+    [holder addObject:presenter];
+    objc_setAssociatedObject(actionController, &kApolloNativeActionMenuPresenterKey, holder,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+BOOL ApolloNativeActionMenuPerformAfterDismissal(id actionController,
+                                                  dispatch_block_t action) {
+    if (!actionController || !action) return NO;
+
+    ApolloNativeActionMenuPresenter *presenter =
+        ApolloNativeActionMenuPresenterForController(actionController);
+    if (!presenter.interaction) {
+        return NO;
+    }
+
+    // UIKit does not guarantee whether an action handler runs before or after
+    // -willEndForConfiguration:. The animator completion intentionally reads
+    // this property at dismissal END, so even a late handler stored after
+    // dismissal begins still cannot fall through the teardown window.
+    presenter.afterDismissalAction = action;
+    return YES;
+}
+
+BOOL ApolloNativeActionMenuPerformWithDismissal(id actionController,
+                                                dispatch_block_t action) {
+    if (!actionController || !action) return NO;
+    ApolloNativeActionMenuPresenter *presenter =
+        ApolloNativeActionMenuPresenterForController(actionController);
+    if (!presenter.interaction || presenter.ended) return NO;
+
+    // Capture while the source page is still attached. UIKit may only ask for
+    // the reverse preview AFTER the selected action pushes a new controller;
+    // its target must remain in the window even when the source button leaves.
+    [presenter captureNativePresentation];
+    [presenter previewForCurrentSource];
+    [presenter prepareForNavigationDismissal];
+    presenter.afterDismissalAction = nil;
+    presenter.pendingPresentationAction = nil;
+    ApolloLog(@"[NativeActionMenu] Starting selected navigation alongside menu dismissal");
+    // The selected UIAction drives UIKit's normal dismissal. Do not finish or
+    // release anything here: the interaction, preview, anchor and surface lease
+    // remain owned until the real animator completion, independent of the push.
+    action();
+    return YES;
+}
+
+static BOOL ApolloNativeActionMenusEnabled(void) {
+    if (@available(iOS 26.0, *)) {
+        return IsLiquidGlass() && ApolloClassUIContextMenuPlatformMetricsGlass != Nil;
+    }
+    return NO;
+}
+
+// Issue #249: whether UIKit's liquid-glass menu morph ("magic morph") is on.
+// _UIContextMenuMagicMorphAnimationEnabled() gates on _UISolariumEnabled() +
+// an internal preference; UIKit consults it when deciding to swap the source
+// preview for a morphable one (UIContextMenuInteraction.mm) and when picking
+// _UIContextMenuLiquidMorphPresentationAnimation (_UIContextMenuPresentation.mm).
+// If the symbol is gone in a future UIKit, assume on — this code only runs on
+// glass builds where Solarium is active, and a wrong YES just means an overlap
+// style UIKit ignores.
+static BOOL ApolloNativeActionMenuMagicMorphEnabled(void) {
+    static BOOL (*sEnabledFn)(void);
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sEnabledFn = (BOOL (*)(void))dlsym(RTLD_DEFAULT, "_UIContextMenuMagicMorphAnimationEnabled");
+    });
+    return sEnabledFn ? sEnabledFn() : YES;
+}
+
+static NSString *ApolloNativeActionDefaultTitle(uint16_t actionKind) {
+    NSUInteger count = sizeof(kApolloNativeActionDefaultTitles) / sizeof(kApolloNativeActionDefaultTitles[0]);
+    return actionKind < count ? kApolloNativeActionDefaultTitles[actionKind] : nil;
+}
+
+static BOOL ApolloNativeActionKindOpensModeratorMenu(uint16_t actionKind) {
+    return actionKind == 124;
+}
+
+static BOOL ApolloNativeActionMenuTitleIsModerator(NSString *title) {
+    return [title isEqualToString:@"Moderator"];
+}
+
+static BOOL ApolloNativeActionMenuTitleIsDestructive(NSString *title) {
+    return [title isEqualToString:@"Delete"]
+        || [title hasPrefix:@"Delete "]
+        || [title isEqualToString:@"Remove"]
+        || [title hasPrefix:@"Remove "];
+}
+
+static UIImage *ApolloNativeActionMenuTintedImage(UIImage *image, UIColor *tintColor) {
+    if (!image || !tintColor) return image;
+    return [image imageWithTintColor:tintColor renderingMode:UIImageRenderingModeAlwaysOriginal];
+}
+
+static void ApolloNativeActionMenuStyleElementTitle(UIMenuElement *element, UIColor *tintColor) {
+    if (!element || ![element respondsToSelector:@selector(setAttributedTitle:)]) return;
+
+    NSString *title = element.title;
+    if (title.length == 0) return;
+
+    NSMutableDictionary *attributes = [NSMutableDictionary dictionary];
+    if (tintColor) attributes[NSForegroundColorAttributeName] = tintColor;
+
+    UIFont *baseFont = [UIFont systemFontOfSize:17.0 weight:UIFontWeightRegular];
+    UIFont *themeFont = ApolloThemeRuntimeFont(baseFont);
+    if (themeFont && ![themeFont.fontName isEqualToString:baseFont.fontName]) {
+        attributes[NSFontAttributeName] = themeFont;
+    }
+    if (attributes.count == 0) return;
+
+    NSAttributedString *attributedTitle = [[NSAttributedString alloc] initWithString:title attributes:attributes];
+    ((void (*)(id, SEL, id))objc_msgSend)(element, @selector(setAttributedTitle:), attributedTitle);
+}
+
+static void ApolloNativeActionMenuStyleElementImage(UIMenuElement *element, UIColor *tintColor) {
+    if (!element || !tintColor || !element.image) return;
+
+    UIImage *tintedImage = ApolloNativeActionMenuTintedImage(element.image, tintColor);
+    if (!tintedImage) return;
+
+    SEL setImageSelector = @selector(setImage:);
+    SEL privateSetImageSelector = @selector(_setImage:);
+    if ([element respondsToSelector:setImageSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(element, setImageSelector, tintedImage);
+    } else if ([element respondsToSelector:privateSetImageSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(element, privateSetImageSelector, tintedImage);
+    }
+}
+
+typedef void (^ApolloNativeActionMenuActionHandler)(UIAction *action);
+
+static void ApolloNativeActionMenuSetSourcePoint(UIView *view, NSValue *point) {
+    sApolloNativeActionMenuSourcePointView = point ? view : nil;
+    sApolloNativeActionMenuSourcePoint = view ? point : nil;
+}
+
+static NSValue *ApolloNativeActionMenuSourcePointForView(UIView *view) {
+    return view && view == sApolloNativeActionMenuSourcePointView ? sApolloNativeActionMenuSourcePoint : nil;
+}
+
+static void ApolloNativeActionMenuPrimeSource(UIView *sourceView, NSValue *sourcePoint) {
+    if (!ApolloNativeActionMenusEnabled()) return;
+    if (!sourceView.window) return;
+
+    sApolloNativeActionMenuSourceView = sourceView;
+    ApolloNativeActionMenuSetSourcePoint(sourceView, sourcePoint);
+    __weak UIView *weakSourceView = sourceView;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *strongSourceView = weakSourceView;
+        if (sApolloNativeActionMenuCaptureDepth == 0 && sApolloNativeActionMenuSourceView == strongSourceView) {
+            sApolloNativeActionMenuSourceView = nil;
+            ApolloNativeActionMenuSetSourcePoint(nil, nil);
+        }
+    });
+}
+
+static void ApolloNativeActionMenuWrapSourceAction(UIAction *action, UIView *sourceView) {
+    if (!action || !sourceView || objc_getAssociatedObject(action, &kApolloNativeActionMenuWrappedSourceActionKey)) return;
+    if (![action respondsToSelector:@selector(handler)] || ![action respondsToSelector:@selector(setHandler:)]) return;
+
+    ApolloNativeActionMenuActionHandler originalHandler =
+        ((ApolloNativeActionMenuActionHandler (*)(id, SEL))objc_msgSend)(action, @selector(handler));
+    if (!originalHandler) return;
+
+    originalHandler = [originalHandler copy];
+    __weak UIView *weakSourceView = sourceView;
+    ApolloNativeActionMenuActionHandler wrappedHandler = ^(UIAction *selectedAction) {
+        ApolloNativeActionMenuPrimeSource(weakSourceView, nil);
+        originalHandler(selectedAction);
+    };
+
+    ((void (*)(id, SEL, id))objc_msgSend)(action, @selector(setHandler:), wrappedHandler);
+    objc_setAssociatedObject(action, &kApolloNativeActionMenuWrappedSourceActionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloNativeActionMenuWrapModeratorAction(UIAction *action) {
+    if (!action || objc_getAssociatedObject(action, &kApolloNativeActionMenuWrappedModeratorActionKey)) return;
+    if (![action respondsToSelector:@selector(handler)] || ![action respondsToSelector:@selector(setHandler:)]) return;
+
+    ApolloNativeActionMenuActionHandler originalHandler =
+        ((ApolloNativeActionMenuActionHandler (*)(id, SEL))objc_msgSend)(action, @selector(handler));
+    if (!originalHandler) return;
+
+    originalHandler = [originalHandler copy];
+    ApolloNativeActionMenuActionHandler wrappedHandler = ^(UIAction *selectedAction) {
+        sApolloNativeActionMenuNextPresentationModeratorStyle = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
+        });
+        originalHandler(selectedAction);
+    };
+
+    ((void (*)(id, SEL, id))objc_msgSend)(action, @selector(setHandler:), wrappedHandler);
+    objc_setAssociatedObject(action, &kApolloNativeActionMenuWrappedModeratorActionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void ApolloNativeActionMenuStyleElement(UIMenuElement *element, BOOL moderatorStyle, UIView *sourceView);
+
+static UIMenu *ApolloNativeActionMenuTransformMenu(UIMenu *menu, BOOL moderatorStyle, UIView *sourceView) {
+    if (![menu isKindOfClass:[UIMenu class]]) return menu;
+    ApolloNativeActionMenuStyleElement(menu, moderatorStyle, sourceView);
+    return menu;
+}
+
+static void ApolloNativeActionMenuStyleElement(UIMenuElement *element, BOOL moderatorStyle, UIView *sourceView) {
+    if (!element) return;
+
+    NSString *title = element.title ?: @"";
+    BOOL opensModeratorMenu = ApolloNativeActionMenuTitleIsModerator(title);
+    BOOL destructive = ApolloNativeActionMenuTitleIsDestructive(title);
+    UIColor *moderatorTintColor = ApolloModeratorColor();
+    UIColor *elementTintColor = (!destructive && (moderatorStyle || opensModeratorMenu)) ? moderatorTintColor : nil;
+
+    ApolloNativeActionMenuStyleElementTitle(element, elementTintColor ? UIColor.labelColor : nil);
+    if (elementTintColor) ApolloNativeActionMenuStyleElementImage(element, elementTintColor);
+
+    if ([element isKindOfClass:[UIAction class]]) {
+        UIAction *action = (UIAction *)element;
+        ApolloNativeActionMenuWrapSourceAction(action, sourceView);
+        if (destructive) {
+            action.attributes = action.attributes | UIMenuElementAttributesDestructive;
+        }
+        if (opensModeratorMenu) {
+            ApolloNativeActionMenuWrapModeratorAction(action);
+        }
+    } else if ([element isKindOfClass:[UIMenu class]]) {
+        UIMenu *menu = (UIMenu *)element;
+        BOOL childModeratorStyle = moderatorStyle || opensModeratorMenu;
+        for (UIMenuElement *child in menu.children) {
+            ApolloNativeActionMenuStyleElement(child, childModeratorStyle, sourceView);
+        }
+    }
+}
+
+static UIImage *ApolloNativeActionMenuSizedIcon(UIImage *image) {
+    if (!image) return nil;
+
+    // Apollo's option-* assets are ~24pt on the long edge and its legacy sheet
+    // shows them at natural size; fitting them into this same box keeps the
+    // glass menu at the stock icon weight (18pt read visibly lighter — #985
+    // review).
+    static const CGFloat maxIconSide = ApolloActionMenuIconBoxSide;
+    CGSize imageSize = image.size;
+    if (imageSize.width <= 0.0 || imageSize.height <= 0.0) {
+        return [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+
+    CGFloat scale = MIN(maxIconSide / imageSize.width, maxIconSide / imageSize.height);
+    if (scale >= 1.0) {
+        return [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+
+    CGSize canvasSize = CGSizeMake(maxIconSide, maxIconSide);
+    CGSize drawSize = CGSizeMake(round(imageSize.width * scale), round(imageSize.height * scale));
+    CGRect drawRect = CGRectMake(
+        floor((canvasSize.width - drawSize.width) / 2.0),
+        floor((canvasSize.height - drawSize.height) / 2.0),
+        drawSize.width,
+        drawSize.height
+    );
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.opaque = NO;
+    // TODO: Modernization - the fallback assumes the main screen. The menu is built from the
+    // never-presented ActionController before a source view is resolved (and via the public
+    // ApolloNativeActionMenuBuildCaptured(controller), which has no view), so no trait source
+    // is reachable here. Asset-catalog images always carry scale > 0, so the image's own
+    // scale (picked by UIKit for the trait environment) is the branch that runs in practice.
+    format.scale = image.scale > 0.0 ? image.scale : UIScreen.mainScreen.scale;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:canvasSize format:format];
+    UIImage *resized = [renderer imageWithActions:^(__unused UIGraphicsImageRendererContext *context) {
+        [[image imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal] drawInRect:drawRect];
+    }];
+
+    return [resized imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
+static UIImage *ApolloNativeActionDefaultImage(uint16_t actionKind) {
+    NSUInteger count = sizeof(kApolloNativeActionDefaultAssetNames) / sizeof(kApolloNativeActionDefaultAssetNames[0]);
+    if (actionKind >= count) return nil;
+    NSString *assetName = kApolloNativeActionDefaultAssetNames[actionKind];
+    if (assetName.length == 0) return nil;
+    UIImage *image = [UIImage imageNamed:assetName];
+    return ApolloNativeActionMenuSizedIcon(image);
+}
+
+static UIView *ApolloNativeActionMenuViewForObject(id object) {
+    if (!object) return nil;
+    if ([object isKindOfClass:[UIView class]]) {
+        return (UIView *)object;
+    }
+
+    SEL viewSelector = @selector(view);
+    if ([object respondsToSelector:viewSelector]) {
+        @try {
+            id view = ((id (*)(id, SEL))objc_msgSend)(object, viewSelector);
+            if ([view isKindOfClass:[UIView class]]) {
+                return (UIView *)view;
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+
+    if ([object isKindOfClass:[UIBarButtonItem class]]) {
+        @try {
+            id view = [object valueForKey:@"view"];
+            if ([view isKindOfClass:[UIView class]]) {
+                return (UIView *)view;
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+
+    return nil;
+}
+
+static UITableView *ApolloNativeActionMenuFindTableView(UIView *view) {
+    if (!view) return nil;
+    if ([view isKindOfClass:[UITableView class]]) {
+        return (UITableView *)view;
+    }
+
+    for (UIView *subview in view.subviews) {
+        UITableView *tableView = ApolloNativeActionMenuFindTableView(subview);
+        if (tableView) return tableView;
+    }
+
+    return nil;
+}
+
+static UITableView *ApolloNativeActionMenuTableViewForPresenter(id presenter) {
+    if (!presenter) return nil;
+
+    SEL tableViewSelector = @selector(tableView);
+    if ([presenter respondsToSelector:tableViewSelector]) {
+        @try {
+            id tableView = ((id (*)(id, SEL))objc_msgSend)(presenter, tableViewSelector);
+            if ([tableView isKindOfClass:[UITableView class]]) {
+                return (UITableView *)tableView;
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+
+    return ApolloNativeActionMenuFindTableView(ApolloNativeActionMenuViewForObject(presenter));
+}
+
+static UIView *ApolloNativeActionMenuSelectedCellForPresenter(id presenter) {
+    UITableView *tableView = ApolloNativeActionMenuTableViewForPresenter(presenter);
+    if (!tableView) return nil;
+
+    NSArray<NSIndexPath *> *selectedIndexPaths = [tableView indexPathsForSelectedRows];
+    NSIndexPath *selectedIndexPath = selectedIndexPaths.firstObject ?: [tableView indexPathForSelectedRow];
+    if (selectedIndexPath) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:selectedIndexPath];
+        if (cell) return cell;
+    }
+
+    for (UITableViewCell *cell in tableView.visibleCells) {
+        if (cell.isSelected || cell.isHighlighted) {
+            return cell;
+        }
+    }
+
+    return nil;
+}
+
+static UIView *ApolloNativeActionMenuCellForGesture(UIGestureRecognizer *gestureRecognizer, id owner) {
+    UIView *gestureView = gestureRecognizer.view;
+    UITableView *tableView = nil;
+    if ([gestureView isKindOfClass:[UITableView class]]) {
+        tableView = (UITableView *)gestureView;
+    } else {
+        tableView = ApolloNativeActionMenuTableViewForPresenter(owner);
+    }
+    if (!tableView) return gestureView;
+
+    CGPoint location = [gestureRecognizer locationInView:tableView];
+    NSIndexPath *indexPath = [tableView indexPathForRowAtPoint:location];
+    UITableViewCell *cell = indexPath ? [tableView cellForRowAtIndexPath:indexPath] : nil;
+    return cell ?: tableView;
+}
+
+static UIView *ApolloNativeActionMenuResolveSourceView(id sender, id owner) {
+    UIView *sourceView = ApolloNativeActionMenuViewForObject(sender);
+    if (sourceView.window) return sourceView;
+
+    // UIKit detaches a rail item's view when moving it into overflow.
+    // Its still-visible overflow control is the stable presentation anchor.
+    if ([sender isKindOfClass:UIBarButtonItem.class] && [owner isKindOfClass:UIViewController.class]) {
+        if (@available(iOS 16.0, macCatalyst 16.0, *)) {
+            sourceView = ApolloNativeActionMenuViewForObject(((UIViewController *)owner).navigationItem.overflowPresentationSource);
+            if (sourceView.window) return sourceView;
+        }
+    }
+
+    sourceView = ApolloNativeActionMenuViewForObject(owner);
+    if (sourceView.window) return sourceView;
+
+    return sApolloNativeActionMenuSourceView.window ? sApolloNativeActionMenuSourceView : nil;
+}
+
+static UIView *ApolloNativeActionMenuCreateProxyAnchorView(UIView *sourceView, BOOL *removeWhenDone) {
+    if (removeWhenDone) *removeWhenDone = NO;
+    if (!sourceView || !sourceView.window) return sourceView;
+
+    UIView *containerView = sourceView.superview ?: sourceView.window;
+    if (!containerView) return sourceView;
+
+    CGPoint center = [sourceView convertPoint:CGPointMake(CGRectGetMidX(sourceView.bounds), CGRectGetMidY(sourceView.bounds))
+                                       toView:containerView];
+    CGRect anchorFrame = CGRectMake(center.x - 0.5, center.y - 0.5, 1.0, 1.0);
+
+    UIView *anchorView = [[UIView alloc] initWithFrame:anchorFrame];
+    anchorView.backgroundColor = UIColor.clearColor;
+    anchorView.opaque = NO;
+    anchorView.userInteractionEnabled = YES;
+    anchorView.accessibilityElementsHidden = YES;
+    anchorView.hidden = NO;
+    [containerView addSubview:anchorView];
+
+    if (removeWhenDone) *removeWhenDone = YES;
+    return anchorView;
+}
+
+// Issue #249 follow-up: the liquid morph is meant for COMPACT tapped controls
+// (bar buttons, a cell's "…" button) — UIKit hides the morph source while the
+// menu is open, which reads as "the control became the menu". When the
+// resolved source is the tapped ROW itself (composer flair row: a full-width
+// table cell), that same hiding reads as the row vanishing until the menu
+// closes. Skip the morph for row-scale sources: the menu still presents
+// anchored at the row (proxy-anchor preview), but the row stays visible.
+static BOOL ApolloNativeActionMenuViewShouldMorph(UIView *view) {
+    if (!view || !view.window) return NO;
+    if ([view isKindOfClass:[UITableViewCell class]]) return NO;
+    if ([view isKindOfClass:[UICollectionViewCell class]]) return NO;
+    // The gesture fallback can resolve the whole table/scroll view.
+    if ([view isKindOfClass:[UIScrollView class]]) return NO;
+    // Anything near full-width is a row, not a control (ASDK cell nodes and
+    // custom row views aren't UITableViewCell subclasses).
+    CGFloat windowWidth = CGRectGetWidth(view.window.bounds);
+    if (windowWidth > 0 && CGRectGetWidth(view.bounds) > 0.6 * windowWidth) return NO;
+    return YES;
+}
+
+static BOOL ApolloNativeActionMenuModeratorStyleActive(void) {
+    NSUInteger count = MIN(sApolloNativeActionMenuCaptureDepth, (NSUInteger)(sizeof(sApolloNativeActionMenuModeratorStyleStack) / sizeof(sApolloNativeActionMenuModeratorStyleStack[0])));
+    for (NSUInteger i = 0; i < count; i++) {
+        if (sApolloNativeActionMenuModeratorStyleStack[i]) return YES;
+    }
+    return NO;
+}
+
+static BOOL ApolloNativeActionMenuActionControllerIsModeratorOnly(id actionController) {
+    return ApolloReadBoolIvar(actionController, "isShowingOnlyModeratorActions", NO);
+}
+
+// Most ActionController subclasses have no custom header. A couple embed a
+// custom header view above the action rows; flattening those into a native
+// UIMenu would silently drop the header. ModeratorReportsController (the
+// "View Reports" moderator action) is special-cased: we DO convert it, but
+// render its report list as native inline menu sections (see
+// ApolloNativeActionMenuBuildModeratorReportSections), so it is not treated as
+// an opaque custom header here.
+static BOOL ApolloNativeActionMenuActionControllerHasCustomHeader(id actionController) {
+    if ([actionController isMemberOfClass:ApolloClassModeratorReportsController]) {
+        return NO;
+    }
+    return ApolloReadObjectIvar(actionController, "headerView") != nil;
+}
+
+static void ApolloNativeActionMenuBeginCaptureStyled(id sender, id owner, BOOL moderatorStyle) {
+    if (!ApolloNativeActionMenusEnabled()) return;
+
+    UIView *sourceView = ApolloNativeActionMenuResolveSourceView(sender, owner);
+    if (sourceView) {
+        sApolloNativeActionMenuSourceView = sourceView;
+    }
+    if (sApolloNativeActionMenuCaptureDepth < sizeof(sApolloNativeActionMenuModeratorStyleStack) / sizeof(sApolloNativeActionMenuModeratorStyleStack[0])) {
+        sApolloNativeActionMenuModeratorStyleStack[sApolloNativeActionMenuCaptureDepth] = moderatorStyle;
+    }
+    sApolloNativeActionMenuCaptureDepth++;
+}
+
+static void ApolloNativeActionMenuBeginCapture(id sender, id owner) {
+    ApolloNativeActionMenuBeginCaptureStyled(sender, owner, NO);
+}
+
+static void ApolloNativeActionMenuBeginModeratorCapture(id sender, id owner) {
+    ApolloNativeActionMenuBeginCaptureStyled(sender, owner, YES);
+}
+
+static void ApolloNativeActionMenuEndCapture(void) {
+    if (sApolloNativeActionMenuCaptureDepth > 0) {
+        sApolloNativeActionMenuCaptureDepth--;
+        if (sApolloNativeActionMenuCaptureDepth < sizeof(sApolloNativeActionMenuModeratorStyleStack) / sizeof(sApolloNativeActionMenuModeratorStyleStack[0])) {
+            sApolloNativeActionMenuModeratorStyleStack[sApolloNativeActionMenuCaptureDepth] = NO;
+        }
+    }
+    if (sApolloNativeActionMenuCaptureDepth == 0) {
+        sApolloNativeActionMenuSourceView = nil;
+        ApolloNativeActionMenuSetSourcePoint(nil, nil);
+    }
+}
+
+static void ApolloNativeActionMenuBeginPointCapture(UIView *source, CGPoint point, id owner) {
+    ApolloNativeActionMenuBeginCapture(source, owner);
+    if (sApolloNativeActionMenuSourceView == source)
+        ApolloNativeActionMenuSetSourcePoint(source, [NSValue valueWithCGPoint:point]);
+}
+
+void ApolloNativeActionMenuPresentFromPoint(UIView *source, CGPoint point, id owner, dispatch_block_t build) {
+    if (!build) return;
+    ApolloNativeActionMenuBeginPointCapture(source, point, owner);
+    @try {
+        build();
+    } @finally {
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+static UITableView *ApolloNativeActionMenuTableView(id actionController) {
+    UITableView *tableView = ApolloReadObjectIvar(actionController, "tableView");
+    return [tableView isKindOfClass:[UITableView class]] ? tableView : nil;
+}
+
+static void ApolloNativeActionMenuPrimeChainedSourceView(id actionController) {
+    UIView *sourceView = objc_getAssociatedObject(actionController, &kApolloNativeActionMenuSourceViewKey);
+    // A follow-up sheet (Share → Text / Message Link) opens where the first one did.
+    NSValue *sourcePoint = objc_getAssociatedObject(actionController, &kApolloNativeActionMenuSourcePointKey);
+    ApolloNativeActionMenuPrimeSource(sourceView, sourcePoint);
+}
+
+// A moderator row waits for UIKit to finish the menu's reverse morph so the
+// page it pushes doesn't start under it. Only the subreddit moderator menu's
+// rows push pages (Mod Queue, Mod Log, …). Every other moderator row acts in
+// place, presents a sheet (Ban User) or opens the next menu (Remove → Add
+// Removal Reason → Select Reason… → Notify user via…, Set Post Flair), and
+// holding those left the screen idle for ~1 s per step (#1375). Option lists
+// (text actions) have no kind and never push.
+static BOOL ApolloNativeActionMenuRowOpensModeratorPage(id actionController, NSInteger row) {
+    void *actionsBuffer = ApolloReadRawIvar(actionController, "actions");
+    int64_t actionCount = ApolloSwiftArrayCount(actionsBuffer);
+    if (row < 0 || row >= actionCount) return NO;
+    uint16_t kind = *(uint16_t *)((uint8_t *)actionsBuffer + 0x20 + row * 0x30);
+    return ApolloActionMenuItemIDForKind(ApolloActionMenuContextModeratorSubreddit, kind) &&
+        !ApolloActionMenuItemIDForKind(ApolloActionMenuContextModeratorPost, kind) &&
+        !ApolloActionMenuItemIDForKind(ApolloActionMenuContextModeratorComment, kind);
+}
+
+static void ApolloNativeActionMenuSelectRow(id actionController, NSInteger row) {
+    // Finish the reverse menu morph before a moderator row changes pages.
+    // The presenter association is cleared before this deferred call runs.
+    if ([objc_getAssociatedObject(actionController, &kApolloNativeActionMenuModeratorSelectionKey) boolValue] &&
+        ApolloNativeActionMenuRowOpensModeratorPage(actionController, row) &&
+        ApolloNativeActionMenuPerformAfterDismissal(actionController, ^{
+            ApolloNativeActionMenuSelectRow(actionController, row);
+        })) return;
+    if (!actionController || ![actionController respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+        ApolloLog(@"[NativeActionMenu] Cannot invoke ActionController row %ld", (long)row);
+        return;
+    }
+
+    objc_setAssociatedObject(actionController, &kApolloNativeActionMenuInvokingActionKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloNativeActionMenuPrimeChainedSourceView(actionController);
+
+    UITableView *tableView = ApolloNativeActionMenuTableView(actionController);
+    NSIndexPath *indexPath = [NSIndexPath indexPathForRow:row inSection:0];
+    ((void (*)(id, SEL, id, id))objc_msgSend)(
+        actionController,
+        @selector(tableView:didSelectRowAtIndexPath:),
+        tableView,
+        indexPath
+    );
+}
+
+static NSInteger ApolloNativeActionMenuRowForActionKind(id actionController,
+                                                        uint16_t requestedKind) {
+    void *actionsBuffer = ApolloReadRawIvar(actionController, "actions");
+    int64_t actionCount = ApolloSwiftArrayCount(actionsBuffer);
+    for (int64_t row = 0; row < actionCount; row++) {
+        uint8_t *element = (uint8_t *)actionsBuffer + 0x20 + row * 0x30;
+        if (*(uint16_t *)(element + 0x00) == requestedKind) return (NSInteger)row;
+    }
+    return NSNotFound;
+}
+
+static BOOL sApolloNativeCapturingController;
+static BOOL sApolloNativeCapturingMenuContext;
+static id sApolloNativeCapturedController;
+
+id ApolloNativeActionMenuCaptureController(UIView *source, dispatch_block_t build) {
+    if (sApolloNativeCapturingController || !source.window || !build) return nil;
+    sApolloNativeCapturingController = YES;
+    sApolloNativeCapturedController = nil;
+    @try { build(); }
+    @finally {
+        sApolloNativeCapturingController = NO;
+        sApolloNativeCapturingMenuContext = NO;
+    }
+    id controller = sApolloNativeCapturedController;
+    sApolloNativeCapturedController = nil;
+    if (controller) objc_setAssociatedObject(controller, &kApolloNativeActionMenuSourceViewKey,
+        source, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return controller;
+}
+
+id ApolloNativeActionMenuCaptureMenuController(UIView *source, dispatch_block_t build) {
+    if (sApolloNativeCapturingController) return nil;
+    sApolloNativeCapturingMenuContext = YES;
+    return ApolloNativeActionMenuCaptureController(source, build);
+}
+
+// Some sheets come one run-loop turn after their row's tap (Sort by Top's time
+// ranges): keep capturing, checking every 50 ms for up to 300 ms.
+static void ApolloNativeActionMenuFinishLateCapture(UIView *source, NSUInteger attempt, void (^done)(id controller)) {
+    id controller = sApolloNativeCapturedController;
+    if (!controller && attempt < 6) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            ApolloNativeActionMenuFinishLateCapture(source, attempt + 1, done);
+        });
+        return;
+    }
+    sApolloNativeCapturingController = NO;
+    sApolloNativeCapturingMenuContext = NO;
+    sApolloNativeCapturedController = nil;
+    if (controller) objc_setAssociatedObject(controller, &kApolloNativeActionMenuSourceViewKey,
+        source, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    done(controller);
+}
+
+void ApolloNativeActionMenuCaptureLateMenuController(UIView *source, dispatch_block_t build,
+                                                     void (^done)(id _Nullable controller)) {
+    if (sApolloNativeCapturingController || !source.window || !build || !done) {
+        if (done) done(nil);
+        return;
+    }
+    sApolloNativeCapturingController = YES;
+    sApolloNativeCapturingMenuContext = YES;
+    sApolloNativeCapturedController = nil;
+    @try { build(); }
+    @catch (NSException *exception) {
+        sApolloNativeCapturingController = NO;
+        sApolloNativeCapturingMenuContext = NO;
+        @throw;
+    }
+    ApolloNativeActionMenuFinishLateCapture(source, 0, done);
+}
+
+BOOL ApolloNativeActionMenuHasAction(id controller, uint16_t kind) {
+    return controller && ApolloNativeActionMenuRowForActionKind(controller, kind) != NSNotFound;
+}
+
+void ApolloNativeActionMenuInvokeAction(id controller, uint16_t kind) {
+    NSInteger row = ApolloNativeActionMenuRowForActionKind(controller, kind);
+    if (row != NSNotFound) ApolloNativeActionMenuSelectRow(controller, row);
+}
+
+static BOOL ApolloNativeActionMenuPerformPendingDirectAction(id actionController) {
+    if (sApolloNativeCapturingController &&
+        [actionController isKindOfClass:ApolloClassActionController]) {
+        // The tap hook that armed this sheet's context disarms it once the
+        // handler returns, before the captured menu is built: claim it now.
+        if (sApolloNativeCapturingMenuContext) ApolloActionMenuCaptureContextForController(actionController);
+        sApolloNativeCapturedController = actionController;
+        return YES;
+    }
+    UIViewController *owner = sApolloNativeDirectActionOwner;
+    if (!owner || ![actionController isKindOfClass:ApolloClassActionController]) {
+        return NO;
+    }
+
+    UIView *sourceView = sApolloNativeDirectActionSourceView;
+    uint16_t actionKind = sApolloNativeDirectActionKind;
+    sApolloNativeDirectActionOwner = nil;
+    sApolloNativeDirectActionSourceView = nil;
+    sApolloNativeDirectActionKind = UINT16_MAX;
+
+    // Native menu construction disables every row when this Swift flag is
+    // false. A direct action has no disabled UI to enforce it, so honor the
+    // same gate before preparing or selecting a row. Missing ivar fails closed.
+    if (!ApolloReadBoolIvar(actionController, "actionsEnabled", NO)) {
+        ApolloLog(@"[NativeActionMenu] Posts action kind %u disabled", actionKind);
+        return YES;
+    }
+
+    ApolloActionMenuPrepareControllerForDirectAction(actionController);
+    NSInteger row = ApolloNativeActionMenuRowForActionKind(actionController, actionKind);
+    if (row == NSNotFound) {
+        ApolloLog(@"[NativeActionMenu] Posts action kind %u unavailable", actionKind);
+        return YES;
+    }
+
+    if (sourceView) {
+        objc_setAssociatedObject(actionController, &kApolloNativeActionMenuSourceViewKey,
+                                 sourceView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    ApolloLog(@"[NativeActionMenu] Invoking Posts action kind %u directly", actionKind);
+    ApolloNativeActionMenuSelectRow(actionController, row);
+    return YES;
+}
+
+BOOL ApolloNativeActionMenuInvokePostsAction(UIViewController *postsViewController,
+                                             UIView *sourceView,
+                                             uint16_t actionKind) {
+    SEL selector = @selector(moreOptionsBarButtonItemTappedWithSender:);
+    if (!postsViewController || !sourceView ||
+        ![postsViewController respondsToSelector:selector] ||
+        sApolloNativeDirectActionOwner) {
+        return NO;
+    }
+
+    sApolloNativeDirectActionOwner = postsViewController;
+    sApolloNativeDirectActionSourceView = sourceView;
+    sApolloNativeDirectActionKind = actionKind;
+    ((void (*)(id, SEL, id))objc_msgSend)(postsViewController, selector, sourceView);
+
+    BOOL consumed = sApolloNativeDirectActionOwner == nil;
+    if (!consumed) {
+        ApolloLog(@"[NativeActionMenu] Posts action kind %u did not produce an ActionController",
+                  actionKind);
+        sApolloNativeDirectActionOwner = nil;
+        sApolloNativeDirectActionSourceView = nil;
+        sApolloNativeDirectActionKind = UINT16_MAX;
+    }
+    return consumed;
+}
+
+static BOOL ApolloNativeActionMenuPerformOwningControllerAction(id actionController,
+                                                                 uint16_t actionKind) {
+    // Find in Comments is the one native action whose handler reaches the
+    // CommentsViewController through ActionController.presentingViewController.
+    // The Liquid Glass replacement never presents ActionController, so that
+    // relationship is nil and kind 57 silently stops after dismissing the menu.
+    // Use Apollo's existing Cmd-F entry point on the controller that owns the
+    // captured source button. The same selector owns both classic and Glass
+    // search presentation (ApolloFindInCommentsGlass.xm hooks it on Glass).
+    if (actionKind != 57) return NO;
+
+    UIView *sourceView = objc_getAssociatedObject(actionController,
+                                                   &kApolloNativeActionMenuSourceViewKey);
+    UIViewController *owner = ApolloNativeActionMenuContentControllerForView(sourceView);
+    SEL selector = @selector(searchCommentsKeyCommandSelected);
+    if (![owner respondsToSelector:selector]) {
+        ApolloLog(@"[NativeActionMenu] Find in Comments owner unavailable; falling back to ActionController");
+        return NO;
+    }
+
+    __weak UIViewController *weakOwner = owner;
+    BOOL deferred = ApolloNativeActionMenuPerformAfterDismissal(actionController, ^{
+        UIViewController *strongOwner = weakOwner;
+        if (!strongOwner.viewIfLoaded.window || ![strongOwner respondsToSelector:selector]) return;
+        ApolloLog(@"[NativeActionMenu] Opening Find in Comments from its owning controller");
+        ((void (*)(id, SEL))objc_msgSend)(strongOwner, selector);
+    });
+    if (!deferred) {
+        ApolloLog(@"[NativeActionMenu] Find in Comments dismissal owner unavailable; falling back to ActionController");
+    }
+    return deferred;
+}
+
+static UIAction *ApolloNativeActionMenuAction(NSString *title, NSString *subtitle, UIImage *image, UIColor *tintColor, BOOL opensModeratorMenu, BOOL destructive, BOOL checked, BOOL enabled, id actionController, NSInteger row, uint16_t actionKind) {
+    if (title.length == 0) {
+        return nil;
+    }
+
+    destructive = destructive || ApolloNativeActionMenuTitleIsDestructive(title);
+    if (destructive) {
+        tintColor = nil;
+    } else if (tintColor && image) {
+        image = ApolloNativeActionMenuTintedImage(image, tintColor);
+    }
+
+    UIAction *action = [UIAction actionWithTitle:title image:image identifier:nil handler:^(__unused UIAction *selectedAction) {
+        if (opensModeratorMenu) {
+            sApolloNativeActionMenuNextPresentationModeratorStyle = YES;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
+            });
+            // The moderator sheet this row opens gets its own saved layout.
+            ApolloActionMenuArmModeratorFollowUp(actionController);
+        }
+        if (!ApolloNativeActionMenuPerformOwningControllerAction(actionController, actionKind)) {
+            ApolloNativeActionMenuSelectRow(actionController, row);
+        }
+    }];
+
+    ApolloNativeActionMenuStyleElementTitle(action, tintColor ? UIColor.labelColor : nil);
+
+    if (subtitle.length > 0 && [action respondsToSelector:@selector(setSubtitle:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(action, @selector(setSubtitle:), subtitle);
+    }
+
+    UIMenuElementAttributes attributes = 0;
+    if (destructive) attributes |= UIMenuElementAttributesDestructive;
+    if (!enabled) attributes |= UIMenuElementAttributesDisabled;
+    action.attributes = attributes;
+
+    if (checked && [action respondsToSelector:@selector(setState:)]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(action, @selector(setState:), 1);
+    }
+
+    return action;
+}
+
+BOOL ApolloNativeActionMenusActive(void) {
+    return ApolloNativeActionMenusEnabled();
+}
+
+// Same styling path as ApolloNativeActionMenuAction, minus the ActionController
+// round trip: the settings preview shows the menu, it never performs it.
+UIMenuElement *ApolloNativeActionMenuPreviewAction(NSString *title, UIImage *image, BOOL moderator, BOOL enabled) {
+    if (title.length == 0) return nil;
+    BOOL destructive = ApolloNativeActionMenuTitleIsDestructive(title);
+    UIColor *tintColor = (moderator && !destructive) ? ApolloModeratorColor() : nil;
+    if (tintColor && image) image = ApolloNativeActionMenuTintedImage(image, tintColor);
+    UIAction *action = [UIAction actionWithTitle:title image:image identifier:nil handler:^(__unused UIAction *selectedAction) {}];
+    ApolloNativeActionMenuStyleElementTitle(action, tintColor ? UIColor.labelColor : nil);
+    UIMenuElementAttributes attributes = 0;
+    if (destructive) attributes |= UIMenuElementAttributesDestructive;
+    if (!enabled) attributes |= UIMenuElementAttributesDisabled;
+    action.attributes = attributes;
+    return action;
+}
+
+static void ApolloNativeActionMenuSortSavedCategoriesIfNeeded(id presenter, id actionController) {
+    if (![presenter isMemberOfClass:objc_getClass("_TtC6Apollo32SavedPostsCommentsViewController")]) {
+        return;
+    }
+
+    NSString *actionsDescription = ApolloReadSwiftStringIvar(actionController, "actionsDescription");
+    if (![actionsDescription hasPrefix:@"Show saved items for category"]) {
+        return;
+    }
+
+    void *actionsBuffer = ApolloReadRawIvar(actionController, "actions");
+    int64_t actionCount = ApolloSwiftArrayCount(actionsBuffer);
+    if (actionCount < 3) {
+        return;
+    }
+
+    uint8_t tmpAction[0x30];
+    for (int64_t i = 2; i < actionCount; i++) {
+        uint8_t *elementI = (uint8_t *)actionsBuffer + 0x20 + i * 0x30;
+        NSString *titleI = ApolloDecodeSwiftString(*(uint64_t *)(elementI + 0x08), *(uint64_t *)(elementI + 0x10));
+        if (titleI.length == 0) continue;
+
+        int64_t j = i - 1;
+        while (j >= 1) {
+            uint8_t *elementJ = (uint8_t *)actionsBuffer + 0x20 + j * 0x30;
+            NSString *titleJ = ApolloDecodeSwiftString(*(uint64_t *)(elementJ + 0x08), *(uint64_t *)(elementJ + 0x10));
+            if (titleJ.length == 0 || [titleJ localizedCaseInsensitiveCompare:titleI] <= 0) break;
+            j--;
+        }
+
+        int64_t insertIndex = j + 1;
+        if (insertIndex == i) continue;
+
+        memcpy(tmpAction, elementI, sizeof(tmpAction));
+        memmove((uint8_t *)actionsBuffer + 0x20 + (insertIndex + 1) * 0x30,
+                (uint8_t *)actionsBuffer + 0x20 + insertIndex * 0x30,
+                (i - insertIndex) * 0x30);
+        memcpy((uint8_t *)actionsBuffer + 0x20 + insertIndex * 0x30, tmpAction, sizeof(tmpAction));
+    }
+}
+
+// Renders ModeratorReportsController's report data as native inline UIMenu
+// sections. The controller embeds a custom scrollable header table listing
+// moderator state, moderator reports, and user reports. Rather than parse the
+// underlying Swift [[Any]] storage (whose leaves may be Swift String, Int, or
+// bridged NSString/NSNumber), we reuse Apollo's own data source to render the
+// cells and read their labels — this reproduces Apollo's exact formatting.
+//
+// headerTableView / dataSource are non-optional stored properties, so they are
+// created and have their cells registered in the controller's initializer,
+// before presentation — making it safe to dequeue cells here.
+static UIMenuElement *ApolloNativeActionMenuMakeReportRow(NSString *title, NSString *subtitle) {
+    UIAction *row = [UIAction actionWithTitle:title image:nil identifier:nil handler:^(__unused UIAction *action) {}];
+    row.attributes = UIMenuElementAttributesDisabled;
+    SEL setSubtitleSelector = @selector(setSubtitle:);
+    if (subtitle.length > 0 && [row respondsToSelector:setSubtitleSelector]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(row, setSubtitleSelector, subtitle);
+    }
+    return row;
+}
+
+static UIMenu *ApolloNativeActionMenuMakeReportSection(NSString *header, NSArray<UIMenuElement *> *rows) {
+    return [UIMenu menuWithTitle:(header ?: @"") image:nil identifier:nil options:UIMenuOptionsDisplayInline children:rows];
+}
+
+// Section header titles, recovered from Hopper
+// (-[ModeratorReportsControllerDataSource tableView:viewForHeaderInSection:]):
+// section 1 = moderator reports, section 2 = user reports, section 0 = the
+// moderator action/state, whose title depends on the state tag byte.
+static NSString *ApolloNativeActionMenuReportSectionHeader(id controller, NSInteger section) {
+    if (section == 1) return @"Moderator Reports";
+    if (section == 2) return @"User Reports";
+
+    ptrdiff_t stateOffset = ApolloIvarOffset(object_getClass(controller), "state");
+    if (stateOffset < 0) return nil;
+    uint8_t stateTag = *(uint8_t *)((uint8_t *)(__bridge void *)controller + stateOffset + 0x10);
+    switch (stateTag) {
+        case 0: return @"Approved by";
+        case 1: return @"Removed as Spam by";
+        case 2: return @"Removed by";
+        default: return nil;
+    }
+}
+
+static NSArray<UIMenuElement *> *ApolloNativeActionMenuBuildModeratorReportSections(id actionController) {
+    if (![actionController isMemberOfClass:ApolloClassModeratorReportsController]) {
+        return nil;
+    }
+
+    id<UITableViewDataSource> dataSource = (id<UITableViewDataSource>)ApolloReadObjectIvar(actionController, "dataSource");
+    UITableView *table = (UITableView *)ApolloReadObjectIvar(actionController, "headerTableView");
+    if (!dataSource || ![table isKindOfClass:[UITableView class]]) {
+        return nil;
+    }
+    if (![dataSource respondsToSelector:@selector(tableView:numberOfRowsInSection:)]
+        || ![dataSource respondsToSelector:@selector(tableView:cellForRowAtIndexPath:)]) {
+        return nil;
+    }
+
+    NSMutableArray<UIMenuElement *> *sections = [NSMutableArray array];
+    @try {
+        NSInteger sectionCount = 3;
+        if ([dataSource respondsToSelector:@selector(numberOfSectionsInTableView:)]) {
+            sectionCount = [dataSource numberOfSectionsInTableView:table];
+        }
+
+        for (NSInteger section = 0; section < sectionCount; section++) {
+            NSInteger rowCount = [dataSource tableView:table numberOfRowsInSection:section];
+            if (rowCount <= 0) continue;
+
+            NSMutableArray<UIMenuElement *> *rows = [NSMutableArray array];
+            for (NSInteger row = 0; row < rowCount; row++) {
+                NSIndexPath *indexPath = [NSIndexPath indexPathForRow:row inSection:section];
+                UITableViewCell *cell = [dataSource tableView:table cellForRowAtIndexPath:indexPath];
+                NSString *title = cell.textLabel.text;
+                if (title.length == 0) continue;
+                NSString *subtitle = cell.detailTextLabel.text;
+                [rows addObject:ApolloNativeActionMenuMakeReportRow(title, subtitle)];
+            }
+
+            if (rows.count > 0) {
+                NSString *header = ApolloNativeActionMenuReportSectionHeader(actionController, section);
+                [sections addObject:ApolloNativeActionMenuMakeReportSection(header, rows)];
+            }
+        }
+    } @catch (__unused NSException *exception) {
+        ApolloLogError(@"[NativeActionMenu] Failed to render moderator reports: %@", exception);
+        return nil;
+    }
+
+    return sections.count > 0 ? sections : nil;
+}
+
+static UIMenu *ApolloNativeActionMenuBuildMenu(id actionController, BOOL moderatorStyle) {
+    objc_setAssociatedObject(actionController, &kApolloNativeActionMenuModeratorSelectionKey,
+        @(moderatorStyle), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // A customised ••• layout (Settings → Interface → Action Menus) permutes
+    // the controller's native actions in place; it must land before the
+    // buffer is walked below. Memoised per controller, no-op otherwise.
+    ApolloActionMenuPrepareController(actionController, nil);
+
+    void *actionsBuffer = ApolloReadRawIvar(actionController, "actions");
+    void *textActionsBuffer = ApolloReadRawIvar(actionController, "textActions");
+    int64_t actionCount = ApolloSwiftArrayCount(actionsBuffer);
+    int64_t textActionCount = ApolloSwiftArrayCount(textActionsBuffer);
+    BOOL enabled = ApolloReadBoolIvar(actionController, "actionsEnabled", YES);
+
+    if (actionCount <= 0 && textActionCount <= 0) {
+        return nil;
+    }
+
+    NSMutableArray<UIMenuElement *> *children = [NSMutableArray array];
+    UIColor *moderatorTintColor = ApolloModeratorColor();
+    UIColor *menuTintColor = moderatorStyle ? moderatorTintColor : nil;
+
+    NSArray<UIMenuElement *> *reportSections = ApolloNativeActionMenuBuildModeratorReportSections(actionController);
+    if (reportSections.count > 0) {
+        [children addObjectsFromArray:reportSections];
+    }
+
+    for (int64_t i = 0; i < actionCount; i++) {
+        uint8_t *element = (uint8_t *)actionsBuffer + 0x20 + i * 0x30;
+        uint16_t actionKind = *(uint16_t *)(element + 0x00);
+        NSString *title = ApolloDecodeSwiftString(*(uint64_t *)(element + 0x08), *(uint64_t *)(element + 0x10));
+        NSString *subtitle = ApolloDecodeSwiftString(*(uint64_t *)(element + 0x18), *(uint64_t *)(element + 0x20));
+        if (title.length == 0) {
+            title = ApolloNativeActionDefaultTitle(actionKind);
+        }
+        UIImage *image = ApolloNativeActionDefaultImage(actionKind);
+        BOOL opensModeratorMenu = ApolloNativeActionKindOpensModeratorMenu(actionKind);
+        UIColor *actionTintColor = opensModeratorMenu ? moderatorTintColor : menuTintColor;
+        BOOL destructive = ApolloNativeActionMenuTitleIsDestructive(title);
+        UIAction *action = ApolloNativeActionMenuAction(title, subtitle, image, actionTintColor, opensModeratorMenu, destructive, NO, enabled, actionController, (NSInteger)i, actionKind);
+        if (action) {
+            UIMenuElement *element = action;
+            // actionKind 51 = Submit Post: swap the plain row for the quick
+            // post-type group (Photo/Link/Text/Poll) when one is available.
+            if (actionKind == 51 && enabled) {
+                NSInteger row = (NSInteger)i;
+                UIMenu *postTypes = ApolloSubmitPostTypesMenu(actionController, ^{
+                    ApolloNativeActionMenuSelectRow(actionController, row);
+                });
+                if (postTypes) element = postTypes;
+            }
+            ApolloActionMenuTagElementWithNativeKind(element, actionKind);
+            [children addObject:element];
+        }
+    }
+
+    if (actionCount > 0 && textActionCount > 0 && children.count > 0) {
+        NSMutableArray<UIMenuElement *> *textChildren = [NSMutableArray array];
+        for (int64_t i = 0; i < textActionCount; i++) {
+            uint8_t *element = (uint8_t *)textActionsBuffer + 0x20 + i * 0x18;
+            NSInteger row = (NSInteger)(actionCount + i);
+            NSString *title = ApolloDecodeSwiftString(*(uint64_t *)(element + 0x00), *(uint64_t *)(element + 0x08));
+            BOOL destructive = (*(uint8_t *)(element + 0x10) != 0) || ApolloNativeActionMenuTitleIsDestructive(title);
+            BOOL checked = *(uint8_t *)(element + 0x12) != 0;
+
+            UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row, UINT16_MAX);
+            if (action) {
+                [textChildren addObject:action];
+            }
+        }
+        if (textChildren.count > 0) {
+            UIMenu *inlineTextMenu = [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:textChildren];
+            [children addObject:inlineTextMenu];
+        }
+    } else {
+        for (int64_t i = 0; i < textActionCount; i++) {
+            uint8_t *element = (uint8_t *)textActionsBuffer + 0x20 + i * 0x18;
+            NSInteger row = (NSInteger)(actionCount + i);
+            NSString *title = ApolloDecodeSwiftString(*(uint64_t *)(element + 0x00), *(uint64_t *)(element + 0x08));
+            BOOL destructive = (*(uint8_t *)(element + 0x10) != 0) || ApolloNativeActionMenuTitleIsDestructive(title);
+            BOOL checked = *(uint8_t *)(element + 0x12) != 0;
+
+            UIAction *action = ApolloNativeActionMenuAction(title, nil, nil, menuTintColor, NO, destructive, checked, enabled, actionController, row, UINT16_MAX);
+            if (action) {
+                [children addObject:action];
+            }
+        }
+    }
+
+    if (children.count == 0) {
+        return nil;
+    }
+
+    NSString *title = ApolloReadSwiftStringIvar(actionController, "actionsDescription") ?: @"";
+    // Every feature-registered row (Public Sticky from Subreddit, Show/Hide
+    // Deleted Comments, Gallery View, ...) is injected here through the single
+    // action-menu registry; see ApolloActionMenu.h for the registration contract.
+    ApolloActionMenuInjectMenuElements(children, title, actionController);
+    return [UIMenu menuWithTitle:title children:children];
+}
+
+// Ordinary menu dismissals reuse the owned glass surface in both directions;
+// a blank stand-in leaves two lenses over the still-visible source page.
+// Navigation instead retires that source with a separate clear preview below.
+// Non-owned controls use only geometry.
+// All targets need a stable window-hosted view: iOS 27 AnimationKit requires a
+// superview, so UIWindow itself is invalid, even when the source page detaches.
+
+@implementation ApolloNativeActionMenuPresenter
+
+// A queued captured menu can be superseded before it owns an anchor. Its
+// pending block then releases the presenter without any UIKit end callback.
+// Notify only accepted captured requests; immediate NO remains the caller's
+// responsibility. Normal finish clears both blocks, so this cannot double-end.
+- (void)dealloc {
+    dispatch_block_t feedbackEnd = _previewFeedbackEnd;
+    dispatch_block_t didEnd = nil;
+    if (_notifiesCapturedCancellation) didEnd = _didEnd;
+    if (feedbackEnd || didEnd) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (feedbackEnd) feedbackEnd();
+            if (didEnd) didEnd();
+        });
+    }
+}
+
+// End ownership explicitly, including aborts: the anchor retains its presenter.
+
+- (UIContextMenuConfiguration *)contextMenuInteraction:(__unused UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(__unused CGPoint)location {
+    UIMenu *menu = self.menu;
+    if (!menu || self.ended) return nil;
+    self.didRequestConfiguration = YES;
+
+    return [UIContextMenuConfiguration configurationWithIdentifier:NSUUID.UUID previewProvider:nil actionProvider:^UIMenu *(__unused NSArray<UIMenuElement *> *suggestedActions) {
+        return menu;
+    }];
+}
+
+// Issue #249: UIKit's iOS 26 liquid-glass menu bloom only runs when the menu
+// style asks for it. -[_UIContextMenuLiquidMorphPresentationAnimation
+// sourcePreviewMorphsToMenu] requires preferredLayout == 3 (compact/actions-
+// only) AND shouldMenuOverlapSourcePreview == YES; without a delegate style
+// UIKit uses +[_UIContextMenuStyle defaultStyle] (layout 100, overlap NO) and
+// the presentation degrades to the legacy fade. Mirror what UIKit's own
+// button-menu path builds in _UIControlMenuSupportDefaultMenuStyle().
+// NOTE: layout 3 swaps the presentation to the actions-only controller, so
+// this style is only correct for menus that have NO preview platter.
+static id ApolloNativeActionMenuCompactMenuStyle(void) {
+    Class styleClass = objc_getClass("_UIContextMenuStyle");
+    SEL defaultStyleSelector = @selector(defaultStyle);
+    if (!styleClass || ![styleClass respondsToSelector:defaultStyleSelector]) return nil;
+
+    id style = ((id (*)(id, SEL))objc_msgSend)(styleClass, defaultStyleSelector);
+    if (!style) return nil;
+
+    SEL setPreferredLayoutSelector = @selector(setPreferredLayout:);
+    if ([style respondsToSelector:setPreferredLayoutSelector]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(style, setPreferredLayoutSelector, 3);
+    }
+    SEL setOverlapSelector = @selector(setShouldMenuOverlapSourcePreview:);
+    if ([style respondsToSelector:setOverlapSelector]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(style, setOverlapSelector, ApolloNativeActionMenuMagicMorphEnabled());
+    }
+    return style;
+}
+
+- (id)_contextMenuInteraction:(__unused UIContextMenuInteraction *)interaction styleForMenuWithConfiguration:(__unused UIContextMenuConfiguration *)configuration {
+    id style = ApolloNativeActionMenuCompactMenuStyle();
+    // A finger location has no visible control to morph into the menu.
+    SEL overlap = @selector(setShouldMenuOverlapSourcePreview:);
+    if (self.sourcePoint && [style respondsToSelector:overlap]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(style, overlap, NO);
+    }
+    return style;
+}
+
+- (UITargetedPreview *)previewForCurrentSource {
+    if (self.ended) return nil;
+    UIWindow *window = self.presentationWindow ?: self.sourceView.window;
+    if (!window) return nil;
+
+    // Preserve a detached source's last target, not the proxy button's 1pt center.
+    UIView *source = self.morphSourceView ?: (self.morphPreview ? nil : self.sourceView);
+    UIView *ownedSurface = ApolloNavigationActionsMenuSourceView(source);
+    UIView *geometry = ownedSurface ?: source;
+    // For non-owned controls, copy native geometry without portaling the live view.
+    if (geometry == source && self.morphSourceView) {
+        SEL selector = @selector(_morphView);
+        if ([source respondsToSelector:selector]) {
+            UIView *resolved = ((id (*)(id, SEL))objc_msgSend)(source, selector);
+            if (resolved.window == window) geometry = resolved;
+        }
+    }
+    CGPoint center = self.presentationAnchorCenter;
+    CGSize size = self.morphPreview ? self.morphPreview.view.bounds.size : CGSizeMake(1, 1);
+    if (geometry.window == window && !CGRectIsEmpty(geometry.bounds)) {
+        CGRect rect = [geometry convertRect:geometry.bounds toView:window];
+        center = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
+        if (!self.morphPreview) size = rect.size;
+    }
+    if (!self.morphPreview) {
+        UIView *host = [[UIView alloc] initWithFrame:window.bounds];
+        host.backgroundColor = UIColor.clearColor;
+        host.opaque = NO;
+        host.userInteractionEnabled = NO;
+        host.accessibilityElementsHidden = YES;
+        host.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [window addSubview:host];
+        self.morphHostView = host;
+        CGPoint targetCenter = [window convertPoint:center toView:host];
+        UIView *previewSource = ownedSurface;
+        if (!previewSource) {
+            UIView *placeholder = [[UIView alloc] initWithFrame:(CGRect){CGPointZero, size}];
+            placeholder.backgroundColor = UIColor.clearColor;
+            placeholder.opaque = NO;
+            placeholder.userInteractionEnabled = NO;
+            placeholder.accessibilityElementsHidden = YES;
+            placeholder.center = targetCenter;
+            [host addSubview:placeholder];
+            self.morphStandInView = placeholder;
+            previewSource = placeholder;
+        }
+        UIPreviewParameters *parameters = [UIPreviewParameters new];
+        parameters.backgroundColor = UIColor.clearColor;
+        parameters.visiblePath = [UIBezierPath bezierPathWithRoundedRect:previewSource.bounds
+            cornerRadius:MIN(size.width, size.height) / 2];
+        parameters.shadowPath = [UIBezierPath bezierPath];
+        UIPreviewTarget *target = [[UIPreviewTarget alloc] initWithContainer:host center:targetCenter];
+        self.morphPreview = [[UITargetedPreview alloc] initWithView:previewSource parameters:parameters target:target];
+    } else if (hypot(self.presentationAnchorCenter.x - center.x,
+                      self.presentationAnchorCenter.y - center.y) > 0.5) {
+        // Follow a live source; retain the last window-backed target if detached.
+        CGPoint targetCenter = [window convertPoint:center toView:self.morphHostView];
+        UIPreviewTarget *target = [[UIPreviewTarget alloc] initWithContainer:self.morphHostView center:targetCenter];
+        [UIView performWithoutAnimation:^{ self.morphStandInView.center = targetCenter; }];
+        self.morphPreview = [self.morphPreview retargetedPreviewWithTarget:target];
+    }
+    self.presentationAnchorCenter = center;
+    return self.morphPreview;
+}
+
+- (UITargetedPreview *)navigationPreviewForDismissal {
+    if (self.navigationDismissalPreview) return self.navigationDismissalPreview;
+    if (self.ended || !self.morphHostView.window) return nil;
+    UITargetedPreview *sourcePreview = [self previewForCurrentSource];
+    if (!sourcePreview) return nil;
+    CGSize size = sourcePreview.view.bounds.size;
+    size.width = MAX(1, size.width);
+    size.height = MAX(1, size.height);
+    UIView *placeholder = [[UIView alloc] initWithFrame:(CGRect){CGPointZero, size}];
+    placeholder.backgroundColor = UIColor.clearColor;
+    placeholder.opaque = NO;
+    placeholder.userInteractionEnabled = NO;
+    placeholder.accessibilityElementsHidden = YES;
+    CGPoint center = [self.presentationWindow convertPoint:self.presentationAnchorCenter toView:self.morphHostView];
+    placeholder.center = center;
+    [self.morphHostView addSubview:placeholder];
+    self.navigationDismissalSource = placeholder;
+    UIPreviewParameters *parameters = [UIPreviewParameters new];
+    parameters.backgroundColor = UIColor.clearColor;
+    parameters.shadowPath = [UIBezierPath bezierPath];
+    UIPreviewTarget *target = [[UIPreviewTarget alloc] initWithContainer:self.morphHostView center:center];
+    self.navigationDismissalPreview = [[UITargetedPreview alloc] initWithView:placeholder parameters:parameters target:target];
+    return self.navigationDismissalPreview;
+}
+
+- (void)prepareForNavigationDismissal {
+    self.navigationHandoffStarted = YES;
+    UITargetedPreview *preview = [self navigationPreviewForDismissal];
+    // A UIAction may run after willEnd and its first preview request. Retarget
+    // that existing transition too, while keeping both previews alive until
+    // normal completion. Otherwise the upcoming delegate request uses it.
+    BOOL retargeted = NO;
+    SEL retarget = @selector(retargetDismissingMenuToPreview:);
+    if (self.dismissing && preview &&
+        ApolloSendObject(self.nativePresentation, @selector(disappearanceTransition)) &&
+        [self.nativePresentation respondsToSelector:retarget]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(self.nativePresentation, retarget, preview);
+        retargeted = YES;
+    }
+    ApolloLog(@"[NativeActionMenu] Prepared transparent navigation dismissal preview (retargeted=%d)", retargeted);
+}
+
+- (UITargetedPreview *)contextMenuInteraction:(__unused UIContextMenuInteraction *)interaction previewForHighlightingMenuWithConfiguration:(__unused UIContextMenuConfiguration *)configuration {
+    return [self previewForCurrentSource];
+}
+
+- (UITargetedPreview *)contextMenuInteraction:(__unused UIContextMenuInteraction *)interaction previewForDismissingMenuWithConfiguration:(__unused UIContextMenuConfiguration *)configuration {
+    return self.navigationHandoffStarted ? [self navigationPreviewForDismissal] : [self previewForCurrentSource];
+}
+
+- (void)contextMenuInteraction:(__unused UIContextMenuInteraction *)interaction willDisplayMenuForConfiguration:(__unused UIContextMenuConfiguration *)configuration animator:(__unused id<UIContextMenuInteractionAnimating>)animator {
+    self.didBeginPresentation = YES;
+    [self captureNativePresentation];
+}
+
+- (void)contextMenuInteraction:(__unused UIContextMenuInteraction *)interaction willEndForConfiguration:(__unused UIContextMenuConfiguration *)configuration animator:(id<UIContextMenuInteractionAnimating>)animator {
+    if (self.ended || self.dismissing) return;
+    [self captureNativePresentation];
+    self.dismissing = YES;
+    // Retain this preview/anchor through reverse morph and late preview callbacks.
+    if (animator) {
+        [animator addCompletion:^{ [self finishPresentation]; }];
+        [self watchMenuFadeOut];
+    } else {
+        [self finishPresentation];
+    }
+}
+
+// The dismissing presentation's menu view (private UIKit, read defensively).
+- (UIView *)dismissingMenuView {
+    id presentation = self.nativePresentation;
+    SEL uiControllerSelector = @selector(uiController);
+    if (![presentation respondsToSelector:uiControllerSelector]) return nil;
+    id uiController = ((id (*)(id, SEL))objc_msgSend)(presentation, uiControllerSelector);
+    SEL menuViewSelector = @selector(menuView);
+    if (![uiController respondsToSelector:menuViewSelector]) return nil;
+    id menuView = ((id (*)(id, SEL))objc_msgSend)(uiController, menuViewSelector);
+    return [menuView isKindOfClass:UIView.class] ? menuView : nil;
+}
+
+- (void)watchMenuFadeOut {
+    if (self.fadeLink) return;
+    if (![self dismissingMenuView]) {
+        // A future UIKit without these views: the animator completion stays
+        // the only release, as before.
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            ApolloLog(@"[NativeActionMenu] No menu view to watch; follow-up menus wait for UIKit's completion");
+        });
+        return;
+    }
+    self.dismissalStartTime = CACurrentMediaTime();
+    ApolloNativeActionMenuFadeLinkProxy *proxy = [ApolloNativeActionMenuFadeLinkProxy new];
+    proxy.presenter = self;
+    self.fadeLink = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(tick:)];
+    [self.fadeLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+}
+
+- (void)stopWatchingMenuFadeOut {
+    [self.fadeLink invalidate];
+    self.fadeLink = nil;
+}
+
+- (void)fadeLinkTick:(__unused CADisplayLink *)link {
+    if (self.ended || self.menuFaded) {
+        [self stopWatchingMenuFadeOut];
+        return;
+    }
+    UIView *menuView = [self dismissingMenuView];
+    CALayer *layer = menuView.layer.presentationLayer ?: menuView.layer;
+    // Below 2% opacity the collapsed menu no longer shows.
+    if (menuView.window && !menuView.hidden && layer.opacity > 0.02f) return;
+    [self stopWatchingMenuFadeOut];
+    self.menuFaded = YES;
+    dispatch_block_t next = self.pendingPresentationAction;
+    // A chosen action keeps priority over a queued menu, as in -finishPresentation.
+    if (!next || self.afterDismissalAction) return;
+    ApolloLog(@"[NativeActionMenu] Menu faded out %.0f ms into its dismissal; opening the next one",
+              (CACurrentMediaTime() - self.dismissalStartTime) * 1000.0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // A late selected action can arrive between the fade and this turn.
+        // It cancels this queued menu even if it already started navigation.
+        if (self.ended || self.afterDismissalAction || self.pendingPresentationAction != next) return;
+        self.pendingPresentationAction = nil;
+        next();
+    });
+}
+
+// A dismissing menu that has faded out no longer draws a lens of its own, so a
+// menu from another source may open now instead of waiting for UIKit to settle.
+// One reusing the same owned navigation surface still needs UIKit's handoff
+// (or the completion): both transitions would drive that surface.
+- (BOOL)hasFadedOutBeforePresentationFromSource:(UIView *)source {
+    if (!self.dismissing || !self.menuFaded || self.ended) return NO;
+    UIView *surface = ApolloNavigationActionsMenuSourceView(source);
+    return !surface || surface != self.morphPreview.view;
+}
+
+- (void)finishPresentation {
+    if (self.ended) return;
+    self.ended = YES;
+    [self stopWatchingMenuFadeOut];
+    UIView *source = self.sourceView;
+    BOOL ownsAnchor = objc_getAssociatedObject(source, &kApolloNativeActionMenuControllerKey) == self;
+    if (self.interaction) [source removeInteraction:self.interaction];
+    if (ownsAnchor) {
+        objc_setAssociatedObject(source, &kApolloNativeActionMenuControllerKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        if (self.removeSourceViewOnEnd) [source removeFromSuperview];
+    }
+    if (ApolloNativeActionMenuPresenterForController(self.actionController) == self) {
+        ApolloNativeActionMenuSetPresenterForController(self.actionController, nil);
+    }
+    dispatch_block_t feedbackEnd = self.previewFeedbackEnd;
+    self.previewFeedbackEnd = nil;
+    if (feedbackEnd) feedbackEnd();
+    dispatch_block_t didEnd = self.didEnd;
+    self.didEnd = nil;
+    if (didEnd) didEnd();
+    UIWindow *window = self.presentationWindow;
+    dispatch_block_t selectedAction = self.afterDismissalAction;
+    if (!selectedAction && ApolloNativeActionMenuActivePresenter(window) == self) {
+        ApolloNativeActionMenuSetActivePresenter(self.presentationWindow, nil);
+    }
+    // UIKit owns source visibility: never reset hidden/alpha or remove the real surface.
+    [self.morphStandInView removeFromSuperview];
+    self.morphStandInView = nil;
+    [self.navigationDismissalSource removeFromSuperview];
+    self.navigationDismissalSource = nil;
+    self.navigationDismissalPreview = nil;
+    [self.morphHostView removeFromSuperview];
+    self.morphHostView = nil;
+    self.morphPreview = nil;
+    self.interaction = nil;
+    self.nativePresentation = nil;
+    self.menu = nil;
+    self.presentationWindow = nil;
+    [self.surfaceLease invalidate];
+    self.surfaceLease = nil;
+    dispatch_block_t next = self.pendingPresentationAction;
+    self.pendingPresentationAction = nil;
+    if (selectedAction) {
+        // Reserve the window through next-turn action execution, blocking competing menus.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.afterDismissalAction = nil;
+            if (ApolloNativeActionMenuActivePresenter(window) == self) {
+                ApolloNativeActionMenuSetActivePresenter(window, nil);
+            }
+            selectedAction();
+        });
+    } else if (next) {
+        dispatch_async(dispatch_get_main_queue(), next);
+    }
+}
+
+- (void)captureNativePresentation {
+    if (self.ended || self.nativePresentation) return;
+    SEL presentations = @selector(presentationsByIdentifier);
+    if (![self.interaction respondsToSelector:presentations]) return;
+    id values = ((id (*)(id, SEL))objc_msgSend)(self.interaction, presentations);
+    // Capture the sole presentation before dismissMenu clears it mid-animation;
+    // UIKit's internal identifier differs from our configuration identifier.
+    if ([values isKindOfClass:NSDictionary.class] && [values count] == 1) {
+        self.nativePresentation = [values allValues].firstObject;
+    }
+}
+
+- (id)nativeHandoffPresentationForSource:(UIView *)source {
+    UIView *surface = ApolloNavigationActionsMenuSourceView(source);
+    if (self.navigationHandoffStarted || !self.dismissing || !self.didBeginPresentation || !surface ||
+        surface != self.morphPreview.view || surface.window != self.presentationWindow ||
+        !self.didRequestConfiguration || !ApolloNativeActionMenuMagicMorphEnabled()) return nil;
+
+    SEL disappearance = @selector(disappearanceTransition);
+    if (![self.interaction respondsToSelector:@selector(setOutgoingPresentation:)]) return nil;
+    id previous = self.nativePresentation;
+    id transition = [previous respondsToSelector:disappearance] ?
+        ((id (*)(id, SEL))objc_msgSend)(previous, disappearance) : nil;
+    Class morph = objc_getClass("_UIContextMenuLiquidMorphPresentationAnimation");
+    // Never reuse A's inherited outgoing transition for B -> C, and never
+    // start a competing lens if UIKit cannot provide a compatible handoff.
+    return morph && [transition isKindOfClass:morph] ? previous : nil;
+}
+
+- (BOOL)presentFromView:(UIView *)source completion:(dispatch_block_t)completion {
+    UIWindow *window = source.window;
+    if (!window || self.ended) return NO;
+    NSUInteger latest = [objc_getAssociatedObject(window, &kApolloNativeActionMenuWindowRequestKey) unsignedIntegerValue];
+    if (!self.requestGeneration) {
+        self.requestWindow = window;
+        self.requestGeneration = latest + 1;
+        objc_setAssociatedObject(window, &kApolloNativeActionMenuWindowRequestKey, @(self.requestGeneration), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if (self.requestWindow != window || self.requestGeneration != latest) {
+        // Reject stale queued taps before they can dismiss a newer menu.
+        [self finishPresentation];
+        return NO;
+    }
+    ApolloNativeActionMenuPresenter *active = ApolloNativeActionMenuActivePresenter(window);
+    if (active == self && self.interaction) return YES;
+    if (active != self && active.afterDismissalAction) {
+        // Chosen actions take priority, including those awaiting next-turn execution.
+        [self finishPresentation];
+        return YES;
+    }
+    id previousPresentation = [active nativeHandoffPresentationForSource:source];
+    if (active && active != self && !active.ended && !previousPresentation &&
+        ![active hasFadedOutBeforePresentationFromSource:source]) {
+        // Dismiss an open/preparing menu first. Compatible requests during
+        // dismissal reuse its outgoing transition instead of this queue, and
+        // the queue opens once the dismissing menu has faded out.
+        __weak UIView *weakSource = source;
+        active.pendingPresentationAction = ^{
+            UIView *liveSource = weakSource;
+            if (liveSource.window == window) [self presentFromView:liveSource completion:completion];
+            else [self finishPresentation];
+        };
+        if (!active.dismissing) [active.interaction dismissMenu];
+        return YES;
+    }
+
+    UIContextMenuInteraction *interaction = [[UIContextMenuInteraction alloc] initWithDelegate:self];
+    SEL present = @selector(_presentMenuAtLocation:);
+    if (![interaction respondsToSelector:present]) return NO;
+    // Share UIKit's outgoing transition to avoid competing return/open glass animations.
+    SEL setOutgoing = @selector(setOutgoingPresentation:);
+    if (previousPresentation && [interaction respondsToSelector:setOutgoing]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(interaction, setOutgoing, previousPresentation);
+    }
+    BOOL removeAnchor = NO;
+    UIView *anchor = ApolloNativeActionMenuCreateProxyAnchorView(source, &removeAnchor);
+    if (!anchor.window) return NO;
+    if (self.sourcePoint) {
+        anchor.center = [source convertPoint:self.sourcePoint.CGPointValue toView:anchor.superview];
+    }
+    self.sourceView = anchor;
+    self.morphSourceView = !self.sourcePoint && ApolloNativeActionMenuViewShouldMorph(source) ? source : nil;
+    self.presentationWindow = window;
+    self.presentationAnchorCenter = [anchor convertPoint:CGPointMake(CGRectGetMidX(anchor.bounds),
+        CGRectGetMidY(anchor.bounds)) toView:window];
+    self.removeSourceViewOnEnd = removeAnchor;
+    self.interaction = interaction;
+    [anchor addInteraction:interaction];
+    objc_setAssociatedObject(anchor, &kApolloNativeActionMenuControllerKey, self, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloNativeActionMenuSetPresenterForController(self.actionController, self);
+    ApolloNativeActionMenuSetActivePresenter(window, self);
+    // Acquire before configuration/preview to protect preparation from late item updates.
+    self.surfaceLease = ApolloNativeActionMenuAcquireSurface(
+        ApolloNavigationActionsMenuSourceView(self.morphSourceView), self.requestGeneration);
+
+    SEL driver = @selector(_setFallbackDriverStyle:);
+    if ([interaction respondsToSelector:driver]) {
+        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(interaction, driver, 1);
+    }
+    CGPoint location = CGPointMake(CGRectGetMidX(anchor.bounds), CGRectGetMidY(anchor.bounds));
+    ((void (*)(id, SEL, CGPoint))objc_msgSend)(interaction, present, location);
+    [self captureNativePresentation];
+    // Configuration is synchronous; display can be delayed. Only rejection
+    // before configuration lacks an end animator; delayed willDisplay is not failure.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.didRequestConfiguration && !self.ended) [self finishPresentation];
+    });
+    ApolloLog(@"[NativeActionMenu] Presentation requested for %@ (%lu sections)",
+        NSStringFromClass(source.class), (unsigned long)self.menu.children.count);
+    if (completion) completion();
+    return YES;
+}
+
+@end
+
+typedef UIMenu * (^ApolloNativeActionMenuProvider)(NSArray<UIMenuElement *> *suggestedActions);
+
+%hook UIContextMenuConfiguration
++ (instancetype)configurationWithIdentifier:(id<NSCopying>)identifier previewProvider:(id)previewProvider actionProvider:(ApolloNativeActionMenuProvider)actionProvider {
+    // Process-wide: only the glass renderer's menus and Apollo's customisable
+    // long-press menus (a delegate hook below is running) are touched.
+    ApolloActionMenuContext longPressContext = sApolloActionMenuLongPressContext;
+    BOOL nativeMenus = ApolloNativeActionMenusEnabled();
+    if (!actionProvider || (!nativeMenus && !longPressContext)) {
+        return %orig(identifier, previewProvider, actionProvider);
+    }
+
+    ApolloNativeActionMenuProvider originalActionProvider = [actionProvider copy];
+    UIView *sourceView = sApolloNativeActionMenuConfigurationSourceView;
+    ApolloNativeActionMenuProvider wrappedActionProvider = ^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+        UIMenu *menu = originalActionProvider(suggestedActions);
+        // Settings → Interface → Action Menus: the long press shows the same
+        // actions as that object's ••• menu, so it takes the same saved
+        // layout. Applied to Apollo's own rows, before any styling below.
+        if (longPressContext) menu = ApolloActionMenuApplyLayoutToContextMenu(menu, longPressContext);
+        if (!nativeMenus) return menu;
+        BOOL moderatorStyle = ApolloNativeActionMenuModeratorStyleActive() || sApolloNativeActionMenuNextPresentationModeratorStyle;
+        if (sApolloNativeActionMenuNextPresentationModeratorStyle) {
+            sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
+        }
+        return ApolloNativeActionMenuTransformMenu(menu, moderatorStyle, sourceView);
+    };
+    return %orig(identifier, previewProvider, wrappedActionProvider);
+}
+%end
+
+// Touch and hold: a post in a feed (PostCellActionTaker — every list of post
+// cells), the post at the top of its comments, and a comment. Each builds its
+// configuration synchronously inside %orig; the image/link menus the same
+// delegates return over media or a link are told apart by their rows
+// (ApolloActionMenuApplyLayoutToContextMenu). Statics restored in @finally.
+%hook _TtC6Apollo19PostCellActionTaker
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    ApolloActionMenuContext previousContext = sApolloActionMenuLongPressContext;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    sApolloActionMenuLongPressContext = ApolloActionMenuContextPost;
+    UIContextMenuConfiguration *configuration = nil;
+    @try {
+        configuration = %orig;
+    } @finally {
+        sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+        sApolloActionMenuLongPressContext = previousContext;
+    }
+    return configuration;
+}
+%end
+
+%hook _TtC6Apollo24CommentSectionController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    ApolloActionMenuContext previousContext = sApolloActionMenuLongPressContext;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    sApolloActionMenuLongPressContext = ApolloActionMenuContextComment;
+    UIContextMenuConfiguration *configuration = nil;
+    @try {
+        configuration = %orig;
+    } @finally {
+        sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+        sApolloActionMenuLongPressContext = previousContext;
+    }
+    return configuration;
+}
+%end
+
+%hook _TtC6Apollo31CommentsHeaderSectionController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    ApolloActionMenuContext previousContext = sApolloActionMenuLongPressContext;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    // The comments view's own ••• menu: same actions, same Moderator follow-up.
+    sApolloActionMenuLongPressContext = ApolloActionMenuContextPostDetail;
+    UIContextMenuConfiguration *configuration = nil;
+    @try {
+        configuration = %orig;
+    } @finally {
+        sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+        sApolloActionMenuLongPressContext = previousContext;
+    }
+    return configuration;
+}
+%end
+
+%hook _TtC6Apollo22InboxSectionController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    UIContextMenuConfiguration *configuration = %orig;
+    sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+    return configuration;
+}
+%end
+
+// Store the press per configuration so highlighting and dismissal use the
+// same point. UIKit handles screen-edge avoidance.
+static UITargetedPreview *ApolloMediaMenuPressPreview(UIContextMenuInteraction *interaction,
+                                                     UIContextMenuConfiguration *configuration) {
+    NSValue *location = objc_getAssociatedObject(configuration, &kApolloMediaMenuPressLocationKey);
+    UIView *source = interaction.view;
+    if (!location || !source.window) return nil;
+
+    UIView *anchor = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
+    anchor.userInteractionEnabled = NO;
+    UIPreviewParameters *parameters = [UIPreviewParameters new];
+    parameters.backgroundColor = UIColor.clearColor;
+    parameters.visiblePath = [UIBezierPath bezierPathWithRect:anchor.bounds];
+    UIPreviewTarget *target = [[UIPreviewTarget alloc] initWithContainer:source center:location.CGPointValue];
+    // Only the target container needs a window; the preview view may be detached.
+    return [[UITargetedPreview alloc] initWithView:anchor parameters:parameters target:target];
+}
+
+void ApolloNativeActionMenuAnchorMediaConfiguration(UIContextMenuConfiguration *configuration, CGPoint point) {
+    if (!configuration || !ApolloNativeActionMenusEnabled()) return;
+    objc_setAssociatedObject(configuration, &kApolloMediaMenuPressLocationKey,
+                             [NSValue valueWithCGPoint:point], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    ApolloLog(@"[NativeActionMenus] media menu anchored at press (%.0f, %.0f)", point.x, point.y);
+}
+
+%hook _TtC6Apollo21MediaViewerController
+- (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
+    UIView *previousSourceView = sApolloNativeActionMenuConfigurationSourceView;
+    sApolloNativeActionMenuConfigurationSourceView = interaction.view;
+    UIContextMenuConfiguration *configuration = %orig;
+    sApolloNativeActionMenuConfigurationSourceView = previousSourceView;
+    ApolloNativeActionMenuAnchorMediaConfiguration(configuration, location);
+    return configuration;
+}
+
+- (UITargetedPreview *)contextMenuInteraction:(UIContextMenuInteraction *)interaction previewForHighlightingMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
+    UITargetedPreview *preview = ApolloMediaMenuPressPreview(interaction, configuration);
+    return preview ?: %orig;
+}
+
+- (UITargetedPreview *)contextMenuInteraction:(UIContextMenuInteraction *)interaction previewForDismissingMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
+    UITargetedPreview *preview = ApolloMediaMenuPressPreview(interaction, configuration);
+    return preview ?: %orig;
+}
+
+// Fullscreen media needs only actions, even when Apollo supplies a preview
+// provider. Feed preview platters keep their existing presentation.
+%new
+- (id)_contextMenuInteraction:(UIContextMenuInteraction *)interaction styleForMenuWithConfiguration:(UIContextMenuConfiguration *)configuration {
+    if (!ApolloNativeActionMenusEnabled()) return nil;
+    id style = ApolloNativeActionMenuCompactMenuStyle();
+    if (objc_getAssociatedObject(configuration, &kApolloMediaMenuPressLocationKey)) {
+        // Avoid stretching the menu through a one-point bubble.
+        SEL overlap = @selector(setShouldMenuOverlapSourcePreview:);
+        if ([style respondsToSelector:overlap]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(style, overlap, NO);
+        }
+    }
+    return style;
+}
+%end
+
+static UIViewController *ApolloNativeActionMenuViewControllerForView(UIView *view) {
+    UIResponder *responder = view;
+    while (responder) {
+        if ([responder isKindOfClass:[UIViewController class]]) {
+            return (UIViewController *)responder;
+        }
+        responder = responder.nextResponder;
+    }
+    return nil;
+}
+
+// Navigation-bar buttons belong to the navigation controller's view hierarchy,
+// not directly to the visible content controller. Resolve the actual content
+// owner before invoking an action whose state lives on that controller.
+static UIViewController *ApolloNativeActionMenuContentControllerForView(UIView *view) {
+    UIViewController *controller = ApolloNativeActionMenuViewControllerForView(view);
+    while (controller) {
+        UIViewController *next = nil;
+        if ([controller isKindOfClass:[UINavigationController class]]) {
+            next = ((UINavigationController *)controller).visibleViewController;
+        } else if ([controller isKindOfClass:[UITabBarController class]]) {
+            next = ((UITabBarController *)controller).selectedViewController;
+        }
+        if (!next || next == controller) break;
+        controller = next;
+    }
+    return controller;
+}
+
+// Apollo's banned-user screen still presents its 2017-era Swift
+// ActionController when Liquid Glass is unavailable.  On some iOS 18 builds
+// that controller crashes while being presented, before the moderator can
+// choose "Edit Ban" (issue #765).  Keep Apollo's own row handlers—the code
+// that opens the contextual comment or pre-filled BanUserViewController—but
+// host those actions in UIKit's stable action sheet instead.  This is scoped
+// to this one screen and only runs when the iOS 26 native-menu replacement is
+// not active.
+static void ApolloLegacyBannedUserAppendActions(NSMutableArray<UIAction *> *actions,
+                                                 NSArray<UIMenuElement *> *elements) {
+    for (UIMenuElement *element in elements) {
+        if ([element isKindOfClass:[UIAction class]]) {
+            [actions addObject:(UIAction *)element];
+        } else if ([element isKindOfClass:[UIMenu class]]) {
+            ApolloLegacyBannedUserAppendActions(actions, ((UIMenu *)element).children);
+        }
+    }
+}
+
+static BOOL ApolloLegacyBannedUserActionMenuPresent(id presenter,
+                                                     id actionController,
+                                                     void (^completion)(void)) {
+    if (ApolloNativeActionMenusEnabled()) return NO;
+    if (![actionController isKindOfClass:ApolloClassActionController]) return NO;
+
+    UIViewController *host = [presenter isKindOfClass:[UIViewController class]] ? presenter : nil;
+    UIViewController *content = [host isKindOfClass:[UINavigationController class]]
+        ? ((UINavigationController *)host).topViewController
+        : host;
+    if (![content isKindOfClass:objc_getClass("_TtC6Apollo34ModeratorBannedUsersViewController")]) return NO;
+    if (ApolloReadBoolIvar(actionController, "showKeyboardOnAppearanceForTextEntryView", NO)) return NO;
+    if (ApolloNativeActionMenuActionControllerHasCustomHeader(actionController)) return NO;
+
+    UIMenu *menu = ApolloNativeActionMenuBuildMenu(actionController, YES);
+    if (!menu) return NO;
+
+    NSMutableArray<UIAction *> *menuActions = [NSMutableArray array];
+    ApolloLegacyBannedUserAppendActions(menuActions, menu.children);
+    if (menuActions.count == 0) return NO;
+
+    UIView *sourceView = ApolloNativeActionMenuSelectedCellForPresenter(content)
+        ?: ApolloNativeActionMenuViewForObject(content);
+    if (!sourceView.window) return NO;
+    objc_setAssociatedObject(actionController, &kApolloNativeActionMenuSourceViewKey,
+                             sourceView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:nil
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    for (UIAction *menuAction in menuActions) {
+        UIAction *retainedMenuAction = menuAction;
+        UIAlertActionStyle style = (menuAction.attributes & UIMenuElementAttributesDestructive)
+            ? UIAlertActionStyleDestructive
+            : UIAlertActionStyleDefault;
+        UIAlertAction *alertAction = [UIAlertAction actionWithTitle:menuAction.title
+                                                              style:style
+                                                            handler:^(__unused UIAlertAction *selectedAction) {
+            ApolloNativeActionMenuActionHandler handler =
+                ((ApolloNativeActionMenuActionHandler (*)(id, SEL))objc_msgSend)(retainedMenuAction,
+                                                                                 @selector(handler));
+            if (handler) handler(retainedMenuAction);
+        }];
+        alertAction.enabled = !(menuAction.attributes & UIMenuElementAttributesDisabled);
+        [sheet addAction:alertAction];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
+    if (popover) {
+        popover.sourceView = sourceView;
+        popover.sourceRect = sourceView.bounds;
+    }
+
+    ApolloLog(@"[NativeActionMenu] Using UIKit fallback for banned-user actions (%lu item(s))",
+              (unsigned long)menuActions.count);
+    [host presentViewController:sheet animated:YES completion:completion];
+    return YES;
+}
+
+// Walk down the presentedViewController chain to the top-most window-backed
+// controller that can legally present a new modal. Skips the window-less
+// ActionController (which the native-menu path never actually presents).
+static UIViewController *ApolloNativeActionMenuTopMostPresenter(UIViewController *viewController) {
+    UIViewController *result = viewController;
+    Class actionControllerClass = ApolloClassActionController;
+    while (result.presentedViewController
+           && ![result.presentedViewController isKindOfClass:actionControllerClass]) {
+        result = result.presentedViewController;
+    }
+    return result;
+}
+
+UIMenu *ApolloNativeActionMenuBuildCaptured(id controller) {
+    // A sheet Apollo flags moderator-only keeps the moderator styling, and its
+    // page-opening rows wait for the menu to close, as when presented.
+    return ApolloNativeActionMenuBuildMenu(controller, ApolloNativeActionMenuActionControllerIsModeratorOnly(controller));
+}
+
+BOOL ApolloNativeActionMenuPresentCaptured(UIMenu *menu, UIView *source, id controller, dispatch_block_t didEnd) {
+    if (!menu.children.count || !source.window) return NO;
+    ApolloNativeActionMenuPresenter *presenter = [ApolloNativeActionMenuPresenter new];
+    presenter.menu = menu;
+    presenter.actionController = controller;
+    presenter.didEnd = didEnd;
+    BOOL accepted = [presenter presentFromView:source completion:nil];
+    presenter.notifiesCapturedCancellation = accepted;
+    if (accepted) {
+        NSHashTable *holder = [NSHashTable weakObjectsHashTable];
+        [holder addObject:presenter];
+        objc_setAssociatedObject(source, &kApolloNativeActionMenuCapturedSourcePresenterKey, holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return accepted;
+}
+
+BOOL ApolloNativeActionMenuPresentCapturedAtPoint(UIMenu *menu, UIView *source, CGPoint point,
+                                                 id controller, dispatch_block_t didEnd) {
+    if (!menu.children.count || !source.window) return NO;
+    ApolloNativeActionMenuPresenter *presenter = [ApolloNativeActionMenuPresenter new];
+    presenter.menu = menu;
+    presenter.actionController = controller;
+    presenter.didEnd = didEnd;
+    presenter.sourcePoint = [NSValue valueWithCGPoint:point];
+    ApolloLog(@"[NativeActionMenus] captured media menu at press (%.0f, %.0f)", point.x, point.y);
+    BOOL accepted = [presenter presentFromView:source completion:nil];
+    presenter.notifiesCapturedCancellation = accepted;
+    if (accepted) {
+        NSHashTable *holder = [NSHashTable weakObjectsHashTable];
+        [holder addObject:presenter];
+        objc_setAssociatedObject(source, &kApolloNativeActionMenuCapturedSourcePresenterKey, holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return accepted;
+}
+
+void ApolloNativeActionMenuPreviewFeedback(UIView *source, CGPoint point) {
+    NSHashTable *holder = objc_getAssociatedObject(source, &kApolloNativeActionMenuCapturedSourcePresenterKey);
+    ApolloNativeActionMenuPresenter *presenter = holder.anyObject;
+    if (!presenter || presenter.ended || presenter.previewFeedbackEnd || !source.window) return;
+    presenter.previewFeedbackEnd = ApolloMediaMenuBeginPreviewFeedback(source, point);
+}
+
+static BOOL ApolloNativeActionMenuPresent(id presenter, id actionController, void (^completion)(void)) {
+    // Capture even on the legacy path: UIKit may defer its table/geometry
+    // callbacks until after the originating tap has returned.
+    ApolloActionMenuCaptureContextForController(actionController);
+    ApolloPaneCaptureMenuOwner(actionController);
+    if (!ApolloNativeActionMenusEnabled()) return NO;
+    if (![actionController isKindOfClass:ApolloClassActionController]) return NO;
+    if (ApolloReadBoolIvar(actionController, "showKeyboardOnAppearanceForTextEntryView", NO)) return NO;
+    if (ApolloNativeActionMenuActionControllerHasCustomHeader(actionController)) return NO;
+
+    ApolloNativeActionMenuSortSavedCategoriesIfNeeded(presenter, actionController);
+
+    BOOL moderatorStyle = ApolloNativeActionMenuModeratorStyleActive()
+        || sApolloNativeActionMenuNextPresentationModeratorStyle
+        || ApolloNativeActionMenuActionControllerIsModeratorOnly(actionController);
+    if (sApolloNativeActionMenuNextPresentationModeratorStyle) {
+        sApolloNativeActionMenuNextPresentationModeratorStyle = NO;
+    }
+    UIMenu *menu = ApolloNativeActionMenuBuildMenu(actionController, moderatorStyle);
+    if (!menu) {
+        ApolloLog(@"[NativeActionMenu] Could not build native menu for %@", actionController);
+        return NO;
+    }
+
+    UIView *sourceView = sApolloNativeActionMenuSourceView
+        ?: ApolloNativeActionMenuSelectedCellForPresenter(presenter)
+        ?: ApolloNativeActionMenuViewForObject(presenter);
+    if (!sourceView || !sourceView.window) {
+        ApolloLog(@"[NativeActionMenu] No source view/window for %@", actionController);
+        return NO;
+    }
+    objc_setAssociatedObject(actionController, &kApolloNativeActionMenuSourceViewKey, sourceView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSValue *sourcePoint = ApolloNativeActionMenuSourcePointForView(sourceView);
+    objc_setAssociatedObject(actionController, &kApolloNativeActionMenuSourcePointKey, sourcePoint, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    ApolloNativeActionMenuPresenter *menuPresenter = [ApolloNativeActionMenuPresenter new];
+    menuPresenter.menu = menu;
+    menuPresenter.actionController = actionController;
+    menuPresenter.sourcePoint = sourcePoint;
+    return [menuPresenter presentFromView:sourceView completion:completion];
+}
+
+static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionController) {
+    if (!ApolloNativeActionMenusEnabled()) return NO;
+    if (![actionController isKindOfClass:ApolloClassActionController]) return NO;
+    if (ApolloReadBoolIvar(actionController, "showKeyboardOnAppearanceForTextEntryView", NO)) return NO;
+    if (ApolloNativeActionMenuActionControllerHasCustomHeader(actionController)) return NO;
+
+    BOOL moderatorStyle = ApolloNativeActionMenuModeratorStyleActive()
+        || sApolloNativeActionMenuNextPresentationModeratorStyle
+        || ApolloNativeActionMenuActionControllerIsModeratorOnly(actionController);
+    if (!ApolloNativeActionMenuBuildMenu(actionController, moderatorStyle)) return NO;
+
+    UIView *sourceView = sApolloNativeActionMenuSourceView
+        ?: ApolloNativeActionMenuSelectedCellForPresenter(presenter)
+        ?: ApolloNativeActionMenuViewForObject(presenter);
+    return sourceView.window != nil;
+}
+
+// The six ••• tap hooks below also arm the menu CONTEXT for the customised
+// layouts (ApolloActionMenuLayout.h — which of the four customisable menus is
+// opening, keyed by entry point, see ApolloActionMenu.xm) and disarm it in
+// @finally, so an unclaimed tap can never leak into an unrelated sheet.
+
+%hook _TtC6Apollo17LargePostCellNode
+- (void)moreOptionsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)moderatorOptionsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)moderatorBannerNodeTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo19CompactPostCellNode
+- (void)moreOptionsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)moderatorOptionsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)moderatorBannerNodeTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo15CommentCellNode
+- (void)moreOptionsTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextComment);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)moderatorBannerNodeTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorComment);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+// The comment cell's own shield (Hopper: -[CommentCellNode modButtonTappedWithSender:]).
+- (void)modButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorComment);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo13InboxCellNode
+- (void)moreOptionsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo13RichMediaNode
+- (void)moreOptionsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    // The comments header's media ••• builds the same post-options sheet as a
+    // feed cell's (PostCellActionTaker), so it is the Post menu too.
+    ApolloActionMenuArmContext(ApolloActionMenuContextPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)moderatorBannerNodeTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo22CommentsHeaderCellNode
+- (void)moderatorBannerNodeTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo23MediaPageViewController
+- (void)moreButtonTapped:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo20QuickBarKeyboardView
+- (void)moreButtonTapped:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo19PostsViewController
+- (void)moreOptionsBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    UIViewController *previousPaneOwner = ApolloPaneSetMenuOwner((UIViewController *)self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextFeed);
+    @try {
+        %orig;
+    } @finally {
+        ApolloPaneSetMenuOwner(previousPaneOwner);
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)sortBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)moderatorBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorSubreddit);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo22CommentsViewController
+- (void)moreOptionsBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    UIViewController *previousPaneOwner = ApolloPaneSetMenuOwner((UIViewController *)self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextPostDetail);
+    @try {
+        %orig;
+    } @finally {
+        ApolloPaneSetMenuOwner(previousPaneOwner);
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+
+- (void)sortBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)moderatorBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    ApolloActionMenuArmContext(ApolloActionMenuContextModeratorPost);
+    @try {
+        %orig;
+    } @finally {
+        ApolloActionMenuDisarmContext();
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo32PostsSearchResultsViewController
+- (void)sortBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo26UserCommentsViewController
+- (void)sortBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo21ProfileViewController
+- (void)moreOptionsBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)accountsBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo28PrivateMessageViewController
+- (void)moreBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)sendAsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)modActionsBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+// Touch and hold a message (modmail, private message, the user info bubble):
+// Apollo builds its sheet (Copy Text, Select Text, Share, Report/Block) and
+// presents it from the window's root controller with no source view, so the
+// glass menu took the whole screen as its anchor and never appeared. Anchor
+// it where the finger is, like the media long-press menus.
+- (void)longPressedMessagesCollectionViewWithLongPressGestureRecognizer:(UILongPressGestureRecognizer *)gestureRecognizer {
+    UIView *view = gestureRecognizer.view;
+    if (gestureRecognizer.state != UIGestureRecognizerStateBegan || !view.window) {
+        %orig;
+        return;
+    }
+    ApolloNativeActionMenuBeginCapture(view, self);
+    if (sApolloNativeActionMenuSourceView == view) {
+        CGPoint point = [gestureRecognizer locationInView:view];
+        ApolloNativeActionMenuSetSourcePoint(view, [NSValue valueWithCGPoint:point]);
+        ApolloLog(@"[NativeActionMenu] message long press anchored at (%.0f, %.0f) in %@",
+                  point.x, point.y, NSStringFromClass(view.class));
+    }
+    @try {
+        %orig;
+    } @finally {
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo19InboxViewController
+- (void)markAllReadBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+// The red Delete button of a row swiped open: _UISwipeActionDynamicButton on
+// iOS 26, UISwipeActionStandardButton before it.
+static UIView *ApolloNativeActionMenuSwipeDeleteButton(UIView *view, NSUInteger depth) {
+    for (UIView *subview in view.subviews) {
+        if (subview.hidden || subview.alpha <= 0.01) continue;
+        NSString *name = NSStringFromClass(subview.class);
+        if ([name containsString:@"SwipeAction"] && [name hasSuffix:@"Button"]) return subview;
+        // Swipe actions sit beside the cell, never inside its content.
+        if (depth < 5 && ![subview isKindOfClass:UITableViewCell.class]) {
+            UIView *found = ApolloNativeActionMenuSwipeDeleteButton(subview, depth + 1);
+            if (found) return found;
+        }
+    }
+    return nil;
+}
+
+%hook _TtC6Apollo24RedditListViewController
+- (void)tappedAddBarButtonItem:(id)sender {
+    UIView *sourceView = ApolloNativeActionMenuViewForObject(sender);
+    if (!sourceView) {
+        sourceView = ApolloNativeActionMenuViewForObject(ApolloReadObjectIvar(self, "addBarButtonItem"));
+    }
+    ApolloNativeActionMenuBeginCapture(sourceView ?: sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+// A swiped row's Delete reaches Apollo's "Delete Multireddit" / "Unsubscribe
+// from …" sheet with no sender; open it where that button is, not from the
+// whole list. Anchored in the table: UIKit removes the swipe button right
+// away on iOS 26.5, which closed a menu attached to it.
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(NSInteger)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    UIView *button = tableView.window ? ApolloNativeActionMenuSwipeDeleteButton(tableView, 0) : nil;
+    if (!button) {
+        %orig;
+        return;
+    }
+    CGPoint point = [button convertPoint:CGPointMake(CGRectGetMidX(button.bounds), CGRectGetMidY(button.bounds))
+                                  toView:tableView];
+    ApolloNativeActionMenuBeginPointCapture(tableView, point, self);
+    @try {
+        %orig;
+    } @finally {
+        ApolloNativeActionMenuEndCapture();
+    }
+}
+%end
+
+%hook _TtC6Apollo26ModmailInboxViewController
+- (void)sortButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)moreOptionsButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)moderatorAreaTitleViewButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginModeratorCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo32SavedPostsCommentsViewController
+- (void)savedCategoriesButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)titleViewTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    if (ApolloNativeActionMenuPresent(self, viewControllerToPresent, completion)) {
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook _TtC6Apollo25ComposePostViewController
+- (void)cancelButtonTapped:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)presentationControllerDidAttemptToDismiss:(id)presentationController {
+    if (sApolloNativeActionMenuCaptureDepth > 0) {
+        %orig;
+        return;
+    }
+    ApolloNativeActionMenuBeginCapture(self, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    UIView *sourceView = [tableView cellForRowAtIndexPath:indexPath] ?: tableView;
+    ApolloNativeActionMenuBeginCapture(sourceView, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo21ComposeViewController
+- (void)cancelBarButtonTapped:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)presentationControllerDidAttemptToDismiss:(id)presentationController {
+    if (sApolloNativeActionMenuCaptureDepth > 0) {
+        %orig;
+        return;
+    }
+    ApolloNativeActionMenuBeginCapture(self, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo29WatcherComposerViewController
+- (void)cancelBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)presentationControllerDidAttemptToDismiss:(id)presentationController {
+    if (sApolloNativeActionMenuCaptureDepth > 0) {
+        %orig;
+        return;
+    }
+    ApolloNativeActionMenuBeginCapture(self, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo27AutoModeratorViewController
+- (void)cancelBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo40SettingsDeleteImgurUploadsViewController
+- (void)deleteButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(NSInteger)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    UIView *sourceView = [tableView cellForRowAtIndexPath:indexPath] ?: tableView;
+    ApolloNativeActionMenuBeginCapture(sourceView, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)longPressedTableViewWithGestureRecognizer:(UIGestureRecognizer *)gestureRecognizer {
+    UIView *sourceView = ApolloNativeActionMenuCellForGesture(gestureRecognizer, self);
+    ApolloNativeActionMenuBeginCapture(sourceView, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo37SettingsTouchIDPasscodeViewController
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    UIView *sourceView = [tableView cellForRowAtIndexPath:indexPath] ?: tableView;
+    ApolloNativeActionMenuBeginCapture(sourceView, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo27SettingsAboutViewController
+- (void)resetAllBarButtonItemTapped:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo22SettingsViewController
+- (void)exportBarButtonItemTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo30CrosspostPerformViewController
+- (void)flairSelectorTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo22ModQueueViewController
+- (void)modQueueFilterNodeTapped {
+    id filterNode = ApolloReadObjectIvar(self, "modQueueFilterNode");
+    UIView *filterNodeView = ApolloNativeActionMenuViewForObject(filterNode);
+    BOOL filterNodeDispatchActive = sApolloNativeActionMenuCaptureDepth > 0
+        && sApolloNativeActionMenuSourceView == filterNodeView;
+    id source = filterNodeDispatchActive
+        ? filterNode
+        : ApolloReadObjectIvar(self, "filterBarButtonItem");
+    ApolloNativeActionMenuBeginCapture(source, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+
+- (void)titleViewButtonTappedWithSender:(id)sender {
+    ApolloNativeActionMenuBeginCapture(sender, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo18ModQueueFilterNode
+- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+    // The nav-bar item and bottom filter node call the same no-argument action.
+    // Texture dispatches the node's target synchronously from this method, so
+    // preserve the actual touched node for the nested controller hook above.
+    ApolloNativeActionMenuBeginCapture(self, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo27ModeratorLogsViewController
+- (void)modLogsFilterNodeTapped {
+    id filterNode = ApolloReadObjectIvar(self, "modLogsFilterNode");
+    UIView *filterNodeView = ApolloNativeActionMenuViewForObject(filterNode);
+    BOOL fromFilterNode = sApolloNativeActionMenuCaptureDepth > 0 &&
+        sApolloNativeActionMenuSourceView == filterNodeView;
+    ApolloNativeActionMenuBeginCapture(fromFilterNode ? filterNode : ApolloReadObjectIvar(self, "filterBarButtonItem"), self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo17ModLogsFilterNode
+- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+    ApolloNativeActionMenuBeginCapture(self, self);
+    %orig;
+    ApolloNativeActionMenuEndCapture();
+}
+%end
+
+%hook _TtC6Apollo16ActionController
+- (void)viewWillAppear:(BOOL)animated {
+    // Legacy sheet: a customised ••• layout (ApolloActionMenu.xm) permutes the
+    // native actions here, before Apollo's own appearance work sizes the
+    // table from actions.count. Memoised per controller; a no-op for an
+    // untouched menu and on the glass path (this controller is never
+    // presented there — the UIMenu builder calls the same prepare).
+    ApolloActionMenuPrepareController(self, nil);
+    UIViewController *actionController = (UIViewController *)self;
+    if (!objc_getAssociatedObject(self, &kApolloNativeActionMenuLifecycleFallbackKey)
+        && ApolloNativeActionMenuCanFallbackPresent(actionController.presentingViewController, self)) {
+        actionController.view.hidden = YES;
+    }
+    %orig;
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+
+    if (objc_getAssociatedObject(self, &kApolloNativeActionMenuLifecycleFallbackKey)) return;
+
+    UIViewController *actionController = (UIViewController *)self;
+    UIViewController *presenter = actionController.presentingViewController;
+    if (!ApolloNativeActionMenuCanFallbackPresent(presenter, self)) return;
+
+    objc_setAssociatedObject(self, &kApolloNativeActionMenuLifecycleFallbackKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    actionController.view.hidden = YES;
+
+    __strong UIViewController *strongActionController = actionController;
+    __strong UIViewController *strongPresenter = presenter;
+    [strongActionController dismissViewControllerAnimated:NO completion:^{
+        if (!ApolloNativeActionMenuPresent(strongPresenter, strongActionController, nil)) {
+            ApolloLog(@"[NativeActionMenu] Lifecycle fallback could not present native menu for %@", strongActionController);
+        }
+    }];
+}
+%end
+
+%hook _TtC6Apollo26ApolloNavigationController
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    ApolloCommentNavigatorPreparePresentation(viewControllerToPresent);
+    if (!ApolloProfileMoreMenuPreparePresentation((UIViewController *)self, viewControllerToPresent)) return;
+    if (ApolloNativeActionMenuPerformPendingDirectAction(viewControllerToPresent)) {
+        if (completion) completion();
+        return;
+    }
+    if (ApolloNativeActionMenuPresent(self, viewControllerToPresent, completion)) {
+        return;
+    }
+    if (ApolloLegacyBannedUserActionMenuPresent(self, viewControllerToPresent, completion)) {
+        return;
+    }
+    %orig;
+}
+%end
+
+%hook UIViewController
+
+- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
+    ApolloCommentNavigatorPreparePresentation(viewControllerToPresent);
+    if (!ApolloProfileMoreMenuPreparePresentation((UIViewController *)self, viewControllerToPresent)) return;
+    if (ApolloNativeActionMenuPerformPendingDirectAction(viewControllerToPresent)) {
+        if (completion) completion();
+        return;
+    }
+    if (ApolloNativeActionMenuPresent(self, viewControllerToPresent, completion)) {
+        return;
+    }
+    if (ApolloLegacyBannedUserActionMenuPresent(self, viewControllerToPresent, completion)) {
+        return;
+    }
+
+    // When an action handler presents a follow-up screen DIRECTLY from the
+    // ActionController (e.g. "Share as Image"), instead of dismissing first,
+    // the controller has no window under the native-menu replacement, so the
+    // presentation is a silent no-op. Redirect it to the real captured
+    // presenter. Working actions (Reply/Give Award/Report) dismiss first, so
+    // their invoking flag is already cleared and they never hit this path.
+    Class actionControllerClass = ApolloClassActionController;
+    if ([self isKindOfClass:actionControllerClass]
+        && [objc_getAssociatedObject(self, &kApolloNativeActionMenuInvokingActionKey) boolValue]
+        && ![viewControllerToPresent isKindOfClass:actionControllerClass]
+        && !((UIViewController *)self).viewIfLoaded.window) {
+        UIView *sourceView = objc_getAssociatedObject(self, &kApolloNativeActionMenuSourceViewKey)
+            ?: sApolloNativeActionMenuSourceView;
+        UIViewController *realPresenter = ApolloNativeActionMenuTopMostPresenter(
+            ApolloNativeActionMenuViewControllerForView(sourceView));
+        if (realPresenter.viewIfLoaded.window) {
+            objc_setAssociatedObject(self, &kApolloNativeActionMenuInvokingActionKey, nil, OBJC_ASSOCIATION_ASSIGN);
+            ApolloLog(@"[NativeActionMenu] Redirecting %@ from window-less ActionController to %@", viewControllerToPresent, realPresenter);
+            [realPresenter presentViewController:viewControllerToPresent animated:flag completion:completion];
+            return;
+        }
+        ApolloLog(@"[NativeActionMenu] Could not resolve a window-backed presenter to redirect %@", viewControllerToPresent);
+    }
+
+    %orig;
+}
+
+- (void)dismissViewControllerAnimated:(BOOL)flag completion:(void (^)(void))completion {
+    if ([self isKindOfClass:ApolloClassActionController]
+        && [objc_getAssociatedObject(self, &kApolloNativeActionMenuInvokingActionKey) boolValue]) {
+        objc_setAssociatedObject(self, &kApolloNativeActionMenuInvokingActionKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        if (completion) completion();
+        return;
+    }
+    %orig;
+}
+
+%end

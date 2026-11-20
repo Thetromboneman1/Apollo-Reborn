@@ -1,0 +1,452 @@
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import "ApolloCommon.h"
+#import "ApolloFollowingSection.h"
+#import "ApolloSwiftRuntime.h"
+#import "ApolloClasses.h"
+#import "ApolloNativeActionMenus.h"
+
+// Overlay confirmation buttons without shifting or clearing the row.
+static char kListConfirmation, kCellConfirmation, kEditingRightMargin, kEditingStarPriorities, kEditingSelection;
+
+static UITableView *ApolloEditingTable(UIView *view) {
+    for (UIView *v = view; v; v = v.superview) {
+        if ([v isKindOfClass:UITableView.class]) return (UITableView *)v;
+    }
+    return nil;
+}
+
+static BOOL ApolloEditingIsList(UITableView *table) {
+    Class cls = ApolloClassRedditListViewController;
+    return cls && [(id)table.dataSource isKindOfClass:cls];
+}
+
+// Keep the stars in place while editing; restore on exit. Apply at lifecycle
+// entry points to avoid layoutSubviews recursion.
+//
+// Only rows with a reorder grip get the fixed 23pt gap before it. A row
+// without one keeps UIKit's own margin, which is where its star rests: the
+// content view still ends at the section index, so the star stays put. The
+// resting margin depends on the setup (about 23pt with Subreddit List
+// Enhancements' wider inset, 8pt without it), so a fixed 23pt there moved the
+// non-Favorites stars 15pt left on some lists.
+static void ApolloEditingAlignStar(UITableViewCell *cell, BOOL editing) {
+    UITableView *table = ApolloEditingTable(cell);
+    NSNumber *original = objc_getAssociatedObject(cell, &kEditingRightMargin);
+    NSArray<NSNumber *> *priorities = objc_getAssociatedObject(cell, &kEditingStarPriorities);
+    BOOL editingList = editing && ApolloEditingIsList(table)
+        && !ApolloSubredditListIsSwipeEditing(table);
+    // These lifecycle hooks also run for unrelated UIKit cells. Do not probe
+    // Apollo's ivars unless this is an editing list row or a row we modified.
+    if (!editingList && !original && !priorities) return;
+    UIButton *star = ApolloObjectIvar(cell, "accessoryButton");
+    if (![star isKindOfClass:UIButton.class]) return;
+    UIEdgeInsets margins = cell.contentView.layoutMargins;
+    if (editingList) {
+        // Keep the star button from stretching and shifting its glyph.
+        if (!priorities) {
+            priorities = @[@([star contentHuggingPriorityForAxis:UILayoutConstraintAxisHorizontal]),
+                           @([star contentCompressionResistancePriorityForAxis:UILayoutConstraintAxisHorizontal])];
+            objc_setAssociatedObject(cell, &kEditingStarPriorities, priorities, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        [star setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [star setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    } else if (priorities.count == 2) {
+        [star setContentHuggingPriority:priorities[0].floatValue forAxis:UILayoutConstraintAxisHorizontal];
+        [star setContentCompressionResistancePriority:priorities[1].floatValue forAxis:UILayoutConstraintAxisHorizontal];
+        objc_setAssociatedObject(cell, &kEditingStarPriorities, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // UIKit sets the row's grip (showsReorderControl) before calling setEditing:.
+    if (editingList && cell.showsReorderControl) {
+        if (!original) objc_setAssociatedObject(cell, &kEditingRightMargin, @(margins.right), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (objc_getAssociatedObject(cell, &kCellConfirmation)) return;
+        margins.right = 23.0;
+    } else {
+        // Leaving Edit mode, or a row that lost its grip while editing.
+        if (!original) return;
+        margins.right = original.doubleValue;
+        objc_setAssociatedObject(cell, &kEditingRightMargin, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    cell.contentView.layoutMargins = margins;
+}
+
+@interface ApolloListEditConfirmation : NSObject <UIGestureRecognizerDelegate>
+@property(nonatomic, weak) UITableView *table;
+@property(nonatomic, weak) UITableViewCell *cell;
+@property(nonatomic, strong) UIView *panel;
+@property(nonatomic, strong) UITapGestureRecognizer *outsideTap;
+@property(nonatomic) UIEdgeInsets contentMargins;
+@property(nonatomic) BOOL closing;
+@property(nonatomic, strong) NSMutableArray<NSArray *> *reorderControls;
+- (void)dismiss;
+- (void)close;
+- (void)confirm:(UIButton *)button;
+@end
+
+@implementation ApolloListEditConfirmation
+- (void)dismiss {
+    // Restore grip interaction after dismissal, reload, or reuse.
+    for (NSArray *entry in self.reorderControls) {
+        ((UIView *)entry[0]).userInteractionEnabled = [entry[1] boolValue];
+    }
+    self.reorderControls = nil;
+    if (self.cell) {
+        self.cell.contentView.layoutMargins = self.contentMargins;
+        [self.cell layoutIfNeeded];
+    }
+    objc_setAssociatedObject(self.cell, &kCellConfirmation, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self.panel removeFromSuperview];
+    [self.table removeGestureRecognizer:self.outsideTap];
+    [self.table.panGestureRecognizer removeTarget:self action:@selector(scrolled:)];
+    self.panel = nil;
+    self.cell = nil;
+    self.outsideTap = nil;
+    if (objc_getAssociatedObject(self.table, &kListConfirmation) == self) {
+        objc_setAssociatedObject(self.table, &kListConfirmation, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+- (void)close {
+    UIView *panel = self.panel;
+    UITableViewCell *cell = self.cell;
+    if (!panel || !cell) { [self dismiss]; return; }
+    if (self.closing) return;
+    self.closing = YES;
+    // Ignore taps while closing; the completion retains this state.
+    panel.userInteractionEnabled = NO;
+    [self.table removeGestureRecognizer:self.outsideTap];
+    [self.table.panGestureRecognizer removeTarget:self action:@selector(scrolled:)];
+    [UIView animateWithDuration:UIAccessibilityIsReduceMotionEnabled() ? 0.0 : 0.28
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        cell.contentView.layoutMargins = self.contentMargins;
+        [cell layoutIfNeeded];
+        panel.subviews.firstObject.transform = CGAffineTransformMakeTranslation(CGRectGetWidth(panel.bounds), 0.0);
+    } completion:^(BOOL finished) {
+        // A reload, reuse or another minus tap may have replaced this panel.
+        if (self.panel == panel) [self dismiss];
+    }];
+}
+- (void)scrolled:(UIPanGestureRecognizer *)gesture {
+    if (gesture.state == UIGestureRecognizerStateBegan) [self dismiss];
+}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldReceiveTouch:(UITouch *)touch {
+    for (UIView *view = touch.view; view; view = view.superview) {
+        if ([NSStringFromClass(view.class) isEqualToString:@"UITableViewCellEditControl"]) return NO;
+    }
+    // Exclude the panel bounds from outside taps during animation.
+    if (self.panel && CGRectContainsPoint(self.panel.bounds, [touch locationInView:self.panel])) return NO;
+    return ![touch.view isDescendantOfView:self.panel];
+}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+    return YES;
+}
+- (void)confirm:(UIButton *)button {
+    UITableView *table = self.table;
+    UITableViewCell *cell = self.cell;
+    NSIndexPath *path = [table indexPathForCell:cell];
+    os_log_debug(ApolloFixLog(), "[ApolloFix] [ListEditing] confirmation tapped editing=%{public}d validRow=%{public}d", table.editing, path != nil);
+    // Read before dismiss removes the button.
+    CGPoint anchor = [button convertPoint:CGPointMake(CGRectGetMidX(button.bounds), CGRectGetMidY(button.bounds))
+                                   toView:cell];
+    [self dismiss];
+    // Resolve the current row before the remapping hooks translate its index.
+    if (table.editing && path && [table.dataSource respondsToSelector:@selector(tableView:commitEditingStyle:forRowAtIndexPath:)]) {
+        ApolloFollowingAnimateNextRemoval(table, path);
+        id dataSource = table.dataSource;
+        void (^commit)(void) = ^{
+            [dataSource tableView:table commitEditingStyle:UITableViewCellEditingStyleDelete forRowAtIndexPath:path];
+        };
+        // Apollo's confirmation sheet has no sender; without this the Liquid
+        // Glass menu opens from the whole list (#1545).
+        if (cell.window) ApolloNativeActionMenuPresentFromPoint(cell, anchor, dataSource, commit);
+        else commit();
+    }
+}
+@end
+
+static BOOL ApolloEditingShowConfirmation(UIControl *control) {
+    if (![NSStringFromClass(control.class) isEqualToString:@"UITableViewCellEditControl"]) return NO;
+    UIView *parent = control.superview;
+    while (parent && ![parent isKindOfClass:UITableViewCell.class]) parent = parent.superview;
+    UITableViewCell *cell = (UITableViewCell *)parent;
+    UITableView *table = ApolloEditingTable(cell);
+    if (!ApolloEditingIsList(table) || !table.editing || cell.editingStyle != UITableViewCellEditingStyleDelete) return NO;
+    NSIndexPath *path = [table indexPathForCell:cell];
+    if (!path) return NO;
+    ApolloListEditConfirmation *state = objc_getAssociatedObject(table, &kListConfirmation);
+    BOOL sameCell = state.cell == cell;
+    if (sameCell) { [state close]; return YES; }
+    [state close];
+    // Keep outgoing animations independent. Clean up any earlier confirmation
+    // on this cell before installing the new one.
+    [(ApolloListEditConfirmation *)objc_getAssociatedObject(cell, &kCellConfirmation) dismiss];
+    state = [ApolloListEditConfirmation new];
+    state.table = table;
+    objc_setAssociatedObject(table, &kListConfirmation, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSString *title = nil;
+    if ([table.delegate respondsToSelector:@selector(tableView:titleForDeleteConfirmationButtonForRowAtIndexPath:)]) {
+        title = [table.delegate tableView:table titleForDeleteConfirmationButtonForRowAtIndexPath:path];
+    }
+    if (!title.length) title = NSLocalizedString(@"Delete", nil);
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    [button setTitle:title forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    button.backgroundColor = UIColor.systemRedColor;
+    button.layer.cornerRadius = 16.0;
+    button.layer.cornerCurve = kCACornerCurveContinuous;
+    button.accessibilityIdentifier = @"ApolloListEditConfirmation";
+    [button addTarget:state action:@selector(confirm:) forControlEvents:UIControlEventTouchUpInside];
+    UIView *panel = [UIView new];
+    // Cover the grip around the rounded button with the row background.
+    panel.clipsToBounds = YES;
+    UIView *surface = [UIView new];
+    surface.backgroundColor = cell.contentView.backgroundColor ?: cell.backgroundColor;
+    surface.translatesAutoresizingMaskIntoConstraints = NO;
+    [panel addSubview:surface];
+    panel.translatesAutoresizingMaskIntoConstraints = NO;
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    [surface addSubview:button];
+    [cell addSubview:panel];
+    // Preserve native button sizing, rounded to the display pixel.
+    CGFloat scale = cell.traitCollection.displayScale;
+    CGFloat textWidth = [title sizeWithAttributes:@{NSFontAttributeName: button.titleLabel.font}].width;
+    CGFloat width = ceil((textWidth + 24.0) * scale) / scale;
+    [NSLayoutConstraint activateConstraints:@[
+        [panel.trailingAnchor constraintEqualToAnchor:cell.safeAreaLayoutGuide.trailingAnchor constant:-30.0],
+        [panel.topAnchor constraintEqualToAnchor:cell.topAnchor],
+        [panel.bottomAnchor constraintEqualToAnchor:cell.bottomAnchor],
+        [panel.widthAnchor constraintEqualToConstant:width + 8.0],
+        [surface.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor],
+        [surface.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor],
+        [surface.topAnchor constraintEqualToAnchor:panel.topAnchor],
+        [surface.bottomAnchor constraintEqualToAnchor:panel.bottomAnchor],
+        [button.leadingAnchor constraintEqualToAnchor:surface.leadingAnchor constant:4.0],
+        [button.trailingAnchor constraintEqualToAnchor:surface.trailingAnchor constant:-4.0],
+        [button.centerYAnchor constraintEqualToAnchor:surface.centerYAnchor],
+        [button.heightAnchor constraintEqualToAnchor:surface.heightAnchor constant:-8.0]
+    ]];
+    os_log_debug(ApolloFixLog(),
+        "[ApolloFix] [ListEditing] showing confirmation %{public}@", title);
+    state.cell = cell;
+    objc_setAssociatedObject(cell, &kCellConfirmation, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    state.panel = panel;
+    state.outsideTap = [[UITapGestureRecognizer alloc] initWithTarget:state action:@selector(close)];
+    state.outsideTap.cancelsTouchesInView = NO;
+    state.outsideTap.delegate = state;
+    [table addGestureRecognizer:state.outsideTap];
+    [table.panGestureRecognizer addTarget:state action:@selector(scrolled:)];
+    [cell layoutIfNeeded];
+    // Disable the covered grip so it cannot intercept confirmation taps.
+    state.reorderControls = [NSMutableArray new];
+    NSMutableArray<UIView *> *pending = [NSMutableArray arrayWithArray:cell.subviews];
+    while (pending.count) {
+        UIView *view = pending.lastObject;
+        [pending removeLastObject];
+        if ([NSStringFromClass(view.class) containsString:@"ReorderControl"]) {
+            [state.reorderControls addObject:@[view, @(view.userInteractionEnabled)]];
+            view.userInteractionEnabled = NO;
+        } else {
+            [pending addObjectsFromArray:view.subviews];
+        }
+    }
+    [cell bringSubviewToFront:panel];
+    UIView *star = ApolloObjectIvar(cell, "accessoryButton");
+    state.contentMargins = cell.contentView.layoutMargins;
+    CGRect starFrame = [star convertRect:star.bounds toView:cell];
+    CGFloat starNudge = star ? MAX(16.0, CGRectGetMaxX(starFrame) - CGRectGetMinX(panel.frame) + 8.0) : 0.0;
+    surface.transform = CGAffineTransformMakeTranslation(width + 8.0, 0.0);
+    // Narrow the text/star stack to truncate the label without moving its left edge.
+    UIEdgeInsets confirmationMargins = state.contentMargins;
+    confirmationMargins.right += starNudge;
+    [UIView animateWithDuration:UIAccessibilityIsReduceMotionEnabled() ? 0.0 : 0.28
+                          delay:0.0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        cell.contentView.layoutMargins = confirmationMargins;
+        [cell layoutIfNeeded];
+        surface.transform = CGAffineTransformIdentity;
+    } completion:nil];
+    return YES;
+}
+
+%hook UIControl
+- (void)sendAction:(SEL)action to:(id)target forEvent:(UIEvent *)event {
+    // The minus sends rotation and confirmation actions; only the latter toggles the panel.
+    if (action == @selector(editControlWasClicked:) && ApolloEditingShowConfirmation(self)) return;
+    if (action == @selector(_toggleRotate) &&
+        [NSStringFromClass(self.class) isEqualToString:@"UITableViewCellEditControl"] &&
+        ApolloEditingIsList(ApolloEditingTable(self))) return;
+    %orig;
+}
+%end
+
+%hook UITableView
+- (void)setEditing:(BOOL)editing animated:(BOOL)animated {
+    [(ApolloListEditConfirmation *)objc_getAssociatedObject(self, &kListConfirmation) dismiss];
+    BOOL list = ApolloEditingIsList(self);
+    if (list && editing && !objc_getAssociatedObject(self, &kEditingSelection)) {
+        objc_setAssociatedObject(self, &kEditingSelection, @(self.allowsSelectionDuringEditing), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        self.allowsSelectionDuringEditing = NO;
+    }
+    %orig;
+    if (list) {
+        for (NSIndexPath *path in self.indexPathsForSelectedRows.copy) [self deselectRowAtIndexPath:path animated:NO];
+        // Most rows are already unhighlighted. Re-sending NO still enters the
+        // subreddit selection-chrome hooks for every row on each Edit/Done tap.
+        for (UITableViewCell *cell in self.visibleCells) {
+            if (cell.highlighted) [cell setHighlighted:NO animated:NO];
+        }
+        if (!editing) {
+            NSNumber *previous = objc_getAssociatedObject(self, &kEditingSelection);
+            if (previous) self.allowsSelectionDuringEditing = previous.boolValue;
+            objc_setAssociatedObject(self, &kEditingSelection, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+}
+- (void)reloadData {
+    [(ApolloListEditConfirmation *)objc_getAssociatedObject(self, &kListConfirmation) dismiss];
+    %orig;
+}
+%end
+
+%hook UITableViewCell
+- (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
+    if (highlighted) {
+        UITableView *table = ApolloEditingTable(self);
+        if (table.editing && ApolloEditingIsList(table)) highlighted = NO;
+    }
+    %orig(highlighted, animated);
+}
+- (void)setSelected:(BOOL)selected animated:(BOOL)animated {
+    if (selected) {
+        UITableView *table = ApolloEditingTable(self);
+        if (table.editing && ApolloEditingIsList(table)) selected = NO;
+    }
+    %orig(selected, animated);
+}
+- (void)setEditing:(BOOL)editing animated:(BOOL)animated {
+    ApolloEditingAlignStar(self, editing);
+    %orig;
+}
+- (void)didMoveToSuperview {
+    %orig;
+    ApolloEditingAlignStar(self, self.editing);
+}
+- (void)prepareForReuse {
+    ApolloListEditConfirmation *state = objc_getAssociatedObject(self, &kCellConfirmation);
+    if (state.cell == self) [state dismiss];
+    ApolloEditingAlignStar(self, NO);
+    %orig;
+}
+%end
+
+static UITableView *ApolloEditingFindListTable(UIView *view) {
+    if ([view isKindOfClass:UITableView.class] && ApolloEditingIsList((UITableView *)view)) return (UITableView *)view;
+    for (UIView *child in view.subviews) {
+        UITableView *table = ApolloEditingFindListTable(child);
+        if (table) return table;
+    }
+    return nil;
+}
+
+static void ApolloEditingMatchListBackground(UIViewController *controller) {
+    if (!controller.isViewLoaded) return;
+    UITableView *table = ApolloEditingFindListTable(controller.view);
+    UIColor *color = nil;
+    for (UITableViewCell *cell in table.visibleCells) {
+        // A selected Home/Popular/All row has a transient darker surface.
+        // Sampling it would leave the entire list tinted after selection ends.
+        if (cell.selected || cell.highlighted) continue;
+        for (UIColor *candidate in @[cell.contentView.backgroundColor ?: UIColor.clearColor,
+                                     cell.backgroundColor ?: UIColor.clearColor]) {
+            if (CGColorGetAlpha([candidate resolvedColorWithTraitCollection:table.traitCollection].CGColor) > 0.99) {
+                color = candidate;
+                break;
+            }
+        }
+        if (color) break;
+    }
+    if (!color) return;
+    // The top inset and scroll-edge effect draw from the table's background.
+    table.backgroundColor = color;
+    controller.view.backgroundColor = color;
+}
+
+// Apollo installs its own section-index pan on the list's ancestor. Its
+// native shouldReceiveTouch implementation accepts every touch (0x10063a0c0),
+// including the reorder grip. Reject that gesture at touch-began so UIKit's
+// reorder control receives the complete drag instead of an index/page scrub.
+static BOOL ApolloEditingTouchHitsReorder(UIView *view, UITouch *touch) {
+    if (view.hidden || view.alpha < 0.01) return NO;
+    if ([NSStringFromClass(view.class) containsString:@"ReorderControl"] &&
+        CGRectContainsPoint(view.bounds, [touch locationInView:view])) return YES;
+    for (UIView *child in view.subviews) {
+        if (ApolloEditingTouchHitsReorder(child, touch)) return YES;
+    }
+    return NO;
+}
+
+@interface ApolloEditListController : UIViewController @end
+%group ApolloListEditingController
+%hook ApolloEditListController
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gesture shouldReceiveTouch:(UITouch *)touch {
+    // The enhancement index handles its own scrub. Apollo's hidden native
+    // index pan uses different letter geometry, especially in a split column.
+    for (UIView *view = touch.view; view; view = view.superview) {
+        if ([NSStringFromClass(view.class) isEqualToString:@"ApolloSubredditIndexOverlayView"]) return NO;
+    }
+    UITableView *table = ApolloEditingFindListTable(((UIViewController *)self).view);
+    if (table.editing) {
+        for (UITableViewCell *cell in table.visibleCells) {
+            if (ApolloEditingTouchHitsReorder(cell, touch)) return NO;
+        }
+    }
+    return %orig(gesture, touch);
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    ApolloEditingMatchListBackground(self);
+}
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    ApolloEditingMatchListBackground(self);
+}
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    %orig;
+    // Strong local, deliberately (as in #897): Logos hands hooked methods an
+    // __unsafe_unretained self, so a block that names self would not keep
+    // the list alive, and tearing down its scene right after a trait flip
+    // could free it before the block runs (the crash class behind #893/#943).
+    // Owning it for one main-queue turn is harmless: the block only recolours.
+    UIViewController *controller = (UIViewController *)self;
+    dispatch_async(dispatch_get_main_queue(), ^{ ApolloEditingMatchListBackground(controller); });
+}
+%end
+%end
+
+// The Swift cell skips super.prepareForReuse, so hook both implementations.
+@interface ApolloEditListCell : UITableViewCell @end
+%group ApolloListEditingCells
+%hook ApolloEditListCell
+- (void)prepareForReuse {
+    ApolloListEditConfirmation *state = objc_getAssociatedObject(self, &kCellConfirmation);
+    if (state.cell == self) [state dismiss];
+    ApolloEditingAlignStar(self, NO);
+    %orig;
+}
+%end
+%end
+
+%ctor {
+    %init;
+    Class listClass = objc_getClass("_TtC6Apollo24RedditListViewController");
+    if (listClass) {
+        %init(ApolloListEditingController, ApolloEditListController = listClass);
+    }
+    Class cellClass = objc_getClass("_TtC6Apollo23RedditListTableViewCell");
+    if (cellClass) {
+        %init(ApolloListEditingCells, ApolloEditListCell = cellClass);
+    }
+}

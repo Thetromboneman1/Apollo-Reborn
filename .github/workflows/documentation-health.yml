@@ -1,0 +1,86 @@
+name: Documentation health
+
+on:
+  # Self-heal only on main. On PR branches its [skip ci] commit became the
+  # PR head and left it with no checks; PRs get the read-only check instead.
+  push:
+    branches:
+      - main
+  pull_request:
+
+# Read-only by default. Only the push job below may commit, and only
+# generated documentation (docs/ and Markdown/HTML documents).
+permissions:
+  contents: read
+
+concurrency:
+  group: documentation-health-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  documentation-health:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REPOSITORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install SVG renderer
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends librsvg2-bin
+      - name: Refresh generated documentation
+        run: python3 scripts/documentation_health.py --write
+      - name: Verify documentation and rendered diagrams
+        run: python3 scripts/documentation_health.py --check
+      - name: Require generated files in pull requests
+        run: |
+          git diff --check
+          if git status --porcelain | grep -q .; then
+            git status --short
+            echo "Generated documentation is stale. Run: python3 scripts/documentation_health.py --write"
+            exit 1
+          fi
+
+  # Same check name on push to main. Its commit uses GITHUB_TOKEN, which does
+  # not trigger workflows, so it must never land on a PR branch.
+  self-heal:
+    name: documentation-health
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      REPOSITORY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install SVG renderer
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends librsvg2-bin
+      - name: Refresh generated documentation
+        run: python3 scripts/documentation_health.py --write
+      - name: Verify documentation and rendered diagrams
+        run: python3 scripts/documentation_health.py --check
+      - name: Commit self-healed documentation
+        run: |
+          if ! git status --porcelain | grep -q .; then
+            exit 0
+          fi
+          # The generator only rewrites docs/ and Markdown/HTML documents;
+          # anything else changing here is a bug, so fail instead of committing it.
+          unexpected=$(git status --porcelain | sed -E 's/^.{3}//' | grep -Ev '(^docs/|[.](md|mdx|html)$)' || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error title=Unexpected generated changes::$(echo "$unexpected" | paste -sd, -)"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: refresh generated repository state [skip ci]"
+          git push
