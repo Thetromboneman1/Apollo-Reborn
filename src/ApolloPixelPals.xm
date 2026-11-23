@@ -1163,6 +1163,23 @@ void ApolloPixelPalsApplyDisplay(void) {
 }
 %end
 
+#pragma mark - Status bar taps on Duo
+
+// Apollo swaps handleTapAction: with notify_dogBark: after this hook is in
+// place, so this runs for handleTapAction:. Apollo's version keeps taps near
+// the center for Pixel Pals, which is hidden on Duo, so there the tap goes
+// straight to UIKit's handler, now under notify_dogBark:.
+%hook UIStatusBarManager
+- (void)notify_dogBark:(id)action {
+    if (_cmd == @selector(handleTapAction:) && ApolloDuoDeviceDetected()) {
+        ApolloLog(@"[PixelPals] Duo status bar tap passed to UIKit");
+        ((void (*)(id, SEL, id))objc_msgSend)(self, @selector(notify_dogBark:), action);
+        return;
+    }
+    %orig;
+}
+%end
+
 %hook _TtC6Apollo29PixelPalChooserViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
@@ -1329,6 +1346,9 @@ void ApolloPalHomeOpenFromAnywhere(BOOL animated) {
 
 %ctor {
     %init; // this file's hooks (an explicit %ctor replaces Logos' implicit one)
+    if (!class_getInstanceMethod(UIStatusBarManager.class, @selector(notify_dogBark:))) {
+        ApolloLog(@"[PixelPals] notify_dogBark: not found; Duo status bar taps keep Apollo's Pixel Pals check");
+    }
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect island;
         UIScreen *screen = ApolloMainTabBarController().viewIfLoaded.window.screen;
