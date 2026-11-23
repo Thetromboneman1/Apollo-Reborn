@@ -2880,10 +2880,12 @@ static BOOL ApolloNativeActionMenuCanFallbackPresent(id presenter, id actionCont
     ApolloNativeActionMenuBeginCapture(sender, self);
     UIViewController *previousPaneOwner = ApolloPaneSetMenuOwner((UIViewController *)self);
     ApolloActionMenuArmContext(ApolloActionMenuContextFeed);
+    ApolloActionMenuArmOwner((UIViewController *)self);
     @try {
         %orig;
     } @finally {
         ApolloPaneSetMenuOwner(previousPaneOwner);
+        ApolloActionMenuArmOwner(nil);
         ApolloActionMenuDisarmContext();
         ApolloNativeActionMenuEndCapture();
     }
