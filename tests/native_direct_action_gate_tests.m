@@ -27,6 +27,8 @@ static void ApolloActionMenuCaptureContextForController(__unused id controller) 
 static void ApolloActionMenuPrepareControllerForDirectAction(__unused id controller) { sPrepared++; }
 static NSInteger ApolloNativeActionMenuRowForActionKind(__unused id controller, __unused uint16_t kind) { return sRow; }
 static void ApolloNativeActionMenuSelectRow(__unused id controller, __unused NSInteger row) { sSelected++; }
+// No nested submenu is waiting in these tests (upstream #1766).
+static BOOL ApolloNativeActionMenuDeliverNestedChild(__unused id controller) { return NO; }
 
 // INCLUDE_PRODUCTION_DIRECT_DISPATCH
 
