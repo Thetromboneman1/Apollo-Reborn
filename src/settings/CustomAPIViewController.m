@@ -3282,6 +3282,64 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     });
 }
 
+// Features → iPhone Duo → Sidebar (upstream #1765): the landscape feed sidebar.
+- (ApolloSettingsSection *)buildDuoSidebarSection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *feedSidebar =
+        [ApolloSettingsRow switchRowWithID:@"duo.feedSidebar"
+                                     title:@"Feed Sidebar"
+                                      isOn:^BOOL { return sDuoFeedSidebarEnabled; }
+                                  onToggle:^(UISwitch *sender) {
+            sDuoFeedSidebarEnabled = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyDuoFeedSidebarEnabled];
+            ApolloDuoSplitFeedSidebarChanged();
+            [weakSelf visibilityDidChange];
+        }];
+    ApolloSettingsRow *feedSidebarStyle =
+        [ApolloSettingsRow valueRowWithID:@"duo.feedSidebarStyle"
+                                   title:@"Sidebar Style"
+                                  detail:^NSString * {
+            return sDuoFeedSidebarStyle == ApolloDuoFeedSidebarStyleStandard ? @"Standard" : @"Liquid Glass";
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.feedSidebarStyle"],
+                // Listed like Panel Style's options.
+                @"Sidebar Style", @[ @"Standard", @"Liquid Glass" ],
+                sDuoFeedSidebarStyle == ApolloDuoFeedSidebarStyleStandard ? 0 : 1, ^(NSInteger picked) {
+                    NSInteger style = picked == 0 ? ApolloDuoFeedSidebarStyleStandard : ApolloDuoFeedSidebarStyleLiquidGlass;
+                    if (sDuoFeedSidebarStyle == style) return;
+                    sDuoFeedSidebarStyle = style;
+                    [NSUserDefaults.standardUserDefaults setInteger:style forKey:UDKeyDuoFeedSidebarStyle];
+                    [weakSelf reloadRowWithID:@"duo.feedSidebarStyle"];
+                    ApolloDuoSplitFeedSidebarChanged();
+                });
+        }];
+    feedSidebarStyle.visible = ^BOOL { return sDuoFeedSidebarEnabled; };
+    NSArray<NSString *> *sidebarContents = @[ @"Favorites", @"Multireddits", @"Both" ];
+    ApolloSettingsRow *feedSidebarContent =
+        [ApolloSettingsRow valueRowWithID:@"duo.feedSidebarContent"
+                                   title:@"Show in Sidebar"
+                                  detail:^NSString * {
+            NSInteger content = sDuoFeedSidebarContent;
+            return content >= 0 && content < (NSInteger)sidebarContents.count ? sidebarContents[content] : sidebarContents[0];
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.feedSidebarContent"],
+                @"Show in Sidebar", sidebarContents, sDuoFeedSidebarContent, ^(NSInteger picked) {
+                    if (sDuoFeedSidebarContent == picked) return;
+                    sDuoFeedSidebarContent = picked;
+                    [NSUserDefaults.standardUserDefaults setInteger:picked forKey:UDKeyDuoFeedSidebarContent];
+                    [weakSelf reloadRowWithID:@"duo.feedSidebarContent"];
+                    ApolloDuoSplitFeedSidebarChanged();
+                });
+        }];
+    feedSidebarContent.visible = feedSidebarStyle.visible;
+
+    return [ApolloSettingsSection sectionWithTitle:@"Sidebar"
+                                            footer:@"When the Duo is open in landscape, the sidebar lists your feeds in place of the List button."
+                                              rows:@[ feedSidebar, feedSidebarStyle, feedSidebarContent ]];
+}
+
 // Shared with the Duo page while retaining the existing contextual entrance.
 - (ApolloSettingsRow *)buildDuoPanelStyleRow {
     __weak typeof(self) weakSelf = self;
@@ -6571,11 +6629,14 @@ replacementString:(NSString *)string {
         footer:@"Focused centers the landscape feed in a narrower column. Subreddit Panel Style controls the open display's subreddit panel. These options also remain available from their existing controls."
         rows:@[landscape, [self buildDuoPanelStyleRow]]];
     openDisplay.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+    ApolloSettingsSection *sidebar = [self buildDuoSidebarSection];
+    sidebar.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
     return @[
         [ApolloSettingsSection sectionWithTitle:@"Video Playback"
             footer:@"When enabled, partly folding the open portrait display puts fullscreen video above the fold and playback controls below it. Off by default."
             rows:@[tabletop]],
-        openDisplay
+        openDisplay,
+        sidebar
     ];
 }
 @end
