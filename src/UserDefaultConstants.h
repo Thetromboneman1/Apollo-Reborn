@@ -25,7 +25,6 @@ static NSString *const UDKeyRedirectURI = @"RedirectURI";
 // An account with no entry here falls back to the global client id/secret/redirect
 // URI above.
 static NSString *const UDKeyPerAccountCredentials = @"PerAccountAPICredentials";
-static NSString *const UDKeyUseCustomOAuthSignIn = @"UseCustomOAuthSignIn";
 static NSString *const UDKeyUserAgent = @"UserAgent";
 static NSString *const UDKeyBlockAnnouncements = @"DisableApollonouncements";
 static NSString *const UDKeyEnableFLEX = @"EnableFlexDebugging";
@@ -120,6 +119,15 @@ static NSString *const UDKeySortFavoritesAlphabetically = @"SortFavoritesAlphabe
 // Ask before adding or removing a favorite via the Subreddits-list star.
 // Opt-in; default OFF. See ApolloFavoriteConfirm.xm.
 static NSString *const UDKeyConfirmFavoriteToggle = @"ConfirmFavoriteToggle";
+// Keep hidden posts in single-subreddit feeds (adds show=all to their
+// listings). Default OFF. See ApolloShowHiddenPostsHooks.xm.
+static NSString *const UDKeyShowHiddenPostsInSubreddits = @"ShowHiddenPostsInSubreddits";
+// Keep a subreddit's ••• Show/Hide Hidden Posts choice after the app quits.
+// Default OFF: a choice lasts until the app quits.
+static NSString *const UDKeyShowHiddenPostsRememberPerSubreddit = @"ShowHiddenPostsRememberPerSubreddit";
+// Saved ••• choices: lowercased subreddit name -> @YES/@NO. Reset Subreddit
+// Choices removes them.
+static NSString *const UDKeyShowHiddenPostsSubredditChoices = @"ShowHiddenPostsSubredditChoices";
 // Per-account sorting preferences, keyed by the per-account favorites identity
 // (u:name / anonymous). Missing entries default OFF; shared preference is above.
 static NSString *const UDKeyFavoriteSortingByAccount = @"FavoriteSortingByAccount";
@@ -442,6 +450,15 @@ static NSString *const UDKeyDuoSubredditPanelGlassEnabled = @"DuoSubredditPanelG
 // Opt-in tabletop video layout on a partly folded Duo. Default OFF.
 static NSString *const UDKeyDuoTabletopVideoEnabled = @"DuoTabletopVideoEnabled";
 static NSString *const ApolloDuoVideoLayoutDidChangeNotification = @"ApolloDuoVideoLayoutDidChangeNotification";
+// The feed sidebar beside Posts on the open Duo in landscape: NO = the List
+// button (default), YES = the sidebar.
+static NSString *const UDKeyDuoFeedSidebarEnabled = @"DuoFeedSidebarEnabled";
+// The feed sidebar's look: ApolloDuoFeedSidebarStyle (0 = Liquid Glass, a
+// rounded glass panel; 1 = Standard, a solid column edge to edge, default).
+static NSString *const UDKeyDuoFeedSidebarStyle = @"DuoFeedSidebarStyle";
+// What the feed sidebar lists under Subreddits: ApolloDuoFeedSidebarContent
+// (0 = Favorites, default; 1 = Multireddits; 2 = Both).
+static NSString *const UDKeyDuoFeedSidebarContent = @"DuoFeedSidebarContent";
 // Subreddit quick-switcher (feed title tap, Posts tab long press): YES = the
 // tweak's Modern search sheet (default on Duo), NO = Apollo's Classic inline popup
 // (default elsewhere; it doesn't carry over a Duo unfold).
@@ -701,10 +718,31 @@ static NSString *const UDKeyWebJSONEnabled = @"WebJSONEnabled";
 // runs every 10 minutes instead of every minute. No effect on API-key accounts.
 // Default NO; offered once at the first API-key-free sign-in.
 static NSString *const UDKeyReduceRateLimiting = @"ReduceRateLimiting";
+// With Reduce Rate Limiting on: the share of Reddit's ten-minute request budget
+// (percent used, 30-100 in steps of 5) at which optional lookups pause until it
+// resets (ApolloWebJSONOptionalReadPause). 100 never pauses early. Default 70.
+static NSString *const UDKeyReduceRateLimitingPauseAt = @"ReduceRateLimitingPauseAt";
+// Rate Limit Warnings (API-Key-Free accounts): a notice when the account in use
+// reaches 50, 75 and 90 percent of Reddit's request budget, and when Reduce
+// Rate Limiting's Pause Extras At stop is reached (ApolloRateLimitMeter.h).
+// Default NO.
+static NSString *const UDKeyRateLimitWarnings = @"RateLimitWarnings";
+// Rate Limit Meter: a small floating gauge with the live count for the
+// API-Key-Free account in use (ApolloRateLimitMeter.h). Default NO.
+static NSString *const UDKeyRateLimitMeter = @"RateLimitMeter";
+// Where the meter was last dropped: @[x, y] as fractions of the space it can
+// move in, so it lands in the same spot after a rotation or a fold. Not
+// user-facing.
+static NSString *const UDKeyRateLimitMeterPosition = @"RateLimitMeterPosition";
 // Set once the Reduce Rate Limiting prompt has been shown (at the first
 // API-key-free sign-in, or at the first rate limit for accounts that signed in
 // before the prompt existed), so it never asks twice. Not user-facing.
 static NSString *const UDKeyReduceRateLimitingOffered = @"ReduceRateLimitingOffered";
+// Accounts Reddit reports as suspended (ApolloAccountSuspension.m): lowercased
+// username -> epoch seconds the suspension ends, 0 for no end date. Written
+// from Reddit's own answers, kept so the red banner can say why before the
+// first one arrives. Not user-facing.
+static NSString *const UDKeyAccountSuspensions = @"AccountSuspensions";
 // Use Route Updates (ApolloWebJSONRouteUpdates.m). While API-Key-Free Mode is
 // on, fetch keyless-routes.json from the repository so maintainers can change
 // which reddit.com routes blocked API-key-free reads take without a release.

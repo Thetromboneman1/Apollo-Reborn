@@ -215,6 +215,22 @@ extern NSInteger sDuoUnfoldedFeedLayout;
 // Standard (default NO) or Liquid Glass for the open Duo subreddit panel.
 extern BOOL sDuoSubredditPanelGlassEnabled;
 extern BOOL sDuoTabletopVideoEnabled; // opt-in, default NO
+// The feed sidebar beside Posts on the open Duo in landscape (default NO).
+extern BOOL sDuoFeedSidebarEnabled;
+typedef NS_ENUM(NSInteger, ApolloDuoFeedSidebarStyle) {
+    ApolloDuoFeedSidebarStyleLiquidGlass = 0,
+    ApolloDuoFeedSidebarStyleStandard = 1,
+};
+// Standard (default; a solid column) or Liquid Glass (a rounded glass panel)
+// for the feed sidebar.
+extern NSInteger sDuoFeedSidebarStyle;
+typedef NS_ENUM(NSInteger, ApolloDuoFeedSidebarContent) {
+    ApolloDuoFeedSidebarContentFavorites = 0,
+    ApolloDuoFeedSidebarContentMultireddits = 1,
+    ApolloDuoFeedSidebarContentBoth = 2,
+};
+// What the feed sidebar lists under Subreddits (default Favorites).
+extern NSInteger sDuoFeedSidebarContent;
 // Modern sheet or Apollo's Classic popup for the subreddit quick-switcher.
 extern BOOL sSubredditSwitcherSheetEnabled;
 BOOL ApolloSupportsNativeTabBarScrollBehavior(void);
@@ -413,6 +429,8 @@ typedef NS_ENUM(NSInteger, ApolloSubredditFeedIconStyle) {
     ApolloSubredditFeedIconStyleTinted = 2,
     ApolloSubredditFeedIconStyleSoftTile = 3,
     ApolloSubredditFeedIconStyleSolidTile = 4,
+    // Tinted's glyphs in the system text color: white in Dark Mode, black in Light.
+    ApolloSubredditFeedIconStyleMonochrome = 5,
 };
 typedef NS_ENUM(NSInteger, ApolloSubredditFeedLayout) {
     ApolloSubredditFeedLayoutRows = 0,
@@ -432,6 +450,10 @@ extern BOOL sPerAccountFavoritesEnabled;
 extern BOOL sSortFavoritesAlphabetically;
 // Opt-in confirm sheet before the Subreddits-list star mutates favorites.
 extern BOOL sConfirmFavoriteToggle;
+// Hidden posts stay in single-subreddit feeds (UDKeyShowHiddenPostsInSubreddits).
+extern BOOL sShowHiddenPostsInSubreddits;
+// ••• choices are saved per subreddit (UDKeyShowHiddenPostsRememberPerSubreddit).
+extern BOOL sShowHiddenPostsRememberPerSubreddit;
 // Hide the description subtitles under the subreddit list's built-in feed rows
 // (see UDKeyHideSubredditListDescriptions). Independent of the enhancements master.
 extern BOOL sHideSubredditListDescriptions;
@@ -686,6 +708,13 @@ extern BOOL sWebJSONEnabled;
 // active account is API-key-free; read it through
 // ApolloReduceRateLimitingActive() (ApolloReduceRateLimiting.h). Default NO.
 extern BOOL sReduceRateLimiting;
+// UDKeyReduceRateLimitingPauseAt: percent of Reddit's request budget used at
+// which Reduce Rate Limiting pauses optional lookups. 30-100; default 70.
+extern NSInteger sReduceRateLimitingPauseAt;
+// UDKeyRateLimitWarnings / UDKeyRateLimitMeter: the budget notices and the
+// floating gauge (ApolloRateLimitMeter.h). Both default NO.
+extern BOOL sRateLimitWarnings;
+extern BOOL sRateLimitMeter;
 // Use Route Updates (UDKeyKeylessRouteUpdates): keyless-routes.json may adjust
 // the API-Key-Free route table (ApolloWebJSONRouteUpdates.h). Default YES.
 extern BOOL sKeylessRouteUpdates;

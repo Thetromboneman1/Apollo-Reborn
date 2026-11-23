@@ -1,9 +1,16 @@
 #import <UIKit/UIKit.h>
 __BEGIN_DECLS
 void ApolloDuoSplitScheduleUpdate(void);
+/// The feed sidebar setting changed; Posts lays it out again.
+void ApolloDuoSplitFeedSidebarChanged(void);
 BOOL ApolloDuoSplitIsResizing(void);
 /// A drag is moving the Posts columns; a cancelled one puts the old widths back.
 BOOL ApolloDuoSplitIsColumnDragging(void);
+/// The thread open beside the Posts feed page `feedPage` (its top page; one a
+/// Back drag holds behind the feed counts), or nil.
+UIViewController *ApolloDuoSplitThreadBesideFeed(UIViewController *feedPage);
+/// `page`, open in the Posts thread pane, sits beside the feed column showing `layer`.
+BOOL ApolloDuoSplitThreadBesideFeedLayer(UIViewController *page, CALayer *layer);
 BOOL ApolloDuoSplitIsUnfolded(void);
 BOOL ApolloDuoRequiresSubredditEnhancements(void);
 BOOL ApolloDuoSplitIsUnfoldedPortrait(void);
@@ -13,6 +20,12 @@ CGSize ApolloDuoLayoutSize(CGSize liveSize);
 /// Apollo shares the opened display with a window stacked above or below it
 /// (Picture in Picture or another app on top): full width, but under 600pt tall.
 BOOL ApolloDuoSplitIsShortPane(void);
+/// Whether `table` is the subreddit list in the drawer that opens beside the
+/// feed rail. The rail already holds the feed shortcuts and the favorites, so
+/// the list leaves those rows out there.
+BOOL ApolloDuoSplitListOmitsRailRows(UITableView *table);
+/// The subreddit list reloaded; the feed rail rereads which shortcuts it has.
+void ApolloDuoSplitSubredditListDidReload(UITableView *table);
 /// The Original/Focused feed layout applies: unfolded, or a short pane.
 BOOL ApolloDuoSplitShowsFeedLayout(void);
 CGFloat ApolloDuoSplitTransitionContentWidth(UIView *view, CGFloat trailingInset);

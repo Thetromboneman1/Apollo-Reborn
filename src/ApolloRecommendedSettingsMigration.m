@@ -21,7 +21,6 @@ void ApolloApplyRecommendedSettingsMigration(NSUserDefaults *defaults) {
     NSDictionary<NSString *, id> *requestedValues = @{
         // Accounts and API-key-free authentication.
         UDKeyWebJSONEnabled: @YES,
-        UDKeyUseCustomOAuthSignIn: @YES,
         UDKeyUseModernRedditChat: @YES,
         UDKeyUseModernRedditModmail: @NO,
         // Prevent the older API-key-free mailbox compatibility migration from

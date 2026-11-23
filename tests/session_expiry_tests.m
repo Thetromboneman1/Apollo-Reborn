@@ -14,6 +14,8 @@ static NSMutableDictionary *entries;
 static Entry *ApolloWebSessionFor(NSString *username) { return entries[username]; }
 static NSURL *ApolloWebJSONURLWithFragment(NSURL *url, NSString *fragment) { (void)fragment; return url; }
 static NSString *ApolloWebJSONBrowserUserAgent(void) { return @"test"; }
+// The live probe also hands its account object to ApolloAccountSuspension (tested on its own).
+static BOOL ApolloAccountSuspensionNoteUserData(NSString *username, NSDictionary *userData) { (void)username; (void)userData; return NO; }
 static NSMutableArray *pending;
 static NSMutableArray *silent;
 static NSMutableArray *delayed;
@@ -91,6 +93,8 @@ static void ApolloWebJSONRecordRateLimit(NSString *username, NSURLRequest *reque
 #undef NSURLSession
 #undef NSURLSessionDataTask
 static void ApolloWebJSONMergeSetCookiesFromResponse(NSString *username, NSHTTPURLResponse *response) { (void)username; (void)response; merges++; }
+// Reddit's budget report off each answer goes to ApolloWebJSONBudget (tested on its own).
+static void ApolloWebJSONNoteBudget(NSString *username, NSHTTPURLResponse *http) { (void)username; (void)http; }
 static void require(BOOL okay) { if (!okay) { NSLog(@"FAIL"); abort(); } }
 static NSHTTPURLResponse *response(NSInteger status, NSString *mime) {
     return [[NSHTTPURLResponse alloc] initWithURL:[NSURL URLWithString:@"https://www.reddit.com/api/me.json"] statusCode:status HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type":mime}];

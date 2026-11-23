@@ -1017,6 +1017,22 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
 
 #pragma mark - The list VC hooks
 
+// The cell Apollo is building under the remap: its table, the native path the
+// remap handed Apollo, and the visible path the table asked for. Main thread.
+static __unsafe_unretained UITableView *sFollowingCellTable;
+static NSIndexPath *sFollowingCellNativePath;
+static NSIndexPath *sFollowingCellVisiblePath;
+// The same for a header Apollo is measuring: the native section it was handed
+// and the visible one it stands for.
+static __unsafe_unretained UITableView *sFollowingHeaderTable;
+static NSInteger sFollowingHeaderNative = NSNotFound;
+static NSInteger sFollowingHeaderVisible = NSNotFound;
+
+NSInteger ApolloFollowingVisibleSectionForCallout(UITableView *tableView, NSInteger section) {
+    if (tableView && tableView == sFollowingHeaderTable && section == sFollowingHeaderNative) return sFollowingHeaderVisible;
+    return section;
+}
+
 %group ApolloFollowingList
 
 %hook RedditListViewController
@@ -1057,7 +1073,20 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
         ApolloLog(@"[FollowingSection] cellForRow: no native path for %ld/%ld", (long)indexPath.section, (long)indexPath.row);
         return %orig(tableView, indexPath); // fail soft: let Apollo interpret the visible path
     }
-    return %orig(tableView, nativePath);
+    // Apollo dequeues with the path it gets; the dequeue hook below turns it
+    // back into the visible one.
+    __unsafe_unretained UITableView *outerTable = sFollowingCellTable;
+    NSIndexPath *outerNative = sFollowingCellNativePath, *outerVisible = sFollowingCellVisiblePath;
+    sFollowingCellTable = tableView;
+    sFollowingCellNativePath = nativePath;
+    sFollowingCellVisiblePath = indexPath;
+    @try {
+        return %orig(tableView, nativePath);
+    } @finally {
+        sFollowingCellTable = outerTable;
+        sFollowingCellNativePath = outerNative;
+        sFollowingCellVisiblePath = outerVisible;
+    }
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
@@ -1068,13 +1097,26 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
         if (map.entries.count == 0) return 0.0;
         // Borrow the height Apollo uses for the first entry's own (non-empty)
         // native section, so the band matches every other section exactly.
-        return %orig(tableView, map.entries.firstObject.nativeSection);
+        nativeSection = map.entries.firstObject.nativeSection;
+    } else {
+        if (nativeSection == NSNotFound) return 0.0;
+        // A collation section whose only rows were u_ entries must fully collapse
+        // even though Apollo still counts its native rows.
+        if (ApolloFollowingCollationSectionCollapsed(map, nativeSection)) return 0.0;
     }
-    if (nativeSection == NSNotFound) return 0.0;
-    // A collation section whose only rows were u_ entries must fully collapse
-    // even though Apollo still counts its native rows.
-    if (ApolloFollowingCollationSectionCollapsed(map, nativeSection)) return 0.0;
-    return %orig(tableView, nativeSection);
+    // See ApolloFollowingVisibleSectionForCallout.
+    __unsafe_unretained UITableView *outerTable = sFollowingHeaderTable;
+    NSInteger outerNative = sFollowingHeaderNative, outerVisible = sFollowingHeaderVisible;
+    sFollowingHeaderTable = tableView;
+    sFollowingHeaderNative = nativeSection;
+    sFollowingHeaderVisible = section;
+    @try {
+        return %orig(tableView, nativeSection);
+    } @finally {
+        sFollowingHeaderTable = outerTable;
+        sFollowingHeaderNative = outerNative;
+        sFollowingHeaderVisible = outerVisible;
+    }
 }
 
 - (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
@@ -1202,6 +1244,12 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
 }
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(NSInteger)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    // A row's swipe action commits while UIKit still holds the swiped row, and
+    // Apollo answers with reloadData. Reloading under the swipe leaves its
+    // offset and delete animation on whichever rows reuse those cells (gaps,
+    // missing rows, a row pushed sideways). Remove the row as Edit mode does.
+    if (editingStyle == UITableViewCellEditingStyleDelete && ApolloSubredditListIsSwipeEditing(tableView))
+        ApolloFollowingAnimateNextRemoval(tableView, indexPath);
     ApolloFollowingMap *map = ApolloFollowingMapFor((UIViewController *)self);
     if (!map.active) {
         %orig(tableView, editingStyle, indexPath);
@@ -1389,6 +1437,17 @@ NSIndexPath *ApolloFollowingVisibleIndexPathForNative(UITableView *tableView, NS
 %group ApolloFollowingTable
 
 %hook UITableView
+
+// UIKit sizes a dequeued cell from the row at the path it is given. Apollo
+// passes the native path, which under the remap is another visible row (so
+// the cell takes that row's height), or no row at all ("request for rect at
+// invalid index path", once the sections are reordered). Give UIKit the
+// visible path the cell is for.
+- (__kindof UITableViewCell *)dequeueReusableCellWithIdentifier:(NSString *)identifier forIndexPath:(NSIndexPath *)indexPath {
+    if (!sFollowingCellTable || (UITableView *)self != sFollowingCellTable
+        || ![indexPath isEqual:sFollowingCellNativePath]) return %orig;
+    return %orig(identifier, sFollowingCellVisiblePath);
+}
 
 - (void)reloadData {
     // Defer additional reloads until the removal animation completes.

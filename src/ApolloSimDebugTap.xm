@@ -16,6 +16,8 @@
 #if APOLLO_SIM_BUILD
 
 #import "ApolloAccountCredentials.h"
+#import "ApolloAccountSuspension.h"
+#import "ApolloAutoHideTabBar.h"
 #import "ApolloAsyncDisplayGuard.h"
 #import "ApolloAutoHideTabBar.h"
 #import "ApolloTiledText.h"
@@ -2794,10 +2796,71 @@ static BOOL ApolloSimDebugHandleIntegratedMainCommand(NSString *contents) {
         ApolloWebJSONSimSetOAuthBlockedReads(on);
         return YES;
     }
+    // "suspension <days>|noend|off": Reddit's answer about the ACTIVE account,
+    // for testing without a suspended one: suspended with that long left
+    // (fractions work: 0.2 is under five hours), suspended with no end date, or
+    // not suspended. It goes through the call Reddit's own answers do
+    // (ApolloAccountSuspensionNoteUserData), so the red banner follows. The
+    // account's next real answer from Reddit replaces it.
+    if ([contents hasPrefix:@"suspension "]) {
+        NSString *argument = [[contents substringFromIndex:11]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString *username = ApolloActiveAccountUsername();
+        if (username.length == 0) {
+            ApolloLog(@"[SimDebugTap] suspension: no active account");
+            return YES;
+        }
+        NSMutableDictionary *user = [@{ @"name": username } mutableCopy];
+        if ([argument isEqualToString:@"off"]) {
+            user[@"is_suspended"] = @NO;
+        } else {
+            user[@"is_suspended"] = @YES;
+            if (argument.doubleValue > 0) {
+                user[@"suspension_expiration_utc"] = @(floor([[NSDate date] timeIntervalSince1970] + argument.doubleValue * 86400.0));
+            }
+        }
+        BOOL changed = ApolloAccountSuspensionNoteUserData(username, user);
+        ApolloLog(@"[SimDebugTap] suspension %@ for u/%@ -> %@", argument, username, changed ? @"changed" : @"no change");
+        return YES;
+    }
     // "routehealth" logs the API-Key-Free route health; "routehealth reset" clears it.
     if ([contents hasPrefix:@"routehealth"]) {
         if ([contents containsString:@"reset"]) ApolloWebJSONRouteHealthReset();
         ApolloLog(@"[SimDebugTap] route health:\n%@", ApolloWebJSONRouteHealthDescription([NSDate timeIntervalSinceReferenceDate]));
+        return YES;
+    }
+    // "budget <used> [limit] [seconds]" gives the active account a request-budget
+    // report as if Reddit had sent it (default limit 100, 300 s left); "budget
+    // clear" forgets every report. Drives Reduce Rate Limiting's Pause Extras At
+    // stop, the Rate Limit Warnings and the Rate Limit Meter.
+    if ([contents hasPrefix:@"budget "]) {
+        NSArray<NSString *> *parts = [[[contents substringFromIndex:7]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+            componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        NSString *username = ApolloActiveWebSessionUsername();
+        if ([parts.firstObject isEqualToString:@"clear"]) {
+            ApolloWebJSONSimSetBudget(username, 0, 0, 0);
+            ApolloLog(@"[SimDebugTap] budget cleared");
+            return YES;
+        }
+        double used = parts.count > 0 ? parts[0].doubleValue : 0;
+        double limit = parts.count > 1 ? parts[1].doubleValue : 100;
+        NSTimeInterval seconds = parts.count > 2 ? parts[2].doubleValue : 300;
+        ApolloWebJSONSimSetBudget(username, used, limit, seconds);
+        ApolloLog(@"[SimDebugTap] budget %.0f of %.0f, %.0fs left for the active account", used, limit, seconds);
+        return YES;
+    }
+    // "ratelimit <seconds>" holds the active account as a refused request does
+    // (default 300 s) and "ratelimit off" ends the hold: the notice, the held
+    // lookups and the lists waiting for the reset, with nothing really refused.
+    if ([contents hasPrefix:@"ratelimit"]) {
+        NSString *argument = [[contents substringFromIndex:9]
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        NSString *username = ApolloActiveWebSessionUsername();
+        NSTimeInterval seconds = [argument isEqualToString:@"off"] ? 0 : (argument.length > 0 ? argument.doubleValue : 300);
+        ApolloWebJSONSimSetRateLimit(username, seconds);
+        ApolloLog(@"[SimDebugTap] rate limit on u/%@: %@", username,
+                  seconds > 0 ? [NSString stringWithFormat:@"held for %.0fs", seconds] : @"lifted");
         return YES;
     }
     if ([contents hasPrefix:@"lpm "]) {

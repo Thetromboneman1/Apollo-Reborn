@@ -7,6 +7,7 @@
 #import "settings/ApolloSetupAssistant.h"
 #import "ApolloSignInSplash.h"
 #import "ApolloSpelling.h"
+#import "ApolloShowHiddenPosts.h"
 #import "settings/ApolloSiriSettingsViewController.h"
 #import "ApolloCommon.h"
 #import "ApolloAppIcon.h"
@@ -31,7 +32,8 @@
 #import "ApolloAllPlusNSFW.h"        // ApolloAllPlusInvalidate() -- drop cached candidates on toggle
 #import "settings/ApolloAISettingsViewController.h"
 #import "ApolloWebSessionStore.h"
-#import "ApolloReduceRateLimiting.h"
+#import "ApolloRateLimitMeter.h"
+#import "settings/ApolloRateLimitSettingsViewController.h"
 #import "ApolloWebJSONRouteUpdates.h"
 #import "settings/ApolloKeylessRouteStatusViewController.h"
 #import "ApolloKagiSearch.h"         // Kagi Session Link (Search tab's Kagi mode)
@@ -674,60 +676,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 
 - (void)apollo_applySecureTextEntry:(BOOL)secure toCell:(UITableViewCell *)cell {
     [self apollo_textFieldInCell:cell].secureTextEntry = secure;
-}
-
-- (NSArray<NSString *> *)registeredURLSchemes {
-    NSArray *urlTypes = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleURLTypes"];
-    NSMutableArray *schemes = [NSMutableArray array];
-    for (NSDictionary *urlType in urlTypes) {
-        NSArray *urlSchemes = urlType[@"CFBundleURLSchemes"];
-        if (urlSchemes) {
-            for (NSString *scheme in urlSchemes) {
-                if (![scheme hasPrefix:@"twitterkit-"]) {
-                    [schemes addObject:scheme];
-                }
-            }
-        }
-    }
-    return schemes;
-}
-
-- (BOOL)isRedirectURISchemeValid:(NSString *)uriString {
-    if (uriString.length == 0) {
-        return YES; // Empty uses default, which is valid
-    }
-    NSURL *url = [NSURL URLWithString:uriString];
-    NSString *scheme = [url scheme];
-    if (!scheme) {
-        return NO;
-    }
-    NSArray *registeredSchemes = [self registeredURLSchemes];
-    for (NSString *registered in registeredSchemes) {
-        if ([scheme caseInsensitiveCompare:registered] == NSOrderedSame) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-- (BOOL)apollo_usesCustomOAuthSignIn {
-    return [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseCustomOAuthSignIn];
-}
-
-- (NSString *)apollo_redirectURIDetailText {
-    if ([self apollo_usesCustomOAuthSignIn]) {
-        return @"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported, including http/https (required for \"Web app\" Reddit API clients).";
-    }
-
-    NSString *registered = [[self registeredURLSchemes] componentsJoinedByString:@", "];
-    if (registered.length == 0) registered = @"none";
-    return [NSString stringWithFormat:@"Must match the app whose API key you're using. URI scheme (part before ://) must be registered in Info.plist under CFBundleURLTypes. Registered: %@", registered];
-}
-
-- (void)apollo_applyRedirectURITextColorToCell:(UITableViewCell *)cell {
-    UITextField *textField = [self apollo_textFieldInCell:cell];
-    if (!textField) return;
-    textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
 }
 
 - (UIImage *)decodeBase64ToImage:(NSString *)strEncodeData {
@@ -1484,6 +1432,9 @@ typedef NS_ENUM(NSInteger, Tag) {
     subreddits.iconSystemName   = @"person.3.fill";               subreddits.iconTileColor   = [UIColor systemRedColor];
     profileLayout.iconSystemName = @"person.crop.circle.fill";   profileLayout.iconTileColor = [UIColor systemTealColor];
     interface_.iconSystemName   = @"slider.horizontal.3";         interface_.iconTileColor   = [UIColor systemPurpleColor];
+    // iphone.duo arrived in iOS 27.2; 27.1 on the Duo gets the plain iPhone.
+    duo.iconSystemName          = [UIImage systemImageNamed:@"iphone.duo"] ? @"iphone.duo" : @"iphone";
+    if (@available(iOS 15.0, *)) duo.iconTileColor = [UIColor systemMintColor];
     linkPreviews.iconSystemName = @"link";                        linkPreviews.iconTileColor = [UIColor systemBlueColor];
     polls.iconSystemName        = @"chart.bar.fill";              polls.iconTileColor        = [UIColor systemYellowColor];
     apolloAI.iconSystemName     = @"sparkles";                    apolloAI.iconTileColor     = [UIColor systemIndigoColor];
@@ -1714,8 +1665,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                                                                      placeholder:defaultRedirectURI
                                                                             text:sRedirectURI
                                                                              tag:TagRedirectURI
-                                                                          detail:[weakSelf apollo_redirectURIDetailText]];
-            [weakSelf apollo_applyRedirectURITextColorToCell:cell];
+                                                                          detail:@"Must match the redirect URI registered with your Reddit API app. Any URI scheme is supported, including http/https (required for \"Web app\" Reddit API clients)."];
             return cell ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
         }
                                   onSelect:nil];
@@ -1807,18 +1757,6 @@ typedef NS_ENUM(NSInteger, Tag) {
 - (ApolloSettingsSection *)buildAPIKeysSignInSection {
     __weak typeof(self) weakSelf = self;
 
-    ApolloSettingsRow *universalOAuth =
-        [ApolloSettingsRow customRowWithID:@"api.universalOAuth"
-                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
-            return [weakSelf switchCellWithIdentifier:@"Cell_API_CustomOAuth"
-                                                label:@"Universal OAuth Sign-In"
-                                               detail:@"Signs in with an in-app web view so any Redirect URI works, including http/https (\"Web app\" Reddit API clients). Turn off for Apollo's native sign-in."
-                                                   on:[weakSelf apollo_usesCustomOAuthSignIn]
-                                               action:@selector(customOAuthSignInSwitchToggled:)]
-                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-        }
-                                  onSelect:nil];
-
     // reddit.com web sign-in, surfaced outside the Polls screen (issue #847):
     // the session powers polls, approximate vote breakdowns, and future
     // web-only features, so it belongs where accounts live. The Polls screen
@@ -1893,7 +1831,7 @@ typedef NS_ENUM(NSInteger, Tag) {
                                             footer:@"Choose how accounts sign in, or get help setting up your keys. "
                                                     "The reddit.com web sign-in unlocks features Reddit's API doesn't offer, "
                                                     "like polls and approximate vote breakdowns."
-                                              rows:@[ universalOAuth, webSignIn, troubleshooting, setupGuide ]];
+                                              rows:@[ webSignIn, troubleshooting, setupGuide ]];
 }
 
 #pragma mark - reddit.com web sign-in (issue #847)
@@ -1999,21 +1937,19 @@ typedef NS_ENUM(NSInteger, Tag) {
     // Only exists while API-Key-Free Mode is on (see -_applyWebJSONEnabled:).
     webSessionLogin.visible = ^BOOL { return sWebJSONEnabled; };
 
-    // Reddit gives API-key-free accounts a much smaller request budget, so this
-    // trades a little polish for fewer requests while one is active (see
-    // ApolloReduceRateLimiting.h). Offered once at the first API-key-free sign-in.
-    ApolloSettingsRow *reduceRateLimiting =
-        [ApolloSettingsRow customRowWithID:@"api.reduceRateLimiting"
-                                      cell:^UITableViewCell *(__unused UITableView *tableView, __unused ApolloSettingsRow *row) {
-            return [weakSelf switchCellWithIdentifier:@"Cell_API_ReduceRateLimiting"
-                                                label:@"Reduce Rate Limiting"
-                                               detail:@"Reddit limits API-key-free accounts more tightly. This uses fewer requests: profile pictures load in batches (without frames), Community Highlights refresh every 30 minutes, and your sign-in is checked less often."
-                                                   on:sReduceRateLimiting
-                                               action:@selector(reduceRateLimitingSwitchToggled:)]
-                ?: [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-        }
-                                  onSelect:nil];
-    reduceRateLimiting.visible = ^BOOL { return sWebJSONEnabled; };
+    // Everything about Reddit's request budget for API-key-free accounts has
+    // a screen of its own (ApolloRateLimitSettingsViewController): Reduce Rate
+    // Limiting with its Pause Extras At slider, Rate Limit Warnings and the
+    // Rate Limit Meter.
+    ApolloSettingsRow *rateLimit =
+        [ApolloSettingsRow disclosureRowWithID:@"api.rateLimit"
+                                         title:@"Rate Limit"
+                                        detail:^NSString *{ return @"Use fewer requests, get warnings, show a live meter"; }
+                                          push:^UIViewController *{
+            return [[ApolloRateLimitSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        }];
+    rateLimit.detailAsSubtitle = YES;
+    rateLimit.visible = ^BOOL { return sWebJSONEnabled; };
 
     // Which routes API-key-free reads are taking, what Reddit has blocked
     // since launch, and the Use Route Updates switch
@@ -2062,7 +1998,7 @@ typedef NS_ENUM(NSInteger, Tag) {
 
     return [ApolloSettingsSection sectionWithTitle:@"Experimental"
                                             footer:@"Sign in to reddit.com instead of using API keys."
-                                              rows:@[ webJSON, webSessionLogin, reduceRateLimiting, routeStatus, modernChat, modernModmail ]];
+                                              rows:@[ webJSON, webSessionLogin, rateLimit, routeStatus, modernChat, modernModmail ]];
 }
 
 - (ApolloSettingsSection *)buildAPIKeysExtrasSection {
@@ -3346,6 +3282,64 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
     });
 }
 
+// Features → iPhone Duo → Sidebar (upstream #1765): the landscape feed sidebar.
+- (ApolloSettingsSection *)buildDuoSidebarSection {
+    __weak typeof(self) weakSelf = self;
+    ApolloSettingsRow *feedSidebar =
+        [ApolloSettingsRow switchRowWithID:@"duo.feedSidebar"
+                                     title:@"Feed Sidebar"
+                                      isOn:^BOOL { return sDuoFeedSidebarEnabled; }
+                                  onToggle:^(UISwitch *sender) {
+            sDuoFeedSidebarEnabled = sender.isOn;
+            [NSUserDefaults.standardUserDefaults setBool:sender.isOn forKey:UDKeyDuoFeedSidebarEnabled];
+            ApolloDuoSplitFeedSidebarChanged();
+            [weakSelf visibilityDidChange];
+        }];
+    ApolloSettingsRow *feedSidebarStyle =
+        [ApolloSettingsRow valueRowWithID:@"duo.feedSidebarStyle"
+                                   title:@"Sidebar Style"
+                                  detail:^NSString * {
+            return sDuoFeedSidebarStyle == ApolloDuoFeedSidebarStyleStandard ? @"Standard" : @"Liquid Glass";
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.feedSidebarStyle"],
+                // Listed like Panel Style's options.
+                @"Sidebar Style", @[ @"Standard", @"Liquid Glass" ],
+                sDuoFeedSidebarStyle == ApolloDuoFeedSidebarStyleStandard ? 0 : 1, ^(NSInteger picked) {
+                    NSInteger style = picked == 0 ? ApolloDuoFeedSidebarStyleStandard : ApolloDuoFeedSidebarStyleLiquidGlass;
+                    if (sDuoFeedSidebarStyle == style) return;
+                    sDuoFeedSidebarStyle = style;
+                    [NSUserDefaults.standardUserDefaults setInteger:style forKey:UDKeyDuoFeedSidebarStyle];
+                    [weakSelf reloadRowWithID:@"duo.feedSidebarStyle"];
+                    ApolloDuoSplitFeedSidebarChanged();
+                });
+        }];
+    feedSidebarStyle.visible = ^BOOL { return sDuoFeedSidebarEnabled; };
+    NSArray<NSString *> *sidebarContents = @[ @"Favorites", @"Multireddits", @"Both" ];
+    ApolloSettingsRow *feedSidebarContent =
+        [ApolloSettingsRow valueRowWithID:@"duo.feedSidebarContent"
+                                   title:@"Show in Sidebar"
+                                  detail:^NSString * {
+            NSInteger content = sDuoFeedSidebarContent;
+            return content >= 0 && content < (NSInteger)sidebarContents.count ? sidebarContents[content] : sidebarContents[0];
+        }
+                                onSelect:^{
+            ApolloSettingsPresentPicker(weakSelf, [weakSelf cellForRowID:@"duo.feedSidebarContent"],
+                @"Show in Sidebar", sidebarContents, sDuoFeedSidebarContent, ^(NSInteger picked) {
+                    if (sDuoFeedSidebarContent == picked) return;
+                    sDuoFeedSidebarContent = picked;
+                    [NSUserDefaults.standardUserDefaults setInteger:picked forKey:UDKeyDuoFeedSidebarContent];
+                    [weakSelf reloadRowWithID:@"duo.feedSidebarContent"];
+                    ApolloDuoSplitFeedSidebarChanged();
+                });
+        }];
+    feedSidebarContent.visible = feedSidebarStyle.visible;
+
+    return [ApolloSettingsSection sectionWithTitle:@"Sidebar"
+                                            footer:@"When the Duo is open in landscape, the sidebar lists your feeds in place of the List button."
+                                              rows:@[ feedSidebar, feedSidebarStyle, feedSidebarContent ]];
+}
+
 // Shared with the Duo page while retaining the existing contextual entrance.
 - (ApolloSettingsRow *)buildDuoPanelStyleRow {
     __weak typeof(self) weakSelf = self;
@@ -3388,8 +3382,6 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
             return ApolloSettingsRouteInstantiate(@"feed-shortcuts");
         }];
 
-    ApolloSettingsRow *panelStyle = [self buildDuoPanelStyleRow];
-
     // Pushes the dedicated Subreddit Sections screen: the FOLLOWING section
     // for followed users, drag-to-reorder for the special sections, and a
     // live preview of the list layout (see ApolloSubredditSectionsViewController).
@@ -3428,8 +3420,57 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
                                   }];
     return [ApolloSettingsSection sectionWithTitle:@"Subreddit List"
                                             footer:nil
-                                              rows:@[ feedShortcuts, subredditSections, panelStyle,
+                                              rows:@[ feedShortcuts, subredditSections,
                                                       perAccountFavorites, sortFavoritesAlphabetically, confirmFavoriteToggle ]];
+}
+
+- (ApolloSettingsSection *)buildSubredditFeedsSection {
+    __weak typeof(self) weakSelf = self;
+
+    ApolloSettingsRow *showHiddenPosts =
+        [ApolloSettingsRow switchRowWithID:@"sub.showHiddenPosts"
+                                     title:@"Show Hidden Posts"
+                                      isOn:^BOOL { return sShowHiddenPostsInSubreddits; }
+                                  onToggle:^(UISwitch *sender) {
+                                      sShowHiddenPostsInSubreddits = sender.isOn;
+                                      [[NSUserDefaults standardUserDefaults] setBool:sender.isOn
+                                                                              forKey:UDKeyShowHiddenPostsInSubreddits];
+                                  }];
+    ApolloSettingsRow *rememberPerSubreddit =
+        [ApolloSettingsRow switchRowWithID:@"sub.showHiddenPostsRemember"
+                                     title:@"Remember Per Subreddit"
+                                      isOn:^BOOL { return sShowHiddenPostsRememberPerSubreddit; }
+                                  onToggle:^(UISwitch *sender) {
+                                      sShowHiddenPostsRememberPerSubreddit = sender.isOn;
+                                      [[NSUserDefaults standardUserDefaults] setBool:sender.isOn
+                                                                              forKey:UDKeyShowHiddenPostsRememberPerSubreddit];
+                                      if (sender.isOn) ApolloShowHiddenSaveSessionChoices([NSUserDefaults standardUserDefaults]);
+                                      [weakSelf visibilityDidChange];
+                                  }];
+    ApolloSettingsRow *resetChoices =
+        [ApolloSettingsRow buttonRowWithID:@"sub.showHiddenPostsReset"
+                                     title:@"Reset Subreddit Choices"
+                                    action:^{ [weakSelf promptResetShowHiddenChoices]; }];
+    resetChoices.visible = ^BOOL {
+        return ApolloShowHiddenSavedChoiceCount([NSUserDefaults standardUserDefaults]) > 0;
+    };
+
+    return [ApolloSettingsSection sectionWithTitle:@"Subreddit Feeds"
+                                            footer:@"Show Hidden Posts: posts you hid show up again in subreddit feeds. Home, Popular, All and multireddits still hide them. Reddit's \"hide posts I voted on\" options don't apply in these feeds either. Pull to refresh an open feed.\n\nA subreddit's ••• menu changes this for that subreddit until Apollo quits. Remember Per Subreddit keeps that choice."
+                                              rows:@[ showHiddenPosts, rememberPerSubreddit, resetChoices ]];
+}
+
+- (void)promptResetShowHiddenChoices {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Reset Subreddit Choices?"
+                                                                   message:@"Every subreddit goes back to the Show Hidden Posts setting."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Reset" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        ApolloShowHiddenClearChoices([NSUserDefaults standardUserDefaults]);
+        [weakSelf visibilityDidChange];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (ApolloSettingsSection *)buildSubredditsLayoutSection {
@@ -3541,6 +3582,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
         case ApolloSubredditFeedIconStyleTinted: return @"Tinted";
         case ApolloSubredditFeedIconStyleSoftTile: return @"Soft Tile";
         case ApolloSubredditFeedIconStyleSolidTile: return @"Solid Tile";
+        case ApolloSubredditFeedIconStyleMonochrome: return @"Monochrome";
         default: return @"Classic";
     }
 }
@@ -3556,7 +3598,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
 
 - (void)setSubredditFeedIconStyle:(NSInteger)iconStyle {
     if (iconStyle < ApolloSubredditFeedIconStyleClassic ||
-        iconStyle > ApolloSubredditFeedIconStyleSolidTile) {
+        iconStyle > ApolloSubredditFeedIconStyleMonochrome) {
         iconStyle = ApolloSubredditFeedIconStyleClassic;
     }
     sSubredditFeedIconStyle = iconStyle;
@@ -3582,7 +3624,7 @@ static NSInteger ApolloHeaderStylePickerValue(NSInteger index, BOOL blurAvailabl
 - (void)presentSubredditFeedIconStylePickerFromSourceView:(UIView *)sourceView {
     __weak typeof(self) weakSelf = self;
     ApolloSettingsPresentPicker(self, sourceView, @"Icon Style",
-                                @[@"Classic", @"Circle", @"Tinted", @"Soft Tile", @"Solid Tile"],
+                                @[@"Classic", @"Circle", @"Tinted", @"Soft Tile", @"Solid Tile", @"Monochrome"],
                                 sSubredditFeedIconStyle,
                                 ^(NSInteger pickedIndex) {
         [weakSelf setSubredditFeedIconStyle:pickedIndex];
@@ -5193,7 +5235,6 @@ replacementString:(NSString *)string {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sRedirectURI = textField.text;
         [[NSUserDefaults standardUserDefaults] setValue:sRedirectURI forKey:UDKeyRedirectURI];
-        textField.textColor = ([self apollo_usesCustomOAuthSignIn] || [self isRedirectURISchemeValid:textField.text]) ? [UIColor labelColor] : [UIColor systemRedColor];
     } else if (textField.tag == TagUserAgent) {
         textField.text = [textField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         sUserAgent = textField.text;
@@ -5391,10 +5432,8 @@ replacementString:(NSString *)string {
 
     // The Web Session Login row only exists while the mode is on.
     [self visibilityDidChange];
-}
-
-- (void)reduceRateLimitingSwitchToggled:(UISwitch *)sender {
-    ApolloReduceRateLimitingSetEnabled(sender.isOn);
+    // And the Rate Limit Meter is only up for an API-Key-Free account.
+    ApolloRateLimitMeterSettingsChanged();
 }
 
 // Modern Chat / Modmail are a plain app-wide choice for every account.
@@ -5480,12 +5519,6 @@ replacementString:(NSString *)string {
     valueLabel.text = [NSString stringWithFormat:@"%.2f", snapped];
     sAllPlusNSFWBoost = snapped;
     [[NSUserDefaults standardUserDefaults] setDouble:snapped forKey:UDKeyAllPlusNSFWBoost];
-}
-
-- (void)customOAuthSignInSwitchToggled:(UISwitch *)sender {
-    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyUseCustomOAuthSignIn];
-    // The Redirect URI row's explainer text and validity color both depend on this.
-    [self reloadRowWithID:@"api.redirectURI"];
 }
 
 // Subreddit List Enhancements, Modern Subreddit Dividers and Hide Multireddit
@@ -5974,27 +6007,6 @@ replacementString:(NSString *)string {
 
 @implementation ApolloAccountsAPIKeysViewController
 - (NSString *)apollo_screenTitle { return @"Accounts & API Keys"; }
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    // The sign-in and rate-limit offers can turn Reduce Rate Limiting on while
-    // this screen stays on the stack (the sign-in sheet doesn't trigger
-    // another viewWillAppear), so follow the setting directly.
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(apollo_reduceRateLimitingDidChange:)
-                                                 name:ApolloReduceRateLimitingDidChangeNotification
-                                               object:nil];
-}
-- (void)apollo_reduceRateLimitingDidChange:(NSNotification *)notification {
-    (void)notification;
-    // Update the switch in place: a reload here would cut short the switch's
-    // own animation when the change came from tapping it.
-    UITableViewCell *cell = [self cellForRowID:@"api.reduceRateLimiting"];
-    for (UIView *subview in cell.contentView.subviews) {
-        if (![subview isKindOfClass:[UISwitch class]]) continue;
-        UISwitch *toggle = (UISwitch *)subview;
-        if (toggle.isOn != sReduceRateLimiting) [toggle setOn:sReduceRateLimiting animated:YES];
-    }
-}
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return @[ [self buildAPIKeysDefaultSection],
               [self buildAPIKeysKagiSection],
@@ -6105,6 +6117,7 @@ replacementString:(NSString *)string {
 }
 - (NSArray<ApolloSettingsSection *> *)buildForm {
     return [@[ [self buildSubredditsMainSection],
+               [self buildSubredditFeedsSection],
                [self buildSubredditsLayoutSection] ]
         arrayByAddingObjectsFromArray:[self buildSubredditsSearchSections]];
 }
@@ -6616,11 +6629,14 @@ replacementString:(NSString *)string {
         footer:@"Focused centers the landscape feed in a narrower column. Subreddit Panel Style controls the open display's subreddit panel. These options also remain available from their existing controls."
         rows:@[landscape, [self buildDuoPanelStyleRow]]];
     openDisplay.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
+    ApolloSettingsSection *sidebar = [self buildDuoSidebarSection];
+    sidebar.visible = ^BOOL { return ApolloDuoUsesAdaptiveBars(); };
     return @[
         [ApolloSettingsSection sectionWithTitle:@"Video Playback"
             footer:@"When enabled, partly folding the open portrait display puts fullscreen video above the fold and playback controls below it. Off by default."
             rows:@[tabletop]],
-        openDisplay
+        openDisplay,
+        sidebar
     ];
 }
 @end

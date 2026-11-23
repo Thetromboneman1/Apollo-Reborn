@@ -41,7 +41,7 @@
 @interface ApolloInterfaceSettingsViewController : CustomAPIViewController // Features → Interface
 @end
 
-@interface ApolloDuoSettingsViewController : CustomAPIViewController // Duo hardware only
+@interface ApolloDuoSettingsViewController : CustomAPIViewController // Features → iPhone Duo (Duo only)
 @end
 
 @interface ApolloNotificationBackendViewController : CustomAPIViewController // Advanced → Notification Backend
