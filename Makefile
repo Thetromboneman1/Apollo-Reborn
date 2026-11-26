@@ -440,6 +440,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAccountSuspension.m \
     $(SRC_DIR)/ApolloSuspensionBanner.m \
     $(SRC_DIR)/ApolloWebJSONWriteRepair.m \
+    $(SRC_DIR)/ApolloWebJSONFriends.m \
     $(SRC_DIR)/ApolloWebJSONRoutes.m \
     $(SRC_DIR)/ApolloWebJSONBudget.m \
     $(SRC_DIR)/ApolloRateLimitMeter.m \
