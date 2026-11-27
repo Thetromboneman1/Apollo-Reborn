@@ -242,6 +242,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloPostedCommentInsert.xm \
     $(SRC_DIR)/ApolloLoadMoreComments.xm \
     $(SRC_DIR)/ApolloCommentSubmitFailure.xm \
+    $(SRC_DIR)/ApolloPostSubmitFailure.xm \
     $(SRC_DIR)/ApolloLiveCommentsFollow.xm \
     $(SRC_DIR)/ApolloCommentNavigationModel.m \
     $(SRC_DIR)/ApolloCommentNavigator.xm \
@@ -249,6 +250,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/settings/ApolloSettingsGeneralTable.xm \
     $(SRC_DIR)/settings/ApolloSettingsNativeInjections.xm \
     $(SRC_DIR)/ApolloPerPostCommentSort.xm \
+    $(SRC_DIR)/ApolloStickiedMarkRead.xm \
     $(SRC_DIR)/ApolloURLOpenCommentSort.xm \
     $(SRC_DIR)/ApolloLiquidGlassTabGesture.m \
     $(SRC_DIR)/ApolloLiquidGlass.xm \
@@ -440,6 +442,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloAccountSuspension.m \
     $(SRC_DIR)/ApolloSuspensionBanner.m \
     $(SRC_DIR)/ApolloWebJSONWriteRepair.m \
+    $(SRC_DIR)/ApolloWebJSONFriends.m \
     $(SRC_DIR)/ApolloWebJSONRoutes.m \
     $(SRC_DIR)/ApolloWebJSONBudget.m \
     $(SRC_DIR)/ApolloRateLimitMeter.m \
